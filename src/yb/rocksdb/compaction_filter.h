@@ -21,14 +21,15 @@
 // under the License.
 //
 
-#ifndef ROCKSDB_INCLUDE_ROCKSDB_COMPACTION_FILTER_H
-#define ROCKSDB_INCLUDE_ROCKSDB_COMPACTION_FILTER_H
+#ifndef YB_ROCKSDB_COMPACTION_FILTER_H
+#define YB_ROCKSDB_COMPACTION_FILTER_H
 
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "yb/util/slice.h"
+#include "yb/rocksdb/metadata.h"
 
 namespace rocksdb {
 
@@ -45,6 +46,8 @@ struct CompactionFilterContext {
 
 // CompactionFilter allows an application to modify/delete a key-value at
 // the time of compaction.
+
+YB_DEFINE_ENUM(FilterDecision, (kKeep)(kDiscard));
 
 class CompactionFilter {
  public:
@@ -100,11 +103,11 @@ class CompactionFilter {
   // The last paragraph is not true if you set max_subcompactions to more than
   // 1. In that case, subcompaction from multiple threads may call a single
   // CompactionFilter concurrently.
-  virtual bool Filter(int level,
-                      const Slice& key,
-                      const Slice& existing_value,
-                      std::string* new_value,
-                      bool* value_changed) const = 0;
+  virtual FilterDecision Filter(int level,
+                                const Slice& key,
+                                const Slice& existing_value,
+                                std::string* new_value,
+                                bool* value_changed) = 0;
 
   // The compaction process invokes this method on every merge operand. If this
   // method returns true, the merge operand will be ignored and not written out
@@ -130,6 +133,14 @@ class CompactionFilter {
   // using a snapshot.
   virtual bool IgnoreSnapshots() const { return false; }
 
+  // Gives the compaction filter an opportunity to return a "user frontier" that will be used to
+  // update the frontier stored in the version edit metadata when the compaction result is
+  // installed.
+  //
+  // As a concrete use case, we use this to pass the history cutoff timestamp from the DocDB
+  // compaction filter into the version edit metadata. See DocDBCompactionFilter.
+  virtual UserFrontierPtr GetLargestUserFrontier() const { return nullptr; }
+
   // Returns a name that identifies this compaction filter.
   // The name will be printed to LOG file on start up for diagnosis.
   virtual const char* Name() const = 0;
@@ -150,4 +161,4 @@ class CompactionFilterFactory {
 
 }  // namespace rocksdb
 
-#endif // ROCKSDB_INCLUDE_ROCKSDB_COMPACTION_FILTER_H
+#endif // YB_ROCKSDB_COMPACTION_FILTER_H

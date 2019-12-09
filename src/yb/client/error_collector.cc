@@ -30,8 +30,10 @@
 // under the License.
 //
 
-#include "yb/client/client.h"
 #include "yb/client/error_collector.h"
+
+#include "yb/client/error.h"
+#include "yb/client/client.h"
 
 namespace yb {
 namespace client {
@@ -43,24 +45,35 @@ ErrorCollector::ErrorCollector() {
 ErrorCollector::~ErrorCollector() {}
 
 void ErrorCollector::AddError(std::unique_ptr<YBError> error) {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard<simple_spinlock> l(mutex_);
   errors_.push_back(std::move(error));
 }
 
 int ErrorCollector::CountErrors() const {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard<simple_spinlock> l(mutex_);
   return errors_.size();
 }
 
 CollectedErrors ErrorCollector::GetErrors() {
   CollectedErrors result;
   {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard<simple_spinlock> l(mutex_);
     errors_.swap(result);
   }
   return result;
 }
 
+Status ErrorCollector::GetSingleErrorStatus() {
+  std::lock_guard<simple_spinlock> l(mutex_);
+  if (errors_.size() == 1) {
+    return errors_.front()->status();
+  }
+  return Status::OK();
+}
+
+void ErrorCollector::AddError(std::shared_ptr<YBOperation> operation, Status status) {
+  AddError(std::make_unique<YBError>(std::move(operation), std::move(status)));
+}
 
 } // namespace internal
 } // namespace client

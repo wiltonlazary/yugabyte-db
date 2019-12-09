@@ -37,12 +37,17 @@ import org.junit.Test;
 import java.util.Arrays;
 import java.util.List;
 
-import static org.junit.Assert.assertArrayEquals;
-import static org.junit.Assert.assertEquals;
+import static org.yb.AssertionWrappers.assertArrayEquals;
+import static org.yb.AssertionWrappers.assertEquals;
 
 /**
  * Test for {@link NetUtil}.
  */
+import org.yb.YBTestRunner;
+
+import org.junit.runner.RunWith;
+
+@RunWith(value=YBTestRunner.class)
 public class TestNetUtil {
 
   /**

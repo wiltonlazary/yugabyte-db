@@ -38,6 +38,9 @@
 #include <boost/optional.hpp>
 
 #include "yb/common/wire_protocol.h"
+#include "yb/consensus/consensus.h"
+#include "yb/docdb/cql_operation.h"
+#include "yb/docdb/pgsql_operation.h"
 #include "yb/gutil/stl_util.h"
 #include "yb/gutil/strings/numbers.h"
 #include "yb/gutil/walltime.h"
@@ -48,13 +51,17 @@
 #include "yb/tablet/tablet_peer.h"
 #include "yb/tserver/tserver.pb.h"
 #include "yb/util/debug/trace_event.h"
+#include "yb/util/debug-util.h"
 #include "yb/util/flag_tags.h"
 #include "yb/util/locks.h"
 #include "yb/util/trace.h"
 
 DEFINE_test_flag(int32, tablet_inject_latency_on_apply_write_txn_ms, 0,
                  "How much latency to inject when a write operation is applied.");
+DEFINE_test_flag(bool, tablet_pause_apply_write_ops, false,
+                 "Pause applying of write operations.");
 TAG_FLAG(tablet_inject_latency_on_apply_write_txn_ms, runtime);
+TAG_FLAG(tablet_pause_apply_write_ops, runtime);
 
 namespace yb {
 namespace tablet {
@@ -71,10 +78,13 @@ using tserver::WriteResponsePB;
 using strings::Substitute;
 
 WriteOperation::WriteOperation(
-    std::unique_ptr<WriteOperationState> state, DriverType type,
-    MonoTime deadline, WriteOperationContext* context)
-    : Operation(std::move(state), type, OperationType::kWrite),
-      context_(*context), deadline_(deadline), start_time_(MonoTime::Now()) {
+    std::unique_ptr<WriteOperationState> state, int64_t term, CoarseTimePoint deadline,
+    WriteOperationContext* context)
+    : Operation(std::move(state), OperationType::kWrite),
+      context_(*context), term_(term), deadline_(deadline), start_time_(MonoTime::Now()),
+      // If term is unknown, it means that we are creating operation at replica.
+      // So it was already submitted at leader.
+      submitted_(term == yb::OpId::kUnknownTerm) {
 }
 
 consensus::ReplicateMsgPtr WriteOperation::NewReplicateMsg() {
@@ -94,52 +104,44 @@ void WriteOperation::DoStart() {
   state()->tablet()->StartOperation(state());
 }
 
+Status WriteOperation::DoAborted(const Status& status) {
+  TRACE("FINISH: aborting operation");
+  state()->Abort();
+  return status;
+}
+
 // FIXME: Since this is called as a void in a thread-pool callback,
 // it seems pointless to return a Status!
-Status WriteOperation::Apply() {
-  TRACE_EVENT0("txn", "WriteOperation::Apply");
+Status WriteOperation::DoReplicated(int64_t leader_term, Status* complete_status) {
+  TRACE_EVENT0("txn", "WriteOperation::Complete");
   TRACE("APPLY: Starting");
 
   if (PREDICT_FALSE(
           ANNOTATE_UNPROTECTED_READ(FLAGS_tablet_inject_latency_on_apply_write_txn_ms) > 0)) {
-    TRACE("Injecting $0ms of latency due to --tablet_inject_latency_on_apply_write_txn_ms",
-          FLAGS_tablet_inject_latency_on_apply_write_txn_ms);
-    SleepFor(MonoDelta::FromMilliseconds(FLAGS_tablet_inject_latency_on_apply_write_txn_ms));
+      TRACE("Injecting $0ms of latency due to --tablet_inject_latency_on_apply_write_txn_ms",
+            FLAGS_tablet_inject_latency_on_apply_write_txn_ms);
+      SleepFor(MonoDelta::FromMilliseconds(FLAGS_tablet_inject_latency_on_apply_write_txn_ms));
+  } else {
+    TEST_PAUSE_IF_FLAG(tablet_pause_apply_write_ops);
   }
 
-  Tablet* tablet = state()->tablet();
+  *complete_status = state()->tablet()->ApplyRowOperations(state());
+  // Failure is regular case, since could happen because transaction was aborted, while
+  // replicating it's intents.
+  LOG_IF(INFO, !complete_status->ok()) << "Apply operation failed: " << *complete_status;
 
-  tablet->ApplyRowOperations(state());
-
-  return Status::OK();
-}
-
-void WriteOperation::PreCommit() {
-  TRACE_EVENT0("txn", "WriteOperation::PreCommit");
-  TRACE("PRECOMMIT: Releasing row and schema locks");
-  // Perform early lock release after we've applied all changes
-  state()->ReleaseDocDbLocks(tablet());
-}
-
-void WriteOperation::Finish(OperationResult result) {
-  TRACE_EVENT0("txn", "WriteOperation::Finish");
-  if (PREDICT_FALSE(result == Operation::ABORTED)) {
-    TRACE("FINISH: aborting operation");
-    state()->Abort();
-    return;
-  }
-
-  DCHECK_EQ(result, Operation::COMMITTED);
   // Now that all of the changes have been applied and the commit is durable
   // make the changes visible to readers.
   TRACE("FINISH: making edits visible");
   state()->Commit();
 
   TabletMetrics* metrics = tablet()->metrics();
-  if (metrics && type() == consensus::LEADER) {
+  if (metrics && state()->has_completion_callback()) {
     auto op_duration_usec = MonoTime::Now().GetDeltaSince(start_time_).ToMicroseconds();
     metrics->write_op_duration_client_propagated_consistency->Increment(op_duration_usec);
   }
+
+  return Status::OK();
 }
 
 string WriteOperation::ToString() const {
@@ -148,8 +150,16 @@ string WriteOperation::ToString() const {
   WallTime abs_time = WallTime_Now() - d.ToSeconds();
   string abs_time_formatted;
   StringAppendStrftime(&abs_time_formatted, "%Y-%m-%d %H:%M:%S", (time_t)abs_time, true);
-  return Substitute("WriteOperation [type=$0, start_time=$1, state=$2]",
-                    DriverType_Name(type()), abs_time_formatted, state()->ToString());
+  return Substitute("WriteOperation { start_time: $0 state: $1 }",
+                    abs_time_formatted, state()->ToString());
+}
+
+WriteOperation::~WriteOperation() {
+  // If operation was submitted, then it's lifetime is controlled by operation tracker and we
+  // don't have to do it here.
+  if (!submitted_) {
+    context_.Aborted(this);
+  }
 }
 
 void WriteOperation::DoStartSynchronization(const Status& status) {
@@ -162,26 +172,29 @@ void WriteOperation::DoStartSynchronization(const Status& status) {
     auto local_limit = context_.ReportReadRestart();
     restart_time->set_local_limit_ht(local_limit.ToUint64());
     // Global limit is ignored by caller, so we don't set it.
-    state()->completion_callback()->OperationCompleted();
+    state()->CompleteWithStatus(Status::OK());
     return;
   }
 
   if (!status.ok()) {
-    state()->completion_callback()->CompleteWithStatus(status);
+    state()->CompleteWithStatus(status);
     return;
   }
 
-  context_.StartExecution(std::move(self));
+  self->submitted_ = true;
+  context_.Submit(std::move(self), term_);
 }
 
 WriteOperationState::WriteOperationState(Tablet* tablet,
                                          const tserver::WriteRequestPB *request,
-                                         tserver::WriteResponsePB *response)
+                                         tserver::WriteResponsePB *response,
+                                         docdb::OperationKind kind)
     : OperationState(tablet),
       // We need to copy over the request from the RPC layer, as we're modifying it in the tablet
       // layer.
       request_(request ? new WriteRequestPB(*request) : nullptr),
-      response_(response) {
+      response_(response),
+      kind_(kind) {
 }
 
 void WriteOperationState::Abort() {
@@ -189,22 +202,27 @@ void WriteOperationState::Abort() {
     tablet()->mvcc_manager()->Aborted(hybrid_time_);
   }
 
-  ReleaseDocDbLocks(tablet());
+  ReleaseDocDbLocks();
 
   // After aborting, we may respond to the RPC and delete the
   // original request, so null them out here.
   ResetRpcFields();
 }
 
+void WriteOperationState::UpdateRequestFromConsensusRound() {
+  request_ = consensus_round()->replicate_msg()->mutable_write_request();
+}
+
 void WriteOperationState::Commit() {
   tablet()->mvcc_manager()->Replicated(hybrid_time_);
+  ReleaseDocDbLocks();
 
   // After committing, we may respond to the RPC and delete the
   // original request, so null them out here.
   ResetRpcFields();
 }
 
-void WriteOperationState::ReleaseDocDbLocks(Tablet* tablet) {
+void WriteOperationState::ReleaseDocDbLocks() {
   // Free DocDB multi-level locks.
   docdb_locks_.Reset();
 }

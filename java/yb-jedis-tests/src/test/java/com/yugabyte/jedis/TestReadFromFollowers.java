@@ -12,40 +12,36 @@
 //
 package com.yugabyte.jedis;
 
+import com.google.common.net.HostAndPort;
 import com.google.protobuf.ByteString;
 import org.apache.commons.text.RandomStringGenerator;
-import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.yb.Common;
-import org.yb.client.GetTableSchemaResponse;
-import org.yb.client.LocatedTablet;
-import org.yb.client.ModifyClusterConfigLiveReplicas;
-import org.yb.client.TestUtils;
-import org.yb.client.YBClient;
-import org.yb.client.YBTable;
+import org.yb.YBParameterizedTestRunner;
+import org.yb.client.*;
 import org.yb.master.Master;
+import org.yb.minicluster.MiniYBCluster;
 import org.yb.minicluster.MiniYBDaemon;
-import redis.clients.jedis.HostAndPort;
+
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.YBJedis;
 import redis.clients.util.JedisClusterCRC16;
 
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
-import java.util.*;
-import java.util.stream.Collectors;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.List;
+import java.util.Map;
 
-import static junit.framework.TestCase.assertEquals;
-import static junit.framework.TestCase.fail;
-import static junit.framework.TestCase.assertNotNull;
-import static junit.framework.TestCase.assertNull;
-import static junit.framework.TestCase.assertTrue;
+import static junit.framework.TestCase.*;
 
-@RunWith(Parameterized.class)
+@RunWith(value=YBParameterizedTestRunner.class)
 public class TestReadFromFollowers extends BaseJedisTest {
   private static final Logger LOG = LoggerFactory.getLogger(TestYBJedis.class);
 
@@ -73,7 +69,7 @@ public class TestReadFromFollowers extends BaseJedisTest {
   }
 
   @Override
-  public void setUpBefore() throws Exception {
+  public void setUpBefore() {
     TestUtils.clearReservedPorts();
   }
 
@@ -92,6 +88,10 @@ public class TestReadFromFollowers extends BaseJedisTest {
     assertEquals(Common.PartitionSchemaPB.HashSchema.REDIS_HASH_SCHEMA,
         tableSchema.getPartitionSchema().getHashSchema());
 
+    setUpJedisClient();
+  }
+
+  public void setUpJedisClient() throws Exception {
     // Setup the Jedis client.
     List<InetSocketAddress> redisContactPoints = miniCluster.getRedisContactPoints();
 
@@ -116,7 +116,25 @@ public class TestReadFromFollowers extends BaseJedisTest {
     for (int i = 0; i < nReads; i++) {
       String s = generator.generate(20);
       LOG.info("Iteration {}. Setting and getting {}", i, s);
-      assertEquals("OK", jedis_client.set(s, "v"));
+      boolean write_succeeded = false;
+      String ret;
+      for (int j = 0; j < 20; j++) {
+        try {
+          ret = jedis_client.set(s, "v");
+        } catch (Exception e) {
+          if (e.getMessage().contains("Not the leader")) {
+            continue;
+          }
+          throw e;
+        }
+        if (ret.equals("OK")) {
+          write_succeeded = true;
+          break;
+        }
+      }
+
+      assertTrue(write_succeeded);
+
       TestUtils.waitFor(() -> {
         if (jedis_client.get(s) == null) {
           return false;
@@ -186,6 +204,7 @@ public class TestReadFromFollowers extends BaseJedisTest {
         "--placement_zone=" + PLACEMENT_ZONE2, "--placement_uuid=" + PLACEMENT_UUID));
 
     createMiniCluster(3, masterArgs, tserverArgs);
+    waitForTServersAtMasterLeader();
 
     YBClient syncClient = miniCluster.getClient();
 
@@ -439,5 +458,97 @@ public class TestReadFromFollowers extends BaseJedisTest {
         fail(String.format("Invalid value %s returned for key %s", value, s));
       }
     }
+  }
+
+  @Test
+  public void testRestartDuringFollowerRead() throws Exception {
+    testRestartDuringFollowerReadWithValueSize(10);
+  }
+
+  @Test
+  public void testRestartDuringFollowerReadWithFlushes() throws Exception {
+    testRestartDuringFollowerReadWithValueSize(10240);
+  }
+
+  public void testRestartDuringFollowerReadWithValueSize(int valSize) throws Exception {
+    assertNull(miniCluster);
+
+    // We don't want the tablets to move while we are testing.
+    List<String> masterArgs = Arrays.asList("--enable_load_balancing=false");
+
+    String tserverAssertLocalTablet = "--assert_local_tablet_server_selected=false";
+    List<List<String>> tserverArgs = new ArrayList<List<String>>();
+    tserverArgs.add(Arrays.asList(tserverRedisFollowerFlag, tserverAssertLocalTablet));
+    tserverArgs.add(Arrays.asList(tserverRedisFollowerFlag, tserverAssertLocalTablet));
+    tserverArgs.add(Arrays.asList(tserverRedisFollowerFlag, tserverAssertLocalTablet));
+
+    createMiniCluster(3, masterArgs, tserverArgs);
+
+    // Setup the Jedis client.
+    setUpJedis();
+
+    char[] arr = new char[valSize];
+    Arrays.fill(arr, 'v');
+    String val = new String(arr);
+
+    for (int i = 0; i < 200; i++) {
+      String s = "key-" + i;
+      LOG.info("Inserting key {}", s);
+      assertEquals("OK", jedis_client.set(s, val));
+    }
+    LOG.info("Done loading the data");
+    for (int i = 0; i < 200; i++) {
+      String s = "key-" + i;
+      LOG.info("Reading key {}", s);
+      String value = jedis_client.get(s);
+
+      while (value == null || !value.equals(val)) {
+        // We hope that all the followers have caught up to the updates by now. In case they aren't
+        // we may loop here.
+        LOG.error(String.format("Unexpected: Invalid value %s returned for key %s", value, s));
+
+        value = jedis_client.get(s);
+      }
+    }
+    LOG.info("Done reading the data before restart");
+
+    miniCluster.restart();
+    setUpJedisClient();
+
+    LOG.info("Restarted after loading the data");
+    int missingValues = 0;
+    StringBuilder missing = new StringBuilder();
+    for (int i = 0; i < 200; i++) {
+      String s = "key-" + i;
+      LOG.info("Reading key {}", s);
+      String value;
+      try {
+        value = jedis_client.get(s);
+      } catch (Exception e) {
+        LOG.error("Caught exception while trying to read key " + s, e);
+        i--;  // Retry the same key.
+        continue;
+      }
+      if (value == null || !value.equals(val)) {
+        // If we were able to read the value before the restart, we should be able to
+        // read it after the restart as well. Failure here shall be considered a test failure.
+        LOG.error(String.format("Invalid value %s returned for key %s", value, s));
+        missingValues++;
+        missing.append(s);
+        missing.append(", ");
+      } else {
+        LOG.debug("Read value as expected. After restart.");
+      }
+    }
+    // We may expect upto 1 missing edit/key-value for each tablet.
+    // TODO: Reset this to 0, when we start persisting noops related to commit index advancement.
+    int kMissingAllowed = 24;
+    if (missingValues > kMissingAllowed) {
+      fail(String.format("Missed %d values : %s", missingValues, missing.toString()));
+    } else if (missingValues > 0) {
+      LOG.info(String.format("[OK for now] Missed %d values : %s",
+               missingValues, missing.toString()));
+    }
+    LOG.info("Done reading after restart.");
   }
 }

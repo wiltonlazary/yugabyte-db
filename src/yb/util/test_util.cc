@@ -33,9 +33,7 @@
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
-#include <gtest/gtest.h>
 #include <gtest/gtest-spi.h>
-#include <boost/scope_exit.hpp>
 
 #include "yb/gutil/strings/strcat.h"
 #include "yb/gutil/strings/substitute.h"
@@ -55,6 +53,7 @@ DEFINE_string(test_leave_files, "on_failure",
 DEFINE_int32(test_random_seed, 0, "Random seed to use for randomized tests");
 DECLARE_int64(memory_limit_hard_bytes);
 DECLARE_bool(enable_tracing);
+DECLARE_bool(running_test);
 
 using std::string;
 using strings::Substitute;
@@ -105,6 +104,7 @@ void YBTest::SetUp() {
   InitGoogleLoggingSafeBasic("yb_test");
   FLAGS_enable_tracing = true;
   FLAGS_memory_limit_hard_bytes = 8 * 1024 * 1024 * 1024L;
+  FLAGS_running_test = true;
   for (const char* env_var_name : {
       "ASAN_OPTIONS",
       "LSAN_OPTIONS",
@@ -227,7 +227,7 @@ void AssertEventually(const std::function<void(void)>& f,
       testing::TestPartResultArray results;
       testing::ScopedFakeTestPartResultReporter reporter(
           testing::ScopedFakeTestPartResultReporter::INTERCEPT_ONLY_CURRENT_THREAD,
-      &results);
+          &results);
       f();
 
       // Determine whether their function produced any new test failure results.
@@ -298,6 +298,31 @@ Status WaitFor(std::function<Result<bool>()> condition,
               max_delay);
 }
 
+void AssertLoggedWaitFor(
+    std::function<Result<bool>()> condition,
+    MonoDelta timeout,
+    const string& description,
+    MonoDelta initial_delay,
+    double delay_multiplier,
+    MonoDelta max_delay) {
+  LOG(INFO) << description;
+  ASSERT_OK(WaitFor(condition, timeout, description, initial_delay));
+  LOG(INFO) << description << " - DONE";
+}
+
+Status LoggedWaitFor(
+    std::function<Result<bool>()> condition,
+    MonoDelta timeout,
+    const string& description,
+    MonoDelta initial_delay,
+    double delay_multiplier,
+    MonoDelta max_delay) {
+  LOG(INFO) << description << " - started";
+  auto status = WaitFor(condition, timeout, description, initial_delay);
+  LOG(INFO) << description << " - completed: " << yb::ToString(status);
+  return status;
+}
+
 string GetToolPath(const string& tool_name) {
   string exe;
   CHECK_OK(Env::Default()->GetExecutablePath(&exe));
@@ -315,6 +340,13 @@ int CalcNumTablets(int num_tablet_servers) {
 #else
   return num_tablet_servers * 3;
 #endif
+}
+
+void WaitStopped(const CoarseDuration& duration, std::atomic<bool>* stop) {
+  auto end = CoarseMonoClock::now() + duration;
+  while (!stop->load(std::memory_order_acquire) && CoarseMonoClock::now() < end) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
 }
 
 } // namespace yb

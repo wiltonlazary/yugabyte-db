@@ -16,9 +16,11 @@
 #######################################
 
 set(ROCKSUTIL_SRCS
+    rocksdb_encrypted_file_factory.cc
     yb_rocksdb.cc
     yb_rocksdb_logger.cc
-    write_batch_formatter.cc)
+    write_batch_formatter.cc
+    ${ROCKSUTIL_SRCS_EXTENSIONS})
 
 set(ROCKSUTIL_LIBS
     gflags
@@ -28,11 +30,15 @@ set(ROCKSUTIL_LIBS
     yb_util)
 
 ADD_YB_LIBRARY(yb_rocksutil
-                       SRCS ${ROCKSUTIL_SRCS}
-                       DEPS ${ROCKSUTIL_LIBS})
+               SRCS ${ROCKSUTIL_SRCS}
+               DEPS ${ROCKSUTIL_LIBS})
 
 add_dependencies(yb_rocksutil gen_version_info)
 
-set(YB_TEST_LINK_LIBS yb_rocksutil ${YB_MIN_TEST_LIBS})
+set(YB_TEST_LINK_LIBS yb_rocksutil ${YB_TEST_LINK_LIBS_EXTENSIONS} ${YB_MIN_TEST_LIBS})
 
 ADD_YB_TEST(yb_rocksdb_logger-test)
+
+ADD_YB_TEST(rocksdb_encrypted_env-test)
+target_link_libraries(rocksdb_encrypted_env-test encryption_test_util)
+

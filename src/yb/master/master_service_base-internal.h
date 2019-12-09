@@ -17,6 +17,7 @@
 #include "yb/master/master_service_base.h"
 #include "yb/master/catalog_manager.h"
 #include "yb/rpc/rpc_context.h"
+#include "yb/util/strongly_typed_bool.h"
 
 namespace yb {
 namespace master {
@@ -35,10 +36,15 @@ template <class ReqType, class RespType, class FnType>
 void MasterServiceBase::HandleOnLeader(const ReqType* req,
                                        RespType* resp,
                                        rpc::RpcContext* rpc,
-                                       FnType f) {
+                                       FnType f,
+                                       HoldCatalogLock hold_catalog_lock) {
   CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
   if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, rpc)) {
     return;
+  }
+
+  if (!hold_catalog_lock) {
+    l.Unlock();
   }
 
   const Status s = f();
@@ -47,21 +53,34 @@ void MasterServiceBase::HandleOnLeader(const ReqType* req,
 }
 
 template <class HandlerType, class ReqType, class RespType>
-void MasterServiceBase::HandleIn(const ReqType* req,
-                                 RespType* resp,
-                                 rpc::RpcContext* rpc,
-                                 Status (HandlerType::*f)(RespType*)) {
-  HandleOnLeader(req, resp, rpc, [=]() -> Status {
-      return (handler(static_cast<HandlerType*>(nullptr))->*f)(resp); });
+void MasterServiceBase::HandleOnAllMasters(
+    const ReqType* req, RespType* resp, rpc::RpcContext* rpc,
+    Status (HandlerType::*f)(const ReqType* req, RespType*)) {
+  Status s = (handler(static_cast<HandlerType*>(nullptr))->*f)(req, resp);
+  CheckRespErrorOrSetUnknown(s, resp);
+  rpc->RespondSuccess();
 }
 
 template <class HandlerType, class ReqType, class RespType>
 void MasterServiceBase::HandleIn(const ReqType* req,
                                  RespType* resp,
                                  rpc::RpcContext* rpc,
-                                 Status (HandlerType::*f)(const ReqType*, RespType*)) {
+                                 Status (HandlerType::*f)(RespType*),
+                                 HoldCatalogLock hold_catalog_lock) {
   HandleOnLeader(req, resp, rpc, [=]() -> Status {
-      return (handler(static_cast<HandlerType*>(nullptr))->*f)(req, resp); });
+      return (handler(static_cast<HandlerType*>(nullptr))->*f)(resp); },
+      hold_catalog_lock);
+}
+
+template <class HandlerType, class ReqType, class RespType>
+void MasterServiceBase::HandleIn(const ReqType* req,
+                                 RespType* resp,
+                                 rpc::RpcContext* rpc,
+                                 Status (HandlerType::*f)(const ReqType*, RespType*),
+                                 HoldCatalogLock hold_catalog_lock) {
+  HandleOnLeader(req, resp, rpc, [=]() -> Status {
+      return (handler(static_cast<HandlerType*>(nullptr))->*f)(req, resp); },
+      hold_catalog_lock);
 }
 
 template <class HandlerType, class ReqType, class RespType>
@@ -69,9 +88,11 @@ void MasterServiceBase::HandleIn(const ReqType* req,
                                  RespType* resp,
                                  rpc::RpcContext* rpc,
                                  Status (HandlerType::*f)(
-                                     const ReqType*, RespType*, rpc::RpcContext*)) {
+                                     const ReqType*, RespType*, rpc::RpcContext*),
+                                 HoldCatalogLock hold_catalog_lock) {
   HandleOnLeader(req, resp, rpc, [=]() -> Status {
-      return (handler(static_cast<HandlerType*>(nullptr))->*f)(req, resp, rpc); });
+      return (handler(static_cast<HandlerType*>(nullptr))->*f)(req, resp, rpc); },
+      hold_catalog_lock);
 }
 
 } // namespace master

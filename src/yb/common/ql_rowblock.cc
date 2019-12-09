@@ -17,11 +17,14 @@
 
 #include "yb/util/bfql/directory.h"
 #include "yb/util/bfql/bfql.h"
+
+#include "yb/common/ql_value.h"
 #include "yb/common/wire_protocol.h"
 
 namespace yb {
 
 using std::shared_ptr;
+using std::string;
 
 //----------------------------------------- QL row ----------------------------------------
 QLRow::QLRow(const shared_ptr<const Schema>& schema)
@@ -40,13 +43,13 @@ QLRow::~QLRow() {
 
 void QLRow::Serialize(const QLClient client, faststring* buffer) const {
   for (size_t col_idx = 0; col_idx < schema_->num_columns(); ++col_idx) {
-    values_.at(col_idx).Serialize(column_type(col_idx), client, buffer);
+    values_[col_idx].Serialize(column_type(col_idx), client, buffer);
   }
 }
 
 Status QLRow::Deserialize(const QLClient client, Slice* data) {
   for (size_t col_idx = 0; col_idx < schema_->num_columns(); ++col_idx) {
-    RETURN_NOT_OK(values_.at(col_idx).Deserialize(column_type(col_idx), client, data));
+    RETURN_NOT_OK(values_[col_idx].Deserialize(column_type(col_idx), client, data));
   }
   return Status::OK();
 }
@@ -57,7 +60,7 @@ string QLRow::ToString() const {
     if (col_idx > 0) {
       s+= ", ";
     }
-    s += values_.at(col_idx).ToString();
+    s += values_[col_idx].ToString();
   }
   s += " }";
   return s;
@@ -73,6 +76,22 @@ QLRow& QLRow::operator=(QLRow&& other) {
   this->~QLRow();
   new(this) QLRow(other);
   return *this;
+}
+
+const QLValue& QLRow::column(const size_t col_idx) const {
+  return values_[col_idx];
+}
+
+QLValue* QLRow::mutable_column(const size_t col_idx) {
+  return &values_[col_idx];
+}
+
+void QLRow::SetColumnValues(const std::vector<QLValue>& column_values) {
+  values_ = column_values;
+}
+
+void QLRow::SetColumn(size_t col_idx, QLValuePB value) {
+  values_[col_idx] = std::move(value);
 }
 
 //-------------------------------------- QL row block --------------------------------------
@@ -131,25 +150,19 @@ Status QLRowBlock::Deserialize(const QLClient client, Slice* data) {
   return Status::OK();
 }
 
-Status QLRowBlock::GetRowCount(const QLClient client, const std::string& data, size_t* count) {
+Result<size_t> QLRowBlock::GetRowCount(const QLClient client, const string& data) {
   CHECK_EQ(client, YQL_CLIENT_CQL);
-  int32_t cnt = 0;
   Slice slice(data);
-  RETURN_NOT_OK(CQLDecodeNum(sizeof(cnt), NetworkByteOrder::Load32, &slice, &cnt));
-  *count = cnt;
-  return Status::OK();
+  return VERIFY_RESULT(CQLDecodeLength(&slice));
 }
 
-Status QLRowBlock::AppendRowsData(
-    const QLClient client, const std::string& src, std::string* dst) {
+Status QLRowBlock::AppendRowsData(const QLClient client, const string& src, string* dst) {
   CHECK_EQ(client, YQL_CLIENT_CQL);
-  int32_t src_cnt = 0;
   Slice src_slice(src);
-  RETURN_NOT_OK(CQLDecodeNum(sizeof(src_cnt), NetworkByteOrder::Load32, &src_slice, &src_cnt));
+  const int32_t src_cnt = VERIFY_RESULT(CQLDecodeLength(&src_slice));
   if (src_cnt > 0) {
-    int32_t dst_cnt = 0;
     Slice dst_slice(*dst);
-    RETURN_NOT_OK(CQLDecodeNum(sizeof(dst_cnt), NetworkByteOrder::Load32, &dst_slice, &dst_cnt));
+    int32_t dst_cnt = VERIFY_RESULT(CQLDecodeLength(&dst_slice));
     if (dst_cnt == 0) {
       *dst = src;
     } else {
@@ -159,6 +172,11 @@ Status QLRowBlock::AppendRowsData(
     }
   }
   return Status::OK();
+}
+
+string QLRowBlock::ZeroRowsData(const QLClient client) {
+  CHECK_EQ(client, YQL_CLIENT_CQL);
+  return string(sizeof(int32_t), 0); // Encode 32-bit 0 length.
 }
 
 } // namespace yb

@@ -18,19 +18,20 @@
 
 #include <boost/optional/optional.hpp>
 
-#include "yb/consensus/metadata.pb.h"
 #include "yb/consensus/consensus.pb.h"
+#include "yb/consensus/metadata.pb.h"
 #include "yb/tserver/tserver_admin.pb.h"
+#include "yb/tserver/tserver_service.pb.h"
 
+#include "yb/common/entity_ids.h"
 #include "yb/gutil/ref_counted.h"
 #include "yb/gutil/gscoped_ptr.h"
 #include "yb/gutil/strings/substitute.h"
+#include "yb/rpc/rpc_controller.h"
+#include "yb/server/monitored_task.h"
 #include "yb/util/status.h"
 #include "yb/util/memory/memory.h"
-#include "yb/common/entity_ids.h"
 
-#include "yb/server/monitored_task.h"
-#include "yb/rpc/rpc_controller.h"
 
 namespace yb {
 
@@ -118,7 +119,7 @@ class RetryingTSRpcTask : public MonitoredTask {
   MonitoredTaskState AbortAndReturnPrevState() override;
 
   MonitoredTaskState state() const override {
-    return state_.load();
+    return state_.load(std::memory_order_acquire);
   }
 
   MonoTime start_timestamp() const override { return start_ts_; }
@@ -171,6 +172,9 @@ class RetryingTSRpcTask : public MonitoredTask {
   // pool, rather than a reactor thread, so it may do blocking IO operations.
   void DoRpcCallback();
 
+  // Called when the async task unregisters either successfully or unsuccessfully.
+  virtual void UnregisterAsyncTaskCallback();
+
   Master* const master_;
   ThreadPool* const callback_pool_;
   const gscoped_ptr<TSPicker> replica_picker_;
@@ -187,12 +191,17 @@ class RetryingTSRpcTask : public MonitoredTask {
   std::shared_ptr<tserver::TabletServerAdminServiceProxy> ts_admin_proxy_;
   std::shared_ptr<consensus::ConsensusServiceProxy> consensus_proxy_;
 
-  std::atomic<int64_t> reactor_task_id_;
+  std::atomic<rpc::ScheduledTaskId> reactor_task_id_{rpc::kInvalidTaskId};
 
  private:
   // Returns true if we should impose a limit in the number of retries for this task type.
   bool RetryLimitTaskType() {
     return type() != ASYNC_CREATE_REPLICA && type() != ASYNC_DELETE_REPLICA;
+  }
+
+  // Returns true if we should not retry for this task type.
+  bool NoRetryTaskType() {
+    return type() == ASYNC_FLUSH_TABLETS;
   }
 
   // Reschedules the current task after a backoff delay.
@@ -294,6 +303,7 @@ class AsyncDeleteReplica : public RetrySpecificTSRpcTask {
 
   void HandleResponse(int attempt) override;
   bool SendRequest(int attempt) override;
+  void UnregisterAsyncTaskCallback() override;
 
   const TabletId tablet_id_;
   const tablet::TabletDataState delete_type_;
@@ -331,7 +341,7 @@ class AsyncAlterTable : public RetryingTSRpcTask {
 
   uint32_t schema_version_;
   scoped_refptr<TabletInfo> tablet_;
-  tserver::AlterSchemaResponsePB resp_;
+  tserver::ChangeMetadataResponsePB resp_;
 };
 
 class AsyncCopartitionTable : public RetryingTSRpcTask {
@@ -396,7 +406,7 @@ class CommonInfoForRaftTask : public RetryingTSRpcTask {
   virtual std::string change_config_ts_uuid() const { return change_config_ts_uuid_; }
 
  protected:
-  // Used by SendRequest. Return's false if RPC should not be sent.
+  // Used by SendOrReceiveData. Return's false if RPC should not be sent.
   virtual bool PrepareRequest(int attempt) = 0;
 
   TabletServerId permanent_uuid() const;

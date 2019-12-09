@@ -53,12 +53,12 @@ class TunnelConnection : public std::enable_shared_from_this<TunnelConnection> {
   }
 
   void Shutdown() {
-    strand_.dispatch([this] {
+    strand_.dispatch([this, shared_self = shared_from_this()] {
       boost::system::error_code ec;
       inbound_socket_.shutdown(boost::asio::ip::tcp::socket::shutdown_type::shutdown_both, ec);
-      LOG_IF_WITH_PREFIX(WARNING, ec) << "Shutdown failed: " << ec.message();
+      LOG_IF_WITH_PREFIX(INFO, ec) << "Shutdown failed: " << ec.message();
       outbound_socket_.shutdown(boost::asio::ip::tcp::socket::shutdown_type::shutdown_both, ec);
-      LOG_IF_WITH_PREFIX(WARNING, ec) << "Shutdown failed: " << ec.message();
+      LOG_IF_WITH_PREFIX(INFO, ec) << "Shutdown failed: " << ec.message();
     });
   }
 
@@ -84,7 +84,7 @@ class TunnelConnection : public std::enable_shared_from_this<TunnelConnection> {
   void HandleRead(const boost::system::error_code& ec, size_t transferred,
                   const SemiTunnel& semi_tunnel) {
     if (ec) {
-      LOG_WITH_PREFIX(WARNING) << "Read failed: " << ec.message();
+      VLOG_WITH_PREFIX(1) << "Read failed: " << ec.message();
       return;
     }
 
@@ -96,7 +96,7 @@ class TunnelConnection : public std::enable_shared_from_this<TunnelConnection> {
   void HandleWrite(const boost::system::error_code& ec, size_t transferred,
                    const SemiTunnel& semi_tunnel) {
     if (ec) {
-      LOG_WITH_PREFIX(WARNING) << "Write failed: " << ec.message();
+      VLOG_WITH_PREFIX(1) << "Write failed: " << ec.message();
       return;
     }
 
@@ -120,7 +120,13 @@ class Tunnel::Impl {
   explicit Impl(boost::asio::io_context* io_context)
       : io_context_(*io_context), strand_(*io_context) {}
 
-  CHECKED_STATUS Start(const Endpoint& local, const Endpoint& remote) {
+  ~Impl() {
+    LOG_IF(DFATAL, !closing_.load(std::memory_order_acquire))
+        << "Tunnel shutdown has not been started";
+  }
+
+  CHECKED_STATUS Start(const Endpoint& local, const Endpoint& remote,
+                       AddressChecker address_checker) {
     auto acceptor = std::make_shared<boost::asio::ip::tcp::acceptor>(io_context_);
     boost::system::error_code ec;
 
@@ -142,9 +148,11 @@ class Tunnel::Impl {
     if (ec) {
       return STATUS_FORMAT(NetworkError, "Listen failed: $0", ec.message());
     }
-    strand_.dispatch([this, acceptor, local, remote]() {
+    strand_.dispatch([
+        this, acceptor, local, remote, address_checker]() {
       local_ = local;
       remote_ = remote;
+      address_checker_ = address_checker;
       acceptor_.emplace(std::move(*acceptor));
       StartAccept();
     });
@@ -152,6 +160,7 @@ class Tunnel::Impl {
   }
 
   void Shutdown() {
+    closing_.store(true, std::memory_order_release);
     strand_.dispatch([this] {
       LOG(INFO) << "Shutdown tunnel: " << local_ << " => " << remote_;
       if (acceptor_) {
@@ -185,6 +194,14 @@ class Tunnel::Impl {
       return;
     }
 
+    if (!CheckAddress()) {
+      boost::system::error_code ec;
+      socket_->close(ec);
+      LOG_IF(WARNING, ec) << "Close failed: " << ec.message();
+      StartAccept();
+      return;
+    }
+
     auto connection = std::make_shared<TunnelConnection>(socket_.get_ptr());
     connection->Start(remote_);
     bool found = false;
@@ -202,13 +219,31 @@ class Tunnel::Impl {
     StartAccept();
   }
 
+  bool CheckAddress() {
+    if (!address_checker_) {
+      return true;
+    }
+
+    boost::system::error_code ec;
+    auto endpoint = socket_->remote_endpoint(ec);
+
+    if (ec) {
+      LOG(WARNING) << "Cannot get remote endpoint: " << ec.message();
+      return true;
+    }
+
+    return address_checker_(endpoint.address());
+  }
+
   boost::asio::io_context& io_context_;
   boost::asio::io_context::strand strand_;
+  AddressChecker address_checker_;
   Endpoint local_;
   Endpoint remote_;
   boost::optional<boost::asio::ip::tcp::acceptor> acceptor_;
   boost::optional<boost::asio::ip::tcp::socket> socket_;
   std::vector<std::weak_ptr<TunnelConnection>> connections_;
+  std::atomic<bool> closing_{false};
 };
 
 Tunnel::Tunnel(boost::asio::io_context* io_context) : impl_(new Impl(io_context)) {
@@ -217,8 +252,9 @@ Tunnel::Tunnel(boost::asio::io_context* io_context) : impl_(new Impl(io_context)
 Tunnel::~Tunnel() {
 }
 
-Status Tunnel::Start(const Endpoint& local, const Endpoint& remote) {
-  return impl_->Start(local, remote);
+Status Tunnel::Start(const Endpoint& local, const Endpoint& remote,
+                     AddressChecker address_checker) {
+  return impl_->Start(local, remote, std::move(address_checker));
 }
 
 void Tunnel::Shutdown() {

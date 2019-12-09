@@ -3,7 +3,7 @@
  * postgres.c
  *	  POSTGRES C Backend Interface
  *
- * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -42,6 +42,8 @@
 #include "catalog/pg_type.h"
 #include "commands/async.h"
 #include "commands/prepare.h"
+#include "executor/spi.h"
+#include "jit/jit.h"
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
 #include "libpq/pqsignal.h"
@@ -69,6 +71,10 @@
 #include "tcop/pquery.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
+#include "utils/inval.h"
+#include "utils/relcache.h"
+#include "utils/catcache.h"
+#include "utils/syscache.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
@@ -76,6 +82,9 @@
 #include "utils/timeout.h"
 #include "utils/timestamp.h"
 #include "mb/pg_wchar.h"
+#include "pg_yb_utils.h"
+#include "libpq/yb_pqcomm_extensions.h"
+#include "utils/rel.h"
 
 /* ----------------
  *		global variables
@@ -141,6 +150,11 @@ static bool doing_extended_query_message = false;
 static bool ignore_till_sync = false;
 
 /*
+ * Flag to keep track of whether statement timeout timer is active.
+ */
+static bool stmt_timeout_active = false;
+
+/*
  * If an unnamed prepared statement exists, it's stored here.
  * We keep it separate from the hashtable kept by commands/prepare.c
  * in order to reduce overhead for short-lived queries.
@@ -156,6 +170,13 @@ static bool UseSemiNewlineNewline = false;	/* -j switch */
 static bool RecoveryConflictPending = false;
 static bool RecoveryConflictRetryable = true;
 static ProcSignalReason RecoveryConflictReason;
+
+/* reused buffer to pass to SendRowDescriptionMessage() */
+static MemoryContext row_description_context = NULL;
+static StringInfoData row_description_buf;
+
+/* Flag to mark cache as invalid if discovered within a txn block. */
+static bool yb_need_cache_refresh = false;
 
 /* ----------------------------------------------------------------
  *		decls for routines only used in this file
@@ -179,6 +200,8 @@ static bool IsTransactionExitStmtList(List *pstmts);
 static bool IsTransactionStmtList(List *pstmts);
 static void drop_unnamed_stmt(void);
 static void log_disconnections(int code, Datum arg);
+static void enable_statement_timeout(void);
+static void disable_statement_timeout(void);
 
 
 /* ----------------------------------------------------------------
@@ -299,7 +322,7 @@ interactive_getc(void)
 
 	c = getc(stdin);
 
-	ProcessClientReadInterrupt(true);
+	ProcessClientReadInterrupt(false);
 
 	return c;
 }
@@ -504,8 +527,9 @@ ReadCommand(StringInfo inBuf)
 /*
  * ProcessClientReadInterrupt() - Process interrupts specific to client reads
  *
- * This is called just after low-level reads. That might be after the read
- * finished successfully, or it was interrupted via interrupt.
+ * This is called just before and after low-level reads.
+ * 'blocked' is true if no data was available to read and we plan to retry,
+ * false if about to read or done reading.
  *
  * Must preserve errno!
  */
@@ -516,23 +540,31 @@ ProcessClientReadInterrupt(bool blocked)
 
 	if (DoingCommandRead)
 	{
-		/* Check for general interrupts that arrived while reading */
+		/* Check for general interrupts that arrived before/while reading */
 		CHECK_FOR_INTERRUPTS();
 
-		/* Process sinval catchup interrupts that happened while reading */
+		/* Process sinval catchup interrupts, if any */
 		if (catchupInterruptPending)
 			ProcessCatchupInterrupt();
 
-		/* Process sinval catchup interrupts that happened while reading */
+		/* Process notify interrupts, if any */
 		if (notifyInterruptPending)
 			ProcessNotifyInterrupt();
 	}
-	else if (ProcDiePending && blocked)
+	else if (ProcDiePending)
 	{
 		/*
-		 * We're dying. It's safe (and sane) to handle that now.
+		 * We're dying.  If there is no data available to read, then it's safe
+		 * (and sane) to handle that now.  If we haven't tried to read yet,
+		 * make sure the process latch is set, so that if there is no data
+		 * then we'll come back here and die.  If we're done reading, also
+		 * make sure the process latch is set, as we might've undesirably
+		 * cleared it while reading.
 		 */
-		CHECK_FOR_INTERRUPTS();
+		if (blocked)
+			CHECK_FOR_INTERRUPTS();
+		else
+			SetLatch(MyLatch);
 	}
 
 	errno = save_errno;
@@ -541,9 +573,9 @@ ProcessClientReadInterrupt(bool blocked)
 /*
  * ProcessClientWriteInterrupt() - Process interrupts specific to client writes
  *
- * This is called just after low-level writes. That might be after the read
- * finished successfully, or it was interrupted via interrupt. 'blocked' tells
- * us whether the
+ * This is called just before and after low-level writes.
+ * 'blocked' is true if no data could be written and we plan to retry,
+ * false if about to write or done writing.
  *
  * Must preserve errno!
  */
@@ -552,25 +584,39 @@ ProcessClientWriteInterrupt(bool blocked)
 {
 	int			save_errno = errno;
 
-	/*
-	 * We only want to process the interrupt here if socket writes are
-	 * blocking to increase the chance to get an error message to the client.
-	 * If we're not blocked there'll soon be a CHECK_FOR_INTERRUPTS(). But if
-	 * we're blocked we'll never get out of that situation if the client has
-	 * died.
-	 */
-	if (ProcDiePending && blocked)
+	if (ProcDiePending)
 	{
 		/*
-		 * We're dying. It's safe (and sane) to handle that now. But we don't
-		 * want to send the client the error message as that a) would possibly
-		 * block again b) would possibly lead to sending an error message to
-		 * the client, while we already started to send something else.
+		 * We're dying.  If it's not possible to write, then we should handle
+		 * that immediately, else a stuck client could indefinitely delay our
+		 * response to the signal.  If we haven't tried to write yet, make
+		 * sure the process latch is set, so that if the write would block
+		 * then we'll come back here and die.  If we're done writing, also
+		 * make sure the process latch is set, as we might've undesirably
+		 * cleared it while writing.
 		 */
-		if (whereToSendOutput == DestRemote)
-			whereToSendOutput = DestNone;
+		if (blocked)
+		{
+			/*
+			 * Don't mess with whereToSendOutput if ProcessInterrupts wouldn't
+			 * do anything.
+			 */
+			if (InterruptHoldoffCount == 0 && CritSectionCount == 0)
+			{
+				/*
+				 * We don't want to send the client the error message, as a)
+				 * that would possibly block again, and b) it would likely
+				 * lead to loss of protocol sync because we may have already
+				 * sent a partial protocol message.
+				 */
+				if (whereToSendOutput == DestRemote)
+					whereToSendOutput = DestNone;
 
-		CHECK_FOR_INTERRUPTS();
+				CHECK_FOR_INTERRUPTS();
+			}
+		}
+		else
+			SetLatch(MyLatch);
 	}
 
 	errno = save_errno;
@@ -695,6 +741,13 @@ pg_analyze_and_rewrite_params(RawStmt *parsetree,
 	(*parserSetup) (pstate, parserSetupArg);
 
 	query = transformTopLevelStmt(pstate, parsetree);
+
+	if (pstate->p_target_relation &&
+		pstate->p_target_relation->rd_rel->relpersistence == RELPERSISTENCE_TEMP
+		&& IsYugaByteEnabled())
+	{
+		SetTxnWithPGRel();
+	}
 
 	if (post_parse_analyze_hook)
 		(*post_parse_analyze_hook) (pstate, query);
@@ -880,9 +933,8 @@ exec_simple_query(const char *query_string)
 	ListCell   *parsetree_item;
 	bool		save_log_statement_stats = log_statement_stats;
 	bool		was_logged = false;
-	bool		isTopLevel;
+	bool		use_implicit_block;
 	char		msec_str[32];
-
 
 	/*
 	 * Report query to various monitoring facilities.
@@ -944,13 +996,14 @@ exec_simple_query(const char *query_string)
 	MemoryContextSwitchTo(oldcontext);
 
 	/*
-	 * We'll tell PortalRun it's a top-level command iff there's exactly one
-	 * raw parsetree.  If more than one, it's effectively a transaction block
-	 * and we want PreventTransactionChain to reject unsafe commands. (Note:
-	 * we're assuming that query rewrite cannot add commands that are
-	 * significant to PreventTransactionChain.)
+	 * For historical reasons, if multiple SQL statements are given in a
+	 * single "simple Query" message, we execute them as a single transaction,
+	 * unless explicit transaction control commands are included to make
+	 * portions of the list be separate transactions.  To represent this
+	 * behavior properly in the transaction machinery, we use an "implicit"
+	 * transaction block.
 	 */
-	isTopLevel = (list_length(parsetree_list) == 1);
+	use_implicit_block = (list_length(parsetree_list) > 1);
 
 	/*
 	 * Run through the raw parsetree(s) and process each one.
@@ -997,6 +1050,16 @@ exec_simple_query(const char *query_string)
 
 		/* Make sure we are in a transaction command */
 		start_xact_command();
+
+		/*
+		 * If using an implicit transaction block, and we're not already in a
+		 * transaction block, start an implicit block to force this statement
+		 * to be grouped together with any following ones.  (We must do this
+		 * each time through the loop; otherwise, a COMMIT/ROLLBACK in the
+		 * list would cause later statements to not be grouped.)
+		 */
+		if (use_implicit_block)
+			BeginImplicitTransactionBlock();
 
 		/* If we got a cancel signal in parsing or prior command, quit */
 		CHECK_FOR_INTERRUPTS();
@@ -1095,25 +1158,17 @@ exec_simple_query(const char *query_string)
 		 */
 		(void) PortalRun(portal,
 						 FETCH_ALL,
-						 isTopLevel,
+						 true,	/* always top level */
 						 true,
 						 receiver,
 						 receiver,
 						 completionTag);
 
-		(*receiver->rDestroy) (receiver);
+		receiver->rDestroy(receiver);
 
 		PortalDrop(portal, false);
 
-		if (IsA(parsetree->stmt, TransactionStmt))
-		{
-			/*
-			 * If this was a transaction control statement, commit it. We will
-			 * start a new xact command for the next command (if any).
-			 */
-			finish_xact_command();
-		}
-		else if (lnext(parsetree_item) == NULL)
+		if (lnext(parsetree_item) == NULL)
 		{
 			/*
 			 * If this is the last parsetree of the query string, close down
@@ -1121,9 +1176,18 @@ exec_simple_query(const char *query_string)
 			 * is so that any end-of-transaction errors are reported before
 			 * the command-complete message is issued, to avoid confusing
 			 * clients who will expect either a command-complete message or an
-			 * error, not one and then the other.  But for compatibility with
-			 * historical Postgres behavior, we do not force a transaction
-			 * boundary between queries appearing in a single query string.
+			 * error, not one and then the other.  Also, if we're using an
+			 * implicit transaction block, we must close that out first.
+			 */
+			if (use_implicit_block)
+				EndImplicitTransactionBlock();
+			finish_xact_command();
+		}
+		else if (IsA(parsetree->stmt, TransactionStmt))
+		{
+			/*
+			 * If this was a transaction control statement, commit it. We will
+			 * start a new xact command for the next command.
 			 */
 			finish_xact_command();
 		}
@@ -1146,7 +1210,9 @@ exec_simple_query(const char *query_string)
 	}							/* end loop over parsetrees */
 
 	/*
-	 * Close down transaction statement, if one is open.
+	 * Close down transaction statement, if one is open.  (This will only do
+	 * something if the parsetree list was empty; otherwise the last loop
+	 * iteration already did it.)
 	 */
 	finish_xact_command();
 
@@ -1192,7 +1258,8 @@ static void
 exec_parse_message(const char *query_string,	/* string to execute */
 				   const char *stmt_name,	/* name for prepared stmt */
 				   Oid *paramTypes, /* parameter types */
-				   int numParams)	/* number of parameters */
+				   int numParams, /* number of parameters */
+				   CommandDest output_dest) /* where to send output */
 {
 	MemoryContext unnamed_stmt_context = NULL;
 	MemoryContext oldcontext;
@@ -1225,7 +1292,8 @@ exec_parse_message(const char *query_string,	/* string to execute */
 	/*
 	 * Start up a transaction command so we can run parse analysis etc. (Note
 	 * that this will normally change current memory context.) Nothing happens
-	 * if we are already in one.
+	 * if we are already in one.  This also arms the statement timeout if
+	 * necessary.
 	 */
 	start_xact_command();
 
@@ -1416,7 +1484,7 @@ exec_parse_message(const char *query_string,	/* string to execute */
 	/*
 	 * Send ParseComplete.
 	 */
-	if (whereToSendOutput == DestRemote)
+	if (output_dest == DestRemote)
 		pq_putemptymessage('1');
 
 	/*
@@ -1513,7 +1581,8 @@ exec_bind_message(StringInfo input_message)
 	/*
 	 * Start up a transaction command so we can call functions etc. (Note that
 	 * this will normally change current memory context.) Nothing happens if
-	 * we are already in one.
+	 * we are already in one.  This also arms the statement timeout if
+	 * necessary.
 	 */
 	start_xact_command();
 
@@ -1579,7 +1648,7 @@ exec_bind_message(StringInfo input_message)
 	 * don't want a failure to occur between GetCachedPlan and
 	 * PortalDefineQuery; that would result in leaking our plancache refcount.
 	 */
-	oldContext = MemoryContextSwitchTo(PortalGetHeapMemory(portal));
+	oldContext = MemoryContextSwitchTo(portal->portalContext);
 
 	/* Copy the plan's query string into the portal */
 	query_string = pstrdup(psrc->query_string);
@@ -1617,10 +1686,11 @@ exec_bind_message(StringInfo input_message)
 		/* we have static list of params, so no hooks needed */
 		params->paramFetch = NULL;
 		params->paramFetchArg = NULL;
+		params->paramCompile = NULL;
+		params->paramCompileArg = NULL;
 		params->parserSetup = NULL;
 		params->parserSetupArg = NULL;
 		params->numParams = numParams;
-		params->paramMask = NULL;
 
 		for (paramno = 0; paramno < numParams; paramno++)
 		{
@@ -1933,6 +2003,14 @@ exec_execute_message(const char *portal_name, long max_rows)
 	start_xact_command();
 
 	/*
+	 * If the planner found a pg relation in this plan, set the appropriate
+	 * flag for the execution txn.
+	 */
+	if (portal->cplan && portal->cplan->usesPostgresRel) {
+		SetTxnWithPGRel();
+	}
+
+	/*
 	 * If we re-issue an Execute protocol request against an existing portal,
 	 * then we are only fetching more rows rather than completely re-executing
 	 * the query from the start. atStart is never reset for a v3 portal, so we
@@ -1986,7 +2064,7 @@ exec_execute_message(const char *portal_name, long max_rows)
 						  receiver,
 						  completionTag);
 
-	(*receiver->rDestroy) (receiver);
+	receiver->rDestroy(receiver);
 
 	if (completed)
 	{
@@ -2005,6 +2083,9 @@ exec_execute_message(const char *portal_name, long max_rows)
 			 * those that start or end a transaction block.
 			 */
 			CommandCounterIncrement();
+
+			/* full command has been executed, reset timeout */
+			disable_statement_timeout();
 		}
 
 		/* Send appropriate CommandComplete to client */
@@ -2090,7 +2171,7 @@ check_log_statement(List *stmt_list)
  * If logging is needed, the duration in msec is formatted into msec_str[],
  * which must be a 32-byte buffer.
  *
- * was_logged should be TRUE if caller already logged query details (this
+ * was_logged should be true if caller already logged query details (this
  * essentially prevents 2 from being returned).
  */
 int
@@ -2178,6 +2259,9 @@ errdetail_params(ParamListInfo params)
 		StringInfoData param_str;
 		MemoryContext oldcontext;
 		int			paramno;
+
+		/* This code doesn't support dynamic param lists */
+		Assert(params->paramFetch == NULL);
 
 		/* Make sure any trash is generated in MessageContext */
 		oldcontext = MemoryContextSwitchTo(MessageContext);
@@ -2287,7 +2371,6 @@ static void
 exec_describe_statement_message(const char *stmt_name)
 {
 	CachedPlanSource *psrc;
-	StringInfoData buf;
 	int			i;
 
 	/*
@@ -2343,16 +2426,17 @@ exec_describe_statement_message(const char *stmt_name)
 	/*
 	 * First describe the parameters...
 	 */
-	pq_beginmessage(&buf, 't'); /* parameter description message type */
-	pq_sendint(&buf, psrc->num_params, 2);
+	pq_beginmessage_reuse(&row_description_buf, 't');	/* parameter description
+														 * message type */
+	pq_sendint16(&row_description_buf, psrc->num_params);
 
 	for (i = 0; i < psrc->num_params; i++)
 	{
 		Oid			ptype = psrc->param_types[i];
 
-		pq_sendint(&buf, (int) ptype, 4);
+		pq_sendint32(&row_description_buf, (int) ptype);
 	}
-	pq_endmessage(&buf);
+	pq_endmessage_reuse(&row_description_buf);
 
 	/*
 	 * Next send RowDescription or NoData to describe the result...
@@ -2364,7 +2448,10 @@ exec_describe_statement_message(const char *stmt_name)
 		/* Get the plan's primary targetlist */
 		tlist = CachedPlanGetTargetList(psrc, NULL);
 
-		SendRowDescriptionMessage(psrc->resultDesc, tlist, NULL);
+		SendRowDescriptionMessage(&row_description_buf,
+								  psrc->resultDesc,
+								  tlist,
+								  NULL);
 	}
 	else
 		pq_putemptymessage('n');	/* NoData */
@@ -2416,7 +2503,8 @@ exec_describe_portal_message(const char *portal_name)
 		return;					/* can't actually do anything... */
 
 	if (portal->tupDesc)
-		SendRowDescriptionMessage(portal->tupDesc,
+		SendRowDescriptionMessage(&row_description_buf,
+								  portal->tupDesc,
 								  FetchPortalTargetList(portal),
 								  portal->formats);
 	else
@@ -2434,25 +2522,27 @@ start_xact_command(void)
 	{
 		StartTransactionCommand();
 
-		/* Set statement timeout running, if any */
-		/* NB: this mustn't be enabled until we are within an xact */
-		if (StatementTimeout > 0)
-			enable_timeout_after(STATEMENT_TIMEOUT, StatementTimeout);
-		else
-			disable_timeout(STATEMENT_TIMEOUT, false);
-
 		xact_started = true;
 	}
+
+	/*
+	 * Start statement timeout if necessary.  Note that this'll intentionally
+	 * not reset the clock on an already started timeout, to avoid the timing
+	 * overhead when start_xact_command() is invoked repeatedly, without an
+	 * interceding finish_xact_command() (e.g. parse/bind/execute).  If that's
+	 * not desired, the timeout has to be disabled explicitly.
+	 */
+	enable_statement_timeout();
 }
 
 static void
 finish_xact_command(void)
 {
+	/* cancel active statement timeout after each command */
+	disable_statement_timeout();
+
 	if (xact_started)
 	{
-		/* Cancel any active statement timeout before committing */
-		disable_timeout(STATEMENT_TIMEOUT, false);
-
 		CommitTransactionCommand();
 
 #ifdef MEMORY_CONTEXT_CHECKING
@@ -2467,6 +2557,10 @@ finish_xact_command(void)
 #endif
 
 		xact_started = false;
+
+		if (YBTransactionsEnabled()) {
+			YBCHandleCommitError();
+		}
 	}
 }
 
@@ -2572,6 +2666,16 @@ quickdie(SIGNAL_ARGS)
 		whereToSendOutput = DestNone;
 
 	/*
+	 * Notify the client before exiting, to give a clue on what happened.
+	 *
+	 * It's dubious to call ereport() from a signal handler.  It is certainly
+	 * not async-signal safe.  But it seems better to try, than to disconnect
+	 * abruptly and leave the client wondering what happened.  It's remotely
+	 * possible that we crash or hang while trying to send the message, but
+	 * receiving a SIGQUIT is a sign that something has already gone badly
+	 * wrong, so there's not much to lose.  Assuming the postmaster is still
+	 * running, it will SIGKILL us soon if we get stuck for some reason.
+	 *
 	 * Ideally this should be ereport(FATAL), but then we'd not get control
 	 * back...
 	 */
@@ -2585,27 +2689,25 @@ quickdie(SIGNAL_ARGS)
 			 errhint("In a moment you should be able to reconnect to the"
 					 " database and repeat your command.")));
 
-	/*
-	 * We DO NOT want to run proc_exit() callbacks -- we're here because
-	 * shared memory may be corrupted, so we don't want to try to clean up our
-	 * transaction.  Just nail the windows shut and get out of town.  Now that
-	 * there's an atexit callback to prevent third-party code from breaking
-	 * things by calling exit() directly, we have to reset the callbacks
-	 * explicitly to make this work as intended.
-	 */
-	on_exit_reset();
-
-	YBOnPostgresBackendShutdown();
+	if (IsYugaByteEnabled()) {
+		YBOnPostgresBackendShutdown();
+	}
 
 	/*
-	 * Note we do exit(2) not exit(0).  This is to force the postmaster into a
-	 * system reset cycle if some idiot DBA sends a manual SIGQUIT to a random
+	 * We DO NOT want to run proc_exit() or atexit() callbacks -- we're here
+	 * because shared memory may be corrupted, so we don't want to try to
+	 * clean up our transaction.  Just nail the windows shut and get out of
+	 * town.  The callbacks wouldn't be safe to run from a signal handler,
+	 * anyway.
+	 *
+	 * Note we do _exit(2) not _exit(0).  This is to force the postmaster into
+	 * a system reset cycle if someone sends a manual SIGQUIT to a random
 	 * backend.  This is necessary precisely because we don't clean up our
 	 * shared memory state.  (The "dead man switch" mechanism in pmsignal.c
 	 * should ensure the postmaster sees this as a crash, too, but no harm in
 	 * being doubly sure.)
 	 */
-	exit(2);
+	_exit(2);
 }
 
 /*
@@ -2638,7 +2740,9 @@ die(SIGNAL_ARGS)
 
 	errno = save_errno;
 
-	YBOnPostgresBackendShutdown();
+	if (IsYugaByteEnabled()) {
+		YBOnPostgresBackendShutdown();
+	}
 }
 
 /*
@@ -2723,7 +2827,8 @@ RecoveryConflictInterrupt(ProcSignalReason reason)
 				if (!IsWaitingForLock())
 					return;
 
-				/* Intentional drop through to check wait for pin */
+				/* Intentional fall through to check wait for pin */
+				/* FALLTHROUGH */
 
 			case PROCSIG_RECOVERY_CONFLICT_BUFFERPIN:
 
@@ -2736,7 +2841,8 @@ RecoveryConflictInterrupt(ProcSignalReason reason)
 
 				MyProc->recoveryConflictPending = true;
 
-				/* Intentional drop through to error handling */
+				/* Intentional fall through to error handling */
+				/* FALLTHROUGH */
 
 			case PROCSIG_RECOVERY_CONFLICT_LOCK:
 			case PROCSIG_RECOVERY_CONFLICT_TABLESPACE:
@@ -2780,7 +2886,8 @@ RecoveryConflictInterrupt(ProcSignalReason reason)
 					break;
 				}
 
-				/* Intentional drop through to session cancel */
+				/* Intentional fall through to session cancel */
+				/* FALLTHROUGH */
 
 			case PROCSIG_RECOVERY_CONFLICT_DATABASE:
 				RecoveryConflictPending = true;
@@ -2918,14 +3025,14 @@ ProcessInterrupts(void)
 	/*
 	 * Don't allow query cancel interrupts while reading input from the
 	 * client, because we might lose sync in the FE/BE protocol.  (Die
-	 * interrupts are OK, because we won't read any further messages from
-	 * the client in that case.)
+	 * interrupts are OK, because we won't read any further messages from the
+	 * client in that case.)
 	 */
 	if (QueryCancelPending && QueryCancelHoldoffCount != 0)
 	{
 		/*
-		 * Re-arm InterruptPending so that we process the cancel request
-		 * as soon as we're done reading the message.
+		 * Re-arm InterruptPending so that we process the cancel request as
+		 * soon as we're done reading the message.
 		 */
 		InterruptPending = true;
 	}
@@ -3565,6 +3672,430 @@ process_postgres_switches(int argc, char *argv[], GucContext ctx,
 #endif
 }
 
+/*
+ * Reload the postgres caches and update the cache version.
+ * Note: if catalog changes sneaked in since getting the
+ * version it is unfortunate but ok. The master version will have
+ * changed too (making our version number obsolete) so we will just end
+ * up needing to do another cache refresh later.
+ * See the comment for yb_catalog_cache_version in 'pg_yb_utils.c' for
+ * more details.
+ */
+static void YBRefreshCache()
+{
+
+	/*
+	 * Check that we are not already inside a transaction or we might end up
+	 * leaking cache references for any open relations (i.e. relations in-use by
+	 * the current transaction).
+	 *
+	 * Caller(s) should have already ensured that this is the case.
+	 */
+	if (xact_started)
+	{
+		ereport(ERROR,
+		        (errcode(ERRCODE_INTERNAL_ERROR),
+				        errmsg("Cannot refresh cache within a transaction")));
+	}
+
+	/* Get the latest syscatalog version from the master */
+	uint64 catalog_master_version = 0;
+	YBCPgGetCatalogMasterVersion(ybc_pg_session,
+	                             (uint64_t *) &catalog_master_version);
+
+	/* Need to execute some (read) queries internally so start a local txn. */
+	start_xact_command();
+
+	/* Clear and reload system catalog caches, including all callbacks. */
+	ResetCatalogCaches();
+	CallSystemCacheCallbacks();
+	YBPreloadRelCache();
+
+	/* Also invalidate the pggate cache. */
+	YBCPgInvalidateCache(ybc_pg_session);
+
+	/* Set the new ysql cache version. */
+	yb_catalog_cache_version = catalog_master_version;
+	yb_need_cache_refresh = false;
+
+	finish_xact_command();
+}
+
+static void YBPrepareCacheRefreshIfNeeded(MemoryContext oldcontext,
+                                          bool consider_retry,
+                                          bool *need_retry)
+{
+	bool need_cache_refresh = false;
+	*need_retry = false;
+
+	/*
+	 * A retry is only required if the transaction is handled by YugaByte.
+	 */
+	if (!IsYugaByteEnabled())
+		return;
+
+	/* Get error data */
+	ErrorData *edata;
+	MemoryContextSwitchTo(oldcontext);
+	edata = CopyErrorData();
+	bool is_retryable_err = YBNeedRetryAfterCacheRefresh(edata);
+
+	/*
+	 * Get the latest syscatalog version from the master to check if we need
+	 * to refresh the cache.
+	 */
+	uint64 catalog_master_version = 0;
+	YBCPgGetCatalogMasterVersion(ybc_pg_session,
+	                             (uint64_t *) &catalog_master_version);
+	need_cache_refresh = yb_catalog_cache_version != catalog_master_version;
+	if (!need_cache_refresh)
+		return;
+
+	/*
+	 * Reset catalog version so that the cache gets marked as invalid and
+	 * will be refreshed after the txn ends.
+	 */
+	yb_need_cache_refresh = true;
+
+	/*
+	 * Prepare to retry the query if possible.
+	 */
+	if (is_retryable_err)
+	{
+		/*
+		 * For single-query transactions we abort the current
+		 * transaction to undo any already-applied operations
+		 * and retry the query.
+		 *
+		 * For transaction blocks we would have to re-apply
+		 * all previous queries and also continue the
+		 * transaction for future queries (before commit).
+		 * So we just re-throw the error in that case.
+		 *
+		 */
+		if (consider_retry && !IsTransactionBlock())
+		{
+			/* Clear error state */
+			FlushErrorState();
+			FreeErrorData(edata);
+
+			/* Abort the transaction and clean up. */
+			AbortCurrentTransaction();
+			if (am_walsender)
+				WalSndErrorCleanup();
+
+			if (MyReplicationSlot != NULL)
+				ReplicationSlotRelease();
+
+			ReplicationSlotCleanup();
+
+			if (doing_extended_query_message)
+				ignore_till_sync = true;
+
+			xact_started = false;
+
+			/* Refresh cache now so that the retry uses latest version. */
+			YBRefreshCache();
+
+			*need_retry = true;
+		}
+		else
+		{
+			ereport(ERROR,
+			        (errcode(ERRCODE_INTERNAL_ERROR),
+					        errmsg("Catalog Version Mismatch: A DDL occurred "
+					               "while processing this query. Try Again.")));
+		}
+
+	}
+}
+
+static const char* yb_parse_command_tag(const char *query_string)
+{
+	List* parsetree_list = pg_parse_query(query_string);
+	RawStmt* raw_parse_tree = linitial_node(RawStmt, parsetree_list);
+	return CreateCommandTag(raw_parse_tree->stmt);
+}
+
+/*
+ * Only retry SELECT, INSERT, UPDATE and DELETE commands.
+ * Do the minimum parsing to find out what the command is
+ */
+static bool yb_check_retry_allowed(const char *query_string)
+{
+	if (!query_string)
+		return false;
+
+	const char* commandTag = yb_parse_command_tag(query_string);
+	return (strncmp(commandTag, "DELETE", 6) == 0 ||
+	        strncmp(commandTag, "INSERT", 6) == 0 ||
+	        strncmp(commandTag, "SELECT", 6) == 0 ||
+	        strncmp(commandTag, "UPDATE", 6) == 0);
+}
+
+static void YBCheckSharedCatalogCacheVersion() {
+	/*
+	 * We cannot refresh the cache if we are already inside a transaction, so don't
+	 * bother checking shared memory.
+	 */
+	if (xact_started)
+		return;
+
+	/*
+	 * Don't check shared memory if we are in initdb. E.g. during initial system
+	 * catalog snapshot creation, tablet servers may not be running.
+	 */
+	if (YBCIsInitDbModeEnvVarSet())
+		return;
+
+	uint64_t shared_catalog_version;
+	HandleYBStatus(YBCGetSharedCatalogVersion(ybc_pg_session, &shared_catalog_version));
+
+	if (yb_catalog_cache_version < shared_catalog_version) {
+		YBRefreshCache();
+	}
+}
+
+/* Whether an error we've got is a "restart read" error. */
+static bool
+yb_is_read_restart_nedeed(const ErrorData* edata)
+{
+	if (!IsYugaByteEnabled())
+		return false;
+
+	return YBCIsRestartReadError(edata->yb_txn_errcode);
+}
+
+/* Whether we are allowed to restart current query/txn in case of "restart read" error. */
+static bool
+yb_is_read_restart_possible(int attempt, const PortalRestartData* restart_data)
+{
+	if (!IsYugaByteEnabled())
+		return false;
+
+	if (YBIsDataSent())
+		return false;
+
+	if (attempt >= YBCGetMaxReadRestartAttempts())
+		return false;
+
+	if (!restart_data)
+		return false;
+
+	// Can't currently restart named statements
+	if (restart_data->portal_name[0] != '\0')
+		return false;
+
+	// Can only restart SELECT queries
+	if (!restart_data->query_string)
+		return false;
+	if (strncmp(restart_data->command_tag, "SELECT", 6) != 0)
+		return false;
+
+	return true;
+}
+
+/*
+ * Make a deep copy of ParamListInfo, allocating it in the current memory context.
+ */
+static ParamListInfo
+yb_copy_param_list(ParamListInfo source)
+{
+	if (source == NULL)
+		return NULL;
+
+	size_t alloc_size = offsetof(ParamListInfoData, params) +
+	                    source->numParams * sizeof(ParamExternData);
+	ParamListInfo result = (ParamListInfo) palloc(alloc_size);
+	// No allocated data structure pointers within ParamListInfo so we use a simple memcpy
+	memcpy(result, source, alloc_size);
+	return result;
+}
+
+/*
+ * Collect data necessary for yb_restart_portal invocation.
+ */
+static PortalRestartData*
+yb_collect_portal_restart_data(const char* portal_name)
+{
+	Portal portal = GetPortalByName(portal_name);
+
+	if (portal == NULL)
+		return NULL;
+
+	PortalRestartData* result = (PortalRestartData*) palloc(sizeof(PortalRestartData));
+
+	result->portal_name  = pstrdup(portal_name);
+	result->query_string = pstrdup(portal->sourceText);
+	result->command_tag  = pstrdup(portal->commandTag);
+
+	result->params      = yb_copy_param_list(portal->portalParams);
+	result->num_params  = result->params ? result->params->numParams : 0;
+	result->param_types = NULL;
+	if (result->num_params > 0)
+	{
+		result->param_types = (Oid*) palloc(result->num_params * sizeof(Oid));
+		for (int i = 0; i < result->num_params; ++i)
+		{
+			result->param_types[i] = result->params->params[i].ptype;
+		}
+	}
+
+	result->num_formats = 0;
+	result->formats     = NULL;
+	if (portal->formats)
+	{
+		result->num_formats = portal->tupDesc->natts;
+		size_t alloc_size   = result->num_formats * sizeof(int16);
+		result->formats     = (int16*) palloc(alloc_size);
+		memcpy(result->formats, portal->formats, alloc_size);
+	}
+
+	return result;
+}
+
+/*
+ * Create a new portal to replace one that might've been partially processed.
+ * Can only restart unnamed portal.
+ */
+static void
+yb_restart_portal(const PortalRestartData* rd)
+{
+
+	/* 1. Redo Parse: Create Cached stmt (no output) */
+	exec_parse_message(rd->query_string,
+	                   rd->portal_name,
+	                   rd->param_types,
+	                   rd->num_params,
+	                   DestNone);
+
+	/* 2. Redo the Bind step */
+
+	/* Create portal */
+	bool no_portal_name = rd->portal_name[0] == '\0';
+	Portal portal = CreatePortal(rd->portal_name,
+	                             no_portal_name /* allowDup */,
+	                             no_portal_name /* dupSilent */);
+
+	/* Set portal data */
+	MemoryContext oldContext = MemoryContextSwitchTo(portal->portalContext);
+
+	const char    *stmt_name = no_portal_name ? NULL : pstrdup(rd->portal_name);
+	ParamListInfo params     = yb_copy_param_list(rd->params);
+
+	MemoryContextSwitchTo(oldContext);
+
+	CachedPlan *cplan = GetCachedPlan(unnamed_stmt_psrc,
+	                                  params,
+	                                  false /* useResOwner */,
+	                                  NULL /* queryEnv */);
+
+	PortalDefineQuery(portal,
+	                  stmt_name,
+	                  rd->query_string,
+	                  rd->command_tag,
+	                  cplan->stmt_list,
+	                  cplan);
+
+	/* Start portal */
+	PortalStart(portal, params, 0 /* eflags */, InvalidSnapshot);
+
+	/* Set the output format */
+	PortalSetResultFormat(portal, rd->num_formats, rd->formats);
+}
+
+/*
+ * Wraps exec_simple_query, attempting to transparently do read restarts when possible.
+ * Accepts execution memory context to revert to in case of an error.
+ */
+static void
+yb_exec_simple_query_attempting_to_restart_read(const char* query_string,
+                                                MemoryContext exec_context)
+{
+	for (int attempt = 0;; ++attempt) {
+		PG_TRY();
+		{
+			YBSaveOutputBufferPosition();
+			exec_simple_query(query_string);
+			return;
+		}
+		PG_CATCH();
+		{
+			// Switch the context from the current execution back to the original context
+			// when server started processing user request.
+			MemoryContext     error_context = MemoryContextSwitchTo(exec_context);
+			ErrorData*        edata         = CopyErrorData();
+			PortalRestartData restart_data  = {
+			    .portal_name  = "",
+			    .query_string = query_string,
+			    .command_tag  = yb_parse_command_tag(query_string),
+			    .num_params   = 0,
+			    .param_types  = NULL,
+			    .params       = NULL,
+			    .num_formats  = 0,
+			    .formats      = NULL
+			};
+
+			if (yb_is_read_restart_nedeed(edata) &&
+			   yb_is_read_restart_possible(attempt, &restart_data)) {
+				/* Cleanup the error, signal txn restart and let the loop continue. */
+				FlushErrorState();
+				PopActiveSnapshot(); // Restart read error occurrs after portal snapshot is pushed.
+				YBRestoreOutputBufferPosition();
+				YBCRestartTransaction();
+			} else {
+				/* If we shouldn't restart - propagate the error. */
+				MemoryContextSwitchTo(error_context);
+				PG_RE_THROW();
+			}
+		}
+		PG_END_TRY();
+	}
+}
+
+/*
+ * Wraps exec_execute_message, attempting to transparently do read restarts when possible.
+ * Accepts execution memory context to revert to in case of an error.
+ */
+static void
+yb_exec_execute_message_attempting_to_restart_read(const char* portal_name,
+                                                   long max_rows,
+                                                   MemoryContext exec_context)
+{
+	PortalRestartData* restart_data = NULL;
+	for (int attempt = 0;; ++attempt) {
+		PG_TRY();
+		{
+			YBSaveOutputBufferPosition();
+			exec_execute_message(portal_name, max_rows);
+			return;
+		}
+		PG_CATCH();
+		{
+			// Switch the context from the current execution back to the original context
+			// when server started processing user request.
+			MemoryContext      error_context = MemoryContextSwitchTo(exec_context);
+			ErrorData*         edata         = CopyErrorData();
+			if (!restart_data)
+				restart_data = yb_collect_portal_restart_data(portal_name);
+
+			if (yb_is_read_restart_nedeed(edata) &&
+			    yb_is_read_restart_possible(attempt, restart_data)) {
+				/* Cleanup the error, signal txn restart, recreate portal and let the loop continue. */
+				FlushErrorState();
+				PopActiveSnapshot(); // Restart read error occurrs after portal snapshot is pushed.
+				yb_restart_portal(restart_data);
+				YBRestoreOutputBufferPosition();
+				YBCRestartTransaction();
+			} else {
+				/* If we shouldn't restart - propagate the error. */
+				MemoryContextSwitchTo(error_context);
+				PG_RE_THROW();
+			}
+		}
+		PG_END_TRY();
+	}
+}
 
 /* ----------------------------------------------------------------
  * PostgresMain
@@ -3582,6 +4113,23 @@ PostgresMain(int argc, char *argv[],
 			 const char *dbname,
 			 const char *username)
 {
+	// TODO(neil) Once we have our system DB, remove the following code.
+	// It is a hack to help us getting by for now.
+	for (int i = 0; i < argc; i++) {
+		if (strcmp(argv[i], "template0") == 0 || strcmp(argv[i], "template1") == 0) {
+			YBSetPreparingTemplates();
+		}
+	}
+	if (dbname) {
+		if (strcmp(dbname, "template0") == 0 || strcmp(dbname, "template1") == 0) {
+			YBSetPreparingTemplates();
+		}
+	} else if (username) {
+		if (strcmp(username, "template0") == 0 || strcmp(username, "template1") == 0) {
+			YBSetPreparingTemplates();
+		}
+	}
+
 	int			firstchar;
 	StringInfoData input_message;
 	sigjmp_buf	local_sigjmp_buf;
@@ -3692,8 +4240,7 @@ PostgresMain(int argc, char *argv[],
 		 * Validate we have been given a reasonable-looking DataDir (if under
 		 * postmaster, assume postmaster did this already).
 		 */
-		Assert(DataDir);
-		ValidatePgVersion(DataDir);
+		checkDataDir();
 
 		/* Change into DataDir (if under postmaster, was done already) */
 		ChangeToDataDir();
@@ -3702,6 +4249,9 @@ PostgresMain(int argc, char *argv[],
 		 * Create lockfile for data directory.
 		 */
 		CreateDataDirLockFile(false);
+
+		/* read control file (error checking and contains config ) */
+		LocalProcessControlFile(false);
 
 		/* Initialize MaxBackends (if under postmaster, was done already) */
 		InitializeMaxBackends();
@@ -3733,7 +4283,7 @@ PostgresMain(int argc, char *argv[],
 	 * it inside InitPostgres() instead.  In particular, anything that
 	 * involves database access should be there, not here.
 	 */
-	InitPostgres(dbname, InvalidOid, username, InvalidOid, NULL);
+	InitPostgres(dbname, InvalidOid, username, InvalidOid, NULL, false);
 
 	/*
 	 * If the PostmasterContext is still around, recycle the space; we don't
@@ -3781,8 +4331,8 @@ PostgresMain(int argc, char *argv[],
 		StringInfoData buf;
 
 		pq_beginmessage(&buf, 'K');
-		pq_sendint(&buf, (int32) MyProcPid, sizeof(int32));
-		pq_sendint(&buf, (int32) MyCancelKey, sizeof(int32));
+		pq_sendint32(&buf, (int32) MyProcPid);
+		pq_sendint32(&buf, (int32) MyCancelKey);
 		pq_endmessage(&buf);
 		/* Need not flush since ReadyForQuery will do it. */
 	}
@@ -3800,6 +4350,19 @@ PostgresMain(int argc, char *argv[],
 	MessageContext = AllocSetContextCreate(TopMemoryContext,
 										   "MessageContext",
 										   ALLOCSET_DEFAULT_SIZES);
+
+	/*
+	 * Create memory context and buffer used for RowDescription messages. As
+	 * SendRowDescriptionMessage(), via exec_describe_statement_message(), is
+	 * frequently executed for ever single statement, we don't want to
+	 * allocate a separate buffer every time.
+	 */
+	row_description_context = AllocSetContextCreate(TopMemoryContext,
+													"RowDescriptionContext",
+													ALLOCSET_DEFAULT_SIZES);
+	MemoryContextSwitchTo(row_description_context);
+	initStringInfo(&row_description_buf);
+	MemoryContextSwitchTo(TopMemoryContext);
 
 	/*
 	 * Remember stand-alone backend startup time
@@ -3858,6 +4421,7 @@ PostgresMain(int argc, char *argv[],
 		 */
 		disable_all_timeouts(false);
 		QueryCancelPending = false; /* second to avoid race condition */
+		stmt_timeout_active = false;
 
 		/* Not reading from the client anymore. */
 		DoingCommandRead = false;
@@ -3882,6 +4446,9 @@ PostgresMain(int argc, char *argv[],
 		if (am_walsender)
 			WalSndErrorCleanup();
 
+		PortalErrorCleanup();
+		SPICleanup();
+
 		/*
 		 * We can't release replication slots inside AbortTransaction() as we
 		 * need to be able to start and abort transactions while having a slot
@@ -3894,6 +4461,8 @@ PostgresMain(int argc, char *argv[],
 
 		/* We also want to cleanup temporary slots on error. */
 		ReplicationSlotCleanup();
+
+		jit_reset_after_error();
 
 		/*
 		 * Now return to normal top-level context and clear ErrorContext for
@@ -4006,6 +4575,11 @@ PostgresMain(int argc, char *argv[],
 			}
 			else
 			{
+				if (IsYugaByteEnabled() && yb_need_cache_refresh)
+				{
+					YBRefreshCache();
+				}
+
 				ProcessCompletedNotifies();
 				pgstat_report_stat(false);
 
@@ -4068,29 +4642,50 @@ PostgresMain(int argc, char *argv[],
 		if (ignore_till_sync && firstchar != EOF)
 			continue;
 
+		if (IsYugaByteEnabled()) {
+			YBCheckSharedCatalogCacheVersion();
+		}
+
 		switch (firstchar)
 		{
 			case 'Q':			/* simple query */
+			{
+				const char *query_string;
+
+				/* Set statement_timestamp() */
+				SetCurrentStatementStartTimestamp();
+
+				query_string = pq_getmsgstring(&input_message);
+				pq_getmsgend(&input_message);
+
+				MemoryContext oldcontext = CurrentMemoryContext;
+
+				PG_TRY();
 				{
-					const char *query_string;
-
-					/* Set statement_timestamp() */
-					SetCurrentStatementStartTimestamp();
-
-					query_string = pq_getmsgstring(&input_message);
-					pq_getmsgend(&input_message);
-
-					if (am_walsender)
-					{
-						if (!exec_replication_command(query_string))
-							exec_simple_query(query_string);
-					}
-					else
-						exec_simple_query(query_string);
-
-					send_ready_for_query = true;
+					if (!am_walsender || !exec_replication_command(query_string))
+                      yb_exec_simple_query_attempting_to_restart_read(query_string, oldcontext);
 				}
-				break;
+				PG_CATCH();
+				{
+					bool need_retry = false;
+					YBPrepareCacheRefreshIfNeeded(oldcontext,
+                                                  yb_check_retry_allowed(query_string),
+                                                  &need_retry);
+
+					if (need_retry)
+					{
+						if (!am_walsender || !exec_replication_command(query_string))
+                          yb_exec_simple_query_attempting_to_restart_read(query_string, oldcontext);
+					} else
+					{
+						PG_RE_THROW();
+					}
+				}
+				PG_END_TRY();
+
+				send_ready_for_query = true;
+			}
+			break;
 
 			case 'P':			/* parse */
 				{
@@ -4117,8 +4712,31 @@ PostgresMain(int argc, char *argv[],
 					}
 					pq_getmsgend(&input_message);
 
-					exec_parse_message(query_string, stmt_name,
-									   paramTypes, numParams);
+					MemoryContext oldcontext = CurrentMemoryContext;
+
+					PG_TRY();
+					{
+						exec_parse_message(query_string,
+						                   stmt_name,
+						                   paramTypes,
+						                   numParams,
+						                   whereToSendOutput);
+					}
+					PG_CATCH();
+					{
+						/*
+						 * TODO Cannot retry parse statements yet (without
+						 * aborting the followup bind/execute.
+						 */
+						bool need_retry = false;
+						YBPrepareCacheRefreshIfNeeded(oldcontext,
+						                              false /* consider_retry */,
+						                              &need_retry);
+						PG_RE_THROW();
+
+					}
+					PG_END_TRY();
+
 				}
 				break;
 
@@ -4149,7 +4767,56 @@ PostgresMain(int argc, char *argv[],
 					max_rows = pq_getmsgint(&input_message, 4);
 					pq_getmsgend(&input_message);
 
-					exec_execute_message(portal_name, max_rows);
+					MemoryContext oldcontext = CurrentMemoryContext;
+
+					PG_TRY();
+					{
+                      yb_exec_execute_message_attempting_to_restart_read(portal_name,
+                                                                         max_rows,
+                                                                         oldcontext);
+					}
+					PG_CATCH();
+					{
+
+						PortalRestartData* restart_data =
+                            yb_collect_portal_restart_data(portal_name);
+
+						/*
+						 * TODO Do not support retrying for prepared statements
+						 * yet. (i.e. if portal is named or has params).
+						 */
+						bool can_retry =
+						    IsYugaByteEnabled() &&
+						    restart_data &&
+						    restart_data->portal_name[0] == '\0' &&
+						    restart_data->num_params == 0 &&
+                                yb_check_retry_allowed(unnamed_stmt_psrc->query_string);
+
+						bool need_retry = false;
+						/*
+						 * Execute may have been partially applied so need to
+						 * cleanup (and restart) the transaction.
+						 */
+						YBPrepareCacheRefreshIfNeeded(oldcontext,
+						                              can_retry,
+						                              &need_retry);
+
+						if (need_retry && can_retry)
+						{
+                          yb_restart_portal(restart_data);
+
+							/* Now ready to retry the execute step. */
+                          yb_exec_execute_message_attempting_to_restart_read(portal_name,
+                                                                             max_rows,
+                                                                             CurrentMemoryContext);
+						}
+						else
+						{
+							PG_RE_THROW();
+						}
+
+					}
+					PG_END_TRY();
 				}
 				break;
 
@@ -4420,11 +5087,8 @@ ShowUsage(const char *title)
 	}
 
 	/*
-	 * the only stats we don't show here are for memory usage -- i can't
-	 * figure out how to interpret the relevant fields in the rusage struct,
-	 * and they change names across o/s platforms, anyway. if you can figure
-	 * out what the entries mean, you can somehow extract resident set size,
-	 * shared text size, and unshared data and stack sizes.
+	 * The only stats we don't show here are ixrss, idrss, isrss.  It takes
+	 * some work to interpret them, and most platforms don't fill them in.
 	 */
 	initStringInfo(&str);
 
@@ -4444,6 +5108,16 @@ ShowUsage(const char *title)
 					 (long) sys.tv_sec,
 					 (long) sys.tv_usec);
 #if defined(HAVE_GETRUSAGE)
+	appendStringInfo(&str,
+					 "!\t%ld kB max resident size\n",
+#if defined(__darwin__)
+	/* in bytes on macOS */
+					 r.ru_maxrss / 1024
+#else
+	/* in kilobytes on most other platforms */
+					 r.ru_maxrss
+#endif
+		);
 	appendStringInfo(&str,
 					 "!\t%ld/%ld [%ld/%ld] filesystem blocks in/out\n",
 					 r.ru_inblock - Save_r.ru_inblock,
@@ -4512,4 +5186,43 @@ log_disconnections(int code, Datum arg)
 					hours, minutes, seconds, msecs,
 					port->user_name, port->database_name, port->remote_host,
 					port->remote_port[0] ? " port=" : "", port->remote_port)));
+}
+
+/*
+ * Start statement timeout timer, if enabled.
+ *
+ * If there's already a timeout running, don't restart the timer.  That
+ * enables compromises between accuracy of timeouts and cost of starting a
+ * timeout.
+ */
+static void
+enable_statement_timeout(void)
+{
+	/* must be within an xact */
+	Assert(xact_started);
+
+	if (StatementTimeout > 0)
+	{
+		if (!stmt_timeout_active)
+		{
+			enable_timeout_after(STATEMENT_TIMEOUT, StatementTimeout);
+			stmt_timeout_active = true;
+		}
+	}
+	else
+		disable_timeout(STATEMENT_TIMEOUT, false);
+}
+
+/*
+ * Disable statement timeout, if active.
+ */
+static void
+disable_statement_timeout(void)
+{
+	if (stmt_timeout_active)
+	{
+		disable_timeout(STATEMENT_TIMEOUT, false);
+
+		stmt_timeout_active = false;
+	}
 }

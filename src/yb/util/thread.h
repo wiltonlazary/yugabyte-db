@@ -44,6 +44,7 @@
 #include "yb/gutil/atomicops.h"
 #include "yb/gutil/ref_counted.h"
 #include "yb/util/async_util.h"
+#include "yb/util/result.h"
 #include "yb/util/status.h"
 
 namespace yb {
@@ -51,6 +52,12 @@ namespace yb {
 class MetricEntity;
 class Thread;
 class WebCallbackRegistry;
+
+#if defined(__linux__)
+typedef int64_t ThreadIdForStack;
+#else
+typedef pthread_t ThreadIdForStack;
+#endif
 
 // Utility to join on a thread, printing warning messages if it
 // takes too long. For example:
@@ -68,22 +75,22 @@ class ThreadJoiner {
  public:
   explicit ThreadJoiner(Thread* thread);
 
-  // Start emitting warnings after this many milliseconds.
+  // Start emitting warnings after specified duration.
   //
   // Default: 1000 ms.
-  ThreadJoiner& warn_after_ms(int ms);
+  ThreadJoiner& warn_after(MonoDelta duration);
 
   // After the warnings after started, emit another warning at the
   // given interval.
   //
   // Default: 1000 ms.
-  ThreadJoiner& warn_every_ms(int ms);
+  ThreadJoiner& warn_every(MonoDelta duration);
 
-  // If the thread has not stopped after this number of milliseconds, give up
+  // If the thread has not stopped after this duration, give up
   // joining on it and return Status::Aborted.
   //
-  // -1 (the default) means to wait forever trying to join.
-  ThreadJoiner& give_up_after_ms(int ms);
+  // MonoDelta::kMax (the default) means to wait forever trying to join.
+  ThreadJoiner& give_up_after(MonoDelta duration);
 
   // Join the thread, subject to the above parameters. If the thread joining
   // fails for any reason, returns RuntimeError. If it times out, returns
@@ -91,20 +98,16 @@ class ThreadJoiner {
   CHECKED_STATUS Join();
 
  private:
-  enum {
-    kDefaultWarnAfterMs = 1000,
-    kDefaultWarnEveryMs = 1000,
-    kDefaultGiveUpAfterMs = -1 // forever
-  };
-
   Thread* thread_;
 
-  int warn_after_ms_;
-  int warn_every_ms_;
-  int give_up_after_ms_;
+  MonoDelta warn_after_ = MonoDelta::FromMilliseconds(1000);
+  MonoDelta warn_every_ = MonoDelta::FromMilliseconds(1000);
+  MonoDelta give_up_after_ = MonoDelta::kMax;
 
   DISALLOW_COPY_AND_ASSIGN(ThreadJoiner);
 };
+
+typedef scoped_refptr<Thread> ThreadPtr;
 
 // Thin wrapper around pthread that can register itself with the singleton ThreadMgr
 // (a private class implemented in thread.cc entirely, which tracks all live threads so
@@ -186,6 +189,22 @@ class Thread : public RefCountedThreadSafe<Thread> {
     return StartThread(category, name, std::bind(f, a1, a2, a3, a4, a5, a6), holder);
   }
 
+  template <class F>
+  static Result<ThreadPtr> Make(
+      const std::string& category, const std::string& name, const F& f) {
+    ThreadPtr result;
+    RETURN_NOT_OK(StartThread(category, name, f, &result));
+    return result;
+  }
+
+  template <class... Args>
+  static Result<ThreadPtr> Make(
+      const std::string& category, const std::string& name, Args&&... args) {
+    ThreadPtr result;
+    RETURN_NOT_OK(StartThread(category, name, std::bind(std::forward<Args>(args)...), &result));
+    return result;
+  }
+
   // Emulates std::thread and detaches.
   ~Thread();
 
@@ -209,6 +228,14 @@ class Thread : public RefCountedThreadSafe<Thread> {
 
   // Returns the thread's pthread ID.
   pthread_t pthread_id() const { return thread_; }
+
+  ThreadIdForStack tid_for_stack() {
+#if defined(__linux__)
+    return tid();
+#else
+    return pthread_id();
+#endif
+  }
 
   const std::string& name() const { return name_; }
   const std::string& category() const { return category_; }
@@ -264,6 +291,22 @@ class Thread : public RefCountedThreadSafe<Thread> {
 #endif
   }
 
+  static ThreadIdForStack CurrentThreadIdForStack() {
+#if defined(__linux__)
+    return CurrentThreadId();
+#else
+    return pthread_self();
+#endif
+  }
+
+  void* user_data() {
+    return user_data_;
+  }
+
+  void SetUserData(void* value) {
+    user_data_ = value;
+  }
+
  private:
   friend class ThreadJoiner;
 
@@ -316,12 +359,17 @@ class Thread : public RefCountedThreadSafe<Thread> {
 
   std::vector<Closure> exit_callbacks_;
 
+  // Some generic user data. For instance could be used to identify thread pool, which started
+  // this thread.
+  void* user_data_ = nullptr;
+
   // Starts the thread running SuperviseThread(), and returns once that thread has
   // initialised and its TID has been read. Waits for notification from the started
   // thread that initialisation is complete before returning. On success, stores a
   // reference to the thread in holder.
-  static CHECKED_STATUS StartThread(const std::string& category, const std::string& name,
-                            const ThreadFunctor& functor, scoped_refptr<Thread>* holder);
+  static CHECKED_STATUS StartThread(
+      const std::string& category, const std::string& name,
+      ThreadFunctor functor, ThreadPtr* holder);
 
   // Wrapper for the user-supplied function. Invoked from the new thread,
   // with the Thread as its only argument. Executes functor_, but before
@@ -347,6 +395,8 @@ class Thread : public RefCountedThreadSafe<Thread> {
   static void FinishThread(void* arg);
 };
 
+typedef scoped_refptr<Thread> ThreadPtr;
+
 // Registers /threadz with the debug webserver, and creates thread-tracking metrics under
 // the given entity.
 Status StartThreadInstrumentation(const scoped_refptr<MetricEntity>& server_metrics,
@@ -354,6 +404,14 @@ Status StartThreadInstrumentation(const scoped_refptr<MetricEntity>& server_metr
 
 // This initializes the thread manager and warms up libunwind's state (see ENG-1402).
 void InitThreading();
+
+void SetThreadName(const std::string& name);
+
+class CDSAttacher {
+ public:
+  CDSAttacher();
+  ~CDSAttacher();
+};
 
 } // namespace yb
 

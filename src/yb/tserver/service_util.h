@@ -19,6 +19,7 @@
 #include <boost/optional.hpp>
 
 #include "yb/rpc/rpc_context.h"
+#include "yb/server/clock.h"
 #include "yb/tserver/tablet_peer_lookup.h"
 #include "yb/tablet/tablet_peer.h"
 #include "yb/util/logging.h"
@@ -32,6 +33,12 @@ void SetupErrorAndRespond(TabletServerErrorPB* error,
                           const Status& s,
                           TabletServerErrorPB::Code code,
                           rpc::RpcContext* context);
+
+void SetupErrorAndRespond(TabletServerErrorPB* error,
+                          const Status& s,
+                          rpc::RpcContext* context);
+
+Result<int64_t> LeaderTerm(const tablet::TabletPeer& tablet_peer);
 
 // Template helpers.
 
@@ -97,33 +104,34 @@ StdStatusCallback BindHandleResponse(RespType* resp,
 //
 // Returns true if successful.
 template<class RespClass>
-bool LookupTabletPeerOrRespond(TabletPeerLookupIf* tablet_manager,
-                               const string& tablet_id,
-                               RespClass* resp,
-                               rpc::RpcContext* context,
-                               std::shared_ptr<tablet::TabletPeer>* peer) {
-  Status status = tablet_manager->GetTabletPeer(tablet_id, peer);
+Result<std::shared_ptr<tablet::TabletPeer>> LookupTabletPeerOrRespond(
+    TabletPeerLookupIf* tablet_manager,
+    const string& tablet_id,
+    RespClass* resp,
+    rpc::RpcContext* context) {
+  std::shared_ptr<tablet::TabletPeer> result;
+  Status status = tablet_manager->GetTabletPeer(tablet_id, &result);
   if (PREDICT_FALSE(!status.ok())) {
     TabletServerErrorPB::Code code = status.IsServiceUnavailable() ?
                                      TabletServerErrorPB::UNKNOWN_ERROR :
                                      TabletServerErrorPB::TABLET_NOT_FOUND;
     SetupErrorAndRespond(resp->mutable_error(), status, code, context);
-    return false;
+    return status;
   }
 
   // Check RUNNING state.
-  tablet::TabletStatePB state = (*peer)->state();
+  tablet::RaftGroupStatePB state = result->state();
   if (PREDICT_FALSE(state != tablet::RUNNING)) {
-    Status s = STATUS(IllegalState, "Tablet not RUNNING",
-                      tablet::TabletStatePB_Name(state));
+    Status s = STATUS(IllegalState, "Tablet not RUNNING", tablet::RaftGroupStatePB_Name(state));
     if (state == tablet::FAILED) {
-      s = s.CloneAndAppend((*peer)->error().ToString());
+      s = s.CloneAndAppend(result->error().ToString());
     }
     SetupErrorAndRespond(resp->mutable_error(), s,
                          TabletServerErrorPB::TABLET_NOT_RUNNING, context);
-    return false;
+    return s;
   }
-  return true;
+
+  return result;
 }
 
 // A transaction completion callback that responds to the client when transactions
@@ -171,6 +179,46 @@ std::unique_ptr<tablet::OperationCompletionCallback> MakeRpcOperationCompletionC
     const server::ClockPtr& clock) {
   return std::make_unique<RpcOperationCompletionCallback<Response>>(
       std::move(context), response, clock);
+}
+
+struct LeaderTabletPeer {
+  tablet::TabletPeerPtr peer;
+  int64_t leader_term;
+
+  bool operator!() const {
+    return !peer;
+  }
+
+  bool FillTerm(TabletServerErrorPB* error, rpc::RpcContext* context);
+};
+
+// The "peer" argument could be provided by the caller in case the caller has already performed
+// the LookupTabletPeerOrRespond call, and we only need to fill the leader term.
+template<class RespClass>
+LeaderTabletPeer LookupLeaderTabletOrRespond(
+    TabletPeerLookupIf* tablet_manager,
+    const std::string& tablet_id,
+    RespClass* resp,
+    rpc::RpcContext* context,
+    std::shared_ptr<tablet::TabletPeer> peer = nullptr) {
+  if (peer) {
+    DCHECK_EQ(peer->tablet_id(), tablet_id);
+  } else {
+    auto peer_result = LookupTabletPeerOrRespond(tablet_manager, tablet_id, resp, context);
+    if (!peer_result.ok()) {
+      return LeaderTabletPeer();
+    }
+    peer = std::move(*peer_result);
+  }
+  LeaderTabletPeer result;
+  result.peer = std::move(peer);
+
+  if (!result.FillTerm(resp->mutable_error(), context)) {
+    return LeaderTabletPeer();
+  }
+  resp->clear_error();
+
+  return result;
 }
 
 }  // namespace tserver

@@ -12,13 +12,13 @@
 //
 package com.yugabyte.jedis;
 
-import junit.framework.TestCase;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.lang.Integer;
 import java.net.InetSocketAddress;
 import java.util.Arrays;
 import java.util.Collection;
@@ -28,9 +28,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
+
+import org.yb.YBParameterizedTestRunner;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
 import redis.clients.jedis.JedisPoolConfig;
+import redis.clients.jedis.Tuple;
 
 import static com.yugabyte.jedis.BaseJedisTest.JedisClientType.JEDISCLUSTER;
 import static junit.framework.TestCase.assertEquals;
@@ -38,9 +41,9 @@ import static junit.framework.TestCase.assertFalse;
 import static junit.framework.TestCase.assertNotNull;
 import static junit.framework.TestCase.assertNull;
 import static junit.framework.TestCase.assertTrue;
-import static org.junit.Assert.fail;
+import static org.yb.AssertionWrappers.fail;
 
-@RunWith(Parameterized.class)
+@RunWith(YBParameterizedTestRunner.class)
 public class TestYBJedis extends BaseJedisTest {
   private static final Logger LOG = LoggerFactory.getLogger(TestYBJedis.class);
 
@@ -59,6 +62,53 @@ public class TestYBJedis extends BaseJedisTest {
   public void testBasicCommands() throws Exception {
     assertEquals("OK", jedis_client.set("k1", "v1"));
     assertEquals("v1", jedis_client.get("k1"));
+  }
+
+  @Test
+  public void testKeysWithDelete() throws Exception {
+    assertEquals("OK", jedis_client.set("k1", "v1"));
+    assertEquals("OK", jedis_client.set("k2", "v2"));
+
+    Map<Long, String> ts = new HashMap<>();
+    ts.put(10L, "v1");
+    ts.put(20L, "v2");
+    ts.put(30L, "v3");
+    ts.put(40L, "v4");
+    ts.put(50L, "v5");
+    assertEquals("OK", jedis_client.tsadd("k3", ts));
+
+    Map<String, Double> pairs = new HashMap<String, Double>();
+    pairs.put("v0", 0.0);
+    pairs.put("v1", 1.0);
+    assertEquals(2L, jedis_client.zadd("k4", pairs).longValue());
+
+    Set<String> keys = new HashSet<String>(Arrays.asList("k1", "k2", "k3", "k4"));
+
+    // Test all 4 keys in the db.
+    assertEquals(keys, jedis_client.keys("*"));
+
+    // Make sure expired and deleted entries don't show up.
+    assertEquals(1L, jedis_client.del("k2").longValue());
+    assertEquals(1L, jedis_client.expire("k4", 2).longValue());
+    keys.remove("k2");
+    keys.remove("k4");
+
+    // Make sure ts with only one entry expired still shows up.
+    Map<Long, String> ts_exp = new HashMap<>();
+    ts_exp.put(0L, "v0");
+    assertEquals("OK", jedis_client.tsadd("k3", ts_exp, "EXPIRE_IN", 2));
+    Thread.sleep(2000);
+
+    // Test k1 and k3 still in db.
+    assertEquals(keys, jedis_client.keys("*"));
+
+    //Now add back keys and make sure they show up.
+    assertEquals("OK", jedis_client.set("k2", "v2"));
+    assertEquals("OK", jedis_client.set("k4", "v4"));
+    keys.add("k2");
+    keys.add("k4");
+
+    assertEquals(keys, jedis_client.keys("*"));
   }
 
   @Test
@@ -89,6 +139,109 @@ public class TestYBJedis extends BaseJedisTest {
       return;
     }
     assertTrue(false);
+  }
+
+  @Test
+  public void testZRangeByScore() throws Exception {
+    Map<String, Double> pairs = new HashMap<String, Double>();
+    pairs.put("v_min", -Double.MAX_VALUE);
+    pairs.put("v_neg", -5.0);
+    pairs.put("v0", 0.0);
+    pairs.put("v1", 1.0);
+    pairs.put("v2", 2.5);
+    pairs.put("v_max", Double.MAX_VALUE);
+
+    assertEquals(6L, jedis_client.zadd("z_key", pairs).longValue());
+    Set<String> values = new HashSet<String>(
+        Arrays.asList("v_min", "v_neg", "v0", "v1", "v2", "v_max"));
+    assertEquals(values, jedis_client.zrangeByScore(
+        "z_key", Double.NEGATIVE_INFINITY, Double.POSITIVE_INFINITY));
+    assertEquals(values, jedis_client.zrangeByScore("z_key","-inf", "+inf"));
+
+    Set<Tuple> valuesScores = new HashSet<Tuple>(
+        Arrays.asList(new Tuple("v_min", -Double.MAX_VALUE)));
+    assertEquals(valuesScores, jedis_client.zrangeByScoreWithScores("z_key", "-inf", "(-5.0"));
+
+    valuesScores = new HashSet<Tuple>(Arrays.asList(new Tuple("v_max", Double.MAX_VALUE)));
+    assertEquals(valuesScores, jedis_client.zrangeByScoreWithScores("z_key", "(2.5", "+inf"));
+
+    values = new HashSet<String>(Arrays.asList("v_neg", "v0", "v1", "v2"));
+    assertEquals(values, jedis_client.zrangeByScore("z_key", -5.0, 2.5));
+
+    values = new HashSet<String>(Arrays.asList("v_neg", "v0"));
+    // offset = 1, the element to start scanning from once we have done our scan.
+    // limit = 2, the number of elements to return.
+    assertEquals(values, jedis_client.zrangeByScore("z_key","-inf", "+inf", 1, 2));
+
+    valuesScores = new HashSet<Tuple>(
+        Arrays.asList(new Tuple("v0", 0.0), new Tuple("v1", 1.0), new Tuple("v2", 2.5)));
+    assertEquals(valuesScores, jedis_client.zrangeByScoreWithScores("z_key","-inf", "+inf", 2, 3));
+
+    // Queries with either negative offset or 0 limit returns empty list.
+    values = new HashSet<String>();
+    assertEquals(values, jedis_client.zrangeByScore("z_key","-inf", "+inf", -1, 6));
+    assertEquals(values, jedis_client.zrangeByScore("z_key","-inf", "+inf", 1, 0));
+    assertEquals(values, jedis_client.zrangeByScore("z_key","-inf", "+inf", -1, -1));
+
+    // Queries with positive offset and limit either negative or larger than length
+    // just scans from offset till the end.
+    values = new HashSet<String>(Arrays.asList("v2", "v_max"));
+    assertEquals(values, jedis_client.zrangeByScore(
+        "z_key",Double.NEGATIVE_INFINITY, Double.POSITIVE_INFINITY, 4, 100));
+    assertEquals(values, jedis_client.zrangeByScore("z_key","-inf", "+inf", 4, -3));
+
+    // Key that doesn't exist returns empty list.
+    values = new HashSet<String>();
+    assertEquals(values, jedis_client.zrangeByScore("key_not_exists","-inf", "+inf"));
+
+    // Key of different type returns error.
+    TSValuePairs tsPairs = new TSValuePairs((1));
+    assertEquals("OK", jedis_client.tsadd("ts_key", tsPairs.pairs));
+    try {
+      jedis_client.zrangeByScore("ts_key", "-inf", "+inf");
+    } catch (Exception e) {
+      assertTrue(e.getMessage().contains(
+          "WRONGTYPE Operation against a key holding the wrong kind of value"));
+      return;
+    }
+    assertTrue(false);
+  }
+
+  @Test
+  public void testKeys() throws Exception {
+    Map <String, String> fields = new HashMap<>();
+    fields.put("f1", "v1");
+    fields.put("f2", "v2");
+    fields.put("f3", "v3");
+    for (int i = 0; i < 100; i++) {
+      for (int j = 0; j < 100; j++) {
+        String str = String.format("key_%d_%d", i, j);
+        if (i < 32) {
+          assertEquals("OK", jedis_client.set(str, "v"));
+        } else if (i < 65) {
+          assertEquals("OK", jedis_client.hmset(str, fields));
+        } else {
+          assertEquals(1L, jedis_client.zadd(str, 1, "a").longValue());
+        }
+      }
+    }
+
+    assertEquals(10000, jedis_client.keys("*").size());
+    assertEquals(10000, jedis_client.keys("key_*_*").size());
+    assertEquals(100, jedis_client.keys("key_*_20").size());
+    assertEquals(1000, jedis_client.keys("key_?_*").size());
+    assertEquals(36, jedis_client.keys("key_[0123]_[^0]").size());
+    assertEquals(0, jedis_client.keys("\\*").size());
+
+    assertEquals("OK", jedis_client.set("key_over_limit", "v"));
+    assertEquals(100, jedis_client.keys("key_?_?").size());
+
+    try {
+      jedis_client.keys("*");
+      fail("Should have failed!");
+    } catch (Exception e) {
+      LOG.info("Expected exception", e);
+    }
   }
 
   @Test
@@ -401,5 +554,114 @@ public class TestYBJedis extends BaseJedisTest {
     } catch (Exception e) {
       LOG.info("Expected exception", e);
     }
+  }
+
+  @Test
+  public void testMultipleDBs() throws Exception {
+    final String secondDBName = "second";
+    createRedisTableForDB(secondDBName);
+
+    Collection dbs = Arrays.asList(DEFAULT_DB_NAME, secondDBName);
+    // Do a read/writes to test everything is working correctly.
+    readAndWriteFromDBs(dbs, 10);
+  }
+
+  public void ttlTest(String key, String value, long true_ttl, int max_ttl_error) throws Exception {
+    long ttl = jedis_client.ttl(key);
+    long pttl = jedis_client.pttl(key);
+    assertTrue(Math.abs(ttl - true_ttl) <= max_ttl_error);
+    assertTrue(Math.abs(pttl - true_ttl * 1000) <= max_ttl_error * 1000);
+    assertEquals(value, jedis_client.get(key));
+  }
+
+  public void expiredTest(String key) throws Exception {
+    assertNull(jedis_client.get(key));
+    assertEquals(-2L, jedis_client.ttl(key).longValue());
+    assertEquals(-2L, jedis_client.pttl(key).longValue());
+    assertEquals(0L, jedis_client.expire(key, 7).longValue());
+  }
+
+  @Test
+  public void testExpireTtl() throws Exception {
+    String k1 = "foo";
+    String k2 = "fu";
+    String k3 = "phu";
+    String value = "bar";
+    int error = 1;
+
+    // Checking expected behavior on a key with no ttl.
+    assertEquals("OK", jedis_client.set(k1, value));
+    assertEquals(value, jedis_client.get(k1));
+    assertEquals(-2L, jedis_client.ttl(k2).longValue());
+    assertEquals(-2L, jedis_client.pttl(k2).longValue());
+    assertEquals(-1L, jedis_client.ttl(k1).longValue());
+    assertEquals(-1L, jedis_client.pttl(k1).longValue());
+    // Setting a ttl and checking expected return values.
+    assertEquals(1L, jedis_client.expire(k1, 3).longValue());
+    ttlTest(k1, value, 3, error);
+    Thread.sleep(2000);
+    ttlTest(k1, value, 1, error);
+    Thread.sleep(2000);
+    expiredTest(k1);
+    // Testing functionality with SETEX.
+    assertEquals("OK", jedis_client.setex(k1, 5, value));
+    ttlTest(k1, value, 5, error);
+    // Set a new, earlier expiration.
+    assertEquals(1L, jedis_client.expire(k1, 2).longValue());
+    ttlTest(k1, value, 2, error);
+    // Check that the value expires as expected.
+    Thread.sleep(2000);
+    expiredTest(k1);
+    // Initialize with SET using the EX flag.
+    assertEquals("OK", jedis_client.set(k1, value, "EX", 2));
+    // Set a new, later, expiration.
+    assertEquals(1L, jedis_client.expire(k1, 8).longValue());
+    ttlTest(k1, value, 8, error);
+    // Checking expected return values after a while, before expiration.
+    Thread.sleep(4000);
+    ttlTest(k1, value, 4, error);
+    // Persisting the key and checking expected return values.
+    assertEquals(1L, jedis_client.persist(k1).longValue());
+    assertEquals(value, jedis_client.get(k1));
+    assertEquals(-1L, jedis_client.ttl(k1).longValue());
+    assertEquals(-1L, jedis_client.pttl(k1).longValue());
+    // Check that the key and value are still there after a while.
+    Thread.sleep(30000);
+    assertEquals(value, jedis_client.get(k1));
+    assertEquals(-1L, jedis_client.ttl(k1).longValue());
+    assertEquals(-1L, jedis_client.pttl(k1).longValue());
+    // Persist a key that does not exist.
+    assertEquals(0L, jedis_client.persist(k2).longValue());
+    // Persist a key that has no TTL.
+    assertEquals(0L, jedis_client.persist(k1).longValue());
+    // Vanilla set on a key and persisting it.
+    assertEquals("OK", jedis_client.set(k2, value));
+    assertEquals(0L, jedis_client.persist(k2).longValue());
+    assertEquals(-1L, jedis_client.ttl(k2).longValue());
+    assertEquals(-1L, jedis_client.pttl(k2).longValue());
+    // Test that setting a zero-valued TTL properly expires the value.
+    assertEquals(1L, jedis_client.expire(k2, 0).longValue());
+    expiredTest(k2);
+    // One more time with a negative TTL.
+    assertEquals("OK", jedis_client.set(k2, value));
+    assertEquals(1L, jedis_client.expire(k2, -7).longValue());
+    expiredTest(k2);
+    assertEquals("OK", jedis_client.setex(k2, -7, value));
+    expiredTest(k2);
+    // Test PExpire
+    assertEquals("OK", jedis_client.set(k2, value));
+    assertEquals(1L, jedis_client.pexpire(k2, 3200).longValue());
+    ttlTest(k2, value, 3, error);
+    Thread.sleep(1000);
+    ttlTest(k2, value, 2, error);
+    Thread.sleep(3000);
+    expiredTest(k2);
+    // Test PSetEx
+    assertEquals("OK", jedis_client.psetex(k3, 2300, value));
+    ttlTest(k3, value, 2, error);
+    Thread.sleep(1000);
+    ttlTest(k3, value, 1, error);
+    Thread.sleep(2000);
+    expiredTest(k3);
   }
 }

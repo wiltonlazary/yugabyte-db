@@ -3,7 +3,7 @@
  * pg_shdepend.c
  *	  routines to support manipulation of the pg_shdepend relation
  *
- * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -66,7 +66,6 @@
 #include "utils/fmgroids.h"
 #include "utils/syscache.h"
 #include "utils/tqual.h"
-
 
 typedef enum
 {
@@ -250,7 +249,7 @@ shdepChangeDep(Relation sdepRel,
 	{
 		/* No new entry needed, so just delete existing entry if any */
 		if (oldtup)
-			CatalogTupleDelete(sdepRel, &oldtup->t_self);
+			CatalogTupleDelete(sdepRel, oldtup);
 	}
 	else if (oldtup)
 	{
@@ -796,7 +795,7 @@ dropDatabaseDependencies(Oid databaseId)
 
 	while (HeapTupleIsValid(tup = systable_getnext(scan)))
 	{
-		CatalogTupleDelete(sdepRel, &tup->t_self);
+		CatalogTupleDelete(sdepRel, tup);
 	}
 
 	systable_endscan(scan);
@@ -949,7 +948,7 @@ shdepDropDependency(Relation sdepRel,
 			continue;
 
 		/* OK, delete it */
-		CatalogTupleDelete(sdepRel, &tup->t_self);
+		CatalogTupleDelete(sdepRel, tup);
 	}
 
 	systable_endscan(scan);

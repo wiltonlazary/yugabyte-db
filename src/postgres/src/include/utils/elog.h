@@ -4,7 +4,7 @@
  *	  POSTGRES error reporting/logging definitions.
  *
  *
- * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/elog.h
@@ -15,6 +15,8 @@
 #define ELOG_H
 
 #include <setjmp.h>
+
+#include "yb/common/ybc_util.h"
 
 /* Error level codes */
 #define DEBUG5		10			/* Debugging messages, in categories of
@@ -129,6 +131,7 @@ extern bool errstart(int elevel, const char *filename, int lineno,
 extern void errfinish(int dummy,...);
 
 extern int	errcode(int sqlerrcode);
+extern int	yb_txn_errcode(uint16_t txn_errcode);
 
 extern int	errcode_for_file_access(void);
 extern int	errcode_for_socket_access(void);
@@ -356,6 +359,9 @@ typedef struct ErrorData
 	char	   *internalquery;	/* text of internally-generated query */
 	int			saved_errno;	/* errno at entry */
 
+	uint16_t	yb_txn_errcode;	/* YB transaction error cast to uint16, as returned by static_cast
+								 * of TransactionErrorTag::Decode
+								 * of Status::ErrorData(TransactionErrorTag::kCategory) */
 	/* context containing associated non-constant strings */
 	struct MemoryContextData *assoc_context;
 } ErrorData;

@@ -27,6 +27,7 @@
 #include "yb/util/enums.h"
 #include "yb/util/status.h"
 #include "yb/util/memory/mc_types.h"
+#include "yb/common/ql_name.h"
 
 namespace yb {
 namespace ql {
@@ -34,12 +35,13 @@ class SemContext;
 
 YB_DEFINE_ENUM(TreeNodeOpcode,
                (kNoOp)
-               (kTreeNode)
                (kPTListNode)
                (kPTCreateKeyspace)
                (kPTUseKeyspace)
+               (kPTAlterKeyspace)
                (kPTCreateTable)
                (kPTAlterTable)
+               (kPTTypeField)
                (kPTCreateType)
                (kPTCreateIndex)
                (kPTTruncateStmt)
@@ -50,10 +52,25 @@ YB_DEFINE_ENUM(TreeNodeOpcode,
                (kPTUpdateStmt)
                (kPTCreateRole)
                (kPTAlterRole)
-               (kPTGrantPermission)
-               (kPTGrantRole)
+               (kPTGrantRevokePermission)
+               (kPTGrantRevokeRole)
                (kPTStartTransaction)
                (kPTCommit)
+               (kPTName)
+               (kPTProperty)
+               (kPTStatic)
+               (kPTConstraint)
+               (kPTCollection)
+               (kPTPrimitiveType)
+               (kPTColumnDefinition)
+               (kPTAlterColumnDefinition)
+               (kPTDmlUsingClauseElement)
+               (kPTTableRef)
+               (kPTOrderBy)
+               (kPTRoleOption)
+               (kPTExplainStmt)
+               (kPTInsertValuesClause)
+               (kPTInsertJsonClause)
 
                // Expressions.
                (kPTExpr)
@@ -78,9 +95,7 @@ class TreeNode : public MCBase {
   virtual ~TreeNode();
 
   // Node type.
-  virtual TreeNodeOpcode opcode() const {
-    return TreeNodeOpcode::kTreeNode;
-  }
+  virtual TreeNodeOpcode opcode() const = 0;
 
   // shared_ptr support.
   template<typename... TypeArgs>
@@ -107,8 +122,14 @@ class TreeNode : public MCBase {
     return loc_;
   }
 
+  void set_internal() {
+    internal_ = true;
+  }
+
  protected:
   YBLocation::SharedPtr loc_;
+
+  bool internal_ = false;
 };
 
 }  // namespace ql

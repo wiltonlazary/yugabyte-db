@@ -44,6 +44,8 @@ namespace tablet {
 struct ReplayState;
 class WriteOperationState;
 
+YB_STRONGLY_TYPED_BOOL(AlreadyApplied);
+
 // Bootstraps an existing tablet by opening the metadata from disk, and rebuilding soft state by
 // playing log segments. A bootstrapped tablet can then be added to an existing consensus
 // configuration as a LEARNER, which will bring its state up to date with the rest of the consensus
@@ -84,7 +86,7 @@ class TabletBootstrap {
   // is also returned as true in this case.
   //
   // If no log segments are found, 'needs_recovery' is set to false.
-  CHECKED_STATUS PrepareRecoveryDir(bool* needs_recovery);
+  CHECKED_STATUS PrepareToReplay(bool* needs_recovery);
 
   // Opens the latest log segments for the Tablet that will allow to rebuild the tablet's soft
   // state. If there are existing log segments in the tablet's log directly they are moved to a
@@ -94,7 +96,7 @@ class TabletBootstrap {
   // If a "log-recovery" directory is already present, we will continue to replay from the
   // "log-recovery" directory. Tablet metadata is updated once replay has finished from the
   // "log-recovery" directory.
-  CHECKED_STATUS OpenLogReaderInRecoveryDir();
+  CHECKED_STATUS OpenLogReader();
 
   // Opens a new log in the tablet's log directory.  The directory is expected to be clean.
   CHECKED_STATUS OpenNewLog();
@@ -111,9 +113,10 @@ class TabletBootstrap {
 
   void PlayWriteRequest(consensus::ReplicateMsg* replicate_msg);
 
-  CHECKED_STATUS PlayUpdateTransactionRequest(consensus::ReplicateMsg* replicate_msg);
+  CHECKED_STATUS PlayUpdateTransactionRequest(
+      consensus::ReplicateMsg* replicate_msg, AlreadyApplied already_applied);
 
-  CHECKED_STATUS PlayAlterSchemaRequest(consensus::ReplicateMsg* replicate_msg);
+  CHECKED_STATUS PlayChangeMetadataRequest(consensus::ReplicateMsg* replicate_msg);
 
   CHECKED_STATUS PlayChangeConfigRequest(consensus::ReplicateMsg* replicate_msg);
 
@@ -121,13 +124,20 @@ class TabletBootstrap {
 
   CHECKED_STATUS PlayTruncateRequest(consensus::ReplicateMsg* replicate_msg);
 
+  CHECKED_STATUS PlayTabletSnapshotOpRequest(consensus::ReplicateMsg* replicate_msg);
+
   void DumpReplayStateToLog(const ReplayState& state);
 
   // Handlers for each type of message seen in the log during replay.
-  CHECKED_STATUS HandleEntry(ReplayState* state, std::unique_ptr<log::LogEntryPB>* entry);
+  CHECKED_STATUS HandleEntry(
+      yb::log::LogEntryMetadata entry_metadata, ReplayState* state,
+      std::unique_ptr<log::LogEntryPB>* entry);
   CHECKED_STATUS HandleReplicateMessage(
-      ReplayState* state, std::unique_ptr<log::LogEntryPB>* replicate_entry);
-  CHECKED_STATUS HandleEntryPair(ReplayState* state, log::LogEntryPB* replicate_entry);
+      yb::log::LogEntryMetadata entry_metadata, ReplayState* state,
+      std::unique_ptr<log::LogEntryPB>* replicate_entry);
+  CHECKED_STATUS HandleEntryPair(
+      ReplayState* state, log::LogEntryPB* replicate_entry, RestartSafeCoarseTimePoint entry_time);
+
   virtual CHECKED_STATUS HandleOperation(consensus::OperationType op_type,
                                          consensus::ReplicateMsg* replicate);
 
@@ -141,9 +151,12 @@ class TabletBootstrap {
   // Return a log prefix string in the standard "T xxx P yyy" format.
   std::string LogPrefix() const;
 
+  Env* GetEnv();
+
   BootstrapTabletData data_;
-  scoped_refptr<TabletMetadata> meta_;
+  RaftGroupMetadataPtr meta_;
   std::shared_ptr<MemTracker> mem_tracker_;
+  std::shared_ptr<MemTracker> block_based_table_mem_tracker_;
   MetricRegistry* metric_registry_;
   TabletStatusListener* listener_;
   std::unique_ptr<TabletClass> tablet_;
@@ -182,6 +195,8 @@ class TabletBootstrap {
   } stats_;
 
   HybridTime rocksdb_last_entry_hybrid_time_ = HybridTime::kMin;
+
+  bool skip_wal_rewrite_;
 
  private:
   DISALLOW_COPY_AND_ASSIGN(TabletBootstrap);

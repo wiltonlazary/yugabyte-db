@@ -60,7 +60,9 @@ EOT
 delete_tmp_files() {
   # Be extra careful before we nuke a directory.
   if [[ -n ${TEST_TMPDIR:-} && $TEST_TMPDIR =~ ^/tmp/ ]]; then
+    set +e
     rm -rf "$TEST_TMPDIR"
+    set -e
   fi
 }
 
@@ -83,7 +85,8 @@ fi
 positional_args=()
 more_test_args=""
 log_dir=""
-declare -i parallelism=$DEFAULT_REPEATED_TEST_PARALLELISM
+declare -i default_parallelism=$DEFAULT_REPEATED_TEST_PARALLELISM
+declare -i parallelism=0
 declare -i iteration=0
 declare -i num_iter=1000
 keep_all_logs=false
@@ -214,6 +217,10 @@ else
   gtest_filter_info="gtest_filter is not set, running all tests in the test program"
 fi
 
+# -------------------------------------------------------------------------------------------------
+# End of argument parsing
+# -------------------------------------------------------------------------------------------------
+
 if [[ $test_filter != "all_tests" ]]; then
   gtest_filter_arg="--gtest_filter=$test_filter"
 fi
@@ -226,7 +233,6 @@ if ! "$is_java_test"; then
           "BUILD_ROOT ('$BUILD_ROOT')"
   fi
 fi
-
 
 timestamp=$( get_timestamp_for_filenames )
 if [[ -z $log_dir ]]; then
@@ -246,22 +252,19 @@ if [[ $iteration -gt 0 ]]; then
   test_log_path=$test_log_path_prefix.log
   if "$is_java_test"; then
     export YB_SUREFIRE_REPORTS_DIR=$test_log_path_prefix.reports
-    raw_test_log_path=$test_log_path
-  else
-    raw_test_log_path=${test_log_path_prefix}__raw.log
   fi
+  export YB_FATAL_DETAILS_PATH_PREFIX=$test_log_path_prefix.fatal_failure_details
 
   set +e
   current_timestamp=$( get_timestamp_for_filenames )
-  export TEST_TMPDIR=/tmp/yb__${script_name_no_ext}_${build_type}_${current_timestamp}_\
-$RANDOM.$RANDOM.$RANDOM.$$
+  export TEST_TMPDIR=/tmp/yb_tests__${current_timestamp}__$RANDOM.$RANDOM.$RANDOM
   mkdir -p "$TEST_TMPDIR"
   set_expected_core_dir "$TEST_TMPDIR"
   if ! "$is_java_test"; then
     determine_test_timeout
   fi
 
-  # TODO: deduplicate the setup here against run_one_test() in common-test-env.sh.
+  # TODO: deduplicate the setup here against run_one_cxx_test() in common-test-env.sh.
   if "$is_java_test"; then
     test_wrapper_cmd_line=(
       "$YB_BUILD_SUPPORT_DIR"/run-test.sh "${positional_args[@]}"
@@ -278,10 +281,10 @@ $RANDOM.$RANDOM.$RANDOM.$$
   (
     cd "$TEST_TMPDIR"
     if "$verbose"; then
-      log "Iteration $iteration logging to $raw_test_log_path"
+      log "Iteration $iteration logging to $test_log_path"
     fi
     ulimit -c unlimited
-    ( set -x; "${test_wrapper_cmd_line[@]}" ) &>"$raw_test_log_path"
+    ( set -x; "${test_wrapper_cmd_line[@]}" ) &>"$test_log_path"
   )
   exit_code=$?
   declare -i end_time_sec=$( date +%s )
@@ -290,9 +293,8 @@ $RANDOM.$RANDOM.$RANDOM.$$
   comment=""
   keep_log=$keep_all_logs
   pass_or_fail="PASSED"
-  if ! did_test_succeed "$exit_code" "$raw_test_log_path"; then
+  if ! did_test_succeed "$exit_code" "$test_log_path"; then
     if ! "$is_java_test"; then
-      postprocess_test_log
       process_core_file
     fi
     if "$skip_address_already_in_use" && \
@@ -312,14 +314,31 @@ $RANDOM.$RANDOM.$RANDOM.$$
         # Compress Java test log.
         mv "$test_log_path" "$YB_SUREFIRE_REPORTS_DIR"
         pushd "$log_dir"
-        test_log_path="$YB_SUREFIRE_REPORTS_DIR.tar.gz"
-        tar czf "$test_log_path" "${YB_SUREFIRE_REPORTS_DIR##*/}"
+        test_log_path="${YB_SUREFIRE_REPORTS_DIR}_combined_logs.txt"
+
+        for file_path in $( ls "$YB_SUREFIRE_REPORTS_DIR"/* | sort ); do
+          (
+            echo
+            echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+            echo "================================================================================"
+            echo "Contents of ${file_path##*/} (copied here by $script_name_no_ext)"
+            echo "================================================================================"
+            echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+            echo
+          ) >>"$test_log_path"
+          cat "$file_path" >>"$test_log_path"
+        done
+
+        gzip "$test_log_path"
+        test_log_path+=".gz"
+
+        # Ignore errors here -- they could happen e.g. if someone opens one of the uncompressed
+        # log files while the test is still running and keeps it open.
+        set +e
         rm -rf "$YB_SUREFIRE_REPORTS_DIR"
+        set -e
         popd
       else
-        if [[ $pass_or_fail == "PASSED" ]]; then
-          mv "$raw_test_log_path" "$test_log_path"
-        fi
         # Compress C++ test log.
         if [[ -f $test_log_path ]]; then
           gzip "$test_log_path"
@@ -332,9 +351,11 @@ $RANDOM.$RANDOM.$RANDOM.$$
     fi
     comment+="; test log path: $test_log_path"
   else
-    rm -f "$raw_test_log_path"
+    rm -f "$test_log_path"
     if "$is_java_test"; then
+      set +e
       rm -rf "$YB_SUREFIRE_REPORTS_DIR"
+      set -e
     fi
   fi
 
@@ -346,6 +367,18 @@ $RANDOM.$RANDOM.$RANDOM.$$
 else
   # $iteration is 0
   # This is the top-level invocation spawning parallel execution of many iterations.
+
+  if [[ $build_type == "tsan" ]]; then
+    default_parallelism=$DEFAULT_REPEATED_TEST_PARALLELISM_TSAN
+  else
+    default_parallelism=$DEFAULT_REPEATED_TEST_PARALLELISM
+  fi
+
+  if [[ $parallelism -eq 0 ]]; then
+    parallelism=$default_parallelism
+    log "Using test parallelism of $parallelism by default (build type: $build_type)"
+  fi
+
   if [[ -n $yb_compiler_type_from_env ]]; then
     log "YB_COMPILER_TYPE env variable was set to '$yb_compiler_type_from_env' by the caller."
   fi
@@ -356,6 +389,7 @@ else
     log "YB_EXTRA_GTEST_FLAGS is not set"
   fi
   log "Saving repeated test execution logs to: $log_dir"
+  ln -sfn "$log_dir" "$HOME/logs/latest_test"
   seq 1 $num_iter | \
     xargs -P $parallelism -n 1 "$0" "${original_args[@]}" --log_dir "$log_dir" --iteration
 fi

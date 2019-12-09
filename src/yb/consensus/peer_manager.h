@@ -36,7 +36,6 @@
 #include <unordered_map>
 
 #include "yb/consensus/consensus_util.h"
-#include "yb/consensus/raft_consensus.h"
 #include "yb/gutil/gscoped_ptr.h"
 #include "yb/gutil/macros.h"
 #include "yb/gutil/ref_counted.h"
@@ -45,6 +44,7 @@
 
 namespace yb {
 
+class MemTracker;
 class ThreadPoolToken;
 
 namespace log {
@@ -53,6 +53,7 @@ class Log;
 
 namespace consensus {
 
+class Consensus;
 class Peer;
 class PeerMessageQueue;
 class PeerProxyFactory;
@@ -90,7 +91,7 @@ class PeerManager {
  private:
   std::string GetLogPrefix() const;
 
-  typedef std::unordered_map<std::string, std::unique_ptr<Peer>> PeersMap;
+  typedef std::unordered_map<std::string, std::shared_ptr<Peer>> PeersMap;
   const std::string tablet_id_;
   const std::string local_uuid_;
   PeerProxyFactory* peer_proxy_factory_;

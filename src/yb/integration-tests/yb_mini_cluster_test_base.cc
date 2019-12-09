@@ -13,9 +13,16 @@
 
 #include "yb/integration-tests/yb_mini_cluster_test_base.h"
 
+#include "yb/client/session.h"
+
 #include "yb/integration-tests/cluster_verifier.h"
 #include "yb/integration-tests/mini_cluster.h"
 #include "yb/integration-tests/external_mini_cluster.h"
+
+using namespace std::literals;
+
+DECLARE_bool(use_priority_thread_pool_for_flushes);
+DECLARE_bool(allow_preempting_compactions);
 
 ///////////////////////////////////////////////////
 // YBMiniClusterTestBase
@@ -26,6 +33,8 @@ namespace yb {
 template <class T>
 void YBMiniClusterTestBase<T>::SetUp() {
   YBTest::SetUp();
+  FLAGS_use_priority_thread_pool_for_flushes = true;
+  FLAGS_allow_preempting_compactions = true;
   verify_cluster_before_next_tear_down_ = true;
 }
 
@@ -37,14 +46,23 @@ void YBMiniClusterTestBase<T>::TearDown() {
 
 template <class T>
 void YBMiniClusterTestBase<T>::DoBeforeTearDown() {
-  if (cluster_ && verify_cluster_before_next_tear_down_) {
-    LOG(INFO) << "Checking cluster consistency...";
-    ASSERT_NO_FATALS(ClusterVerifier(cluster_.get()).CheckCluster());
+  if (cluster_ && verify_cluster_before_next_tear_down_ && !testing::Test::HasFailure()) {
+    if (cluster_->running()) {
+      LOG(INFO) << "Checking cluster consistency...";
+      ASSERT_NO_FATALS(ClusterVerifier(cluster_.get()).CheckCluster());
+    } else {
+      LOG(INFO) << "Not checking cluster consistency: cluster has been shut down or failed to "
+                << "start properly";
+    }
   }
 }
 
 template <class T>
 void YBMiniClusterTestBase<T>::DoTearDown() {
+  if (cluster_) {
+    cluster_->Shutdown();
+    cluster_.reset();
+  }
   YBTest::TearDown();
 }
 
@@ -53,9 +71,34 @@ void YBMiniClusterTestBase<T>::DontVerifyClusterBeforeNextTearDown() {
   verify_cluster_before_next_tear_down_ = false;
 }
 
-// Instantiate explicitly to avoid recompilation a lot of dependent test class due to template
+// Instantiate explicitly to avoid recompilation of a lot of dependent test classes due to template
 // implementation changes.
 template class YBMiniClusterTestBase<MiniCluster>;
 template class YBMiniClusterTestBase<ExternalMiniCluster>;
+
+template <class T>
+Status MiniClusterTestWithClient<T>::CreateClient() {
+  // Connect to the cluster.
+  client_ = VERIFY_RESULT(YBMiniClusterTestBase<T>::cluster_->CreateClient());
+  return Status::OK();
+}
+
+template <class T>
+void MiniClusterTestWithClient<T>::DoTearDown() {
+  client_.reset();
+  YBMiniClusterTestBase<T>::DoTearDown();
+}
+
+template <class T>
+client::YBSessionPtr MiniClusterTestWithClient<T>::NewSession() {
+  auto session = client_->NewSession();
+  session->SetTimeout(60s);
+  return session;
+}
+
+// Instantiate explicitly to avoid recompilation of a lot of dependent test classes due to template
+// implementation changes.
+template class MiniClusterTestWithClient<MiniCluster>;
+template class MiniClusterTestWithClient<ExternalMiniCluster>;
 
 } // namespace yb

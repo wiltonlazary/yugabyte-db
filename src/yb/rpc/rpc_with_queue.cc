@@ -26,11 +26,9 @@ namespace yb {
 namespace rpc {
 
 ConnectionContextWithQueue::ConnectionContextWithQueue(
-    rpc::GrowableBufferAllocator* allocator,
     size_t max_concurrent_calls,
     size_t max_queued_bytes)
-    : ConnectionContextBase(allocator),
-      max_concurrent_calls_(max_concurrent_calls), max_queued_bytes_(max_queued_bytes) {
+    : max_concurrent_calls_(max_concurrent_calls), max_queued_bytes_(max_queued_bytes) {
 }
 
 ConnectionContextWithQueue::~ConnectionContextWithQueue() {
@@ -115,7 +113,8 @@ void ConnectionContextWithQueue::QueueResponse(const ConnectionPtr& conn,
   QueueableInboundCall* queueable_call = down_cast<QueueableInboundCall*>(call.get());
   queueable_call->SetHasReply();
   if (queueable_call == first_without_reply_.load(std::memory_order_acquire)) {
-    conn->reactor()->ScheduleReactorTask(flush_outbound_queue_task_);
+    auto scheduled = conn->reactor()->ScheduleReactorTask(flush_outbound_queue_task_);
+    LOG_IF(WARNING, !scheduled) << "Failed to schedule flush outbound queue";
   }
 }
 
@@ -152,7 +151,8 @@ void ConnectionContextWithQueue::FlushOutboundQueue(Connection* conn) {
 
 void ConnectionContextWithQueue::AssignConnection(const ConnectionPtr& conn) {
   flush_outbound_queue_task_ = MakeFunctorReactorTask(
-      std::bind(&ConnectionContextWithQueue::FlushOutboundQueue, this, conn.get()), conn);
+      std::bind(&ConnectionContextWithQueue::FlushOutboundQueue, this, conn.get()), conn,
+      SOURCE_LOCATION());
 }
 
 } // namespace rpc

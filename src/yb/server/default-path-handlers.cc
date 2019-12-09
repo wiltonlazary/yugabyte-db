@@ -70,6 +70,8 @@
 #include "yb/util/mem_tracker.h"
 #include "yb/util/metrics.h"
 #include "yb/util/jsonwriter.h"
+#include "yb/util/version_info.h"
+#include "yb/util/version_info.pb.h"
 
 DEFINE_int64(web_log_bytes, 1024 * 1024,
     "The maximum number of bytes to display on the debug webserver's log page");
@@ -89,6 +91,7 @@ using strings::Substitute;
 using namespace std::placeholders;
 
 namespace {
+
 // Html/Text formatting tags
 struct Tags {
   string pre_tag, end_pre_tag, line_break, header, end_header;
@@ -110,7 +113,6 @@ struct Tags {
     }
   }
 };
-} // anonymous namespace
 
 // Writes the last FLAGS_web_log_bytes of the INFO logfile to a webpage
 // Note to get best performance, set GLOG_logbuflevel=-1 to prevent log buffering
@@ -163,8 +165,8 @@ static void MemUsageHandler(const Webserver::WebRequest& req, std::stringstream*
 #ifndef TCMALLOC_ENABLED
   (*output) << "Memory tracking is not available unless tcmalloc is enabled.";
 #else
-  char buf[2048];
-  MallocExtension::instance()->GetStats(buf, 2048);
+  char buf[20480];
+  MallocExtension::instance()->GetStats(buf, sizeof(buf));
   // Replace new lines with <br> for html
   string tmp(buf);
   replace_all(tmp, "\n", tags.line_break);
@@ -176,35 +178,36 @@ static void MemUsageHandler(const Webserver::WebRequest& req, std::stringstream*
 static void MemTrackersHandler(const Webserver::WebRequest& req, std::stringstream* output) {
   *output << "<h1>Memory usage by subsystem</h1>\n";
   *output << "<table class='table table-striped'>\n";
-  *output << "  <tr><th>Id</th><th>Parent</th><th>Limit</th><th>Current Consumption</th>"
-      "<th>Peak consumption</th></tr>\n";
+  *output << "  <tr><th>Id</th><th>Current Consumption</th>"
+      "<th>Peak consumption</th><th>Limit</th></tr>\n";
 
-  vector<shared_ptr<MemTracker> > trackers = MemTracker::ListTrackers();
-  for (const shared_ptr<MemTracker>& tracker : trackers) {
-    string parent = tracker->parent() == nullptr ? "none" : tracker->parent()->id();
-    string limit_str = tracker->limit() == -1 ? "none" :
-                       HumanReadableNumBytes::ToString(tracker->limit());
-    string current_consumption_str = HumanReadableNumBytes::ToString(tracker->consumption());
-    string peak_consumption_str = HumanReadableNumBytes::ToString(tracker->peak_consumption());
-    (*output) << Substitute("  <tr><td>$0</td><td>$1</td><td>$2</td>" // id, parent, limit
-                            "<td>$3</td><td>$4</td></tr>\n", // current, peak
-                            tracker->id(), parent, limit_str, current_consumption_str,
-                            peak_consumption_str);
+  std::vector<MemTrackerData> trackers;
+  CollectMemTrackerData(MemTracker::GetRootTracker(), 0, &trackers);
+  for (const auto& data : trackers) {
+    const auto& tracker = data.tracker;
+    const std::string limit_str =
+        tracker->limit() == -1 ? "none" : HumanReadableNumBytes::ToString(tracker->limit());
+    const std::string current_consumption_str =
+        HumanReadableNumBytes::ToString(tracker->consumption());
+    const std::string peak_consumption_str =
+        HumanReadableNumBytes::ToString(tracker->peak_consumption());
+    *output << Format("  <tr data-depth=\"$0\" class=\"level$0\">\n", data.depth);
+    *output << "    <td>" << tracker->id() << "</td>";
+    // UpdateConsumption returns true if consumption is taken from external source,
+    // for instance tcmalloc stats. So we should show only it in this case.
+    if (!data.consumption_excluded_from_ancestors || data.tracker->UpdateConsumption()) {
+      *output << Format("<td>$0</td>", current_consumption_str);
+    } else {
+      auto full_consumption_str = HumanReadableNumBytes::ToString(
+          tracker->consumption() + data.consumption_excluded_from_ancestors);
+      *output << Format("<td>$0 ($1)</td>", current_consumption_str, full_consumption_str);
+    }
+    *output << Format("<td>$0</td><td>$1</td>\n", peak_consumption_str, limit_str);
+    *output << "  </tr>\n";
   }
+
   *output << "</table>\n";
 }
-
-void AddDefaultPathHandlers(Webserver* webserver) {
-  webserver->RegisterPathHandler("/logs", "Logs", LogsHandler, true, false);
-  webserver->RegisterPathHandler("/varz", "Flags", FlagsHandler, true, false);
-  webserver->RegisterPathHandler("/status", "Status", StatusHandler, false, false);
-  webserver->RegisterPathHandler("/memz", "Memory (total)", MemUsageHandler, true, false);
-  webserver->RegisterPathHandler("/mem-trackers", "Memory (detail)",
-                                 MemTrackersHandler, true, false);
-
-  AddPprofPathHandlers(webserver);
-}
-
 
 static void WriteMetricsAsJson(const MetricRegistry* const metrics,
                                const Webserver::WebRequest& req, std::stringstream* output) {
@@ -244,6 +247,50 @@ static void WriteForPrometheus(const MetricRegistry* const metrics,
                                const Webserver::WebRequest& req, std::stringstream* output) {
   PrometheusWriter writer(output);
   WARN_NOT_OK(metrics->WriteForPrometheus(&writer), "Couldn't write text metrics for Prometheus");
+}
+
+static void HandleGetVersionInfo(
+    const Webserver::WebRequest& req, std::stringstream* output) {
+
+  VersionInfoPB version_info;
+  VersionInfo::GetVersionInfoPB(&version_info);
+
+  JsonWriter jw(output, JsonWriter::COMPACT);
+  jw.StartObject();
+
+  jw.String("build_id");
+  jw.String(version_info.build_id());
+  jw.String("build_type");
+  jw.String(version_info.build_type());
+  jw.String("build_number");
+  jw.String(version_info.build_number());
+  jw.String("build_timestamp");
+  jw.String(version_info.build_timestamp());
+  jw.String("build_username");
+  jw.String(version_info.build_username());
+  jw.String("version_number");
+  jw.String(version_info.version_number());
+  jw.String("build_hostname");
+  jw.String(version_info.build_hostname());
+  jw.String("git_revision");
+  jw.String(version_info.git_hash());
+
+  jw.EndObject();
+}
+
+} // anonymous namespace
+
+void AddDefaultPathHandlers(Webserver* webserver) {
+  webserver->RegisterPathHandler("/logs", "Logs", LogsHandler, true, false);
+  webserver->RegisterPathHandler("/varz", "Flags", FlagsHandler, true, false);
+  webserver->RegisterPathHandler("/status", "Status", StatusHandler, false, false);
+  webserver->RegisterPathHandler("/memz", "Memory (total)", MemUsageHandler, true, false);
+  webserver->RegisterPathHandler("/mem-trackers", "Memory (detail)",
+                                 MemTrackersHandler, true, false);
+  webserver->RegisterPathHandler("/api/v1/version-info", "Build Version Info",
+                                 HandleGetVersionInfo, false, false);
+
+  AddPprofPathHandlers(webserver);
 }
 
 void RegisterMetricsJsonHandler(Webserver* webserver, const MetricRegistry* const metrics) {

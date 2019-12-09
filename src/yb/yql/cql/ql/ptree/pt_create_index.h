@@ -9,6 +9,7 @@
 
 #include "yb/client/client.h"
 #include "yb/yql/cql/ql/ptree/pt_create_table.h"
+#include "yb/yql/cql/ql/ptree/pt_column_definition.h"
 
 namespace yb {
 namespace ql {
@@ -59,7 +60,8 @@ class PTCreateIndex : public PTCreateTable {
   }
 
   client::YBTableName yb_table_name() const override {
-    return client::YBTableName(PTCreateTable::yb_table_name().namespace_name().c_str(),
+    return client::YBTableName(YQL_DATABASE_CQL,
+                               PTCreateTable::yb_table_name().namespace_name().c_str(),
                                name_->c_str());
   }
 
@@ -71,13 +73,17 @@ class PTCreateIndex : public PTCreateTable {
     return table_;
   }
 
-  const std::string& indexed_table_id() const {
-    return table_->id();
-  }
+  const std::string& indexed_table_id() const;
 
   bool is_local() const {
     return is_local_;
   }
+
+  const MCVector<ColumnDesc>& column_descs() const {
+    return column_descs_;
+  }
+
+  CHECKED_STATUS AppendIndexColumn(SemContext *sem_context, PTColumnDefinition *column);
 
   virtual CHECKED_STATUS ToTableProperties(TableProperties *table_properties) const override;
 
@@ -89,7 +95,7 @@ class PTCreateIndex : public PTCreateTable {
   // Is it a unique index?
   const bool is_unique_ = false;
   // Index name.
-  const MCSharedPtr<MCString> name_;
+  MCSharedPtr<MCString> name_;
   // Additional covering columns.
   const PTListNode::SharedPtr covering_;
 
@@ -97,9 +103,10 @@ class PTCreateIndex : public PTCreateTable {
   bool is_local_ = false;
   std::shared_ptr<client::YBTable> table_;
   MCVector<ColumnDesc> column_descs_;
-  MCVector<PTColumnDefinition::SharedPtr> column_definitions_;
-  int num_key_columns_ = 0;
-  int num_hash_key_columns_ = 0;
+
+  // Auto-include columns are primary-key columns in the data-table being indexed that are not yet
+  // declared as part of the INDEX.
+  MCList<PTIndexColumn::SharedPtr> auto_includes_;
 };
 
 }  // namespace ql

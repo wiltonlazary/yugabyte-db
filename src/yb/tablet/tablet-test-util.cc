@@ -15,11 +15,13 @@
 
 #include <gflags/gflags.h>
 
+#include "yb/common/ql_value.h"
+
 #include "yb/docdb/doc_rowwise_iterator.h"
 
 #include "yb/gutil/strings/join.h"
 
-#include "yb/tablet/operations/alter_schema_operation.h"
+#include "yb/tablet/operations/change_metadata_operation.h"
 
 #include "yb/tserver/tserver_admin.pb.h"
 
@@ -60,11 +62,11 @@ void YBTabletTest::SetUpTestTablet(const std::string& root_dir) {
 }
 
 void YBTabletTest::AlterSchema(const Schema& schema) {
-  tserver::AlterSchemaRequestPB req;
+  tserver::ChangeMetadataRequestPB req;
   req.set_schema_version(tablet()->metadata()->schema_version() + 1);
 
-  AlterSchemaOperationState operation_state(nullptr, nullptr, &req);
-  ASSERT_OK(tablet()->CreatePreparedAlterSchema(&operation_state, &schema));
+  ChangeMetadataOperationState operation_state(nullptr, nullptr, &req);
+  ASSERT_OK(tablet()->CreatePreparedChangeMetadata(&operation_state, &schema));
   ASSERT_OK(tablet()->AlterSchema(&operation_state));
   operation_state.Finish();
 }
@@ -76,7 +78,7 @@ Status IterateToStringList(
   int fetched = 0;
   std::vector<std::pair<QLValue, std::string>> temp;
   QLTableRow row;
-  while (iter->HasNext() && fetched < limit) {
+  while (VERIFY_RESULT(iter->HasNext()) && fetched < limit) {
     RETURN_NOT_OK(iter->NextRow(&row));
     QLValue key;
     RETURN_NOT_OK(row.GetValue(schema.column_id(0), &key));

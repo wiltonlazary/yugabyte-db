@@ -46,17 +46,24 @@
 #include "yb/common/hybrid_time.h"
 #include "yb/common/wire_protocol.h"
 #include "yb/consensus/consensus.h"
+#include "yb/consensus/test_consensus_context.h"
 #include "yb/consensus/consensus_peers.h"
 #include "yb/consensus/consensus_queue.h"
 #include "yb/consensus/log.h"
 #include "yb/consensus/raft_consensus.h"
+#include "yb/consensus/opid_util.h"
 #include "yb/gutil/map-util.h"
 #include "yb/gutil/strings/substitute.h"
+#include "yb/rpc/messenger.h"
+#include "yb/rpc/rpc_test_util.h"
 #include "yb/server/clock.h"
 #include "yb/util/countdown_latch.h"
 #include "yb/util/locks.h"
 #include "yb/util/test_macros.h"
+#include "yb/util/test_util.h"
 #include "yb/util/threadpool.h"
+
+using namespace std::literals;
 
 #define TOKENPASTE(x, y) x ## y
 #define TOKENPASTE2(x, y) TOKENPASTE(x, y)
@@ -72,12 +79,19 @@ namespace yb {
 namespace consensus {
 
 using log::Log;
+using rpc::Messenger;
 using strings::Substitute;
 
-inline ReplicateMsgPtr CreateDummyReplicate(int term,
-                                            int index,
+constexpr int kTermDivisor = 7;
+
+inline CoarseTimePoint CoarseBigDeadline() {
+  return CoarseMonoClock::now() + 600s;
+}
+
+inline ReplicateMsgPtr CreateDummyReplicate(int64_t term,
+                                            int64_t index,
                                             const HybridTime& hybrid_time,
-                                            int payload_size) {
+                                            int64_t payload_size) {
   auto msg = std::make_shared<ReplicateMsg>();
   OpId* id = msg->mutable_id();
   id->set_term(term);
@@ -107,14 +121,23 @@ RaftPeerPB FakeRaftPeerPB(const std::string& uuid) {
 static inline void AppendReplicateMessagesToQueue(
     PeerMessageQueue* queue,
     const scoped_refptr<server::Clock>& clock,
-    int first_index,
-    int count,
-    int payload_size = 0) {
+    int64_t first_index,
+    int64_t count,
+    int64_t payload_size = 0) {
 
-  for (int index = first_index; index < first_index + count; index++) {
-    int term = index / 7;
-    CHECK_OK(queue->AppendOperation(CreateDummyReplicate(term, index, clock->Now(), payload_size)));
+  for (int64_t index = first_index; index < first_index + count; index++) {
+    int64_t term = index / kTermDivisor;
+    CHECK_OK(queue->TEST_AppendOperation(
+          CreateDummyReplicate(term, index, clock->Now(), payload_size)));
   }
+}
+
+OpId MakeOpIdForIndex(int index) {
+  return MakeOpId(index / kTermDivisor, index);
+}
+
+std::string OpIdStrForIndex(int index) {
+  return OpIdToString(MakeOpIdForIndex(index));
 }
 
 // Builds a configuration of 'num' voters.
@@ -162,7 +185,7 @@ class TestPeerProxy : public PeerProxy {
       // Drop the lock before submitting to the pool, since the callback itself may
       // destroy this instance.
     }
-    CHECK_OK(pool_->SubmitFunc(callback));
+    WARN_NOT_OK(pool_->SubmitFunc(callback), "Submit failed");
   }
 
   virtual void RegisterCallbackAndRespond(Method method, const rpc::ResponseCallback& callback) {
@@ -387,13 +410,19 @@ class NoOpTestPeerProxyFactory : public PeerProxyFactory {
  public:
   NoOpTestPeerProxyFactory() {
     CHECK_OK(ThreadPoolBuilder("test-peer-pool").set_max_threads(3).Build(&pool_));
+    messenger_ = CHECK_RESULT(rpc::MessengerBuilder("test").Build());
   }
 
   PeerProxyPtr NewProxy(const RaftPeerPB& peer_pb) override {
     return std::make_unique<NoOpTestPeerProxy>(pool_.get(), peer_pb);
   }
 
+  Messenger* messenger() const override {
+    return messenger_.get();
+  }
+
   gscoped_ptr<ThreadPool> pool_;
+  std::unique_ptr<rpc::Messenger> messenger_;
 };
 
 typedef std::unordered_map<std::string, std::shared_ptr<RaftConsensus> > TestPeerMap;
@@ -464,23 +493,24 @@ class LocalTestPeerProxy : public TestPeerProxy {
         peers_(peers),
         miss_comm_(false) {}
 
-  virtual void UpdateAsync(const ConsensusRequestPB* request,
-                           RequestTriggerMode trigger_mode,
-                           ConsensusResponsePB* response,
-                           rpc::RpcController* controller,
-                           const rpc::ResponseCallback& callback) override {
+  void UpdateAsync(const ConsensusRequestPB* request,
+                   RequestTriggerMode trigger_mode,
+                   ConsensusResponsePB* response,
+                   rpc::RpcController* controller,
+                   const rpc::ResponseCallback& callback) override {
     RegisterCallback(kUpdate, callback);
     CHECK_OK(pool_->SubmitFunc(
-        std::bind(&LocalTestPeerProxy::SendUpdateRequest, this, request, response)));
+        std::bind(&LocalTestPeerProxy::SendUpdateRequest, this, *request, response)));
   }
 
-  virtual void RequestConsensusVoteAsync(const VoteRequestPB* request,
-                                         VoteResponsePB* response,
-                                         rpc::RpcController* controller,
-                                         const rpc::ResponseCallback& callback) override {
+  void RequestConsensusVoteAsync(const VoteRequestPB* request,
+                                 VoteResponsePB* response,
+                                 rpc::RpcController* controller,
+                                 const rpc::ResponseCallback& callback) override {
     RegisterCallback(kRequestVote, callback);
-    CHECK_OK(pool_->SubmitFunc(
-        std::bind(&LocalTestPeerProxy::SendVoteRequest, this, request, response)));
+    WARN_NOT_OK(
+        pool_->SubmitFunc(std::bind(&LocalTestPeerProxy::SendVoteRequest, this, request, response)),
+        "Submit failed");
   }
 
   template<class Response>
@@ -495,7 +525,6 @@ class LocalTestPeerProxy : public TestPeerProxy {
                              const Response& response_temp,
                              Response* final_response,
                              Method method) {
-
     bool miss_comm_copy;
     {
       std::lock_guard<simple_spinlock> lock(lock_);
@@ -512,20 +541,15 @@ class LocalTestPeerProxy : public TestPeerProxy {
     Respond(method);
   }
 
-  void SendUpdateRequest(const ConsensusRequestPB* request,
+  void SendUpdateRequest(ConsensusRequestPB request,
                          ConsensusResponsePB* response) {
-    // Copy the request and the response for the other peer so that ownership
-    // remains as close to the dist. impl. as possible.
-    ConsensusRequestPB other_peer_req;
-    other_peer_req.CopyFrom(*request);
-
     // Give the other peer a clean response object to write to.
     ConsensusResponsePB other_peer_resp;
     std::shared_ptr<RaftConsensus> peer;
     Status s = peers_->GetPeerByUuid(peer_uuid_, &peer);
 
     if (s.ok()) {
-      s = peer->Update(&other_peer_req, &other_peer_resp);
+      s = peer->Update(&request, &other_peer_resp, CoarseBigDeadline());
       if (s.ok() && !other_peer_resp.has_error()) {
         CHECK(other_peer_resp.has_status());
         CHECK(other_peer_resp.status().IsInitialized());
@@ -533,13 +557,13 @@ class LocalTestPeerProxy : public TestPeerProxy {
     }
     if (!s.ok()) {
       LOG(WARNING) << "Could not Update replica with request: "
-                   << other_peer_req.ShortDebugString()
+                   << request.ShortDebugString()
                    << " Status: " << s.ToString();
       SetResponseError(s, &other_peer_resp);
     }
 
     response->CopyFrom(other_peer_resp);
-    RespondOrMissResponse(request, other_peer_resp, response, kUpdate);
+    RespondOrMissResponse(&request, other_peer_resp, response, kUpdate);
   }
 
 
@@ -592,6 +616,8 @@ class LocalTestPeerProxyFactory : public PeerProxyFactory {
   explicit LocalTestPeerProxyFactory(TestPeerMapManager* peers)
     : peers_(peers) {
     CHECK_OK(ThreadPoolBuilder("test-peer-pool").set_max_threads(3).Build(&pool_));
+    messenger_ = rpc::CreateAutoShutdownMessengerHolder(
+        CHECK_RESULT(rpc::MessengerBuilder("test").Build()));
   }
 
   PeerProxyPtr NewProxy(const consensus::RaftPeerPB& peer_pb) override {
@@ -605,8 +631,13 @@ class LocalTestPeerProxyFactory : public PeerProxyFactory {
     return proxies_;
   }
 
+  rpc::Messenger* messenger() const override {
+    return messenger_.get();
+  }
+
  private:
   gscoped_ptr<ThreadPool> pool_;
+  rpc::AutoShutdownMessengerHolder messenger_;
   TestPeerMapManager* const peers_;
     // NOTE: There is no need to delete this on the dctor because proxies are externally managed
   vector<LocalTestPeerProxy*> proxies_;
@@ -659,20 +690,18 @@ class TestDriver {
 
 // Fake ReplicaOperationFactory that allows for instantiating and unit
 // testing RaftConsensusState. Does not actually support running transactions.
-class MockOperationFactory : public ReplicaOperationFactory {
+class MockOperationFactory : public TestConsensusContext {
  public:
   CHECKED_STATUS StartReplicaOperation(
       const scoped_refptr<ConsensusRound>& round, HybridTime propagated_hybrid_time) override {
     return StartReplicaOperationMock(round.get());
   }
 
-  void SetPropagatedSafeTime(HybridTime ht) override {}
-
   MOCK_METHOD1(StartReplicaOperationMock, Status(ConsensusRound* round));
 };
 
 // A transaction factory for tests, usually this is implemented by TabletPeer.
-class TestOperationFactory : public ReplicaOperationFactory {
+class TestOperationFactory : public TestConsensusContext {
  public:
   TestOperationFactory() {
     CHECK_OK(ThreadPoolBuilder("test-operation-factory").set_max_threads(1).Build(&pool_));
@@ -690,10 +719,8 @@ class TestOperationFactory : public ReplicaOperationFactory {
     return Status::OK();
   }
 
-  void SetPropagatedSafeTime(HybridTime ht) override {}
-
   void ReplicateAsync(ConsensusRound* round) {
-    CHECK_OK(consensus_->Replicate(round));
+    CHECK_OK(consensus_->TEST_Replicate(round));
   }
 
   void WaitDone() {

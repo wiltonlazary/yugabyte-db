@@ -27,20 +27,23 @@
 #include <functional>
 #include <mutex>
 
+#include "yb/gutil/thread_annotations.h"
+
+#include "yb/rocksdb/util/timeout_error.h"
 #include "yb/rocksdb/utilities/transaction_db_mutex.h"
 
 namespace rocksdb {
 
-class TransactionDBMutexImpl : public TransactionDBMutex {
+class CAPABILITY("mutex") TransactionDBMutexImpl : public TransactionDBMutex {
  public:
   TransactionDBMutexImpl() {}
   ~TransactionDBMutexImpl() {}
 
-  Status Lock() override;
+  Status Lock() ACQUIRE() override;
 
   Status TryLockFor(int64_t timeout_time) override;
 
-  void UnLock() override { mutex_.unlock(); }
+  void UnLock() RELEASE() override { mutex_.unlock(); }
 
   friend class TransactionDBCondVarImpl;
 
@@ -81,7 +84,7 @@ Status TransactionDBMutexImpl::Lock() {
   return Status::OK();
 }
 
-Status TransactionDBMutexImpl::TryLockFor(int64_t timeout_time) {
+Status NO_THREAD_SAFETY_ANALYSIS TransactionDBMutexImpl::TryLockFor(int64_t timeout_time) {
   bool locked = true;
 
   if (timeout_time == 0) {
@@ -99,7 +102,7 @@ Status TransactionDBMutexImpl::TryLockFor(int64_t timeout_time) {
 
   if (!locked) {
     // timeout acquiring mutex
-    return STATUS(TimedOut, yb::TimeoutError::kMutexTimeout);
+    return STATUS(TimedOut, TimeoutError(TimeoutCode::kMutex));
   }
 
   return Status::OK();
@@ -134,7 +137,7 @@ Status TransactionDBCondVarImpl::WaitFor(
 
     // Check if the wait stopped due to timing out.
     if (cv_status == std::cv_status::timeout) {
-      s = STATUS(TimedOut, yb::TimeoutError::kMutexTimeout);
+      s = STATUS(TimedOut, TimeoutError(TimeoutCode::kMutex));
     }
   }
 

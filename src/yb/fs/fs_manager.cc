@@ -41,8 +41,6 @@
 #include <glog/stl_logging.h>
 #include <google/protobuf/message.h>
 
-#include "yb/fs/block_id.h"
-#include "yb/fs/file_block_manager.h"
 #include "yb/fs/fs.pb.h"
 #include "yb/gutil/map-util.h"
 #include "yb/gutil/strings/join.h"
@@ -65,10 +63,6 @@ DEFINE_bool(enable_data_block_fsync, true,
             "Disabling this flag may cause data loss in the event of a system crash.");
 TAG_FLAG(enable_data_block_fsync, unsafe);
 
-DEFINE_string(block_manager, "file", "Which block manager to use for storage. "
-              "Only the file block manager is supported for non-Linux systems.");
-TAG_FLAG(block_manager, advanced);
-
 DECLARE_string(fs_data_dirs);
 
 DEFINE_string(fs_wal_dirs, "",
@@ -77,13 +71,17 @@ DEFINE_string(fs_wal_dirs, "",
                   "also and that's a reasonable default for most use cases.");
 TAG_FLAG(fs_wal_dirs, stable);
 
+DEFINE_string(instance_uuid_override, "",
+              "When creating local instance metadata (for master or tserver) in an empty data "
+              "directory, use this UUID instead of randomly-generated one. Can be used to replace "
+              "a node that had its disk wiped in some scenarios.");
+
+DEFINE_test_flag(bool, simulate_fs_create_failure, false,
+                 "Simulate failure during initial creation of fs during the first time "
+                 "process creation.");
+
 using google::protobuf::Message;
 using yb::env_util::ScopedFileDeleter;
-using yb::fs::BlockManagerOptions;
-using yb::fs::CreateBlockOptions;
-using yb::fs::FileBlockManager;
-using yb::fs::ReadableBlock;
-using yb::fs::WritableBlock;
 using std::map;
 using std::unordered_set;
 using strings::Substitute;
@@ -97,10 +95,11 @@ const char *FsManager::kWalDirName = "wals";
 const char *FsManager::kWalFileNamePrefix = "wal";
 const char *FsManager::kWalsRecoveryDirSuffix = ".recovery";
 const char *FsManager::kRocksDBDirName = "rocksdb";
-const char *FsManager::kTabletMetadataDirName = "tablet-meta";
+const char *FsManager::kRaftGroupMetadataDirName = "tablet-meta";
 const char *FsManager::kDataDirName = "data";
 const char *FsManager::kCorruptedSuffix = ".corrupted";
 const char *FsManager::kInstanceMetadataFileName = "instance";
+const char *FsManager::kFsLockFileName = "fs-lock";
 const char *FsManager::kConsensusMetadataDirName = "consensus-meta";
 const char *FsManager::kLogsDirName = "logs";
 
@@ -188,7 +187,14 @@ Status FsManager::Init() {
     // Strip the basename when canonicalizing, as it may not exist. The
     // dirname, however, must exist.
     string canonicalized;
-    RETURN_NOT_OK(env_->Canonicalize(DirName(root), &canonicalized));
+    Status s = env_->Canonicalize(DirName(root), &canonicalized);
+    if (!s.ok()) {
+      return STATUS(
+          InvalidArgument, strings::Substitute(
+          "Cannot create directory for YB data, please check the --fs_data_dirs parameter "
+          "(Passed: $0). Path does not exist: $1\nDetails: $2",
+          FLAGS_fs_data_dirs, root, s.ToString()));
+    }
     canonicalized = JoinPathSegments(canonicalized, BaseName(root));
     InsertOrDie(&canonicalized_roots, root, canonicalized);
   }
@@ -217,28 +223,17 @@ Status FsManager::Init() {
     VLOG(1) << "All roots: " << canonicalized_all_fs_roots_;
   }
 
-  // With the data roots canonicalized, we can initialize the block manager.
-  InitBlockManager();
-
   initted_ = true;
   return Status::OK();
 }
 
-void FsManager::InitBlockManager() {
-  BlockManagerOptions opts;
-  opts.metric_entity = metric_entity_;
-  opts.parent_mem_tracker = parent_mem_tracker_;
-  opts.root_paths = GetDataRootDirs();
-  opts.read_only = read_only_;
-  if (FLAGS_block_manager == "file") {
-    block_manager_.reset(new FileBlockManager(env_, opts));
-  } else {
-    LOG(FATAL) << "Invalid block manager: " << FLAGS_block_manager;
-  }
-}
-
 Status FsManager::Open() {
   RETURN_NOT_OK(Init());
+
+  if (HasAnyLockFiles()) {
+    return STATUS(Corruption, "Lock file is present, filesystem may be in inconsistent state");
+  }
+
   for (const string& root : canonicalized_all_fs_roots_) {
     gscoped_ptr<InstanceMetadataPB> pb(new InstanceMetadataPB);
     RETURN_NOT_OK(pb_util::ReadPBContainerFromPath(env_, GetInstanceMetadataPath(root), pb.get()));
@@ -251,9 +246,36 @@ Status FsManager::Open() {
     }
   }
 
-  RETURN_NOT_OK(block_manager_->Open());
   LOG(INFO) << "Opened local filesystem: " << JoinStrings(canonicalized_all_fs_roots_, ",")
             << std::endl << metadata_->DebugString();
+  return Status::OK();
+}
+
+bool FsManager::HasAnyLockFiles() {
+  for (const string& root : canonicalized_all_fs_roots_) {
+    if (Exists(GetFsLockFilePath(root))) {
+      LOG(INFO) << "Found lock file in dir " << root;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+Status FsManager::DeleteLockFiles() {
+  CHECK(!read_only_);
+  vector<string> removal_list;
+  for (const string& root : canonicalized_all_fs_roots_) {
+    std::string lock_file_path = GetFsLockFilePath(root);
+    if (Exists(lock_file_path)) {
+      removal_list.push_back(lock_file_path);
+    }
+  }
+
+  for (const string& target : removal_list) {
+    RETURN_NOT_OK_PREPEND(env_->DeleteFile(target), "Lock file delete failed");
+  }
+
   return Status::OK();
 }
 
@@ -264,7 +286,7 @@ Status FsManager::DeleteFileSystemLayout(bool delete_logs_also) {
     removal_set = canonicalized_all_fs_roots_;
   } else {
     auto removal_list = GetWalRootDirs();
-    removal_list.push_back(GetTabletMetadataDir());
+    removal_list.push_back(GetRaftGroupMetadataDir());
     removal_list.push_back(GetConsensusMetadataDir());
     for (const string& root : canonicalized_all_fs_roots_) {
       removal_list.push_back(GetInstanceMetadataPath(root));
@@ -288,13 +310,24 @@ Status FsManager::DeleteFileSystemLayout(bool delete_logs_also) {
       RETURN_NOT_OK(env_->DeleteFile(target));
     }
   }
+
+  RETURN_NOT_OK(DeleteLockFiles());
+
   return Status::OK();
 }
 
-Status FsManager::CreateInitialFileSystemLayout() {
+Status FsManager::CreateInitialFileSystemLayout(bool delete_fs_if_lock_found) {
   CHECK(!read_only_);
 
   RETURN_NOT_OK(Init());
+
+  bool fs_cleaned = false;
+
+  // If lock file is present, delete existing filesystem layout before continuing.
+  if (delete_fs_if_lock_found && HasAnyLockFiles()) {
+    RETURN_NOT_OK(DeleteFileSystemLayout());
+    fs_cleaned = true;
+  }
 
   // It's OK if a root already exists as long as there's nothing in it.
   for (const string& root : canonicalized_all_fs_roots_) {
@@ -314,29 +347,38 @@ Status FsManager::CreateInitialFileSystemLayout() {
   // subdirectories.
   //
   // In the event of failure, delete everything we created.
-  deque<ScopedFileDeleter*> delete_on_failure;
-  ElementDeleter d(&delete_on_failure);
-
-  InstanceMetadataPB metadata;
-  CreateInstanceMetadata(&metadata);
+  std::deque<std::unique_ptr<ScopedFileDeleter>> delete_on_failure;
   unordered_set<string> to_sync;
+
   for (const string& root : canonicalized_all_fs_roots_) {
     bool created;
     std::string out_dir;
     RETURN_NOT_OK(SetupRootDir(env_, root, server_type_, &out_dir, &created));
     if (created) {
-      delete_on_failure.push_front(new ScopedFileDeleter(env_, out_dir));
+      delete_on_failure.emplace_front(new ScopedFileDeleter(env_, out_dir));
       to_sync.insert(DirName(out_dir));
     }
+    const string lock_file_path = GetFsLockFilePath(root);
+    if (fs_cleaned || !Exists(lock_file_path)) {
+      std::unique_ptr<WritableFile> file;
+      RETURN_NOT_OK_PREPEND(env_->NewWritableFile(lock_file_path, &file),
+                            "Unable to create lock file.");
+      // Do not delete lock file on error. It is used to detect failed initial create.
+    }
+  }
+
+  InstanceMetadataPB metadata;
+  CreateInstanceMetadata(&metadata);
+  for (const string& root : canonicalized_all_fs_roots_) {
     const string instance_metadata_path = GetInstanceMetadataPath(root);
     RETURN_NOT_OK_PREPEND(WriteInstanceMetadata(metadata, instance_metadata_path),
                           "Unable to write instance metadata");
-    delete_on_failure.push_front(new ScopedFileDeleter(env_, instance_metadata_path));
+    delete_on_failure.emplace_front(new ScopedFileDeleter(env_, instance_metadata_path));
   }
 
   // Initialize ancillary directories.
   auto ancillary_dirs = GetWalRootDirs();
-  ancillary_dirs.push_back(GetTabletMetadataDir());
+  ancillary_dirs.push_back(GetRaftGroupMetadataDir());
   ancillary_dirs.push_back(GetConsensusMetadataDir());
 
   for (const string& dir : ancillary_dirs) {
@@ -344,7 +386,7 @@ Status FsManager::CreateInitialFileSystemLayout() {
     RETURN_NOT_OK_PREPEND(CreateDirIfMissing(dir, &created),
                           Substitute("Unable to create directory $0", dir));
     if (created) {
-      delete_on_failure.push_front(new ScopedFileDeleter(env_, dir));
+      delete_on_failure.emplace_front(new ScopedFileDeleter(env_, dir));
       to_sync.insert(DirName(dir));
     }
   }
@@ -357,31 +399,47 @@ Status FsManager::CreateInitialFileSystemLayout() {
     }
   }
 
-  // Create the block manager.
-  RETURN_NOT_OK_PREPEND(block_manager_->Create(), "Unable to create block manager");
-
   // Create the RocksDB directory under each data directory.
   for (const string& data_root : GetDataRootDirs()) {
-    const string dir = JoinPathSegments(data_root, kRocksDBDirName);
     bool created = false;
+    RETURN_NOT_OK_PREPEND(CreateDirIfMissing(data_root, &created),
+                          Substitute("Unable to create directory $0", data_root));
+    if (created) {
+      delete_on_failure.emplace_front(new ScopedFileDeleter(env_, data_root));
+      to_sync.insert(DirName(data_root));
+    }
+
+    const string dir = JoinPathSegments(data_root, kRocksDBDirName);
+    created = false;
     RETURN_NOT_OK_PREPEND(CreateDirIfMissing(dir, &created),
                           Substitute("Unable to create directory $0", dir));
     if (created) {
-      delete_on_failure.push_front(new ScopedFileDeleter(env_, dir));
+      delete_on_failure.emplace_front(new ScopedFileDeleter(env_, dir));
       to_sync.insert(DirName(dir));
     }
   }
 
+  if (FLAGS_simulate_fs_create_failure) {
+    return STATUS(IOError, "Simulated fs creation error");
+  }
+
   // Success: don't delete any files.
-  for (ScopedFileDeleter* deleter : delete_on_failure) {
+  for (const auto& deleter : delete_on_failure) {
     deleter->Cancel();
   }
+
+  RETURN_NOT_OK(DeleteLockFiles());
+
   return Status::OK();
 }
 
 void FsManager::CreateInstanceMetadata(InstanceMetadataPB* metadata) {
   ObjectIdGenerator oid_generator;
-  metadata->set_uuid(oid_generator.Next());
+  if (!FLAGS_instance_uuid_override.empty()) {
+    metadata->set_uuid(FLAGS_instance_uuid_override);
+  } else {
+    metadata->set_uuid(oid_generator.Next());
+  }
 
   string time_str;
   StringAppendStrftime(&time_str, "%Y-%m-%d %H:%M:%S", time(nullptr), false);
@@ -458,14 +516,18 @@ vector<string> FsManager::GetWalRootDirs() const {
   return wal_dirs;
 }
 
-string FsManager::GetTabletMetadataDir() const {
-  DCHECK(initted_);
-  return JoinPathSegments(
-      GetServerTypeDataPath(canonicalized_metadata_fs_root_, server_type_), kTabletMetadataDirName);
+std::string FsManager::GetRaftGroupMetadataDir(const std::string& data_dir) {
+  return JoinPathSegments(data_dir, kRaftGroupMetadataDirName);
 }
 
-string FsManager::GetTabletMetadataPath(const string& tablet_id) const {
-  return JoinPathSegments(GetTabletMetadataDir(), tablet_id);
+string FsManager::GetRaftGroupMetadataDir() const {
+  DCHECK(initted_);
+  return GetRaftGroupMetadataDir(
+      GetServerTypeDataPath(canonicalized_metadata_fs_root_, server_type_));
+}
+
+string FsManager::GetRaftGroupMetadataPath(const string& tablet_id) const {
+  return JoinPathSegments(GetRaftGroupMetadataDir(), tablet_id);
 }
 
 namespace {
@@ -487,7 +549,7 @@ bool IsValidTabletId(const std::string& fname) {
 } // anonymous namespace
 
 Status FsManager::ListTabletIds(vector<string>* tablet_ids) {
-  string dir = GetTabletMetadataDir();
+  string dir = GetRaftGroupMetadataDir();
   vector<string> children;
   RETURN_NOT_OK_PREPEND(ListDir(dir, &children),
                         Substitute("Couldn't list tablets in metadata directory $0", dir));
@@ -506,11 +568,18 @@ std::string FsManager::GetInstanceMetadataPath(const string& root) const {
   return JoinPathSegments(GetServerTypeDataPath(root, server_type_), kInstanceMetadataFileName);
 }
 
+std::string FsManager::GetFsLockFilePath(const string& root) const {
+  return JoinPathSegments(GetServerTypeDataPath(root, server_type_), kFsLockFileName);
+}
+
 std::string FsManager::GetConsensusMetadataDir() const {
   DCHECK(initted_);
-  return JoinPathSegments(
-      GetServerTypeDataPath(canonicalized_metadata_fs_root_, server_type_),
-      kConsensusMetadataDirName);
+  return GetConsensusMetadataDir(
+      GetServerTypeDataPath(canonicalized_metadata_fs_root_, server_type_));
+}
+
+std::string FsManager::GetConsensusMetadataDir(const std::string& data_dir) {
+  return JoinPathSegments(data_dir, kConsensusMetadataDirName);
 }
 
 std::string FsManager::GetFirstTabletWalDirOrDie(const std::string& table_id,
@@ -521,12 +590,12 @@ std::string FsManager::GetFirstTabletWalDirOrDie(const std::string& table_id,
   return JoinPathSegments(table_wal_dir, Substitute("tablet-$0", tablet_id));
 }
 
-std::string FsManager::GetTabletWalRecoveryDir(const string& tablet_wal_path) const {
+std::string FsManager::GetTabletWalRecoveryDir(const string& tablet_wal_path) {
   return tablet_wal_path + kWalsRecoveryDirSuffix;
 }
 
 std::string FsManager::GetWalSegmentFileName(const string& tablet_wal_path,
-                                             uint64_t sequence_number) const {
+                                             uint64_t sequence_number) {
   return JoinPathSegments(tablet_wal_path,
                           strings::Substitute("$0-$1",
                                               kWalFileNamePrefix,
@@ -569,35 +638,6 @@ void FsManager::DumpFileSystemTree(ostream& out, const string& prefix,
       out << prefix << name << std::endl;
     }
   }
-}
-
-// ==========================================================================
-//  Data read/write interfaces
-// ==========================================================================
-
-Status FsManager::CreateNewBlock(gscoped_ptr<WritableBlock>* block) {
-  CHECK(!read_only_);
-
-  return block_manager_->CreateBlock(block);
-}
-
-Status FsManager::OpenBlock(const BlockId& block_id, gscoped_ptr<ReadableBlock>* block) {
-  return block_manager_->OpenBlock(block_id, block);
-}
-
-Status FsManager::DeleteBlock(const BlockId& block_id) {
-  CHECK(!read_only_);
-
-  return block_manager_->DeleteBlock(block_id);
-}
-
-bool FsManager::BlockExists(const BlockId& block_id) const {
-  gscoped_ptr<ReadableBlock> block;
-  return block_manager_->OpenBlock(block_id, &block).ok();
-}
-
-std::ostream& operator<<(std::ostream& o, const BlockId& block_id) {
-  return o << block_id.ToString();
 }
 
 } // namespace yb

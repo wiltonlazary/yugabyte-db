@@ -15,7 +15,7 @@
 #ifndef YB_YQL_PGGATE_PG_INSERT_H_
 #define YB_YQL_PGGATE_PG_INSERT_H_
 
-#include "yb/yql/pggate/pg_statement.h"
+#include "yb/yql/pggate/pg_dml_write.h"
 
 namespace yb {
 namespace pggate {
@@ -24,56 +24,23 @@ namespace pggate {
 // INSERT
 //--------------------------------------------------------------------------------------------------
 
-class PgInsert : public PgStatement {
+class PgInsert : public PgDmlWrite {
  public:
   // Public types.
-  typedef std::shared_ptr<PgInsert> SharedPtr;
-  typedef std::shared_ptr<const PgInsert> SharedPtrConst;
+  typedef scoped_refptr<PgInsert> ScopedRefPtr;
+  typedef scoped_refptr<const PgInsert> ScopedRefPtrConst;
 
   typedef std::unique_ptr<PgInsert> UniPtr;
   typedef std::unique_ptr<const PgInsert> UniPtrConst;
 
   // Constructors.
-  PgInsert(PgSession::SharedPtr pg_session,
-           const char *database_name,
-           const char *schema_name,
-           const char *table_name);
+  PgInsert(PgSession::ScopedRefPtr pg_session, const PgObjectId& table_id, bool is_single_row_txn);
   virtual ~PgInsert();
-  CHECKED_STATUS Prepare();
 
-  // Set numeric types.
-  CHECKED_STATUS SetColumnInt2(int attnum, int16_t value);
-  CHECKED_STATUS SetColumnInt4(int attnum, int32_t value);
-  CHECKED_STATUS SetColumnInt8(int attnum, int64_t value);
-
-  CHECKED_STATUS SetColumnFloat4(int attnum, float value);
-  CHECKED_STATUS SetColumnFloat8(int attnum, double value);
-
-  // Set string types.
-  CHECKED_STATUS SetColumnText(int attnum, const char *att_value, int att_bytes);
-
-  // Set serialized-to-string types.
-  CHECKED_STATUS SetColumnSerializedData(int attnum, const char *att_value, int att_bytes);
-
-  // Execute.
-  CHECKED_STATUS Exec();
+  StmtOp stmt_op() const override { return StmtOp::STMT_INSERT; }
 
  private:
-  // Allocate column protobuf.
-  PgsqlExpressionPB *AllocColumnPB(int attr_num);
-
-  // Data members.
-  client::YBTableName table_name_;
-  std::shared_ptr<client::YBTable> table_;
-  // TODO(neil) It would make a lot more sense if we index by attr_num instead of ID.
-  std::vector<ColumnDesc> col_descs_;
-  int key_col_count_;
-  int partition_col_count_;
-
-  // Protobuf code.
-  vector<PgsqlExpressionPB *> col_values_;
-  std::shared_ptr<client::YBPgsqlWriteOp> op_;
-  PgsqlWriteRequestPB *req_ = nullptr;
+  void AllocWriteRequest() override;
 };
 
 }  // namespace pggate

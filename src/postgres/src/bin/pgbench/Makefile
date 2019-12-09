@@ -1,6 +1,6 @@
 # src/bin/pgbench/Makefile
 
-PGFILEDESC = "pgbench - a simple program for running benchmark tests"
+PGFILEDESC = "ysql_bench - a simple program for running benchmark tests"
 PGAPPICON = win32
 
 subdir = src/bin/pgbench
@@ -10,7 +10,7 @@ include $(top_builddir)/src/Makefile.global
 OBJS = pgbench.o exprparse.o $(WIN32RES)
 
 override CPPFLAGS := -I. -I$(srcdir) -I$(libpq_srcdir) $(CPPFLAGS)
-override LDFLAGS := -L$(top_builddir)/src/fe_utils -lpgfeutils $(libpq_pgport) $(LDFLAGS)
+LDFLAGS_INTERNAL += -L$(top_builddir)/src/fe_utils -lpgfeutils $(libpq_pgport)
 
 ifneq ($(PORTNAME), win32)
 override CFLAGS += $(PTHREAD_CFLAGS)
@@ -18,9 +18,9 @@ endif
 LIBS += $(PTHREAD_LIBS)
 
 
-all: pgbench
+all: ysql_bench
 
-pgbench: $(OBJS) | submake-libpq submake-libpgport submake-libpgfeutils
+ysql_bench: $(OBJS) | submake-libpq submake-libpgport submake-libpgfeutils
 	$(CC) $(CFLAGS) $^ $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@$(X)
 
 # exprscan is compiled as part of exprparse
@@ -29,16 +29,16 @@ exprparse.o: exprscan.c
 distprep: exprparse.c exprscan.c
 
 install: all installdirs
-	$(INSTALL_PROGRAM) pgbench$(X) '$(DESTDIR)$(bindir)/pgbench$(X)'
+	$(INSTALL_PROGRAM) ysql_bench$(X) '$(DESTDIR)$(bindir)/ysql_bench$(X)'
 
 installdirs:
 	$(MKDIR_P) '$(DESTDIR)$(bindir)'
 
 uninstall:
-	rm -f '$(DESTDIR)$(bindir)/pgbench$(X)'
+	rm -f '$(DESTDIR)$(bindir)/ysql_bench$(X)'
 
 clean distclean:
-	rm -f pgbench$(X) $(OBJS)
+	rm -f ysql_bench$(X) $(OBJS)
 	rm -rf tmp_check
 
 maintainer-clean: distclean

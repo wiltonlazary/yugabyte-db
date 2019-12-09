@@ -95,8 +95,10 @@ set(SERVER_PROCESS_SRCS
   tcmalloc_metrics.cc
   tracing-path-handlers.cc
   webserver.cc
+  pgsql_webserver_wrapper.cc
   webserver_options.cc
   webui_util.cc
+  total_mem_watcher.cc
   ${RPC_SRCS_EXTENSIONS}
 )
 

@@ -18,7 +18,6 @@
 
 #include <memory>
 
-#include "yb/common/ql_value.h"
 #include "yb/common/schema.h"
 
 namespace yb {
@@ -44,15 +43,15 @@ class QLRow {
   }
 
   // Get a mutable/non-mutable column value.
-  const QLValue& column(const size_t col_idx) const { return values_.at(col_idx); }
-  QLValue* mutable_column(const size_t col_idx) { return &values_.at(col_idx); }
+  const QLValue& column(const size_t col_idx) const;
+  QLValue* mutable_column(const size_t col_idx);
+
+  void SetColumn(size_t col_idx, QLValuePB value);
 
   QLRow& operator=(const QLRow& other);
   QLRow& operator=(QLRow&& other);
 
-  void SetColumnValues(const std::vector<QLValue>& column_values) {
-    values_ = column_values;
-  }
+  void SetColumnValues(const std::vector<QLValue>& column_values);
 
   //------------------------------------ debug string ---------------------------------------
   // Return a string for debugging.
@@ -114,10 +113,13 @@ class QLRowBlock {
 
   //-------------------------- utility functions for rows data ------------------------------
   // Return row count.
-  static CHECKED_STATUS GetRowCount(QLClient client, const std::string& data, size_t* count);
+  static Result<size_t> GetRowCount(QLClient client, const std::string& data);
 
   // Append rows data. Caller should ensure the column schemas are the same.
   static CHECKED_STATUS AppendRowsData(QLClient client, const std::string& src, std::string* dst);
+
+  // Return rows data of 0 (empty) rows.
+  static std::string ZeroRowsData(QLClient client);
 
  private:
   // Schema of the selected columns. (Note: this schema has no key column definitions)

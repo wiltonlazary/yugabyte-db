@@ -49,6 +49,7 @@
 
 #include "yb/gutil/macros.h"
 #include "yb/gutil/ref_counted.h"
+#include "yb/gutil/thread_annotations.h"
 
 #include "yb/rpc/rpc_fwd.h"
 #include "yb/rpc/rpc.h"
@@ -56,6 +57,7 @@
 #include "yb/tablet/metadata.pb.h"
 
 #include "yb/util/async_util.h"
+#include "yb/util/capabilities.h"
 #include "yb/util/locks.h"
 #include "yb/util/monotime.h"
 #include "yb/util/semaphore.h"
@@ -70,6 +72,22 @@ class YBPartialRow;
 
 namespace tserver {
 class TabletServerServiceProxy;
+
+// A local tablet server with methods that can be invoked directly and without blocking.
+class GetTabletStatusRequestPB;
+class GetTabletStatusResponsePB;
+
+class LocalTabletServer {
+ public:
+  LocalTabletServer() = default;
+  virtual ~LocalTabletServer() = default;
+
+  virtual CHECKED_STATUS GetTabletStatus(const GetTabletStatusRequestPB* req,
+                                         GetTabletStatusResponsePB* resp) const = 0;
+
+  virtual bool LeaderAndReady(const TabletId& tablet_id, bool allow_stale = false) const = 0;
+};
+
 } // namespace tserver
 
 namespace master {
@@ -98,8 +116,9 @@ class LookupByIdRpc;
 // This class is thread-safe.
 class RemoteTabletServer {
  public:
-  explicit RemoteTabletServer(
-      const std::string& uuid, const std::shared_ptr<tserver::TabletServerServiceProxy>& proxy);
+  RemoteTabletServer(const std::string& uuid,
+                     const std::shared_ptr<tserver::TabletServerServiceProxy>& proxy,
+                     const tserver::LocalTabletServer* local_tserver = nullptr);
   explicit RemoteTabletServer(const master::TSInfoPB& pb);
 
   // Initialize the RPC proxy to this tablet server, if it is not already set up.
@@ -114,9 +133,14 @@ class RemoteTabletServer {
   // Is this tablet server local?
   bool IsLocal() const;
 
+  const tserver::LocalTabletServer* local_tserver() const {
+    return local_tserver_;
+  }
+
   // Return the current proxy to this tablet server. Requires that InitProxy()
   // be called prior to this.
   std::shared_ptr<tserver::TabletServerServiceProxy> proxy() const;
+  ::yb::HostPort ProxyEndpoint() const;
 
   std::string ToString() const;
 
@@ -127,15 +151,24 @@ class RemoteTabletServer {
 
   const CloudInfoPB& cloud_info() const;
 
+  const google::protobuf::RepeatedPtrField<HostPortPB>& public_rpc_hostports() const;
+
+  const google::protobuf::RepeatedPtrField<HostPortPB>& private_rpc_hostports() const;
+
+  bool HasCapability(CapabilityId capability) const;
+
  private:
-  mutable simple_spinlock lock_;
+  mutable rw_spinlock mutex_;
   const std::string uuid_;
 
   google::protobuf::RepeatedPtrField<HostPortPB> public_rpc_hostports_;
   google::protobuf::RepeatedPtrField<HostPortPB> private_rpc_hostports_;
   yb::CloudInfoPB cloud_info_pb_;
   std::shared_ptr<tserver::TabletServerServiceProxy> proxy_;
+  ::yb::HostPort proxy_endpoint_;
+  const tserver::LocalTabletServer* const local_tserver_ = nullptr;
   scoped_refptr<Histogram> dns_resolve_histogram_;
+  std::vector<CapabilityId> capabilities_;
 
   DISALLOW_COPY_AND_ASSIGN(RemoteTabletServer);
 };
@@ -143,12 +176,37 @@ class RemoteTabletServer {
 struct RemoteReplica {
   RemoteTabletServer* ts;
   consensus::RaftPeerPB::Role role;
-  bool failed;
+  MonoTime last_failed_time = MonoTime::kUninitialized;
+  // The state of this replica. Only updated after calling GetTabletStatus.
+  tablet::RaftGroupStatePB state = tablet::RaftGroupStatePB::UNKNOWN;
+
+  RemoteReplica(RemoteTabletServer* ts_, consensus::RaftPeerPB::Role role_)
+      : ts(ts_), role(role_) {}
+
+  void MarkFailed() {
+    last_failed_time = MonoTime::Now();
+  }
+
+  void ClearFailed() {
+    last_failed_time = MonoTime::kUninitialized;
+  }
+
+  bool Failed() const {
+    return last_failed_time.Initialized();
+  }
+
+  std::string ToString() const {
+    return Format("$0 ($1, $2)",
+                  ts->permanent_uuid(),
+                  consensus::RaftPeerPB::Role_Name(role),
+                  Failed() ? "FAILED" : "OK");
+  }
 };
 
 typedef std::unordered_map<std::string, std::unique_ptr<RemoteTabletServer>> TabletServerMap;
 
 YB_STRONGLY_TYPED_BOOL(UpdateLocalTsState);
+YB_STRONGLY_TYPED_BOOL(IncludeFailedReplicas);
 
 // The client's view of a given tablet. This object manages lookups of
 // the tablet's locations, status, etc.
@@ -159,6 +217,7 @@ class RemoteTablet : public RefCountedThreadSafe<RemoteTablet> {
   RemoteTablet(std::string tablet_id,
                Partition partition)
       : tablet_id_(std::move(tablet_id)),
+        log_prefix_(Format("T $0: ", tablet_id_)),
         partition_(std::move(partition)),
         stale_(false) {
   }
@@ -184,8 +243,7 @@ class RemoteTablet : public RefCountedThreadSafe<RemoteTablet> {
   //
   // The provided status is used for logging.
   // Returns true if 'ts' was found among this tablet's replicas, false if not.
-  bool MarkReplicaFailed(RemoteTabletServer *ts,
-                         const Status& status);
+  bool MarkReplicaFailed(RemoteTabletServer *ts, const Status& status);
 
   // Return the number of failed replicas for this tablet.
   int GetNumFailedReplicas() const;
@@ -198,13 +256,19 @@ class RemoteTablet : public RefCountedThreadSafe<RemoteTablet> {
   // callers should always check the result against NULL.
   RemoteTabletServer* LeaderTServer() const;
 
-  // Writes this tablet's TSes (across all replicas) to 'servers'. Skips
-  // failed replicas.
-  //
-  // If 'update_local_ts' is kTrue and the failed replica is the local tserver, then mark this
-  // replica as available and add it to 'servers' if the state of the tablet has changed to RUNNING.
-  void GetRemoteTabletServers(std::vector<RemoteTabletServer*>* servers,
-                              UpdateLocalTsState update_local_ts_state);
+  // Writes this tablet's TSes (across all replicas) to 'servers' for all available replicas. If a
+  // replica has failed recently, check if it is available now if it is local. For remote replica,
+  // wait for some time (configurable) before retrying.
+  void GetRemoteTabletServers(
+      std::vector<RemoteTabletServer*>* servers,
+      IncludeFailedReplicas include_failed_replicas = IncludeFailedReplicas::kFalse);
+
+  std::vector<RemoteTabletServer*> GetRemoteTabletServers(
+      IncludeFailedReplicas include_failed_replicas = IncludeFailedReplicas::kFalse) {
+    std::vector<RemoteTabletServer*> result;
+    GetRemoteTabletServers(&result, include_failed_replicas);
+    return result;
+  }
 
   // Return true if the tablet currently has a known LEADER replica
   // (i.e the next call to LeaderTServer() is likely to return non-NULL)
@@ -217,7 +281,8 @@ class RemoteTablet : public RefCountedThreadSafe<RemoteTablet> {
   }
 
   // Mark the specified tablet server as the leader of the consensus configuration in the cache.
-  void MarkTServerAsLeader(const RemoteTabletServer* server);
+  // Returns whether server was found in replicas_.
+  bool MarkTServerAsLeader(const RemoteTabletServer* server) WARN_UNUSED_RESULT;
 
   // Mark the specified tablet server as a follower in the cache.
   void MarkTServerAsFollower(const RemoteTabletServer* server);
@@ -225,20 +290,28 @@ class RemoteTablet : public RefCountedThreadSafe<RemoteTablet> {
   // Return stringified representation of the list of replicas for this tablet.
   std::string ReplicasAsString() const;
 
+  std::string ToString() const;
+
+  const std::string& LogPrefix() const { return log_prefix_; }
+
+  MonoTime refresh_time() { return refresh_time_.load(std::memory_order_acquire); }
+
  private:
-  // Same as ReplicasAsString(), except that the caller must hold lock_.
+  // Same as ReplicasAsString(), except that the caller must hold mutex_.
   std::string ReplicasAsStringUnlocked() const;
 
   const std::string tablet_id_;
+  const std::string log_prefix_;
   const Partition partition_;
 
-  // All non-const members are protected by 'lock_'.
-  mutable simple_spinlock lock_;
+  // All non-const members are protected by 'mutex_'.
+  mutable rw_spinlock mutex_;
   bool stale_;
   std::vector<RemoteReplica> replicas_;
 
-  // The state of this tablet at each specific replica. Only updated after calling GetTabletStatus.
-  std::unordered_map<std::string, tablet::TabletStatePB> replica_tablet_state_map_;
+  // Last time this object was refreshed. Initialized to MonoTime::Min() so we don't have to be
+  // checking whether it has been initialized everytime we use this value.
+  std::atomic<MonoTime> refresh_time_{MonoTime::Min()};
 
   DISALLOW_COPY_AND_ASSIGN(RemoteTablet);
 };
@@ -256,9 +329,10 @@ class MetaCache : public RefCountedThreadSafe<MetaCache> {
 
   void Shutdown();
 
-  // Add a tablet server proxy.
-  void AddTabletServerProxy(const std::string& permanent_uuid,
-                            const std::shared_ptr<tserver::TabletServerServiceProxy>& proxy);
+  // Add a tablet server's proxy, and optionally the tserver itself it is local.
+  void SetLocalTabletServer(const std::string& permanent_uuid,
+                            const std::shared_ptr<tserver::TabletServerServiceProxy>& proxy,
+                            const tserver::LocalTabletServer* local_tserver);
 
   // Look up which tablet hosts the given partition key for a table. When it is
   // available, the tablet is stored in 'remote_tablet' (if not NULL) and the
@@ -271,15 +345,22 @@ class MetaCache : public RefCountedThreadSafe<MetaCache> {
   // is invoked.
   void LookupTabletByKey(const YBTable* table,
                          const std::string& partition_key,
-                         const MonoTime& deadline,
-                         RemoteTabletPtr* remote_tablet,
-                         const StatusCallback& callback);
+                         CoarseTimePoint deadline,
+                         LookupTabletCallback callback);
+
+  std::future<Result<internal::RemoteTabletPtr>> LookupTabletByKeyFuture(
+      const YBTable* table,
+      const std::string& partition_key,
+      CoarseTimePoint deadline) {
+    return MakeFuture<Result<internal::RemoteTabletPtr>>([&](auto callback) {
+      this->LookupTabletByKey(table, partition_key, deadline, std::move(callback));
+    });
+  }
 
   void LookupTabletById(const TabletId& tablet_id,
-                        const MonoTime& deadline,
-                        RemoteTabletPtr* remote_tablet,
-                        const StatusCallback& callback,
-                        bool use_fast_path_first);
+                        CoarseTimePoint deadline,
+                        LookupTabletCallback callback,
+                        UseCache use_cache);
 
   // Return the local tablet server if available.
   RemoteTabletServer* local_tserver() const {
@@ -312,8 +393,9 @@ class MetaCache : public RefCountedThreadSafe<MetaCache> {
 
   // Lookup the given tablet by key, only consulting local information.
   // Returns true and sets *remote_tablet if successful.
-  RemoteTabletPtr LookupTabletByKeyFastPathUnlocked(const YBTable* table,
-                                                    const std::string& partition_key);
+  RemoteTabletPtr LookupTabletByKeyFastPathUnlocked(
+      const YBTable* table,
+      const std::string& partition_key) REQUIRES_SHARED(mutex_);
 
   RemoteTabletPtr LookupTabletByIdFastPath(const TabletId& tablet_id);
 
@@ -321,9 +403,7 @@ class MetaCache : public RefCountedThreadSafe<MetaCache> {
   //
   // This is called when we get some response from the master which contains
   // the latest host/port info for a server.
-  //
-  // NOTE: Must be called with lock_ held.
-  void UpdateTabletServerUnlocked(const master::TSInfoPB& pb);
+  void UpdateTabletServerUnlocked(const master::TSInfoPB& pb) REQUIRES(mutex_);
 
   // Notify appropriate callbacks that lookup of specified partition group of specified table
   // was failed because of specified status.
@@ -334,11 +414,10 @@ class MetaCache : public RefCountedThreadSafe<MetaCache> {
   bool FastLookupTabletByKeyUnlocked(
       const YBTable* table,
       const std::string& partition_start,
-      RemoteTabletPtr* remote_tablet,
-      const StatusCallback& callback,
-      Lock* lock);
+      const LookupTabletCallback& callback,
+      Lock* lock) REQUIRES_SHARED(mutex_);
 
-  YBClient* client_;
+  YBClient* const client_;
 
   boost::shared_mutex mutex_;
 
@@ -348,7 +427,7 @@ class MetaCache : public RefCountedThreadSafe<MetaCache> {
   // evict entries from this map until the MetaCache is destructed. So, no need to use
   // shared_ptr, etc.
   //
-  // Protected by lock_.
+  // Protected by mutex_.
   TabletServerMap ts_cache_;
 
   // Local tablet server.
@@ -358,13 +437,11 @@ class MetaCache : public RefCountedThreadSafe<MetaCache> {
   //
   // Protected by mutex_.
   struct LookupData {
-    StatusCallback callback;
-    RemoteTabletPtr* remote_tablet;
-    MonoTime deadline;
+    LookupTabletCallback callback;
+    CoarseTimePoint deadline;
 
     std::string ToString() const {
-      return Format("{ remote_tablet: $0 deadline: $1 }",
-                    static_cast<void*>(remote_tablet), deadline);
+      return Format("{ deadline: $1 }", deadline);
     }
   };
 
@@ -377,12 +454,10 @@ class MetaCache : public RefCountedThreadSafe<MetaCache> {
     std::unordered_map<PartitionGroupKey, PartitionToLookupData> tablet_lookups_by_group;
   };
 
-  std::unordered_map<TableId, TableData> tables_;
+  std::unordered_map<TableId, TableData> tables_ GUARDED_BY(mutex_);
 
   // Cache of tablets, keyed by tablet ID.
-  //
-  // Protected by lock_
-  std::unordered_map<std::string, RemoteTabletPtr> tablets_by_id_;
+  std::unordered_map<std::string, RemoteTabletPtr> tablets_by_id_ GUARDED_BY(mutex_);
 
   // Prevents master lookup "storms" by delaying master lookups when all
   // permits have been acquired.
@@ -396,4 +471,5 @@ class MetaCache : public RefCountedThreadSafe<MetaCache> {
 } // namespace internal
 } // namespace client
 } // namespace yb
+
 #endif /* YB_CLIENT_META_CACHE_H */

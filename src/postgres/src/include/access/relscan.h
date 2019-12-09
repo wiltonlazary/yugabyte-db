@@ -4,7 +4,7 @@
  *	  POSTGRES relation scan descriptor definitions.
  *
  *
- * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/relscan.h
@@ -20,6 +20,7 @@
 #include "access/itup.h"
 #include "access/tupdesc.h"
 #include "storage/spin.h"
+#include "ybcam.h"
 
 /*
  * Shared state for parallel heap scan.
@@ -35,11 +36,13 @@ typedef struct ParallelHeapScanDescData
 	Oid			phs_relid;		/* OID of relation to scan */
 	bool		phs_syncscan;	/* report location to syncscan logic? */
 	BlockNumber phs_nblocks;	/* # blocks in relation at start of scan */
-	slock_t		phs_mutex;		/* mutual exclusion for block number fields */
+	slock_t		phs_mutex;		/* mutual exclusion for setting startblock */
 	BlockNumber phs_startblock; /* starting block number */
-	BlockNumber phs_cblock;		/* current block number */
+	pg_atomic_uint64 phs_nallocated;	/* number of blocks allocated to
+										 * workers so far. */
+	bool		phs_snapshot_any;	/* SnapshotAny, not phs_snapshot_data? */
 	char		phs_snapshot_data[FLEXIBLE_ARRAY_MEMBER];
-}			ParallelHeapScanDescData;
+} ParallelHeapScanDescData;
 
 typedef struct HeapScanDescData
 {
@@ -75,6 +78,7 @@ typedef struct HeapScanDescData
 	int			rs_cindex;		/* current tuple's index in vistuples */
 	int			rs_ntuples;		/* number of visible tuples on page */
 	OffsetNumber rs_vistuples[MaxHeapTuplesPerPage];	/* their offsets */
+	YbScanDesc	ybscan;			/* only valid in yb-scan case */
 }			HeapScanDescData;
 
 /*
@@ -137,6 +141,24 @@ typedef struct IndexScanDescData
 
 	/* parallel index scan information, in shared memory */
 	ParallelIndexScanDesc parallel_scan;
+
+	/* During execution, Postgres will push down hints to YugaByte for performance purpose.
+	 * (currently, only LIMIT values are being pushed down). All these execution information will
+	 * kept in "yb_exec_params".
+	 *
+	 * - Generally, "yb_exec_params" is kept in execution-state. As Postgres executor traverses and
+	 *   excutes the nodes, it passes along the execution state. Necessary information (such as
+	 *   LIMIT values) will be collected and written to "yb_exec_params" in EState.
+	 *
+	 * - However, IndexScan execution doesn't use Postgres's node execution infrastructure. Neither
+	 *   execution plan nor execution state is passed to IndexScan operators. As a result,
+	 *   "yb_exec_params" is kept in "IndexScanDescData" to avoid passing EState to a lot of
+	 *   IndexScan functions.
+	 *
+	 * - Postgres IndexScan function will call and pass "yb_exec_params" to PgGate to control the
+	 *   index-scan execution in YugaByte.
+	 */
+	YBCPgExecParameters *yb_exec_params;
 }			IndexScanDescData;
 
 /* Generic structure for parallel scans */
@@ -152,10 +174,11 @@ typedef struct ParallelIndexScanDescData
 typedef struct SysScanDescData
 {
 	Relation	heap_rel;		/* catalog being scanned */
-	Relation	irel;			/* NULL if doing heap scan */
+	Relation	irel;			/* NULL if doing heap or yb scan */
 	HeapScanDesc scan;			/* only valid in heap-scan case */
 	IndexScanDesc iscan;		/* only valid in index-scan case */
 	Snapshot	snapshot;		/* snapshot to unregister at end of scan */
+	YbScanDesc	ybscan;			/* only valid in yb-scan case */
 }			SysScanDescData;
 
 #endif							/* RELSCAN_H */

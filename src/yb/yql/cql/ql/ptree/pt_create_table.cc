@@ -18,6 +18,8 @@
 #include "yb/yql/cql/ql/ptree/pt_create_table.h"
 #include "yb/yql/cql/ql/ptree/sem_context.h"
 
+DECLARE_bool(use_cassandra_authentication);
+
 namespace yb {
 namespace ql {
 
@@ -53,6 +55,14 @@ CHECKED_STATUS PTCreateTable::Analyze(SemContext *sem_context) {
   // Processing table name.
   RETURN_NOT_OK(relation_->AnalyzeName(sem_context, OBJECT_TABLE));
 
+  // For creating an index operation, SemContext::LookupTable should have already checked that the
+  // current role has the ALTER permission on the table. We don't need to check for any additional
+  // permissions for this operation.
+  if (FLAGS_use_cassandra_authentication && opcode() != TreeNodeOpcode::kPTCreateIndex) {
+    RETURN_NOT_OK(sem_context->CheckHasKeyspacePermission(loc(), PermissionType::CREATE_PERMISSION,
+                                                          yb_table_name().namespace_name()));
+  }
+
   // Save context state, and set "this" as current column in the context.
   SymbolEntry cached_entry = *sem_context->current_processing_id();
   sem_context->set_current_create_table_stmt(this);
@@ -62,6 +72,7 @@ CHECKED_STATUS PTCreateTable::Analyze(SemContext *sem_context) {
   // - Process all other elements afterward.
   sem_state.set_processing_column_definition(true);
   RETURN_NOT_OK(elements_->Analyze(sem_context));
+
   sem_state.set_processing_column_definition(false);
   RETURN_NOT_OK(elements_->Analyze(sem_context));
 
@@ -131,18 +142,14 @@ CHECKED_STATUS PTCreateTable::Analyze(SemContext *sem_context) {
   return Status::OK();
 }
 
-namespace {
-
-bool ColumnExists(const MCList<PTColumnDefinition *>& columns, const PTColumnDefinition* column) {
+bool PTCreateTable::ColumnExists(const MCList<PTColumnDefinition *>& columns,
+                                 const PTColumnDefinition* column) {
   return std::find(columns.begin(), columns.end(), column) != columns.end();
 }
-
-} // namespace
 
 CHECKED_STATUS PTCreateTable::AppendColumn(SemContext *sem_context,
                                            PTColumnDefinition *column,
                                            const bool check_duplicate) {
-  RETURN_NOT_OK(CheckType(sem_context, column->datatype()));
   if (check_duplicate && ColumnExists(columns_, column)) {
     return sem_context->Error(column, ErrorCode::DUPLICATE_COLUMN);
   }
@@ -157,7 +164,9 @@ CHECKED_STATUS PTCreateTable::AppendColumn(SemContext *sem_context,
 CHECKED_STATUS PTCreateTable::AppendPrimaryColumn(SemContext *sem_context,
                                                   PTColumnDefinition *column,
                                                   const bool check_duplicate) {
-  RETURN_NOT_OK(CheckPrimaryType(sem_context, column->datatype()));
+  // The column and its datatype should already have been analyzed at this point.
+  // Check if the column can be used as primary column.
+  RETURN_NOT_OK(CheckPrimaryType(sem_context, column));
   if (check_duplicate && ColumnExists(primary_columns_, column)) {
     return sem_context->Error(column, ErrorCode::DUPLICATE_COLUMN);
   }
@@ -169,7 +178,9 @@ CHECKED_STATUS PTCreateTable::AppendPrimaryColumn(SemContext *sem_context,
 CHECKED_STATUS PTCreateTable::AppendHashColumn(SemContext *sem_context,
                                                PTColumnDefinition *column,
                                                const bool check_duplicate) {
-  RETURN_NOT_OK(CheckPrimaryType(sem_context, column->datatype()));
+  // The column and its datatype should already have been analyzed at this point.
+  // Check if the column can be used as hash column.
+  RETURN_NOT_OK(CheckPrimaryType(sem_context, column));
   if (check_duplicate && ColumnExists(hash_columns_, column)) {
     return sem_context->Error(column, ErrorCode::DUPLICATE_COLUMN);
   }
@@ -179,20 +190,11 @@ CHECKED_STATUS PTCreateTable::AppendHashColumn(SemContext *sem_context,
 }
 
 CHECKED_STATUS PTCreateTable::CheckPrimaryType(SemContext *sem_context,
-                                               const PTBaseType::SharedPtr& datatype) {
-  RETURN_NOT_OK(CheckType(sem_context, datatype));
-  if (!QLType::IsValidPrimaryType(datatype->ql_type()->main())) {
-    return sem_context->Error(datatype, ErrorCode::INVALID_PRIMARY_COLUMN_TYPE);
+                                               const PTColumnDefinition *column) const {
+  // Column must have been analyzed. Check if its datatype is allowed for primary column.
+  if (!QLType::IsValidPrimaryType(column->ql_type()->main())) {
+    return sem_context->Error(column, ErrorCode::INVALID_PRIMARY_COLUMN_TYPE);
   }
-  return Status::OK();
-}
-
-CHECKED_STATUS PTCreateTable::CheckType(SemContext *sem_context,
-                                        const PTBaseType::SharedPtr& datatype) {
-  // Although simple datatypes don't need further checking, complex datatypes such as collections,
-  // tuples, and user-defined datatypes need to be analyzed because they have members.
-  RETURN_NOT_OK(datatype->Analyze(sem_context));
-
   return Status::OK();
 }
 
@@ -224,10 +226,13 @@ void PTCreateTable::PrintSemanticAnalysisResult(SemContext *sem_context) {
       sem_output += " <Hash key, Type = ";
     } else if (column->is_primary_key()) {
       sem_output += " <Primary key, ";
+      using SortingType = ColumnSchema::SortingType;
       switch (column->sorting_type()) {
-        case ColumnSchema::SortingType::kNotSpecified: sem_output += "None"; break;
-        case ColumnSchema::SortingType::kAscending: sem_output += "Asc"; break;
-        case ColumnSchema::SortingType::kDescending: sem_output += "Desc"; break;
+        case SortingType::kNotSpecified: sem_output += "None"; break;
+        case SortingType::kAscending: sem_output += "Asc"; break;
+        case SortingType::kDescending: sem_output += "Desc"; break;
+        case SortingType::kAscendingNullsLast: sem_output += "Asc nulls last"; break;
+        case SortingType::kDescendingNullsLast: sem_output += "Desc nulls last"; break;
       }
       sem_output += ", Type = ";
     } else {
@@ -254,51 +259,6 @@ CHECKED_STATUS PTCreateTable::ToTableProperties(TableProperties *table_propertie
 
 //--------------------------------------------------------------------------------------------------
 
-PTColumnDefinition::PTColumnDefinition(MemoryContext *memctx,
-                                       YBLocation::SharedPtr loc,
-                                       const MCSharedPtr<MCString>& name,
-                                       const PTBaseType::SharedPtr& datatype,
-                                       const PTListNode::SharedPtr& qualifiers)
-    : TreeNode(memctx, loc),
-      name_(name),
-      datatype_(datatype),
-      qualifiers_(qualifiers),
-      is_primary_key_(false),
-      is_hash_key_(false),
-      is_static_(false),
-      order_(-1),
-      sorting_type_(ColumnSchema::SortingType::kNotSpecified) {
-}
-
-PTColumnDefinition::~PTColumnDefinition() {
-}
-
-CHECKED_STATUS PTColumnDefinition::Analyze(SemContext *sem_context) {
-  if (!sem_context->processing_column_definition()) {
-    return Status::OK();
-  }
-
-  // Save context state, and set "this" as current column in the context.
-  SymbolEntry cached_entry = *sem_context->current_processing_id();
-  sem_context->set_current_column(this);
-
-  // Analyze column qualifiers.
-  RETURN_NOT_OK(sem_context->MapSymbol(*name_, this));
-  if (qualifiers_ != nullptr) {
-    RETURN_NOT_OK(qualifiers_->Analyze(sem_context));
-  }
-
-  // Add the analyzed column to table.
-  PTCreateTable *table = sem_context->current_create_table_stmt();
-  RETURN_NOT_OK(table->AppendColumn(sem_context, this));
-
-  // Restore the context value as we are done with this colummn.
-  sem_context->set_current_processing_id(cached_entry);
-  return Status::OK();
-}
-
-//--------------------------------------------------------------------------------------------------
-
 PTPrimaryKey::PTPrimaryKey(MemoryContext *memctx,
                            YBLocation::SharedPtr loc,
                            const PTListNode::SharedPtr& columns)
@@ -308,6 +268,18 @@ PTPrimaryKey::PTPrimaryKey(MemoryContext *memctx,
 
 PTPrimaryKey::~PTPrimaryKey() {
 }
+
+namespace {
+
+CHECKED_STATUS SetupKeyNodeFunc(PTIndexColumn *node, SemContext *sem_context) {
+  return node->SetupPrimaryKey(sem_context);
+}
+
+CHECKED_STATUS SetupNestedKeyNodeFunc(PTIndexColumn *node, SemContext *sem_context) {
+  return node->SetupHashKey(sem_context);
+}
+
+} // namespace
 
 CHECKED_STATUS PTPrimaryKey::Analyze(SemContext *sem_context) {
   if (sem_context->processing_column_definition() != is_column_element()) {
@@ -326,9 +298,10 @@ CHECKED_STATUS PTPrimaryKey::Analyze(SemContext *sem_context) {
     RETURN_NOT_OK(table->AppendHashColumn(sem_context, column));
   } else {
     // Decorate all name node of this key as this is a table constraint.
-    TreeNodeOperator<SemContext, PTName> func = &PTName::SetupPrimaryKey;
-    TreeNodeOperator<SemContext, PTName> nested_func = &PTName::SetupHashAndPrimaryKey;
-    RETURN_NOT_OK((columns_->Apply<SemContext, PTName>(sem_context, func, 1, 1, nested_func)));
+    TreeNodePtrOperator<SemContext, PTIndexColumn> func = &SetupKeyNodeFunc;
+    TreeNodePtrOperator<SemContext, PTIndexColumn> nested_func = &SetupNestedKeyNodeFunc;
+    RETURN_NOT_OK(
+        (columns_->Apply<SemContext, PTIndexColumn>(sem_context, func, 1, 1, nested_func)));
   }
   return Status::OK();
 }

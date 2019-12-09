@@ -35,6 +35,7 @@
 
 #include <atomic>
 #include <string>
+#include <thread>
 
 #include <gtest/gtest.h>
 
@@ -45,6 +46,7 @@
 #include "yb/util/result.h"
 #include "yb/util/port_picker.h"
 #include "yb/util/test_macros.h"
+#include "yb/util/thread.h"
 #include "yb/util/tsan_util.h"
 
 #define ASSERT_EVENTUALLY(expr) do { \
@@ -53,6 +55,11 @@
 } while (0)
 
 namespace yb {
+namespace rpc {
+
+class Messenger;
+
+} // namespace rpc
 
 // Our test string literals contain "\x00" that is treated as a C-string null-terminator.
 // So we need to call the std::string constructor that takes the length argument.
@@ -155,7 +162,7 @@ void LogVectorDiff(const std::vector<T>& expected, const std::vector<T>& actual)
   int num_differences_logged = 0;
   size_t num_differences_left = 0;
   size_t min_size = min(expected.size(), actual.size());
-  for (int i = 0; i < min_size; ++i) {
+  for (size_t i = 0; i < min_size; ++i) {
     if (expected[i] != actual[i]) {
       if (num_differences_logged < 16) {
         LOG(WARNING) << "expected[" << i << "]: " << expected[i];
@@ -202,16 +209,120 @@ CHECKED_STATUS WaitFor(
     double delay_multiplier = test_util::kDefaultWaitDelayMultiplier,
     MonoDelta max_delay = MonoDelta::FromMilliseconds(test_util::kDefaultMaxWaitDelayMs));
 
+void AssertLoggedWaitFor(
+    std::function<Result<bool>()> condition,
+    MonoDelta timeout,
+    const string& description,
+    MonoDelta initial_delay = MonoDelta::FromMilliseconds(test_util::kDefaultInitialWaitMs),
+    double delay_multiplier = test_util::kDefaultWaitDelayMultiplier,
+    MonoDelta max_delay = MonoDelta::FromMilliseconds(test_util::kDefaultMaxWaitDelayMs));
+
+CHECKED_STATUS LoggedWaitFor(
+    std::function<Result<bool>()> condition,
+    MonoDelta timeout,
+    const string& description,
+    MonoDelta initial_delay = MonoDelta::FromMilliseconds(test_util::kDefaultInitialWaitMs),
+    double delay_multiplier = test_util::kDefaultWaitDelayMultiplier,
+    MonoDelta max_delay = MonoDelta::FromMilliseconds(test_util::kDefaultMaxWaitDelayMs));
+
 // Return the path of a yb-tool.
 std::string GetToolPath(const std::string& tool_name);
 
 int CalcNumTablets(int num_tablet_servers);
 
-template <class U, class T>
-void SetAtomicFlag(U value, T* flag) {
-  std::atomic<T>& atomic_flag = *pointer_cast<std::atomic<T>*>(flag);
-  atomic_flag.store(value);
-}
+class StopOnFailure {
+ public:
+  explicit StopOnFailure(std::atomic<bool>* stop) : stop_(*stop) {}
+
+  StopOnFailure(const StopOnFailure&) = delete;
+  void operator=(const StopOnFailure&) = delete;
+
+  ~StopOnFailure() {
+    if (!success_) {
+      stop_.store(true, std::memory_order_release);
+    }
+  }
+
+  void Success() {
+    success_ = true;
+  }
+ private:
+  bool success_ = false;
+  std::atomic<bool>& stop_;
+};
+
+// Waits specified duration or when stop switches to true.
+void WaitStopped(const CoarseDuration& duration, std::atomic<bool>* stop);
+
+class SetFlagOnExit {
+ public:
+  explicit SetFlagOnExit(std::atomic<bool>* stop_flag)
+      : stop_flag_(stop_flag) {}
+
+  ~SetFlagOnExit() {
+    stop_flag_->store(true, std::memory_order_release);
+  }
+
+ private:
+  std::atomic<bool>* stop_flag_;
+};
+
+// Holds vector of threads, and provides convenient utilities. Such as JoinAll, Wait etc.
+class TestThreadHolder {
+ public:
+  ~TestThreadHolder() {
+    stop_flag_.store(true, std::memory_order_release);
+    JoinAll();
+  }
+
+  template <class... Args>
+  void AddThread(Args&&... args) {
+    threads_.emplace_back(std::forward<Args>(args)...);
+  }
+
+  void AddThread(std::thread thread) {
+    threads_.push_back(std::move(thread));
+  }
+
+  template <class Functor>
+  void AddThreadFunctor(const Functor& functor) {
+    AddThread([&stop = stop_flag_, functor] {
+      CDSAttacher attacher;
+      SetFlagOnExit set_stop_on_exit(&stop);
+      functor();
+    });
+  }
+
+  void Wait(const CoarseDuration& duration) {
+    yb::WaitStopped(duration, &stop_flag_);
+  }
+
+  void JoinAll() {
+    for (auto& thread : threads_) {
+      if (thread.joinable()) {
+        thread.join();
+      }
+    }
+  }
+
+  void WaitAndStop(const CoarseDuration& duration) {
+    yb::WaitStopped(duration, &stop_flag_);
+    Stop();
+  }
+
+  void Stop() {
+    stop_flag_.store(true, std::memory_order_release);
+    JoinAll();
+  }
+
+  std::atomic<bool>& stop_flag() {
+    return stop_flag_;
+  }
+
+ private:
+  std::atomic<bool> stop_flag_{false};
+  std::vector<std::thread> threads_;
+};
 
 } // namespace yb
 

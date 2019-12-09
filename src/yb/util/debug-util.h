@@ -38,7 +38,8 @@
 #include <vector>
 
 #include "yb/gutil/strings/fastmem.h"
-#include "yb/util/status.h"
+#include "yb/util/result.h"
+#include "yb/util/thread.h"
 
 namespace yb {
 
@@ -69,7 +70,7 @@ Status SetStackTraceSignal(int signum);
 //
 // This function is thread-safe but coarsely synchronized: only one "dumper" thread
 // may be active at a time.
-std::string DumpThreadStack(int64_t tid);
+std::string DumpThreadStack(ThreadIdForStack tid);
 
 // Return the current stack trace, stringified.
 std::string GetStackTrace(
@@ -99,10 +100,7 @@ inline std::string GetStackTraceWithoutTopFrame() {
 std::string GetStackTraceHex();
 
 // This is the same as GetStackTraceHex(), except multi-line in a format that
-// looks very similar to GetStackTrace() but without symbols. Because it's in
-// that format, the tool stacktrace_addr2line.pl in the yb build-support
-// directory can symbolize it automatically (to the extent that addr2line(1)
-// is able to find the symbols).
+// looks very similar to GetStackTrace() but without symbols.
 std::string GetLogFormatStackTraceHex();
 
 // Collect the current stack trace in hex form into the given buffer.
@@ -124,16 +122,6 @@ class StackTrace {
 
   void Reset() {
     num_frames_ = 0;
-  }
-
-  void CopyFrom(const StackTrace& s) {
-    memcpy(this, &s, sizeof(s));
-  }
-
-  bool Equals(const StackTrace& s) {
-    return s.num_frames_ == num_frames_ &&
-      strings::memeq(frames_, s.frames_,
-                     num_frames_ * sizeof(frames_[0]));
   }
 
   // Collect and store the current stack trace. Skips the top 'skip_frames' frames
@@ -177,6 +165,23 @@ class StackTrace {
 
   uint64_t HashCode() const;
 
+  explicit operator bool() const {
+    return num_frames_ != 0;
+  }
+
+  bool operator!() const {
+    return num_frames_ == 0;
+  }
+
+  int compare(const StackTrace& rhs) const {
+    return as_slice().compare(rhs.as_slice());
+  }
+
+  Slice as_slice() const {
+    return Slice(pointer_cast<const char*>(frames_),
+                 pointer_cast<const char*>(frames_ + num_frames_));
+  }
+
  private:
   enum {
     // The maximum number of stack frames to collect.
@@ -188,7 +193,23 @@ class StackTrace {
 
   int num_frames_;
   void* frames_[kMaxFrames];
+
+  friend inline bool operator==(const StackTrace& lhs, const StackTrace& rhs) {
+    return lhs.num_frames_ == rhs.num_frames_ && lhs.as_slice() == rhs.as_slice();
+  }
+
+  friend inline bool operator!=(const StackTrace& lhs, const StackTrace& rhs) {
+    return !(lhs == rhs);
+  }
+
+  friend inline bool operator<(const StackTrace& lhs, const StackTrace& rhs) {
+    return lhs.compare(rhs) < 0;
+  }
 };
+
+Result<StackTrace> ThreadStack(ThreadIdForStack tid);
+// tids should be ordered
+std::vector<Result<StackTrace>> ThreadStacks(const std::vector<ThreadIdForStack>& tids);
 
 constexpr bool IsDebug() {
 #ifdef NDEBUG
@@ -216,11 +237,30 @@ class ScopeLogger {
   std::function<void()> on_scope_bounds_;
 };
 
-std::string GetClassNameStr(void* p);
-
 std::string SymbolizeAddress(
     void *pc,
     const StackTraceLineFormat stack_trace_line_format = StackTraceLineFormat::DEFAULT);
+
+// Demangle a C++-mangled identifier.
+std::string DemangleName(const char* name);
+
+struct SourceLocation {
+  const char* file_name;
+  int line_number;
+
+  std::string ToString() const;
+};
+
+#define SOURCE_LOCATION() SourceLocation {__FILE__, __LINE__}
+
+#define TEST_PAUSE_IF_FLAG(flag_name) \
+    if (PREDICT_FALSE(ANNOTATE_UNPROTECTED_READ(BOOST_PP_CAT(FLAGS_, flag_name)))) { \
+      LOG(INFO) << "Pausing due to flag " << #flag_name; \
+      do { \
+        SleepFor(MonoDelta::FromMilliseconds(100)); \
+      } while (ANNOTATE_UNPROTECTED_READ(BOOST_PP_CAT(FLAGS_, flag_name))); \
+      LOG(INFO) << "Resuming due to flag " << #flag_name; \
+    }
 
 } // namespace yb
 

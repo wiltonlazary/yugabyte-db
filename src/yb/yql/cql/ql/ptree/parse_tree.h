@@ -22,6 +22,7 @@
 #define YB_YQL_CQL_QL_PTREE_PARSE_TREE_H_
 
 #include "yb/client/yb_table_name.h"
+#include "yb/util/mem_tracker.h"
 #include "yb/yql/cql/ql/ptree/tree_node.h"
 #include "yb/yql/cql/ql/util/ql_env.h"
 
@@ -40,7 +41,8 @@ class ParseTree {
   // Public functions.
 
   // Constructs a parse tree. The parse tree saves a reference to the statement string.
-  ParseTree(const std::string& stmt, bool reparsed, const MemTrackerPtr& mem_tracker = nullptr);
+  ParseTree(const std::string& stmt, bool reparsed, const MemTrackerPtr& mem_tracker = nullptr,
+            const bool internal = false);
   ~ParseTree();
 
   // Run semantics analysis.
@@ -81,8 +83,13 @@ class ParseTree {
   bool stale() const {
     return stale_;
   }
+
   void set_stale() const {
     stale_ = true;
+  }
+
+  bool internal() const {
+    return internal_;
   }
 
   // Add table to the set of tables used during semantic analysis.
@@ -102,7 +109,7 @@ class ParseTree {
   const std::string& stmt_;
 
   // Has this statement been reparsed?
-  mutable bool reparsed_ = false;
+  mutable std::atomic<bool> reparsed_ = {false};
 
   std::shared_ptr<BufferAllocator> buffer_allocator_;
 
@@ -130,6 +137,9 @@ class ParseTree {
 
   // Is this parse tree stale?
   mutable bool stale_ = false;
+
+  // Was this generated internally? Used to to bypass authorization enforcement.
+  bool internal_ = false;
 };
 
 }  // namespace ql

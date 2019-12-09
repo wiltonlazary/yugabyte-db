@@ -75,6 +75,7 @@ public abstract class YRpc<R> {
   protected static final String MASTER_SERVICE_NAME = "yb.master.MasterService";
   protected static final String TABLET_SERVER_SERVICE_NAME = "yb.tserver.TabletServerService";
   protected static final String CONSENSUS_SERVICE_NAME = "yb.consensus.ConsensusService";
+  protected static final String CDC_SERVICE_NAME = "yb.cdc.CDCService";
 
   public interface HasKey {
     /**
@@ -110,6 +111,9 @@ public abstract class YRpc<R> {
    * the rest of the code, due to other existing synchronization.
    */
   byte attempt;  // package-private for TabletClient and AsyncYBClient only.
+
+  // Maximum number of attempts to try the RPC. Default 100 times.
+  byte maxAttempts = 100;
 
   // Whether or not retries for this RPC should always go to the same server. This is required in
   // some cases where we do not want the RPC retries to hit a different server serving the same
@@ -242,6 +246,7 @@ public abstract class YRpc<R> {
       buf.append(tablet.getTabletIdAsString());
     }
     buf.append(", attempt=").append(attempt);
+    buf.append(", maxAttempts=").append(maxAttempts);
     buf.append(", ").append(deadlineTracker);
     buf.append(", ").append(deferred);
     buf.append(')');

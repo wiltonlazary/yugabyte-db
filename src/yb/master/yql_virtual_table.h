@@ -42,26 +42,26 @@ class YQLVirtualTable : public common::YQLStorageIf {
 
   // Retrieves all the data for the yql virtual table in form of a QLRowBlock. This data is then
   // used by the iterator.
-  virtual CHECKED_STATUS RetrieveData(const QLReadRequestPB& request,
-                                      std::unique_ptr<QLRowBlock>* vtable) const = 0;
+  virtual Result<std::shared_ptr<QLRowBlock>> RetrieveData(
+      const QLReadRequestPB& request) const = 0;
 
   CHECKED_STATUS GetIterator(const QLReadRequestPB& request,
                              const Schema& projection,
                              const Schema& schema,
                              const TransactionOperationContextOpt& txn_op_context,
-                             MonoTime deadline,
+                             CoarseTimePoint deadline,
                              const ReadHybridTime& read_time,
                              const common::QLScanSpec& spec,
                              std::unique_ptr<common::YQLRowwiseIteratorIf>* iter) const override;
 
-  CHECKED_STATUS BuildYQLScanSpec(const QLReadRequestPB& request,
-                                  const ReadHybridTime& read_time,
-                                  const Schema& schema,
-                                  bool include_static_columns,
-                                  const Schema& static_projection,
-                                  std::unique_ptr<common::QLScanSpec>* spec,
-                                  std::unique_ptr<common::QLScanSpec>* static_row_spec,
-                                  ReadHybridTime* req_read_time) const override;
+  CHECKED_STATUS BuildYQLScanSpec(
+      const QLReadRequestPB& request,
+      const ReadHybridTime& read_time,
+      const Schema& schema,
+      bool include_static_columns,
+      const Schema& static_projection,
+      std::unique_ptr<common::QLScanSpec>* spec,
+      std::unique_ptr<common::QLScanSpec>* static_row_spec) const override;
 
   //------------------------------------------------------------------------------------------------
   // PGSQL Support.
@@ -71,20 +71,10 @@ class YQLVirtualTable : public common::YQLStorageIf {
                              const Schema& projection,
                              const Schema& schema,
                              const TransactionOperationContextOpt& txn_op_context,
-                             MonoTime deadline,
+                             CoarseTimePoint deadline,
                              const ReadHybridTime& read_time,
-                             const common::PgsqlScanSpec& spec,
                              common::YQLRowwiseIteratorIf::UniPtr* iter) const override {
-    LOG(FATAL) << "Postgresql system tables are not yet implemented";
-    return Status::OK();
-  }
-
-  CHECKED_STATUS BuildYQLScanSpec(const PgsqlReadRequestPB& request,
-                                  const ReadHybridTime& read_time,
-                                  const Schema& schema,
-                                  std::unique_ptr<common::PgsqlScanSpec>* spec,
-                                  ReadHybridTime* req_read_time) const override {
-    LOG(FATAL) << "Postgresql system tables are not yet implemented";
+    LOG(FATAL) << "Postgresql virtual tables are not yet implemented";
     return Status::OK();
   }
 
@@ -98,7 +88,7 @@ class YQLVirtualTable : public common::YQLStorageIf {
       return STATUS_SUBSTITUTE(NotFound, "Couldn't find column $0 in schema", col_name);
     }
     const DataType data_type = schema_.column(column_index).type_info()->type();
-    *(row->mutable_column(column_index)) = util::GetValue(value, data_type);
+    row->SetColumn(column_index, util::GetValue(value, data_type));
     return Status::OK();
   }
 

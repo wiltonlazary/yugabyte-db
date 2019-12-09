@@ -39,8 +39,9 @@
 
 #include "yb/common/partition.h"
 #include "yb/common/schema.h"
-#include "yb/consensus/metadata.pb.h"
+#include "yb/consensus/consensus.h"
 #include "yb/consensus/consensus.pb.h"
+#include "yb/consensus/metadata.pb.h"
 #include "yb/fs/fs_manager.h"
 #include "yb/master/master.pb.h"
 #include "yb/tablet/tablet_peer.h"
@@ -97,6 +98,12 @@ class TsTabletManagerTest : public YBTest {
 
     tablet_manager_ = mini_server_->server()->tablet_manager();
     fs_manager_ = mini_server_->server()->fs_manager();
+  }
+
+  void TearDown() override {
+    if (mini_server_) {
+      mini_server_->Shutdown();
+    }
   }
 
   Status CreateNewTablet(const std::string& tablet_id,
@@ -173,7 +180,7 @@ TEST_F(TsTabletManagerTest, TestProperBackgroundFlushOnStartup) {
     replicate_ptr->set_hybrid_time(peer->clock().Now().ToUint64());
     ConsensusRoundPtr round(new ConsensusRound(peer->consensus(), std::move(replicate_ptr)));
     consensus_rounds.emplace_back(round);
-    ASSERT_OK(peer->consensus()->Replicate(round));
+    ASSERT_OK(peer->consensus()->TEST_Replicate(round));
   }
 
   for (int i = 0; i < kNumRestarts; ++i) {

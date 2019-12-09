@@ -24,9 +24,7 @@
 namespace yb {
 namespace rpc {
 
-ConnectionContextWithCallId::ConnectionContextWithCallId(GrowableBufferAllocator* allocator)
-    : ConnectionContextBase(allocator) {
-}
+ConnectionContextWithCallId::ConnectionContextWithCallId() {}
 
 void ConnectionContextWithCallId::DumpPB(const DumpRunningRpcsRequestPB& req,
                                          RpcConnectionPB* resp) {
@@ -63,7 +61,7 @@ void ConnectionContextWithCallId::Shutdown(const Status& status) {
 }
 
 void ConnectionContextWithCallId::CallProcessed(InboundCall* call) {
-  DCHECK(call->connection()->reactor()->IsCurrentThreadOrClosed());
+  DCHECK(call->connection()->reactor()->IsCurrentThreadOrStartedClosing());
 
   ++processed_call_count_;
   auto id = ExtractCallId(call);

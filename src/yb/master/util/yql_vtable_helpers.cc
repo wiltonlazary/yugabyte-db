@@ -11,8 +11,12 @@
 // under the License.
 //
 
-#include "yb/util/yb_partition.h"
 #include "yb/master/util/yql_vtable_helpers.h"
+
+#include "yb/common/ql_value.h"
+
+#include "yb/util/yb_partition.h"
+#include "yb/util/net/dns_resolver.h"
 
 namespace yb {
 namespace master {
@@ -80,25 +84,109 @@ QLValuePB GetReplicationValue(int replication_factor) {
   return value_pb;
 }
 
-Result<PublicPrivateIPs> GetPublicPrivateIPs(const TSInformationPB& ts_info) {
-  const auto& private_host = ts_info.registration().common().private_rpc_addresses()[0].host();
-  if (private_host.empty()) {
-    return STATUS_SUBSTITUTE(IllegalState,
-        "tserver $0 doesn't have any rpc addresses registered",
-        ts_info.tserver_instance().permanent_uuid());
-  }
-  const auto* broadcast_address = !ts_info.registration().common().broadcast_addresses().empty() ?
-      &ts_info.registration().common().broadcast_addresses()[0].host() : &private_host;
+PublicPrivateIPFutures GetPublicPrivateIPFutures(
+    const TSInformationPB& ts_info, Resolver* resolver) {
+  const auto& common = ts_info.registration().common();
+  PublicPrivateIPFutures result;
 
-  PublicPrivateIPs result;
-  RETURN_NOT_OK(result.private_ip.FromString(private_host));
-  if (broadcast_address != &private_host) {
-    RETURN_NOT_OK(result.public_ip.FromString(*broadcast_address));
+  const auto& private_host = common.private_rpc_addresses()[0].host();
+  if (private_host.empty()) {
+    std::promise<Result<InetAddress>> promise;
+    result.private_ip_future = promise.get_future();
+    promise.set_value(STATUS_FORMAT(
+        IllegalState, "Tablet sserver $0 doesn't have any rpc addresses registered",
+        ts_info.tserver_instance().permanent_uuid()));
+    return result;
+  }
+
+  result.private_ip_future = ResolveDnsFuture(private_host, resolver);
+
+  if (!common.broadcast_addresses().empty()) {
+    result.public_ip_future = ResolveDnsFuture(common.broadcast_addresses()[0].host(), resolver);
   } else {
-    result.public_ip = result.private_ip;
+    result.public_ip_future = result.private_ip_future;
   }
 
   return result;
+}
+
+const QLValuePB& GetValueHelper<QLValuePB>::Apply(
+    const QLValuePB& value_pb, const DataType data_type) {
+  return value_pb;
+}
+
+QLValuePB GetValueHelper<std::string>::Apply(const std::string& strval, const DataType data_type) {
+  QLValuePB value_pb;
+  switch (data_type) {
+    case STRING:
+      value_pb.set_string_value(strval);
+      break;
+    case BINARY:
+      value_pb.set_binary_value(strval);
+      break;
+    default:
+      LOG(ERROR) << "unexpected string type " << data_type;
+      break;
+  }
+  return value_pb;
+}
+
+QLValuePB GetValueHelper<std::string>::Apply(
+    const char* strval, size_t len, const DataType data_type) {
+  QLValuePB value_pb;
+  switch (data_type) {
+    case STRING:
+      value_pb.set_string_value(strval, len);
+      break;
+    case BINARY:
+      value_pb.set_binary_value(strval, len);
+      break;
+    default:
+      LOG(ERROR) << "unexpected string type " << data_type;
+      break;
+  }
+  return value_pb;
+}
+
+QLValuePB GetValueHelper<int32_t>::Apply(const int32_t intval, const DataType data_type) {
+  QLValuePB value_pb;
+  switch (data_type) {
+    case INT64:
+      value_pb.set_int64_value(intval);
+      break;
+    case INT32:
+      value_pb.set_int32_value(intval);
+      break;
+    case INT16:
+      value_pb.set_int16_value(intval);
+      break;
+    case INT8:
+      value_pb.set_int8_value(intval);
+      break;
+    default:
+      LOG(ERROR) << "unexpected int type " << data_type;
+      break;
+  }
+  return value_pb;
+}
+
+QLValuePB GetValueHelper<InetAddress>::Apply(
+    const InetAddress& inet_val, const DataType data_type) {
+  QLValuePB result;
+  QLValue::set_inetaddress_value(inet_val, &result);
+  return result;
+}
+
+QLValuePB GetValueHelper<Uuid>::Apply(const Uuid& uuid_val, const DataType data_type) {
+  QLValuePB result;
+  QLValue::set_uuid_value(uuid_val, &result);
+  return result;
+}
+
+QLValuePB GetValueHelper<bool>::Apply(const bool bool_val, const DataType data_type) {
+  QLValuePB value_pb;
+  value_pb.set_bool_value(bool_val);
+  return value_pb;
 }
 
 }  // namespace util

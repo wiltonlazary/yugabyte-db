@@ -21,15 +21,23 @@
 #include <gflags/gflags_declare.h>
 
 #include "yb/client/client.h"
+#include "yb/client/error.h"
+#include "yb/client/session.h"
 #include "yb/client/table_handle.h"
 #include "yb/client/yb_op.h"
 
 #include "yb/common/common.pb.h"
 #include "yb/common/partial_row.h"
+#include "yb/common/ql_value.h"
+
 #include "yb/gutil/strings/join.h"
 #include "yb/gutil/strings/split.h"
 #include "yb/gutil/strings/substitute.h"
+
+#include "yb/yql/redis/redisserver/redis_client.h"
+
 #include "yb/util/atomic.h"
+#include "yb/util/debug/leakcheck_disabler.h"
 #include "yb/util/env.h"
 #include "yb/util/flags.h"
 #include "yb/util/logging.h"
@@ -66,6 +74,7 @@ using yb::client::YBNoOp;
 using yb::client::YBSession;
 using yb::client::YBTable;
 using yb::client::YBValue;
+using yb::redisserver::RedisReply;
 
 DEFINE_bool(load_gen_verbose,
             false,
@@ -167,7 +176,7 @@ ostream& operator <<(ostream& out, const KeyIndexSet &key_index_set) {
 YBSessionFactory::YBSessionFactory(client::YBClient* client, client::TableHandle* table)
     : client_(client), table_(table) {}
 
-string YBSessionFactory::ClientId() { return client_->client_id(); }
+string YBSessionFactory::ClientId() { return client_->id().ToString(); }
 
 SingleThreadedWriter* YBSessionFactory::GetWriter(MultiThreadedWriter* writer, int idx) {
   return new YBSingleThreadedWriter(writer, client_, table_, idx);
@@ -231,6 +240,7 @@ string MultiThreadedAction::GetKeyByIndex(int64_t key_index) {
 
 // Creates a human-readable string with hex characters to be used as a value in our test. This is
 // deterministic based on key_index.
+DISABLE_UBSAN
 string MultiThreadedAction::GetValueByIndex(int64_t key_index) {
   string value;
   int64_t x = key_index;
@@ -329,11 +339,9 @@ void ConfigureRedisSessions(
   std::vector<string> addresses;
   SplitStringUsing(redis_server_addresses, ",", &addresses);
   for (auto& addr : addresses) {
-    shared_ptr<RedisClient> client(new RedisClient());
-    auto remote = ParseEndpoint(addr, 6379);
-    CHECK_OK(remote);
-    client->connect(remote->address().to_string(), remote->port());
-    clients->push_back(client);
+    auto remote = CHECK_RESULT(ParseEndpoint(addr, 6379));
+    clients->push_back(std::make_shared<RedisClient>(
+        remote.address().to_string(), remote.port()));
   }
 }
 
@@ -346,8 +354,8 @@ bool RedisSingleThreadedWriter::Write(
   bool success = false;
   auto writer_index = writer_index_;
   int64_t idx = key_index % clients_.size();
-  clients_[idx]->set(
-      key_str, value_str, [&success, key_index, writer_index](RedisReply& reply) {
+  clients_[idx]->Send(
+      {"SET", key_str, value_str}, [&success, key_index, writer_index](const RedisReply& reply) {
         if ("OK" == reply.as_string()) {
           VLOG(2) << "Writer " << writer_index << " Successfully inserted key #" << key_index
                   << " into redis ";
@@ -357,7 +365,7 @@ bool RedisSingleThreadedWriter::Write(
           success = false;
         }
       });
-  clients_[idx]->sync_commit();
+  clients_[idx]->Commit();
 
   return success;
 }
@@ -368,7 +376,7 @@ void RedisSingleThreadedWriter::HandleInsertionFailure(int64_t key_index, const 
 
 void RedisSingleThreadedWriter::CloseSession() {
   for (auto client : clients_) {
-    client->disconnect();
+    client->Disconnect();
   }
 }
 
@@ -377,7 +385,7 @@ bool RedisNoopSingleThreadedWriter::Write(
   bool success = false;
   auto writer_index = writer_index_;
   int64_t idx = key_index % clients_.size();
-  clients_[idx]->echo("OK", [&success, key_index, writer_index](RedisReply& reply) {
+  clients_[idx]->Send({"ECHO", "OK"}, [&success, key_index, writer_index](const RedisReply& reply) {
     if ("OK" == reply.as_string()) {
       VLOG(2) << "Writer " << writer_index << " Successfully inserted key #" << key_index
               << " into redis ";
@@ -387,7 +395,7 @@ bool RedisNoopSingleThreadedWriter::Write(
       success = false;
     }
   });
-  clients_[idx]->sync_commit();
+  clients_[idx]->Commit();
 
   return success;
 }
@@ -414,9 +422,17 @@ bool YBSingleThreadedWriter::Write(
   }
   Status flush_status = session_->Flush();
   if (!flush_status.ok()) {
+    for (const auto& error : session_->GetPendingErrors()) {
+      // It means that key was actually written successfully, but our retry failed because
+      // it was detected as duplicate request.
+      if (error->status().IsAlreadyPresent()) {
+        return true;
+      }
+      LOG(WARNING) << "Error inserting key '" << key_str << "': " << error->status();
+    }
+
     LOG(WARNING) << "Error inserting key '" << key_str << "': "
-                 << "Flush() failed"
-                 << " (" << flush_status.ToString() << ")";
+                 << "Flush() failed (" << flush_status << ")";
     return false;
   }
   if (insert->response().status() != QLResponsePB::YQL_STATUS_OK) {
@@ -551,7 +567,7 @@ void RedisSingleThreadedReader::ConfigureSession() {
 
 void RedisSingleThreadedReader::CloseSession() {
   for (auto client : clients_) {
-    client->disconnect();
+    client->Disconnect();
   }
 }
 
@@ -639,10 +655,12 @@ ReadStatus RedisSingleThreadedReader::PerformRead(
     int64_t key_index, const string& key_str, const string& expected_value_str) {
   string value_str;
   int64_t idx = key_index % clients_.size();
-  clients_[idx]->get(key_str, [&value_str](RedisReply& reply) { value_str = reply.as_string(); });
+  clients_[idx]->Send({"GET", key_str}, [&value_str](const RedisReply& reply) {
+    value_str = reply.as_string();
+  });
   VLOG(3) << "Trying to read key #" << key_index << " from redis "
           << " key : " << key_str;
-  clients_[idx]->sync_commit();
+  clients_[idx]->Commit();
 
   if (expected_value_str != value_str) {
     LOG(INFO) << "Read the wrong value for #" << key_index << " from redis "

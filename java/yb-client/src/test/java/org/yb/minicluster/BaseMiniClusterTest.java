@@ -10,10 +10,10 @@
  * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
  * or implied.  See the License for the specific language governing permissions and limitations
  * under the License.
- *
  */
 package org.yb.minicluster;
 
+import com.google.common.base.Preconditions;
 import com.google.common.net.HostAndPort;
 import org.junit.AfterClass;
 import org.junit.Before;
@@ -22,10 +22,13 @@ import org.slf4j.LoggerFactory;
 import org.yb.BaseYBTest;
 import org.yb.client.TestUtils;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
 
-import static org.junit.Assert.fail;
+import static org.yb.AssertionWrappers.fail;
 
 /**
  * A base class for tests using a MiniCluster.
@@ -34,16 +37,12 @@ public class BaseMiniClusterTest extends BaseYBTest {
 
   private static final Logger LOG = LoggerFactory.getLogger(BaseMiniClusterTest.class);
 
-  protected static final String NUM_MASTERS_PROP = "NUM_MASTERS";
+  // TODO: review the usage of the constants below.
+  protected static final int NUM_MASTERS = 3;
   protected static final int NUM_TABLET_SERVERS = 3;
-  protected static final int DEFAULT_NUM_MASTERS = 3;
+
   protected static final int STANDARD_DEVIATION_FACTOR = 2;
   protected static final int DEFAULT_TIMEOUT_MS = 50000;
-
-  // Number of masters that will be started for this test if we're starting
-  // a cluster.
-  protected static final int NUM_MASTERS =
-      Integer.getInteger(NUM_MASTERS_PROP, DEFAULT_NUM_MASTERS);
 
   /**
    * This is used as the default timeout when calling YB Java client's async API.
@@ -55,16 +54,43 @@ public class BaseMiniClusterTest extends BaseYBTest {
    */
   protected static MiniYBCluster miniCluster;
 
-  protected static List<String> masterArgs = null;
-  protected static List<String> tserverArgs = null;
+  protected static List<String> masterArgs = new ArrayList<String>();
+  protected static List<String> tserverArgs = new ArrayList<String>();
+
+  protected static Map<String, String> tserverEnvVars = new TreeMap<>();
+
+  protected boolean useIpWithCertificate = MiniYBCluster.DEFAULT_USE_IP_WITH_CERTIFICATE;
+
+  protected String certFile = null;
 
   // Comma separate describing the master addresses and ports.
   protected static String masterAddresses;
   protected static List<HostAndPort> masterHostPorts;
 
+  protected int getReplicationFactor() {
+    return -1;
+  }
+
+  protected int getInitialNumMasters() {
+    return -1;
+  }
+
+  protected int getInitialNumTServers() {
+    return -1;
+  }
+
   // Subclasses can override this to set the number of shards per tablet server.
   protected int overridableNumShardsPerTServer() {
     return MiniYBCluster.DEFAULT_NUM_SHARDS_PER_TSERVER;
+  }
+
+  /** This allows subclasses to optionally skip the usage of a mini-cluster in a test. */
+  protected boolean miniClusterEnabled() {
+    return true;
+  }
+
+  protected void customizeMiniClusterBuilder(MiniYBClusterBuilder builder) {
+    Preconditions.checkNotNull(builder);
   }
 
   /**
@@ -80,14 +106,23 @@ public class BaseMiniClusterTest extends BaseYBTest {
    */
   @Before
   public void setUpBefore() throws Exception {
+    if (!miniClusterEnabled()) {
+      return;
+    }
     TestUtils.clearReservedPorts();
     if (miniCluster == null) {
       createMiniCluster();
     }
   }
 
-  // Helper function to wait for existing tservers to heartbeat to master leader.
+  /**
+   * A helper function to wait for existing tservers to heartbeat to master leader.
+   * @return true if the number of tablet servers found is as expected
+   */
   public boolean waitForTServersAtMasterLeader() throws Exception {
+    if (!miniClusterEnabled()) {
+      return true;
+    }
     return miniCluster.waitForTabletServers(miniCluster.getTabletServers().size());
   }
 
@@ -95,29 +130,58 @@ public class BaseMiniClusterTest extends BaseYBTest {
    * Override this method to create a custom minicluster for your test.
    */
   protected void createMiniCluster() throws Exception {
-    createMiniCluster(NUM_MASTERS, NUM_TABLET_SERVERS);
+    if (!miniClusterEnabled()) {
+      return;
+    }
+    final int replicationFactor = getReplicationFactor();
+    createMiniCluster(
+        TestUtils.getFirstPositiveNumber(
+            getInitialNumMasters(), replicationFactor, MiniYBCluster.DEFAULT_NUM_MASTERS),
+        TestUtils.getFirstPositiveNumber(
+            getInitialNumTServers(), replicationFactor, MiniYBCluster.DEFAULT_NUM_TSERVERS)
+    );
   }
 
   /**
    * Creates a new cluster with the requested number of masters and tservers.
    */
   public void createMiniCluster(int numMasters, int numTservers) throws Exception {
-    createMiniCluster(numMasters, Collections.nCopies(numTservers, tserverArgs));
+    if (!miniClusterEnabled()) {
+      return;
+    }
+    createMiniCluster(numMasters, Collections.nCopies(numTservers, tserverArgs), tserverEnvVars);
   }
 
-  public void createMiniCluster(int numMasters, List<List<String>> tserverArgs)
+  public void createMiniCluster(int numMasters, List<List<String>> tserverArgs) throws Exception {
+    createMiniCluster(numMasters, tserverArgs, null);
+  }
+
+  public void createMiniCluster(int numMasters, List<List<String>> tserverArgs,
+                                Map<String, String> tserverEnvVars)
       throws Exception {
+    if (!miniClusterEnabled()) {
+      return;
+    }
     LOG.info("BaseMiniClusterTest.createMiniCluster is running");
     int numTservers = tserverArgs.size();
-    miniCluster = new MiniYBClusterBuilder()
+    MiniYBClusterBuilder clusterBuilder = new MiniYBClusterBuilder()
                       .numMasters(numMasters)
                       .numTservers(numTservers)
                       .defaultTimeoutMs(DEFAULT_SLEEP)
                       .testClassName(getClass().getName())
                       .masterArgs(masterArgs)
-                      .tserverArgs(tserverArgs)
+                      .perTServerArgs(tserverArgs)
                       .numShardsPerTServer(overridableNumShardsPerTServer())
-                      .build();
+                      .useIpWithCertificate(useIpWithCertificate)
+                      .replicationFactor(getReplicationFactor())
+                      .sslCertFile(certFile);
+
+    if (tserverEnvVars != null) {
+      clusterBuilder.addEnvironmentVariables(tserverEnvVars);
+    }
+
+    customizeMiniClusterBuilder(clusterBuilder);
+    miniCluster = clusterBuilder.build();
     masterAddresses = miniCluster.getMasterAddresses();
     masterHostPorts = miniCluster.getMasterHostPorts();
 
@@ -134,6 +198,9 @@ public class BaseMiniClusterTest extends BaseYBTest {
   public void createMiniCluster(int numMasters, List<String> masterArgs,
                                 List<List<String>> tserverArgs)
       throws Exception {
+    if (!miniClusterEnabled()) {
+      return;
+    }
     LOG.info("BaseMiniClusterTest.createMiniCluster is running");
     int numTservers = tserverArgs.size();
     miniCluster = new MiniYBClusterBuilder()
@@ -142,7 +209,9 @@ public class BaseMiniClusterTest extends BaseYBTest {
                       .defaultTimeoutMs(DEFAULT_SLEEP)
                       .testClassName(getClass().getName())
                       .masterArgs(masterArgs)
-                      .tserverArgs(tserverArgs)
+                      .useIpWithCertificate(useIpWithCertificate)
+                      .perTServerArgs(tserverArgs)
+                      .sslCertFile(certFile)
                       .build();
     masterAddresses = miniCluster.getMasterAddresses();
     masterHostPorts = miniCluster.getMasterHostPorts();
@@ -176,4 +245,5 @@ public class BaseMiniClusterTest extends BaseYBTest {
     LOG.info("BaseMiniClusterTest.tearDownAfterClass is running");
     destroyMiniCluster();
   }
+
 }

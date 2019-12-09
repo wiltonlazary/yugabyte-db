@@ -15,9 +15,12 @@
 
 #include "yb/yql/cql/cqlserver/cql_processor.h"
 
+#include "yb/common/ql_value.h"
+
 #include "yb/gutil/strings/escaping.h"
 
 #include "yb/rpc/connection.h"
+#include "yb/rpc/messenger.h"
 #include "yb/rpc/rpc_context.h"
 
 #include "yb/util/crypt.h"
@@ -58,6 +61,16 @@ METRIC_DEFINE_histogram(
     "RPC requests",
     60000000LU, 2);
 
+METRIC_DEFINE_gauge_int64(server, cql_processors_alive,
+                          "Number of alive CQL Processors.",
+                          yb::MetricUnit::kUnits,
+                          "Number of alive CQL Processors.");
+
+METRIC_DEFINE_counter(server, cql_processors_created,
+                      "Number of created CQL Processors.",
+                      yb::MetricUnit::kUnits,
+                      "Number of created CQL Processors.");
+
 DECLARE_bool(use_cassandra_authentication);
 
 namespace yb {
@@ -79,7 +92,6 @@ using std::unique_ptr;
 
 using client::YBClient;
 using client::YBSession;
-using client::YBMetaDataCache;
 using ql::ExecutedResult;
 using ql::PreparedResult;
 using ql::RowsResult;
@@ -114,23 +126,26 @@ CQLMetrics::CQLMetrics(const scoped_refptr<yb::MetricEntity>& metric_entity)
       METRIC_handler_latency_yb_cqlserver_CQLServerService_Any.Instantiate(metric_entity);
   num_errors_parsing_cql_ =
       METRIC_yb_cqlserver_CQLServerService_ParsingErrors.Instantiate(metric_entity);
+  cql_processors_alive_ = METRIC_cql_processors_alive.Instantiate(metric_entity, 0);
+  cql_processors_created_ = METRIC_cql_processors_created.Instantiate(metric_entity);
 }
 
 //------------------------------------------------------------------------------------------------
 CQLProcessor::CQLProcessor(CQLServiceImpl* service_impl, const CQLProcessorListPos& pos)
-    : QLProcessor(
-          service_impl->messenger(), service_impl->client(), service_impl->metadata_cache(),
-          service_impl->cql_metrics().get(),
-          service_impl->clock(),
-          std::bind(&CQLServiceImpl::GetTransactionManager, service_impl),
-          service_impl->cql_rpc_env()),
+    : QLProcessor(service_impl->client(), service_impl->metadata_cache(),
+                  service_impl->cql_metrics().get(),
+                  service_impl->clock(),
+                  service_impl->transaction_pool_provider()),
       service_impl_(service_impl),
       cql_metrics_(service_impl->cql_metrics()),
       pos_(pos),
       statement_executed_cb_(Bind(&CQLProcessor::StatementExecuted, Unretained(this))) {
+  IncrementCounter(cql_metrics_->cql_processors_created_);
+  IncrementGauge(cql_metrics_->cql_processors_alive_);
 }
 
 CQLProcessor::~CQLProcessor() {
+  DecrementGauge(cql_metrics_->cql_processors_alive_);
 }
 
 void CQLProcessor::ProcessCall(rpc::InboundCallPtr call) {
@@ -145,7 +160,7 @@ void CQLProcessor::ProcessCall(rpc::InboundCallPtr call) {
   if (!CQLRequest::ParseRequest(call_->serialized_request(), compression_scheme,
                                 &request, &response)) {
     cql_metrics_->num_errors_parsing_cql_->Increment();
-    SendResponse(*response);
+    PrepareAndSendResponse(response);
     return;
   }
 
@@ -154,12 +169,19 @@ void CQLProcessor::ProcessCall(rpc::InboundCallPtr call) {
       execute_begin_.GetDeltaSince(parse_begin_).ToMicroseconds());
 
   // Execute the request (perhaps asynchronously).
-  SetCurrentCall(call_);
+  SetCurrentSession(call_->ql_session());
   request_ = std::move(request);
   call_->SetRequest(request_, service_impl_);
   retry_count_ = 0;
   response.reset(ProcessRequest(*request_));
-  if (response != nullptr) {
+  PrepareAndSendResponse(response);
+}
+
+void CQLProcessor::PrepareAndSendResponse(const unique_ptr<CQLResponse>& response) {
+  if (response) {
+    const CQLConnectionContext& context =
+        static_cast<const CQLConnectionContext&>(call_->connection()->context());
+    response->set_registered_events(context.registered_events());
     SendResponse(*response);
   }
 }
@@ -189,7 +211,7 @@ void CQLProcessor::SendResponse(const CQLResponse& response) {
   request_ = nullptr;
   stmts_.clear();
   parse_trees_.clear();
-  SetCurrentCall(nullptr);
+  SetCurrentSession(nullptr);
   service_impl_->ReturnProcessor(pos_);
 }
 
@@ -238,16 +260,14 @@ CQLResponse* CQLProcessor::ProcessRequest(const StartupRequest& req) {
     const auto it = kSupportedOptions.find(name);
     if (it == kSupportedOptions.end() ||
         std::find(it->second.begin(), it->second.end(), value) == it->second.end()) {
-      return new ErrorResponse(
-          req, ErrorResponse::Code::PROTOCOL_ERROR,
-          Substitute("Unsupported option $0 = $1", name, value));
+      YB_LOG_EVERY_N_SECS(WARNING, 60) << Format("Unsupported driver option $0 = $1", name, value);
     }
     if (name == CQLMessage::kCompressionOption) {
       auto& context = static_cast<CQLConnectionContext&>(call_->connection()->context());
       if (value == CQLMessage::kLZ4Compression) {
-        context.set_compression_scheme(CQLMessage::CompressionScheme::LZ4);
+        context.set_compression_scheme(CQLMessage::CompressionScheme::kLz4);
       } else if (value == CQLMessage::kSnappyCompression) {
-        context.set_compression_scheme(CQLMessage::CompressionScheme::SNAPPY);
+        context.set_compression_scheme(CQLMessage::CompressionScheme::kSnappy);
       } else {
         return new ErrorResponse(
             req, ErrorResponse::Code::PROTOCOL_ERROR,
@@ -275,7 +295,8 @@ CQLResponse* CQLProcessor::ProcessRequest(const PrepareRequest& req) {
   shared_ptr<CQLStatement> stmt = service_impl_->AllocatePreparedStatement(
       query_id, ql_env_.CurrentKeyspace(), req.query());
   PreparedResult::UniPtr result;
-  const Status s = stmt->Prepare(this, service_impl_->prepared_stmts_mem_tracker(), &result);
+  const Status s = stmt->Prepare(this, service_impl_->prepared_stmts_mem_tracker(),
+                                 false /* internal */, &result);
   if (!s.ok()) {
     service_impl_->DeletePreparedStatement(stmt);
     return ProcessError(s, stmt->query_id());
@@ -341,7 +362,7 @@ CQLResponse* CQLProcessor::ProcessRequest(const BatchRequest& req) {
 CQLResponse* CQLProcessor::ProcessRequest(const AuthResponseRequest& req) {
   const auto& params = req.params();
   shared_ptr<Statement> stmt = service_impl_->GetAuthPreparedStatement();
-  if (!stmt->Prepare(this).ok()) {
+  if (!stmt->Prepare(this, nullptr /* memtracker */, true /* internal */).ok()) {
     return new ErrorResponse(
         req, ErrorResponse::Code::SERVER_ERROR,
         "Could not prepare statement for querying user " + params.username);
@@ -356,6 +377,9 @@ CQLResponse* CQLProcessor::ProcessRequest(const AuthResponseRequest& req) {
 }
 
 CQLResponse* CQLProcessor::ProcessRequest(const RegisterRequest& req) {
+  CQLConnectionContext& context =
+      static_cast<CQLConnectionContext&>(call_->connection()->context());
+  context.add_registered_events(req.events());
   return new ReadyResponse(req);
 }
 
@@ -370,9 +394,7 @@ shared_ptr<const CQLStatement> CQLProcessor::GetPreparedStatement(const CQLMessa
 
 void CQLProcessor::StatementExecuted(const Status& s, const ExecutedResult::SharedPtr& result) {
   unique_ptr<CQLResponse> response(s.ok() ? ProcessResult(result) : ProcessError(s));
-  if (response) {
-    SendResponse(*response);
-  }
+  PrepareAndSendResponse(response);
 }
 
 CQLResponse* CQLProcessor::ProcessError(const Status& s,
@@ -396,16 +418,21 @@ CQLResponse* CQLProcessor::ProcessError(const Status& s,
         return new UnpreparedErrorResponse(*request_, *query_id);
       }
       // When no unprepared query id is found, it means all statements we executed were queries
-      // (non-prepared statements). In that case, just retry the request (once only).
+      // (non-prepared statements). In that case, just retry the request (once only). The retry
+      // needs to be rescheduled in because this callback may not be executed in the RPC worker
+      // thread. Also, rescheduling gives other calls a chance to execute first before we do.
       if (++retry_count_ == 1) {
         stmts_.clear();
         parse_trees_.clear();
-        return ProcessRequest(*request_);
+        Reschedule(&process_request_task_.Bind(this));
+        return nullptr;
       }
       return new ErrorResponse(*request_, ErrorResponse::Code::INVALID,
                                "Query failed to execute due to stale metadata cache");
     } else if (ql_errcode < ErrorCode::SUCCESS) {
-      if (ql_errcode > ErrorCode::LIMITATION_ERROR) {
+      if (ql_errcode == ErrorCode::UNAUTHORIZED) {
+        return new ErrorResponse(*request_, ErrorResponse::Code::UNAUTHORIZED, s.ToUserMessage());
+      } else if (ql_errcode > ErrorCode::LIMITATION_ERROR) {
         // System errors, internal errors, or crashes.
         return new ErrorResponse(*request_, ErrorResponse::Code::SERVER_ERROR, s.ToUserMessage());
       } else if (ql_errcode > ErrorCode::SEM_ERROR) {
@@ -419,7 +446,10 @@ CQLResponse* CQLProcessor::ProcessError(const Status& s,
 
     LOG(ERROR) << "Internal error: invalid error code " << static_cast<int64_t>(GetErrorCode(s));
     return new ErrorResponse(*request_, ErrorResponse::Code::SERVER_ERROR, "Invalid error code");
+  } else if (s.IsNotAuthorized()) {
+    return new ErrorResponse(*request_, ErrorResponse::Code::UNAUTHORIZED, s.ToUserMessage());
   }
+
   return new ErrorResponse(*request_, ErrorResponse::Code::SERVER_ERROR, s.ToUserMessage());
 }
 
@@ -501,6 +531,20 @@ CQLResponse* CQLProcessor::ProcessResult(const ExecutedResult::SharedPtr& result
   LOG(ERROR) << "Internal error: unknown result type " << static_cast<int>(result->type());
   return new ErrorResponse(
       *request_, ErrorResponse::Code::SERVER_ERROR, "Internal error: unknown result type");
+}
+
+bool CQLProcessor::NeedReschedule() {
+  auto messenger = service_impl_->messenger();
+  if (!messenger) {
+    return false;
+  }
+  return !messenger->ThreadPool(rpc::ServicePriority::kNormal).OwnsThisThread();
+}
+
+void CQLProcessor::Reschedule(rpc::ThreadPoolTask* task) {
+  auto messenger = service_impl_->messenger();
+  DCHECK(messenger != nullptr) << "No messenger to reschedule CQL call";
+  messenger->ThreadPool(rpc::ServicePriority::kNormal).Enqueue(task);
 }
 
 }  // namespace cqlserver

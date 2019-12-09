@@ -52,13 +52,9 @@ struct RpcServerOptions {
   RpcServerOptions();
 
   std::string rpc_bind_addresses;
-  uint16_t default_port;
-  size_t queue_limit;
-  size_t workers_limit;
+  uint16_t default_port = 0;
   int32_t connection_keepalive_time_ms;
 };
-
-YB_DEFINE_ENUM(ServicePriority, (kNormal)(kHigh));
 
 class RpcServer {
  public:
@@ -66,12 +62,12 @@ class RpcServer {
             rpc::ConnectionContextFactoryPtr connection_context_factory);
   ~RpcServer();
 
-  CHECKED_STATUS Init(const std::shared_ptr<rpc::Messenger>& messenger);
+  CHECKED_STATUS Init(rpc::Messenger* messenger);
   // Services need to be registered after Init'ing, but before Start'ing.
   // The service's ownership will be given to a ServicePool.
   CHECKED_STATUS RegisterService(
       size_t queue_limit, rpc::ServiceIfPtr service,
-      ServicePriority priority = ServicePriority::kNormal);
+      rpc::ServicePriority priority = rpc::ServicePriority::kNormal);
   CHECKED_STATUS Bind();
   CHECKED_STATUS Start();
   void Shutdown();
@@ -100,19 +96,13 @@ class RpcServer {
     STARTED
   };
 
-  std::unique_ptr<rpc::ThreadPool> CreateThreadPool(string name_prefix, ServicePriority priority);
-
   string name_;
 
   ServerState server_state_;
 
   const RpcServerOptions options_;
-  std::unique_ptr<rpc::ThreadPool> normal_thread_pool_;
 
-  // This could be used for high-priority services such as Consensus.
-  std::unique_ptr<rpc::ThreadPool> high_priority_thread_pool_;
-
-  std::shared_ptr<rpc::Messenger> messenger_;
+  rpc::Messenger* messenger_ = nullptr;
 
   // Parsed addresses to bind RPC to. Set by Init().
   std::vector<Endpoint> rpc_bind_addresses_;

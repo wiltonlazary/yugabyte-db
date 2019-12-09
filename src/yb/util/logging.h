@@ -46,9 +46,11 @@
 
 #include <fcntl.h>
 
+#include <mutex>
 #include <string>
 
 #include <glog/logging.h>
+#include <boost/preprocessor/cat.hpp>
 #include <boost/preprocessor/stringize.hpp>
 
 #include "yb/gutil/atomicops.h"
@@ -56,6 +58,7 @@
 #include "yb/gutil/walltime.h"
 #include "yb/util/fault_injection.h"
 #include "yb/util/logging_callback.h"
+#include "yb/util/monotime.h"
 
 ////////////////////////////////////////////////////////////////////////////////
 // Throttled logging support
@@ -73,12 +76,22 @@
   static yb::logging_internal::LogThrottler LOG_THROTTLER;  \
   int num_suppressed = 0; \
   if (LOG_THROTTLER.ShouldLog(n_secs, &num_suppressed)) \
-    google::LogMessage( \
-      __FILE__, __LINE__, google::GLOG_ ## severity, num_suppressed, \
-      &google::LogMessage::SendToLog).stream()
+    BOOST_PP_CAT(GOOGLE_LOG_, severity)(num_suppressed).stream()
+
+#define YB_LOG_WITH_PREFIX_EVERY_N_SECS(severity, n_secs) \
+    YB_LOG_EVERY_N_SECS(severity, n_secs) << LogPrefix()
 
 #define YB_LOG_WITH_PREFIX_UNLOCKED_EVERY_N_SECS(severity, n_secs) \
     YB_LOG_EVERY_N_SECS(severity, n_secs) << LogPrefixUnlocked()
+
+// Logs a messages with 2 different severities. By default used severity1, but if during
+// duration there were more than count messages, then it will use severity2.
+#define YB_LOG_HIGHER_SEVERITY_WHEN_TOO_MANY(severity1, severity2, duration, count) \
+  static yb::logging_internal::LogRateThrottler LOG_THROTTLER(duration, count);  \
+  google::LogMessage( \
+    __FILE__, __LINE__, \
+    LOG_THROTTLER.TooMany() ? BOOST_PP_CAT(google::GLOG_, severity2) \
+                            : BOOST_PP_CAT(google::GLOG_, severity1)).stream()
 
 namespace yb {
 enum PRIVATE_ThrottleMsg {THROTTLE_MSG};
@@ -133,12 +146,13 @@ enum PRIVATE_ThrottleMsg {THROTTLE_MSG};
 
 // The direct user-facing macros.
 #define YB_LOG_EVERY_N(severity, n) \
-  GOOGLE_GLOG_COMPILE_ASSERT(google::GLOG_ ## severity < \
-                             google::NUM_SEVERITIES, \
-                             INVALID_REQUESTED_LOG_SEVERITY); \
+  static_assert(google::GLOG_ ## severity < google::NUM_SEVERITIES, \
+                "Invalid requested log severity"); \
   YB_SOME_KIND_OF_LOG_EVERY_N(severity, (n), google::LogMessage::SendToLog)
 
 #define YB_LOG_WITH_PREFIX_EVERY_N(severity, n) YB_LOG_EVERY_N(severity, n) << LogPrefix()
+#define YB_LOG_WITH_PREFIX_UNLOCKED_EVERY_N(severity, n) \
+    YB_LOG_EVERY_N(severity, n) << LogPrefixUnlocked()
 
 #define YB_SYSLOG_EVERY_N(severity, n) \
   YB_SOME_KIND_OF_LOG_EVERY_N(severity, (n), google::LogMessage::SendToSyslogAndLog)
@@ -222,6 +236,7 @@ void LogCommandLineFlags();
 void InitializeGoogleLogging(const char *arg);
 
 namespace logging_internal {
+
 // Internal implementation class used for throttling log messages.
 class LogThrottler {
  public:
@@ -243,6 +258,24 @@ class LogThrottler {
   Atomic32 num_suppressed_;
   uint64_t last_ts_;
 };
+
+// Utility class that is used by YB_LOG_HIGHER_SEVERITY_WHEN_TOO_MANY macros.
+class LogRateThrottler {
+ public:
+  LogRateThrottler(const CoarseMonoClock::duration& duration, int count)
+      : duration_(duration), queue_(count) {}
+
+  bool TooMany();
+ private:
+  std::mutex mutex_;
+  CoarseMonoClock::duration duration_;
+  // Use manual queue implementation to avoid including too heavy boost/circular_buffer
+  // to this very frequently used header.
+  std::vector<CoarseMonoClock::time_point> queue_;
+  size_t head_ = 0;
+  size_t count_ = 0;
+};
+
 } // namespace logging_internal
 
 std::ostream& operator<<(std::ostream &os, const PRIVATE_ThrottleMsg&);
@@ -260,6 +293,7 @@ std::ostream& operator<<(std::ostream &os, const PRIVATE_ThrottleMsg&);
 #define VLOG_WITH_PREFIX(verboselevel) VLOG(verboselevel) << LogPrefix()
 #define DVLOG_WITH_PREFIX(verboselevel) DVLOG(verboselevel) << LogPrefix()
 #define LOG_IF_WITH_PREFIX(severity, condition) LOG_IF(severity, condition) << LogPrefix()
+#define VLOG_IF_WITH_PREFIX(verboselevel, condition) VLOG_IF(verboselevel, condition) << LogPrefix()
 
 // DCHECK_ONLY_NOTNULL is like DCHECK_NOTNULL, but does not result in an unused expression in
 // release mode, so it is suitable for being used as a stand-alone statement. In other words, use

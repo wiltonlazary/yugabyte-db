@@ -15,8 +15,7 @@
 
 #include <hiredis/hiredis.h>
 
-#include <boost/scope_exit.hpp>
-
+#include "yb/util/scope_exit.h"
 #include "yb/util/stol_utils.h"
 
 namespace yb {
@@ -105,6 +104,9 @@ class RedisClient::Impl {
         args.push_back(word.c_str());
         arg_lens.push_back(word.size());
       }
+      if (args.empty()) {
+        continue;
+      }
       if (redisAppendCommandArgv(context_, args.size(), args.data(), arg_lens.data()) != REDIS_OK) {
         NotifyDisconnected();
         Free();
@@ -114,11 +116,11 @@ class RedisClient::Impl {
 
     for (const auto& entry : queue_) {
       redisReply* reply = nullptr;
-      BOOST_SCOPE_EXIT(&reply) {
+      auto se = ScopeExit([&reply] {
         if (reply) {
           freeReplyObject(reply);
         }
-      } BOOST_SCOPE_EXIT_END;
+      });
       if (redisGetReply(context_, pointer_cast<void**>(&reply)) != REDIS_OK) {
         NotifyDisconnected();
         Free();

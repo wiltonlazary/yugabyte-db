@@ -21,10 +21,15 @@ import com.datastax.driver.core.Row;
 import org.junit.Test;
 import org.yb.client.TestUtils;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
+import static org.yb.AssertionWrappers.assertEquals;
+import static org.yb.AssertionWrappers.assertTrue;
+import static org.yb.AssertionWrappers.fail;
 
+import org.yb.YBTestRunner;
+
+import org.junit.runner.RunWith;
+
+@RunWith(value=YBTestRunner.class)
 public class TestStaticColumn extends BaseCQLTest {
 
   private void createTable(boolean insertSeedData) {

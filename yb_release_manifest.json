@@ -1,12 +1,18 @@
 {
   ".": ["$BUILD_ROOT/version_metadata.json"],
+  "postgres": ["$BUILD_ROOT/postgres/*"],
   "www": ["www/*"],
   "bin": ["bin/bulk_load_cleanup.sh",
           "bin/bulk_load_helper.sh",
+          "bin/log_cleanup.sh",
+          "bin/yb-check-failed-tablets.sh",
+          "bin/yb-check-consistency.py",
           "bin/configure",
-          "bin/yb-ctl",
+          "bin/yugabyted",
+          "submodules/yugabyte-installation/bin/yb-ctl",
           "bin/yb-prof.py",
           "$BUILD_ROOT/bin/log-dump",
+          "$BUILD_ROOT/bin/ldb",
           "$BUILD_ROOT/bin/sst_dump",
           "$BUILD_ROOT/bin/yb-admin",
           "$BUILD_ROOT/bin/yb-bulk_load",
@@ -21,13 +27,15 @@
           "thirdparty/installed/common/cqlsh/bin/cqlsh",
           "thirdparty/installed/common/cqlsh/bin/cqlsh.py",
           "thirdparty/installed/common/bin/redis-cli",
-          "thirdparty/installed/common/bin/psql",
-          "thirdparty/installed/uninstrumented/bin/pprof"],
+          "$THIRDPARTY_BUILD_SPECIFIC_DIR/bin/pprof"],
   "lib"      : ["thirdparty/installed/common/cqlsh/lib/*"],
   "pylib"    : ["thirdparty/installed/common/cqlsh/pylib/*"],
-  "java"     : ["java/yb-cli/target/yb-cli-${project.version}.jar",
-                "java/yb-loadtester/target/yb-sample-apps.jar",
-                "java/yb-loadtester/target/yb-sample-apps-sources.jar"],
-  "java/lib" : ["java/yb-cli/target/lib/*.jar",
-                "java/yb-loadtester/target/lib/*.jar"]
+  "share": [
+    "$BUILD_ROOT/share/initial_sys_catalog_snapshot",
+    "sample/*.sql"
+  ],
+  "%symlinks%": {
+    "bin/ysqlsh": "../postgres/bin/ysqlsh",
+    "bin/psql": "../postgres/bin/ysqlsh"
+  }
 }

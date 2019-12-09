@@ -31,35 +31,27 @@
 //
 package org.yb.client;
 
-import com.google.common.base.Joiner;
-import com.google.common.collect.ImmutableSet;
+import org.apache.commons.io.FileUtils;
 import org.junit.runner.Description;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.yb.BaseYBTest;
 import org.yb.client.YBClient.Condition;
+import org.yb.util.EnvAndSysPropertyUtil;
+import org.yb.util.RandomNumberUtil;
+import org.yb.util.SanitizerUtil;
 
 import java.io.*;
-import java.lang.reflect.Field;
-
 import java.net.*;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 
-/**
- * A grouping of methods that help unit testing.
- */
 public class TestUtils {
   private static final Logger LOG = LoggerFactory.getLogger(TestUtils.class);
-
-  // Used by pidOfProcess()
-  private static String UNIX_PROCESS_CLASS_NAME =  "java.lang.UNIXProcess";
-  private static String JDK9_PROCESS_IMPL_CLASS_NAME = "java.lang.ProcessImpl";
-
-  private static Set<String> VALID_SIGNALS =  ImmutableSet.of("STOP", "CONT", "TERM", "KILL");
 
   private static final String BIN_DIR_PROP = "binDir";
 
@@ -69,33 +61,18 @@ public class TestUtils {
       System.getProperty("os.name").toLowerCase().equals("linux");
 
   private static final long startTimeMillis = System.currentTimeMillis();
-  private static Random randomGenerator;
+
+  private static final String defaultTestTmpDir =
+      "/tmp/ybtest-" + System.getProperty("user.name") + "-" + startTimeMillis + "-" +
+          new Random().nextInt(Integer.MAX_VALUE);
+
+  private static final AtomicBoolean defaultTestTmpDirCleanupHookRegistered = new AtomicBoolean();
 
   // The amount of time to wait for in addition to the ttl specified.
   private static final long WAIT_FOR_TTL_EXTENSION_MS = 100;
 
-  private static String NONBLOCKING_RANDOM_DEVICE = "/dev/urandom";
-
   private static PrintStream defaultStdOut = System.out;
   private static PrintStream defaultStdErr = System.err;
-
-  private static final boolean DEFAULT_USE_PER_TEST_LOG_FILES = true;
-
-  static {
-    long seed = System.nanoTime();
-    if (new File(NONBLOCKING_RANDOM_DEVICE).exists()) {
-      try {
-        InputStream in = new FileInputStream(NONBLOCKING_RANDOM_DEVICE);
-        for (int i = 0; i < 64; ++i) {
-          seed = seed * 37 + in.read();
-        }
-        in.close();
-      } catch (IOException ex) {
-        LOG.warn("Failed to read from " + NONBLOCKING_RANDOM_DEVICE + " to seed random generator");
-      }
-    }
-    randomGenerator = new Random(seed);
-  }
 
   public static final int MIN_PORT_TO_USE = 10000;
   public static final int MAX_PORT_TO_USE = 32768;
@@ -112,6 +89,12 @@ public class TestUtils {
 
   private static volatile String cppBinariesDir = null;
   private static volatile String buildType = null;
+
+  /**
+   * When collecting the list of tests to run using the -DcollectTests option to the build, prefix
+   * each line describing a test with this.
+   */
+  private static final String COLLECTED_TESTS_PREFIX = "YUGABYTE_JAVA_TEST: ";
 
   /**
    * @return the path of the flags file to pass to daemon processes
@@ -216,6 +199,10 @@ public class TestUtils {
     return binDir;
   }
 
+  public static String getBuildRootDir() {
+    return new File(getBinDir()).getParent();
+  }
+
   /**
    * @param binName the binary to look for (eg 'yb-tserver')
    * @return the absolute path of that binary
@@ -253,81 +240,35 @@ public class TestUtils {
     }
   }
 
+  public static boolean isReleaseBuild() {
+    return TestUtils.getBuildType().equals("release");
+  }
+
   /**
    * @return the base directory within which we will store server data
    */
   public static String getBaseTmpDir() {
     String testTmpDir = System.getenv("TEST_TMPDIR");
     if (testTmpDir == null) {
-      testTmpDir = "/tmp/ybtest-" + System.getProperty("user.name") + "-" + startTimeMillis + "-" +
-          randomGenerator.nextInt();
+      // If we are generating the temporary directory name here, we are responsible for deleting it.
+      testTmpDir = new File(defaultTestTmpDir).getAbsolutePath();
+      if (defaultTestTmpDirCleanupHookRegistered.compareAndSet(false, true)) {
+        final File tmpDirToCleanUp = new File(testTmpDir);
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+          if (tmpDirToCleanUp.isDirectory()) {
+            try {
+              FileUtils.deleteDirectory(tmpDirToCleanUp);
+            } catch (IOException e) {
+              LOG.error("Failed to delete directory " + tmpDirToCleanUp + " recursively", e);
+            }
+          }
+        }));
+      }
     }
+
     File f = new File(testTmpDir);
     f.mkdirs();
     return f.getAbsolutePath();
-  }
-
-  /**
-   * Gets the pid of a specified process. Relies on reflection and only works on
-   * UNIX process, not guaranteed to work on JDKs other than Oracle and OpenJDK.
-   * @param proc The specified process.
-   * @return The process UNIX pid.
-   * @throws IllegalArgumentException If the process is not a UNIXProcess.
-   * @throws Exception If there are other getting the pid via reflection.
-   */
-  public static int pidOfProcess(Process proc) throws NoSuchFieldException, IllegalAccessException {
-    Class<?> procCls = proc.getClass();
-    final String actualClassName = procCls.getName();
-    if (!actualClassName.equals(UNIX_PROCESS_CLASS_NAME) &&
-        !actualClassName.equals(JDK9_PROCESS_IMPL_CLASS_NAME)) {
-      throw new IllegalArgumentException("pidOfProcess() expects an object of class " +
-          UNIX_PROCESS_CLASS_NAME + " or " + JDK9_PROCESS_IMPL_CLASS_NAME + ", but " +
-          procCls.getName() + " was passed in instead!");
-    }
-    Field pidField = procCls.getDeclaredField("pid");
-    pidField.setAccessible(true);
-    return (Integer) pidField.get(proc);
-  }
-
-  /**
-   * Send a code specified by its string representation to the specified process.
-   * TODO: Use a JNR/JNR-Posix instead of forking the JVM to exec "kill".
-   * @param proc The specified process.
-   * @param sig The string representation of the process (e.g., STOP for SIGSTOP).
-   * @throws IllegalArgumentException If the signal type is not supported.
-   * @throws IllegalStateException If we are unable to send the specified signal.
-   */
-  static void signalProcess(Process proc, String sig) throws Exception {
-    if (!VALID_SIGNALS.contains(sig)) {
-      throw new IllegalArgumentException(sig + " is not a supported signal, only " +
-              Joiner.on(",").join(VALID_SIGNALS) + " are supported");
-    }
-    int pid = pidOfProcess(proc);
-    int rv = Runtime.getRuntime()
-            .exec(String.format("kill -%s %d", sig, pid))
-            .waitFor();
-    if (rv != 0) {
-      throw new IllegalStateException(String.format("unable to send SIG%s to process %s(pid=%d): " +
-              "expected return code from kill, but got %d instead", sig, proc, pid, rv));
-    }
-  }
-
-  /**
-   * Pause the specified process by sending a SIGSTOP using the kill command.
-   * @param proc The specified process.
-   * @throws Exception If error prevents us from pausing the process.
-   */
-  static void pauseProcess(Process proc) throws Exception {
-    signalProcess(proc, "STOP");
-  }
-
-  /**
-   * Resumes the specified process by sending a SIGCONT using the kill command.
-   * @param proc The specified process.
-   * @throws Exception If error prevents us from resuming the process.
-   */
-  static void resumeProcess(Process proc) throws Exception {
-    signalProcess(proc, "CONT");
   }
 
   /**
@@ -392,9 +333,9 @@ public class TestUtils {
   public static int findFreePort(String bindInterface) throws IOException {
     final InetAddress bindIp = InetAddress.getByName(bindInterface);
     final int MAX_ATTEMPTS = 1000;
+    Random rng = RandomNumberUtil.getRandomGenerator();
     for (int attempt = 0; attempt < MAX_ATTEMPTS; ++attempt) {
-      final int port = MIN_PORT_TO_USE +
-          randomGenerator.nextInt(MAX_PORT_TO_USE - MIN_PORT_TO_USE);
+      final int port = MIN_PORT_TO_USE + rng.nextInt(MAX_PORT_TO_USE - MIN_PORT_TO_USE);
       if (!isReservedPort(bindIp, port) && isPortFree(bindIp, port, attempt == MAX_ATTEMPTS - 1)) {
         reservePort(bindIp, port);
         return port;
@@ -404,16 +345,12 @@ public class TestUtils {
         MAX_ATTEMPTS + " attempts");
   }
 
-  public static boolean isJenkins() {
-    return System.getenv("BUILD_ID") != null && System.getenv("JOB_NAME") != null;
-  }
-
   public static void waitFor(Condition condition, long timeoutMs) throws Exception {
     waitFor(condition, timeoutMs, SLEEP_TIME_MS);
   }
 
   public static void waitFor(Condition condition, long timeoutMs, int sleepTime) throws Exception {
-    timeoutMs *= getTimeoutMultiplier();
+    timeoutMs *= SanitizerUtil.getTimeoutMultiplier();
     final long startTimeMs = System.currentTimeMillis();
     while (System.currentTimeMillis() - startTimeMs < timeoutMs && !condition.get()) {
       Thread.sleep(sleepTime);
@@ -438,9 +375,13 @@ public class TestUtils {
     out.println("\n" + HORIZONTAL_LINE + "\n" + msg + "\n" + HORIZONTAL_LINE + "\n");
   }
 
+  public static String formatTestDescrition(String className, String methodName) {
+    return "class=\"" + className + "\", method=\"" + methodName + "\"";
+
+  }
+
   public static String getClassAndMethodStr(Description description) {
-    return "class=\"" + description.getClassName() +
-        "\", method=\"" + description.getMethodName() + "\"";
+    return formatTestDescrition(description.getClassName(), description.getMethodName());
   }
 
   /**
@@ -461,35 +402,28 @@ public class TestUtils {
     }, timeoutMs);
   }
 
-  public static boolean isTSAN() {
-    return getBuildType().equals("tsan");
-  }
-
-  public static long nonTsanVsTsan(long nonTsanValue, long tsanValue) {
-    return isTSAN() ? tsanValue : nonTsanValue;
-  }
-
-  /** @return a timeout multiplier to apply in tests based on the build type */
-  public static double getTimeoutMultiplier() {
-    return isTSAN() ? 3.0 : 1.0;
-  }
-
   /**
-   * Adjusts a timeout based on the build type.
-   *
-   * @param timeout timeout in any time units
-   * @return adjusted timeout
+   * Adjust the given timeout (that should already have been corrected for build type using
+   * {@link org.yb.util.Timeouts#adjustTimeoutSecForBuildType} according to some user overrides such
+   * as {@code YB_MIN_TEST_TIMEOUT_SEC}.
+   * @param timeoutSec the test timeout in seconds to be adjusted
+   * @return the adjusted timeout
    */
-  public static long adjustTimeoutForBuildType(long timeout) {
-    return (long) (timeout * TestUtils.getTimeoutMultiplier());
-  }
-
-  public static Random getRandomGenerator() {
-    return randomGenerator;
-  }
-
-  public static int randomNonNegNumber() {
-    return randomGenerator.nextInt(Integer.MAX_VALUE);
+  public static long finalizeTestTimeoutSec(long timeoutSec) {
+    String minTimeoutStr =
+        EnvAndSysPropertyUtil.getEnvVarOrSystemProperty("YB_MIN_TEST_TIMEOUT_SEC", "0");
+    LOG.info("minTimeoutStr=" + minTimeoutStr);
+    long minTestTimeoutSec;
+    if (minTimeoutStr.toLowerCase().equals("inf")) {
+      minTestTimeoutSec = Integer.MAX_VALUE;
+    } else {
+      minTestTimeoutSec = Long.valueOf(minTimeoutStr);
+    }
+    if (minTestTimeoutSec <= 0) {
+      return timeoutSec;
+    }
+    // The lower bound on the timeout in seconds is minTestTimeoutSec, as specified by the user.
+    return Math.max(timeoutSec, minTestTimeoutSec);
   }
 
   /**
@@ -501,98 +435,18 @@ public class TestUtils {
     Thread.sleep(ttl + WAIT_FOR_TTL_EXTENSION_MS);
   }
 
-  public static String joinLinesForLogging(List<String> lines) {
-    if (lines.isEmpty()) {
-      return "";
-    }
-    StringBuilder sb = new StringBuilder();
-    boolean firstLine = true;
-    for (String line : lines) {
-      if (firstLine) {
-        firstLine = false;
-      } else {
-        sb.append("\n");
-      }
-      sb.append("    " + line);
-    }
-    return sb.toString();
+  public static void reportCollectedTest(
+      String packageAndClassName, String methodNameAndParameters) {
+    System.out.println(COLLECTED_TESTS_PREFIX + packageAndClassName + "#" +
+        methodNameAndParameters);
   }
 
-  public static class CommandResult {
-    public final String cmd;
-    public final int exitCode;
-    public final List<String> stdoutLines;
-    public final List<String> stderrLines;
-
-    public CommandResult(
-        String cmd, int exitCode, List<String> stdoutLines, List<String> stderrLines) {
-      this.cmd = cmd;
-      this.exitCode = exitCode;
-      this.stdoutLines = stdoutLines;
-      this.stderrLines = stderrLines;
-    }
-
-    public boolean isSuccess() {
-      return exitCode == 0;
-    }
-
-    public void logErrorOutput() {
-      if (!stderrLines.isEmpty()) {
-        LOG.warn("Standard error output from command {{ " + cmd + " }}" +
-            (exitCode == 0 ? "" : " (exit code: " + exitCode + "):\n" +
-                joinLinesForLogging(stderrLines)));
-      }
-    }
+  public static void logAndSleepMs(int ms, String msg) throws InterruptedException {
+    LOG.info("Sleeping for " + ms + " milliseconds: " + msg);
+    Thread.sleep(ms);
+    LOG.info("Finished sleeping for " + ms + " milliseconds: " + msg);
   }
 
-  public static List<String> readLinesFrom(File f) throws IOException {
-    if (!f.exists()) {
-      return new ArrayList<>();
-    }
-    BufferedReader reader = new BufferedReader(new InputStreamReader(
-        new FileInputStream(f)));
-    List<String> lines = new ArrayList<>();
-    String line;
-    while ((line = reader.readLine()) != null) {
-      lines.add(line);
-    }
-    return lines;
-  }
-
-  public static CommandResult runShellCommand(String cmd) throws IOException {
-    File outputFile = new File(TestUtils.getBaseTmpDir() + "/tmp_stdout_"  +
-        randomNonNegNumber() + ".txt");
-    File errorFile = new File(TestUtils.getBaseTmpDir() + "/tmp_stderr_"  +
-        randomNonNegNumber() + ".txt");
-    try {
-
-      Process process = new ProcessBuilder().command(Arrays.asList(new String[]{
-          "bash", "-c", cmd
-      })).redirectOutput(outputFile).redirectError(errorFile).start();
-      int exitCode;
-      try {
-        exitCode = process.waitFor();
-      } catch (InterruptedException ex) {
-        throw new IOException("Interrupted while trying to run command: " + cmd, ex);
-      }
-      CommandResult result;
-      return new CommandResult(
-          cmd,
-          exitCode,
-          readLinesFrom(outputFile),
-          readLinesFrom(errorFile));
-    } catch (IOException ex) {
-      LOG.error("Exception while running command: " + cmd, ex);
-      throw ex;
-    } finally {
-      if (outputFile.exists()) {
-        outputFile.delete();
-      }
-      if (errorFile.exists()) {
-        errorFile.delete();
-      }
-    }
-  }
 
   public static String getTestReportFilePrefix() {
     Class testClass;
@@ -610,7 +464,10 @@ public class TestUtils {
           "Found class " + testClass + " in directory " + testClassesDir + ", expected it to be " +
               "in a 'test-classes' directory");
     }
-    File surefireDir = new File(new File(testClassesDir).getParent(), "surefire-reports");
+    final String defaultSurefireReportsDir =
+        new File(new File(testClassesDir).getParent(), "surefire-reports").getPath();
+    File surefireDir = new File(System.getProperty("yb.surefire.reports.directory",
+                                                   defaultSurefireReportsDir));
     if (!surefireDir.isDirectory()) {
       LOG.warn("Directory " + surefireDir + " does not exist, attempting to create");
       if (!surefireDir.mkdirs() && !surefireDir.isDirectory()) {
@@ -626,32 +483,35 @@ public class TestUtils {
     ).toString();
   }
 
-  public static boolean isStringTrue(String value, boolean defaultValue) {
-    if (value == null)
-      return defaultValue;
-    value = value.trim().toLowerCase();
-    if (value.isEmpty() || value.equals("auto") || value.equals("default"))
-      return defaultValue;
-    return !value.equals("0") && !value.equals("no") && !value.equals("false");
-  }
-
-  public static boolean isEnvVarTrue(String envVarName, boolean defaultValue) {
-    return isStringTrue(System.getenv(envVarName), defaultValue);
-  }
-
   public static void resetDefaultStdOutAndErr() {
     System.setOut(defaultStdOut);
     System.setErr(defaultStdErr);
   }
 
-  private static volatile Boolean usePerTestLogFiles = null;
-
-  public static boolean usePerTestLogFiles() {
-    if (usePerTestLogFiles == null) {
-      usePerTestLogFiles = isEnvVarTrue(
-          "YB_JAVA_PER_TEST_LOG_FILES", DEFAULT_USE_PER_TEST_LOG_FILES);
+  /**
+   * @param arr integer parameters
+   * @return the first of the given numbers that is positive
+   */
+  public static int getFirstPositiveNumber(int... arr) {
+    for (int value : arr) {
+      if (value > 0)
+        return value;
     }
-    return usePerTestLogFiles.booleanValue();
+    if (arr.length > 0) {
+      return arr[arr.length - 1];
+    }
+    throw new IllegalArgumentException("No numbers given to firstPositiveNumber");
+  }
+
+  public static <T> List<T> joinLists(List<T> a, List<T> b) {
+    List<T> joinedList = new ArrayList();
+    if (a != null) {
+      joinedList.addAll(a);
+    }
+    if (b != null) {
+      joinedList.addAll(b);
+    }
+    return joinedList;
   }
 
 }

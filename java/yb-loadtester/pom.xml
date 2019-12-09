@@ -50,7 +50,7 @@
       <artifactId>slf4j-api</artifactId>
     </dependency>
     <dependency>
-      <groupId>junit</groupId>
+      <groupId>${junit.groupId}</groupId>
       <artifactId>junit</artifactId>
       <scope>test</scope>
     </dependency>
@@ -79,10 +79,9 @@
       <artifactId>spark-sql_2.10</artifactId>
     </dependency>
     <dependency>
-          <groupId>org.apache.commons</groupId>
-            <artifactId>commons-math3</artifactId>
-              <version>3.5</version>
-          </dependency>
+      <groupId>org.apache.commons</groupId>
+      <artifactId>commons-math3</artifactId>
+    </dependency>
     <dependency>
       <groupId>com.google.code.gson</groupId>
       <artifactId>gson</artifactId>
@@ -90,7 +89,11 @@
     <dependency>
       <groupId>org.postgresql</groupId>
       <artifactId>postgresql</artifactId>
-      <version>42.2.2</version>
+    </dependency>
+    <dependency>
+      <groupId>com.yugabyte</groupId>
+      <artifactId>yb-sample-apps</artifactId>
+      <version>1.0.9</version>
     </dependency>
   </dependencies>
 
@@ -98,15 +101,11 @@
     <plugins>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-failsafe-plugin</artifactId>
-      </plugin>
-      <plugin>
-        <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-dependency-plugin</artifactId>
         <executions>
           <execution>
             <id>copy-dependencies</id>
-            <phase>prepare-package</phase>
+            <phase>${maven-dependency-plugin.phase}</phase>
             <goals>
               <goal>copy-dependencies</goal>
             </goals>
@@ -142,33 +141,5 @@
       </plugin>
     </plugins>
   </build>
-
-  <profiles>
-    <profile>
-      <id>make-assembly</id>
-      <activation>
-        <property>
-          <name>!skipAssembly</name>
-        </property>
-      </activation>
-      <build>
-        <plugins>
-          <plugin>
-            <groupId>org.apache.maven.plugins</groupId>
-            <artifactId>maven-assembly-plugin</artifactId>
-            <configuration>
-              <finalName>yb-sample-apps</finalName>
-              <appendAssemblyId>false</appendAssemblyId>
-              <archive>
-                <manifest>
-                  <mainClass>com.yugabyte.sample.Main</mainClass>
-                </manifest>
-              </archive>
-            </configuration>
-          </plugin>
-        </plugins>
-      </build>
-    </profile>
-  </profiles>
 
 </project>

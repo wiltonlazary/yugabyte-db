@@ -348,6 +348,53 @@ Status WaitUntilAllReplicasHaveOp(const int64_t log_index,
                                               log_index, passed.ToString()));
 }
 
+Status WaitUntilNumberOfAliveTServersEqual(int n_tservers,
+                                           MasterServiceProxy* master_proxy,
+                                           const MonoDelta& timeout) {
+
+  master::ListTabletServersRequestPB req;
+  master::ListTabletServersResponsePB resp;
+  rpc::RpcController controller;
+  controller.set_timeout(timeout);
+
+  // The field primary_only means only tservers that are alive (tservers that have sent at least on
+  // heartbeat in the last FLAG_tserver_unresponsive_timeout_ms milliseconds.)
+  req.set_primary_only(true);
+
+  MonoTime start = MonoTime::Now();
+  MonoDelta passed = MonoDelta::FromMilliseconds(0);
+  while (true) {
+    Status s = master_proxy->ListTabletServers(req, &resp, &controller);
+
+    if (s.ok() &&
+        controller.status().ok() &&
+        !resp.has_error()) {
+      if (resp.servers_size() == n_tservers) {
+        passed = MonoTime::Now().GetDeltaSince(start);
+        return Status::OK();
+      }
+    } else {
+      string error;
+      if (!s.ok()) {
+        error = s.ToString();
+      } else if (!controller.status().ok()) {
+        error = controller.status().ToString();
+      } else {
+        error = resp.error().ShortDebugString();
+      }
+      LOG(WARNING) << "Got error getting list of tablet servers: " << error;
+    }
+    passed = MonoTime::Now().GetDeltaSince(start);
+    if (passed.MoreThan(timeout)) {
+      break;
+    }
+    SleepFor(MonoDelta::FromMilliseconds(50));
+    controller.Reset();
+  }
+  return STATUS(TimedOut, Substitute("Number of alive tservers not equal to $0 after $1 ms. ",
+                                     n_tservers, timeout.ToMilliseconds()));
+}
+
 Status CreateTabletServerMap(MasterServiceProxy* master_proxy,
                              rpc::ProxyCache* proxy_cache,
                              TabletServerMap* ts_map) {
@@ -389,6 +436,8 @@ Status GetConsensusState(const TServerDetails* replica,
                          const MonoDelta& timeout,
                          ConsensusStatePB* consensus_state,
                          LeaderLeaseStatus* leader_lease_status) {
+  DCHECK_ONLY_NOTNULL(replica);
+
   GetConsensusStateRequestPB req;
   GetConsensusStateResponsePB resp;
   RpcController controller;
@@ -423,9 +472,10 @@ Status WaitUntilCommittedConfigMemberTypeIs(int config_size,
                                            const std::string& tablet_id,
                                            const MonoDelta& timeout,
                                            RaftPeerPB::MemberType member_type) {
+  DCHECK_ONLY_NOTNULL(replica);
+
   MonoTime start = MonoTime::Now();
-  MonoTime deadline = start;
-  deadline.AddDelta(timeout);
+  MonoTime deadline = start + timeout;
 
   int backoff_exp = 0;
   const int kMaxBackoffExp = 7;
@@ -447,10 +497,10 @@ Status WaitUntilCommittedConfigMemberTypeIs(int config_size,
     SleepFor(MonoDelta::FromMilliseconds(1 << backoff_exp));
     backoff_exp = min(backoff_exp + 1, kMaxBackoffExp);
   }
-  return STATUS(TimedOut, Substitute("Number of voters does not equal $0 after waiting for $1."
-                                     "Last consensus state: $2. Last status: $3",
-                                     config_size, timeout.ToString(),
-                                     cstate.ShortDebugString(), s.ToString()));
+  return STATUS(TimedOut, Substitute("Number of replicas of type $0 does not equal $1 after "
+                                     "waiting for $2. Last consensus state: $3. Last status: $4",
+                                     RaftPeerPB::MemberType_Name(member_type), config_size,
+                                     timeout.ToString(), cstate.ShortDebugString(), s.ToString()));
 }
 
 template<class Context>
@@ -556,9 +606,9 @@ Status WaitUntilCommittedOpIdIndexIs(int64_t opid_index,
       WaitUntilCommittedOpIdIndexIsContext(opid_index));
 }
 
-class WaitUntilCommittedOpIdIndexGrowContext : public WaitUntilCommittedOpIdIndexContext {
+class WaitUntilCommittedOpIdIndexIsGreaterThanContext : public WaitUntilCommittedOpIdIndexContext {
  public:
-  explicit WaitUntilCommittedOpIdIndexGrowContext(int64_t* value)
+  explicit WaitUntilCommittedOpIdIndexIsGreaterThanContext(int64_t* value)
       : WaitUntilCommittedOpIdIndexContext(Substitute("greater than $0", *value)),
         original_value_(*value), value_(value) {
 
@@ -577,17 +627,33 @@ class WaitUntilCommittedOpIdIndexGrowContext : public WaitUntilCommittedOpIdInde
   int64_t* const value_;
 };
 
-Status WaitUntilCommittedOpIdIndexGrow(int64_t* index,
-                                       TServerDetails* replica,
-                                       const string& tablet_id,
-                                       const MonoDelta& timeout,
-                                       CommittedEntryType type) {
+Status WaitUntilCommittedOpIdIndexIsGreaterThan(int64_t* index,
+                                                TServerDetails* replica,
+                                                const TabletId& tablet_id,
+                                                const MonoDelta& timeout,
+                                                CommittedEntryType type) {
   return WaitUntilCommittedOpIdIndex(
       replica,
       tablet_id,
       timeout,
       type,
-      WaitUntilCommittedOpIdIndexGrowContext(index));
+      WaitUntilCommittedOpIdIndexIsGreaterThanContext(index));
+}
+
+Status WaitUntilCommittedOpIdIndexIsAtLeast(int64_t* index,
+                                            TServerDetails* replica,
+                                            const TabletId& tablet_id,
+                                            const MonoDelta& timeout,
+                                            CommittedEntryType type) {
+  int64_t tmp_index = *index - 1;
+  Status s = WaitUntilCommittedOpIdIndexIsGreaterThan(
+      &tmp_index,
+      replica,
+      tablet_id,
+      timeout,
+      type);
+  *index = tmp_index;
+  return s;
 }
 
 Status GetReplicaStatusAndCheckIfLeader(const TServerDetails* replica,
@@ -956,14 +1022,14 @@ Status WaitForNumTabletsOnTS(TServerDetails* ts,
 
 Status WaitUntilTabletInState(TServerDetails* ts,
                               const std::string& tablet_id,
-                              tablet::TabletStatePB state,
+                              tablet::RaftGroupStatePB state,
                               const MonoDelta& timeout) {
   MonoTime start = MonoTime::Now();
   MonoTime deadline = start;
   deadline.AddDelta(timeout);
   vector<ListTabletsResponsePB::StatusAndSchemaPB> tablets;
   Status s;
-  tablet::TabletStatePB last_state = tablet::UNKNOWN;
+  tablet::RaftGroupStatePB last_state = tablet::UNKNOWN;
   while (true) {
     s = ListTablets(ts, MonoDelta::FromSeconds(10), &tablets);
     if (s.ok()) {
@@ -989,9 +1055,9 @@ Status WaitUntilTabletInState(TServerDetails* ts,
   return STATUS(TimedOut, Substitute("T $0 P $1: Tablet not in $2 state after $3: "
                                      "Tablet state: $4, Status message: $5",
                                      tablet_id, ts->uuid(),
-                                     tablet::TabletStatePB_Name(state),
+                                     tablet::RaftGroupStatePB_Name(state),
                                      MonoTime::Now().GetDeltaSince(start).ToString(),
-                                     tablet::TabletStatePB_Name(last_state), s.ToString()));
+                                     tablet::RaftGroupStatePB_Name(last_state), s.ToString()));
 }
 
 // Wait until the specified tablet is in RUNNING state.
@@ -1043,7 +1109,7 @@ Status StartRemoteBootstrap(const TServerDetails* ts,
   req.set_dest_uuid(ts->uuid());
   req.set_tablet_id(tablet_id);
   req.set_bootstrap_peer_uuid(bootstrap_source_uuid);
-  RETURN_NOT_OK(HostPortToPB(bootstrap_source_addr, req.mutable_source_private_addr()->Add()));
+  HostPortToPB(bootstrap_source_addr, req.mutable_source_private_addr()->Add());
   req.set_caller_term(caller_term);
 
   RETURN_NOT_OK(ts->consensus_proxy->StartRemoteBootstrap(req, &resp, &rpc));

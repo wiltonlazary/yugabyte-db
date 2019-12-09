@@ -12,9 +12,11 @@
 //
 
 #include "yb/master/catalog_manager.h"
+#include "yb/master/permissions_manager.h"
 #include "yb/master/master_defaults.h"
 #include "yb/master/yql_auth_role_permissions_vtable.h"
 #include "yb/common/common.pb.h"
+#include "yb/common/roles_permissions.h"
 #include "yb/gutil/strings/substitute.h"
 
 namespace yb {
@@ -24,27 +26,26 @@ YQLAuthRolePermissionsVTable::YQLAuthRolePermissionsVTable(const Master* const m
     : YQLVirtualTable(master::kSystemAuthRolePermissionsTableName, master, CreateSchema()) {
 }
 
-Status YQLAuthRolePermissionsVTable::RetrieveData(const QLReadRequestPB& request,
-                                                  std::unique_ptr<QLRowBlock>* vtable) const {
-  vtable->reset(new QLRowBlock(schema_));
+Result<std::shared_ptr<QLRowBlock>> YQLAuthRolePermissionsVTable::RetrieveData(
+    const QLReadRequestPB& request) const {
+  auto vtable = std::make_shared<QLRowBlock>(schema_);
   std::vector<scoped_refptr<RoleInfo>> roles;
-  master_->catalog_manager()->GetAllRoles(&roles);
+  master_->catalog_manager()->permissions_manager()->GetAllRoles(&roles);
   for (const auto& rp : roles) {
     auto l = rp->LockForRead();
     const auto& pb = l->data().pb;
-    for (int i = 0; i <  pb.resources_size(); i++) {
-      const auto& rp = pb.resources(i);
-      QLRow& row = (*vtable)->Extend();
+    for (const auto& resource : pb.resources()) {
+      QLRow& row = vtable->Extend();
       RETURN_NOT_OK(SetColumnValue(kRole, pb.role(), &row));
-      RETURN_NOT_OK(SetColumnValue(kResource, rp.canonical_resource(), &row));
+      RETURN_NOT_OK(SetColumnValue(kResource, resource.canonical_resource(), &row));
 
       QLValuePB permissions;
       QLSeqValuePB* list_value = permissions.mutable_list_value();
 
-      for (int j = 0; j < rp.permissions_size(); j++) {
-        const auto& permission = rp.permissions(j);
-        const char* permission_name  = RoleInfo::permissionName(permission);
-        if (permission_name == nullptr) {
+      for (int j = 0; j < resource.permissions_size(); j++) {
+        const auto& permission = resource.permissions(j);
+        string permission_name  = PermissionName(permission);
+        if (permission_name.empty()) {
           return STATUS(InvalidArgument,
                         strings::Substitute("Unknown Permission $0",
                                             PermissionType_Name(permission)));
@@ -57,7 +58,7 @@ Status YQLAuthRolePermissionsVTable::RetrieveData(const QLReadRequestPB& request
     }
   }
 
-  return Status::OK();
+  return vtable;
 }
 
 

@@ -92,7 +92,7 @@ MonoDelta MonoDelta::FromNanoseconds(int64_t ns) {
   return MonoDelta(ns);
 }
 
-MonoDelta::MonoDelta() : nano_delta_(kUninitialized) {
+MonoDelta::MonoDelta() noexcept : nano_delta_(kUninitialized) {
 }
 
 bool MonoDelta::Initialized() const {
@@ -117,8 +117,13 @@ bool MonoDelta::Equals(const MonoDelta &rhs) const {
   return nano_delta_ == rhs.nano_delta_;
 }
 
+bool MonoDelta::IsNegative() const {
+  DCHECK(Initialized());
+  return nano_delta_ < 0;
+}
+
 std::string MonoDelta::ToString() const {
-  return StringPrintf("%.3fs", ToSeconds());
+  return Initialized() ? StringPrintf("%.3fs", ToSeconds()) : "<uninitialized>";
 }
 
 MonoDelta::MonoDelta(int64_t delta)
@@ -157,6 +162,30 @@ MonoDelta& MonoDelta::operator+=(const MonoDelta& rhs) {
   DCHECK(SafeToAdd64(nano_delta_, rhs.nano_delta_));
   DCHECK(nano_delta_ + rhs.nano_delta_ != kUninitialized);
   nano_delta_ += rhs.nano_delta_;
+  return *this;
+}
+
+MonoDelta& MonoDelta::operator-=(const MonoDelta& rhs) {
+  DCHECK(Initialized());
+  DCHECK(rhs.Initialized());
+  DCHECK(SafeToAdd64(nano_delta_, -rhs.nano_delta_));
+  DCHECK(nano_delta_ - rhs.nano_delta_ != kUninitialized);
+  nano_delta_ -= rhs.nano_delta_;
+  return *this;
+}
+
+MonoDelta& MonoDelta::operator*=(int64_t mul) {
+  DCHECK(Initialized());
+  DCHECK_EQ(nano_delta_ * mul / mul, nano_delta_); // Check for overflow
+  DCHECK(nano_delta_ * mul != kUninitialized);
+  nano_delta_ *= mul;
+  return *this;
+}
+
+MonoDelta& MonoDelta::operator/=(int64_t divisor) {
+  DCHECK(Initialized());
+  DCHECK_NE(divisor, 0);
+  nano_delta_ /= divisor;
   return *this;
 }
 
@@ -253,6 +282,16 @@ void MonoTime::AddDelta(const MonoDelta &delta) {
   }
 }
 
+void MonoTime::SubtractDelta(const MonoDelta &delta) {
+  DCHECK(Initialized());
+  DCHECK(delta.Initialized());
+  if (delta == MonoDelta::kMin) {
+    value_ = kMin.value_;
+  } else {
+    value_ -= delta.ToSteadyDuration();
+  }
+}
+
 bool MonoTime::ComesBefore(const MonoTime &rhs) const {
   DCHECK(Initialized());
   DCHECK(rhs.Initialized());
@@ -304,6 +343,18 @@ CoarseMonoClock::time_point CoarseMonoClock::now() {
   int64_t nanos = static_cast<int64_t>(ts.tv_sec) * MonoTime::kNanosecondsPerSecond + ts.tv_nsec;
 #endif // defined(__APPLE__)
   return time_point(duration(nanos));
+}
+
+std::string ToString(CoarseMonoClock::TimePoint time_point) {
+  return MonoDelta(time_point.time_since_epoch()).ToString();
+}
+
+CoarseTimePoint ToCoarse(MonoTime monotime) {
+  return CoarseTimePoint(monotime.ToSteadyTimePoint().time_since_epoch());
+}
+
+std::chrono::steady_clock::time_point ToSteady(CoarseTimePoint time_point) {
+  return std::chrono::steady_clock::time_point(time_point.time_since_epoch());
 }
 
 } // namespace yb

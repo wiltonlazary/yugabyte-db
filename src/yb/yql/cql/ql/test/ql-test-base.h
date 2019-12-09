@@ -51,27 +51,41 @@ namespace ql {
     EXPECT_FALSE(s.ok());                      \
   } while (false)
 
+#define PARSE_INVALID_STMT_ERR(stmt, err_msg)  \
+  do {                                         \
+    Status s = TestParser(stmt);               \
+    EXPECT_FALSE(s.ok());                      \
+    EXPECT_FALSE(s.ToString().find(err_msg) == string::npos); \
+  } while (false)
+
+#define PROCESSOR_RUN(result, stmt)            \
+    LOG(INFO) << "Run: " << stmt;              \
+    Status result = processor->Run(stmt);
+
 #define EXEC_VALID_STMT(stmt)                  \
   do {                                         \
-    Status s = processor->Run(stmt);           \
+    PROCESSOR_RUN(s, stmt);                    \
     EXPECT_TRUE(s.ok());                       \
   } while (false)
 
-#define EXEC_INVALID_STMT(stmt)                \
-  do {                                         \
-    Status s = processor->Run(stmt);           \
-    EXPECT_FALSE(s.ok());                      \
+#define EXEC_INVALID_STMT_WITH_ERROR(stmt, err_msg)           \
+  do {                                                        \
+    PROCESSOR_RUN(s, stmt);                                   \
+    EXPECT_FALSE(s.ok());                                     \
+    EXPECT_FALSE(s.ToString().find(err_msg) == string::npos); \
   } while (false)
+
+#define EXEC_INVALID_STMT(stmt) EXEC_INVALID_STMT_WITH_ERROR(stmt, "")
 
 #define CHECK_VALID_STMT(stmt)                 \
   do {                                         \
-    Status s = processor->Run(stmt);           \
+    PROCESSOR_RUN(s, stmt);                    \
     CHECK(s.ok()) << "Failure: " << s;         \
   } while (false)
 
 #define CHECK_INVALID_STMT(stmt)               \
   do {                                         \
-    Status s = processor->Run(stmt);           \
+    PROCESSOR_RUN(s, stmt);                    \
     CHECK(!s.ok()) << "Expect failure";        \
   } while (false)
 
@@ -91,11 +105,15 @@ class TestQLProcessor : public ClockHolder, public QLProcessor {
   typedef std::unique_ptr<const TestQLProcessor> UniPtrConst;
 
   // Constructors.
-  TestQLProcessor(
-      std::weak_ptr<rpc::Messenger> messenger, std::shared_ptr<client::YBClient> client,
-      std::shared_ptr<client::YBMetaDataCache> cache)
-      : QLProcessor(messenger, client, cache, nullptr /* ql_metrics */, clock_,
-                    TransactionManagerProvider()) { }
+  TestQLProcessor(client::YBClient* client,
+                  std::shared_ptr<client::YBMetaDataCache> cache,
+                  const RoleName& role_name)
+      : QLProcessor(client, cache, nullptr /* ql_metrics */, clock_,
+                    TransactionPoolProvider()) {
+    if (!role_name.empty()) {
+      ql_env_.ql_session()->set_current_role_name(role_name);
+    }
+  }
   virtual ~TestQLProcessor() { }
 
   void RunAsyncDone(
@@ -108,8 +126,8 @@ class TestQLProcessor : public ClockHolder, public QLProcessor {
   void RunAsync(
       const string& stmt, const StatementParameters& params, Callback<void(const Status&)> cb) {
     result_ = nullptr;
-    QLProcessor::RunAsync(
-        stmt, params, Bind(&TestQLProcessor::RunAsyncDone, Unretained(this), cb));
+    parse_tree.reset(); // Delete previous parse tree.
+    RunAsyncInternal(stmt, params, Bind(&TestQLProcessor::RunAsyncDone, Unretained(this), cb));
   }
 
   // Execute a QL statement.
@@ -149,9 +167,28 @@ class TestQLProcessor : public ClockHolder, public QLProcessor {
     ql_env_.RemoveCachedTableDesc(table_name);
   }
 
+  const ParseTree::UniPtr& GetLastParseTree() const {
+    return parse_tree;
+  }
+
  private:
+  void RunAsyncInternal(const std::string& stmt, const StatementParameters& params,
+                        StatementExecutedCallback cb, bool reparsed = false) {
+    const Status s = Prepare(stmt, &parse_tree, reparsed);
+    if (PREDICT_FALSE(!s.ok())) {
+      return cb.Run(s, nullptr /* result */);
+    }
+    // Do not make a copy of stmt and params when binding to the RunAsyncDone callback because when
+    // error occurs due to stale matadata, the statement needs to be reexecuted. We should pass the
+    // original references which are guaranteed to still be alive when the statement is reexecuted.
+    ExecuteAsync(*parse_tree, params, Bind(&QLProcessor::RunAsyncDone, Unretained(this),
+        ConstRef(stmt), ConstRef(params), Unretained(parse_tree.get()), cb));
+  }
+
   // Execute result.
   ExecutedResult::SharedPtr result_;
+
+  ParseTree::UniPtr parse_tree;
 };
 
 // Base class for all QL test cases.
@@ -167,7 +204,9 @@ class QLTestBase : public YBTest {
   virtual void SetUp() override {
     YBTest::SetUp();
   }
+
   virtual void TearDown() override {
+    client_.reset();
     if (cluster_ != nullptr) {
       cluster_->Shutdown();
     }
@@ -177,14 +216,14 @@ class QLTestBase : public YBTest {
   //------------------------------------------------------------------------------------------------
   // Test only the parser.
   CHECKED_STATUS TestParser(const std::string& stmt) {
-    QLProcessor *processor = GetQLProcessor();
+    QLProcessor* processor = GetQLProcessor();
     ParseTree::UniPtr parse_tree;
     return processor->Parse(stmt, &parse_tree);
   }
 
   // Tests parser and analyzer
-  CHECKED_STATUS TestAnalyzer(const string& stmt, ParseTree::UniPtr *parse_tree) {
-    QLProcessor *processor = GetQLProcessor();
+  CHECKED_STATUS TestAnalyzer(const string& stmt, ParseTree::UniPtr* parse_tree) {
+    QLProcessor* processor = GetQLProcessor();
     RETURN_NOT_OK(processor->Parse(stmt, parse_tree));
     RETURN_NOT_OK(processor->Analyze(parse_tree));
     return Status::OK();
@@ -195,13 +234,13 @@ class QLTestBase : public YBTest {
   void CreateSimulatedCluster(int num_tablet_servers = 1);
 
   // Create ql processor.
-  TestQLProcessor *GetQLProcessor();
+  TestQLProcessor* GetQLProcessor(const RoleName& role_name = "");
 
 
   //------------------------------------------------------------------------------------------------
   // Utility functions for QL tests.
 
-  void VerifyPaginationSelect(TestQLProcessor *processor,
+  void VerifyPaginationSelect(TestQLProcessor* processor,
                               const string &select_query,
                               int page_size,
                               const string expected_rows) {
@@ -220,7 +259,7 @@ class QLTestBase : public YBTest {
       if (processor->rows_result()->paging_state().empty()) {
         break;
       }
-      CHECK_OK(params.set_paging_state(processor->rows_result()->paging_state()));
+      CHECK_OK(params.SetPagingState(processor->rows_result()->paging_state()));
     } while (true);
     EXPECT_EQ(expected_rows, rows);
   }
@@ -232,7 +271,7 @@ class QLTestBase : public YBTest {
   std::shared_ptr<MiniCluster> cluster_;
 
   // Simulated YB client.
-  std::shared_ptr<client::YBClient> client_;
+  std::unique_ptr<client::YBClient> client_;
   std::shared_ptr<client::YBMetaDataCache> metadata_cache_;
 
   // QL Processor.

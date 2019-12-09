@@ -15,75 +15,17 @@ package org.yb.cql;
 import com.datastax.driver.core.*;
 import com.datastax.driver.core.ProtocolOptions.Compression;
 
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Iterator;
-import java.util.List;
-
-import org.junit.BeforeClass;
+import com.datastax.driver.core.exceptions.UnauthorizedException;
 import org.junit.Test;
 
-import static org.junit.Assert.*;
+import static org.yb.AssertionWrappers.*;
 
-public class TestAuthentication extends BaseCQLTest {
-  @BeforeClass
-  public static void setUpBeforeClass() throws Exception {
-    // Setting verbose level for debugging.
-    BaseCQLTest.tserverArgs = Arrays.asList("--use_cassandra_authentication=true");
-    BaseCQLTest.setUpBeforeClass();
-  }
+import org.yb.YBTestRunner;
 
-  public Cluster.Builder getDefaultClusterBuilder() {
-    // Default return cassandra/cassandra auth.
-    return super.getDefaultClusterBuilder().withCredentials("cassandra", "cassandra");
-  }
+import org.junit.runner.RunWith;
 
-  public Session getDefaultSession() {
-    Cluster.Builder cb = getDefaultClusterBuilder();
-    Cluster c = cb.build();
-    Session s = c.connect();
-    return s;
-  }
-
-  // Verifies that roleName exists in the system_auth.roles table, and that canLogin and isSuperuser
-  // match the fields 'can_login' and 'is_superuser' for this role.
-  private void verifyRole(String roleName, boolean canLogin, boolean isSuperuser)
-      throws Exception {
-    verifyRoleFields(roleName, canLogin, isSuperuser, new ArrayList<>());
-  }
-
-  private void verifyRoleFields(String roleName, boolean canLogin, boolean isSuperuser,
-                                List<String> memberOf) throws Exception {
-    Session s = getDefaultSession();
-    ResultSet rs = s.execute(
-        String.format("SELECT * FROM system_auth.roles WHERE role = '%s';", roleName));
-
-    Iterator<Row> iter = rs.iterator();
-    assertTrue(String.format("Unable to find role '%s'", roleName), iter.hasNext());
-    Row r = iter.next();
-    assertEquals(r.getBool("can_login"), canLogin);
-    assertEquals(r.getBool("is_superuser"), isSuperuser);
-    assertEquals(r.getList("member_of", String.class), memberOf);
-  }
-
-  private void testCreateRoleHelper(String roleName, String password, boolean canLogin,
-                                    boolean isSuperuser) throws Exception {
-    Session s = getDefaultSession();
-
-    // Create the role.
-    String createStmt = String.format(
-        "CREATE ROLE %s WITH PASSWORD = '%s' AND LOGIN = %s AND SUPERUSER = %s",
-        roleName, password, canLogin, isSuperuser);
-
-    s.execute(createStmt);
-
-    // Verify that we can connect using the new role.
-    checkConnectivity(true, roleName, password, !canLogin);
-
-    // Verify that the information got written into system_auth.roles correctly.
-    verifyRole(roleName, canLogin, isSuperuser);
-  }
-
+@RunWith(value=YBTestRunner.class)
+public class TestAuthentication extends BaseAuthenticationCQLTest {
   @Test(timeout = 100000)
   public void testCreateRoles() throws Exception {
     testCreateRoleHelper("role1", "$!@$q1<>?", false, false);
@@ -117,6 +59,51 @@ public class TestAuthentication extends BaseCQLTest {
     thrown.expect(com.datastax.driver.core.exceptions.InvalidQueryException.class);
     thrown.expectMessage("Role other_role does not exist");
     s.execute(deleteStmt);
+  }
+
+  @Test
+  public void testNoSuperuserCannotDeleteSuperuserRole() throws Exception {
+    String superuser = "superuser1";
+    String user = "no_superuser";
+    String pwd = "password";
+
+    // For now we create this user as a superuser. We will change that attribute later.
+    testCreateRoleHelper(user, pwd, true, true);
+
+    Session s2 = getSession(user, pwd);
+
+    // Create another superuser role using user's session so that it gets all the permissions on
+    // the new role.
+    testCreateRoleHelperWithSession(superuser, pwd, true, true, false, s2);
+
+    Session s = getDefaultSession();
+    s.execute(String.format("ALTER ROLE %s WITH SUPERUSER = false", user));
+
+    // A non-superuser role tries to delete a superuser role.
+    thrown.expect(com.datastax.driver.core.exceptions.UnauthorizedException.class);
+    thrown.expectMessage("Only superusers can drop a role with superuser status");
+    s2.execute(String.format("DROP ROLE %s", superuser));
+  }
+
+  @Test
+  public void testSuperuserCanDeleteAnotherSuperuserRole() throws Exception {
+    String superuser1 = "superuser_1";
+    String superuser2 = "superuser_2";
+    String pwd = "password";
+
+    testCreateRoleHelper(superuser1, pwd, true, true);
+
+    Session s2 = getSession(superuser1, pwd);
+
+    // Create a new role using superuser1's session. This should grant all the permissions on role
+    // superuser2 to superuser1.
+    testCreateRoleHelperWithSession(superuser2, pwd, true, true, true, s2);
+
+    // Verify that superuser1 can delete superuser2.
+    s2.execute(String.format("DROP ROLE %s", superuser2));
+
+    // Verify that we can't connect using the deleted role.
+    checkConnectivity(true, superuser2, pwd, true);
   }
 
   @Test(timeout = 100000)
@@ -210,7 +197,7 @@ public class TestAuthentication extends BaseCQLTest {
   @Test(timeout = 100000)
   public void testAlterNonExistingRole() throws Exception {
     Session s = getDefaultSession();
-    String alterStmt = "ALTER ROLE alter_test_5";
+    String alterStmt = "ALTER ROLE alter_test_5 WITH LOGIN = false";
 
     thrown.expect(com.datastax.driver.core.exceptions.InvalidQueryException.class);
     thrown.expectMessage("Role alter_test_5 does not exist");
@@ -242,34 +229,119 @@ public class TestAuthentication extends BaseCQLTest {
     checkConnectivity(false, null, null, Compression.SNAPPY, true);
   }
 
-  public void checkConnectivity(
-      boolean usingAuth, String optUser, String optPass, boolean expectFailure) {
-    checkConnectivity(usingAuth, optUser, optPass, Compression.NONE, expectFailure);
+  @Test
+  public void testNonSuperuserRoleCannotCreateSuperuserRole() throws Exception {
+    Session s = getDefaultSession();
+    String roleName = "non_superuser";
+    String password = "abc";
+    testCreateRoleHelperWithSession(roleName, password, true, false, false, s);
+
+    grantPermission(CREATE, ALL_ROLES, "", roleName, s);
+
+    Session s2 = getSession(roleName, password);
+    // Verify that we can create a simple role.
+    s2.execute("CREATE ROLE simple_role");
+
+    // Verify that we can't create a superuser role.
+    thrown.expect(UnauthorizedException.class);
+    s2.execute("CREATE ROLE some_superuser_role WITH SUPERUSER = true");
   }
 
-  public void checkConnectivity(boolean usingAuth,
-                                String optUser,
-                                String optPass,
-                                Compression compression,
-                                boolean expectFailure) {
-    // Use superclass definition to not have a default set of credentials.
-    Cluster.Builder cb = super.getDefaultClusterBuilder();
-    Cluster c = null;
-    if (usingAuth) {
-      cb = cb.withCredentials(optUser, optPass);
-    }
-    if (compression != Compression.NONE) {
-      cb = cb.withCompression(compression);
-    }
-    c = cb.build();
-    try {
-      Session s = c.connect();
-      s.execute("SELECT * FROM system_auth.roles;");
-      // If we're expecting a failure, we should NOT be in here.
-      assertFalse(expectFailure);
-    } catch (com.datastax.driver.core.exceptions.AuthenticationException e) {
-      // If we're expecting a failure, we should be in here.
-      assertTrue(expectFailure);
-    }
+  @Test
+  public void testNonSuperuserRoleCannotCreateIfNotExistsSuperuserRole() throws Exception {
+    Session s = getDefaultSession();
+    String roleName = "non_superuser_2";
+    String password = "abc";
+    testCreateRoleHelperWithSession(roleName, password, true, false, false, s);
+
+    grantPermission(CREATE, ALL_ROLES, "", roleName, s);
+
+    Session s2 = getSession(roleName, password);
+    // Verify that we can create a simple role.
+    s2.execute("CREATE ROLE simple_role_2");
+
+    // Verify that CREATE IF NOT EXISTS for an existing role, fails with an unauthorized exception.
+    thrown.expect(UnauthorizedException.class);
+    s2.execute("CREATE ROLE IF NOT EXISTS simple_role_2 WITH SUPERUSER = true");
+  }
+
+  @Test
+  public void testSuperuserRoleCanCreateSuperuserRole() throws Exception {
+    Session s = getDefaultSession();
+    String roleName = "superuser_role";
+    String password = "abc";
+    testCreateRoleHelperWithSession(roleName, password, true, true, false, s);
+
+    // No need to grant permissions to the superuser role.
+    Session s2 = getSession(roleName, password);
+    s2.execute("CREATE ROLE some_superuser_role WITH SUPERUSER = true");
+  }
+
+  @Test
+  public void testAlterSuperuserFieldOfSuperuserRole() throws Exception {
+    String password = "abc";
+    String superuser = "alter_superuser_test_superuser";
+    String nonSuperuser = "alter_superuser_test_non_superuser";
+
+    // Initially create this user with the superuser status, so that it can create another
+    // another superuser. We will remove this role' superuser status before trying to alter a
+    // superuser role.
+    testCreateRoleHelper(nonSuperuser, password, true, true);
+
+    Session s2 = getSession(nonSuperuser, password);
+
+    // Using nonSuperuser role to create superuser so that it automatically acquires all the
+    // permissions on superuser.
+    testCreateRoleHelperWithSession(superuser, password, true, true, true, s2);
+
+    // Remove the superuser status from nonSuperuser to trigger the failure.
+    getDefaultSession().execute(String.format("ALTER ROLE %s WITH SUPERUSER = FALSE",
+                                              nonSuperuser));
+
+    // A non-superuser role tries to alter the superuser field of a superuser role.
+    String alterStmt = String.format("ALTER ROLE %s WITH SUPERUSER = FALSE", superuser);
+    thrown.expect(com.datastax.driver.core.exceptions.UnauthorizedException.class);
+    thrown.expectMessage("Only superusers are allowed to alter superuser status");
+    s2.execute(alterStmt);
+  }
+
+  // The previous test verifies that a non-superuser role cannot alter the superuser status of a
+  // superuser role. This test verifies that a non-superuser role cannot modify the superuser status
+  // of a non-superuser role.
+  @Test
+  public void testAlterSuperuserFieldOfNonSuperuserRole() throws Exception {
+    String password = "abc";
+    String nonSuperuser = "nosuperuser_role_123";
+    String anotherNonSuperuser = "another_nosuperuser_role_123";
+
+    testCreateRoleHelper(nonSuperuser, password, /* canLogin */ true, /* isSuperuser */ false);
+    getDefaultSession().execute(String.format("GRANT ALL ON ALL ROLES to %s", nonSuperuser));
+    getDefaultSession().execute(String.format("GRANT ALL ON ALL KEYSPACES to %s", nonSuperuser));
+
+    Session s2 = getSession(nonSuperuser, password);
+
+    // Using nonSuperuser role to create anotherNonSuperuser so that it automatically acquires all
+    // the permissions on anotherNonSuperuser.
+    testCreateRoleHelperWithSession(anotherNonSuperuser, password, /* canLogin */ true,
+            /* isSuperuser */false, /* verifyConnectivity */ false, /* Session */ s2);
+
+    // Try to modify the superuser status from anotherNonSuperuser to trigger the failure.
+    String alterStmt = String.format("ALTER ROLE %s WITH SUPERUSER = FALSE", anotherNonSuperuser);
+    thrown.expect(com.datastax.driver.core.exceptions.UnauthorizedException.class);
+    thrown.expectMessage("Only superusers are allowed to alter superuser status");
+    s2.execute(alterStmt);
+  }
+
+  @Test
+  public void testRoleCannotDeleteItself() throws Exception {
+    String user = "delete_itself_role";
+    String password = "abc";
+
+    testCreateRoleHelper(user, password, true, true);
+
+    Session s2 = getSession(user, password);
+    thrown.expect(com.datastax.driver.core.exceptions.InvalidQueryException.class);
+    thrown.expectMessage("Cannot DROP primary role for current login");
+    s2.execute(String.format("DROP ROLE %s", user));
   }
 }

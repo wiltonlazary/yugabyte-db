@@ -23,6 +23,7 @@
 #include "yb/rpc/scheduler.h"
 
 #include "yb/util/countdown_latch.h"
+#include "yb/util/memory/memory.h"
 #include "yb/util/tostring.h"
 
 namespace yb {
@@ -35,7 +36,7 @@ using namespace std::literals;
 class SchedulerTest : public RpcTestBase {
  public:
   void SetUp() override {
-    pool_.emplace(1);
+    pool_.emplace("test", 1);
     scheduler_.emplace(&pool_->io_service());
   }
 

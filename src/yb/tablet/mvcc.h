@@ -46,15 +46,16 @@
 namespace yb {
 namespace tablet {
 
-// Allows us to keep track of how a particular value of safe time was replicated, for sanity
+// Allows us to keep track of how a particular value of safe time was obtained, for sanity
 // checking purposes.
-YB_DEFINE_ENUM(SafeTimeSource, (kUnknown)(kNow)(kNextInQueue)(kHybridTimeLease));
+YB_DEFINE_ENUM(SafeTimeSource,
+               (kUnknown)(kNow)(kNextInQueue)(kHybridTimeLease)(kPropagated)(kLastReplicated));
 
 struct SafeTimeWithSource {
   HybridTime safe_time = HybridTime::kMin;
   SafeTimeSource source = SafeTimeSource::kUnknown;
 
-  std::string ToString();
+  std::string ToString() const;
 };
 
 // MvccManager is used to track operations.
@@ -67,6 +68,10 @@ class MvccManager {
  public:
   // `prefix` is used for logging.
   explicit MvccManager(std::string prefix, server::ClockPtr clock);
+
+  // Set special RF==1 mode flag to handle safe time requests correctly in case
+  // there are no heartbeats to update internal propagated_safe_time_ correctly.
+  void SetLeaderOnlyMode(bool leader_only);
 
   // Sets time of last replicated operation, used after bootstrap.
   void SetLastReplicated(HybridTime ht);
@@ -113,24 +118,21 @@ class MvccManager {
   // Returns invalid hybrid time in case it cannot satisfy provided requirements, for instance
   // because of timeout.
   HybridTime SafeTime(
-      HybridTime min_allowed, MonoTime deadline, HybridTime ht_lease) const;
+      HybridTime min_allowed, CoarseTimePoint deadline, HybridTime ht_lease) const;
 
   HybridTime SafeTime(HybridTime ht_lease) const {
-    return SafeTime(HybridTime::kMin /* min_allowed */, MonoTime::kMax /* deadline */, ht_lease);
+    return SafeTime(HybridTime::kMin /* min_allowed */, CoarseTimePoint::max() /* deadline */,
+                    ht_lease);
   }
 
-  HybridTime SafeTime() const {
-    return SafeTime(HybridTime::kMax);
-  }
-
-  HybridTime SafeTimeForFollower(HybridTime min_allowed, MonoTime deadline) const;
+  HybridTime SafeTimeForFollower(HybridTime min_allowed, CoarseTimePoint deadline) const;
 
   // Returns time of last replicated operation.
   HybridTime LastReplicatedHybridTime() const;
 
  private:
   HybridTime DoGetSafeTime(HybridTime min_allowed,
-                           MonoTime deadline,
+                           CoarseTimePoint deadline,
                            HybridTime ht_lease,
                            std::unique_lock<std::mutex>* lock) const;
 
@@ -155,6 +157,8 @@ class MvccManager {
   // leader, this is a safe time that gets updated every time the majority-replicated watermarks
   // change.
   HybridTime propagated_safe_time_ = HybridTime::kMin;
+  // Special flag for RF==1 mode when propagated_safe_time_ can be not up-to-date.
+  bool leader_only_mode_ = false;
 
   // Because different calls that have current hybrid time leader lease as an argument can come to
   // us out of order, we might see an older value of hybrid time leader lease expiration after a
@@ -163,7 +167,7 @@ class MvccManager {
 
   mutable SafeTimeWithSource max_safe_time_returned_with_lease_;
   mutable SafeTimeWithSource max_safe_time_returned_without_lease_;
-  mutable HybridTime max_safe_time_returned_for_follower_ = HybridTime::kMin;
+  mutable SafeTimeWithSource max_safe_time_returned_for_follower_ { HybridTime::kMin };
 };
 
 }  // namespace tablet

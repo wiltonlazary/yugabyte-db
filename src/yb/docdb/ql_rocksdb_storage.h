@@ -36,19 +36,19 @@ class QLRocksDBStorage : public common::YQLStorageIf {
                              const Schema& projection,
                              const Schema& schema,
                              const TransactionOperationContextOpt& txn_op_context,
-                             MonoTime deadline,
+                             CoarseTimePoint deadline,
                              const ReadHybridTime& read_time,
                              const common::QLScanSpec& spec,
                              std::unique_ptr<common::YQLRowwiseIteratorIf> *iter) const override;
 
-  CHECKED_STATUS BuildYQLScanSpec(const QLReadRequestPB& request,
-                                  const ReadHybridTime& read_time,
-                                  const Schema& schema,
-                                  bool include_static_columns,
-                                  const Schema& static_projection,
-                                  std::unique_ptr<common::QLScanSpec>* spec,
-                                  std::unique_ptr<common::QLScanSpec>* static_row_spec,
-                                  ReadHybridTime* req_read_time) const override;
+  CHECKED_STATUS BuildYQLScanSpec(
+      const QLReadRequestPB& request,
+      const ReadHybridTime& read_time,
+      const Schema& schema,
+      bool include_static_columns,
+      const Schema& static_projection,
+      std::unique_ptr<common::QLScanSpec>* spec,
+      std::unique_ptr<common::QLScanSpec>* static_row_spec) const override;
 
   //------------------------------------------------------------------------------------------------
   // PGSQL Support.
@@ -56,16 +56,9 @@ class QLRocksDBStorage : public common::YQLStorageIf {
                              const Schema& projection,
                              const Schema& schema,
                              const TransactionOperationContextOpt& txn_op_context,
-                             MonoTime deadline,
+                             CoarseTimePoint deadline,
                              const ReadHybridTime& read_time,
-                             const common::PgsqlScanSpec& spec,
                              common::YQLRowwiseIteratorIf::UniPtr* iter) const override;
-
-  CHECKED_STATUS BuildYQLScanSpec(const PgsqlReadRequestPB& request,
-                                  const ReadHybridTime& read_time,
-                                  const Schema& schema,
-                                  std::unique_ptr<common::PgsqlScanSpec>* spec,
-                                  ReadHybridTime* req_read_time) const override;
 
  private:
   const DocDB doc_db_;

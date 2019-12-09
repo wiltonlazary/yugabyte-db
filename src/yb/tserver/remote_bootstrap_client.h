@@ -32,6 +32,7 @@
 #ifndef YB_TSERVER_REMOTE_BOOTSTRAP_CLIENT_H
 #define YB_TSERVER_REMOTE_BOOTSTRAP_CLIENT_H
 
+#include <atomic>
 #include <string>
 #include <memory>
 #include <vector>
@@ -39,7 +40,7 @@
 
 #include <gtest/gtest_prod.h>
 
-#include "yb/consensus/consensus.h"
+#include "yb/consensus/consensus_fwd.h"
 #include "yb/gutil/gscoped_ptr.h"
 #include "yb/gutil/macros.h"
 #include "yb/gutil/ref_counted.h"
@@ -49,7 +50,6 @@
 
 namespace yb {
 
-class BlockId;
 class BlockIdPB;
 class FsManager;
 class HostPort;
@@ -62,10 +62,10 @@ class RaftPeerPB;
 } // namespace consensus
 
 namespace tablet {
-class TabletMetadata;
+class RaftGroupMetadata;
 class TabletPeer;
 class TabletStatusListener;
-class TabletSuperBlockPB;
+class RaftGroupReplicaSuperBlockPB;
 } // namespace tablet
 
 namespace tserver {
@@ -101,13 +101,13 @@ class RemoteBootstrapClient {
   // If the consensus metadata exists on disk for this tablet, and if
   // 'caller_term' is lower than the current term stored in that consensus
   // metadata, then this method will fail with a Status::InvalidArgument error.
-  CHECKED_STATUS SetTabletToReplace(const scoped_refptr<tablet::TabletMetadata>& meta,
+  CHECKED_STATUS SetTabletToReplace(const scoped_refptr<tablet::RaftGroupMetadata>& meta,
                                     int64_t caller_term);
 
   // Start up a remote bootstrap session to bootstrap from the specified
   // bootstrap peer. Place a new superblock indicating that remote bootstrap is
   // in progress. If the 'metadata' pointer is passed as NULL, it is ignored,
-  // otherwise the TabletMetadata object resulting from the initial remote
+  // otherwise the RaftGroupMetadata object resulting from the initial remote
   // bootstrap response is returned.
   // ts_manager pointer allows the bootstrap function to assign non-random
   // data and wal directories for the bootstrapped tablets.
@@ -115,7 +115,7 @@ class RemoteBootstrapClient {
   CHECKED_STATUS Start(const std::string& bootstrap_peer_uuid,
                        rpc::ProxyCache* proxy_cache,
                        const HostPort& bootstrap_peer_addr,
-                       scoped_refptr<tablet::TabletMetadata>* metadata,
+                       scoped_refptr<tablet::RaftGroupMetadata>* metadata,
                        TSTabletManager* ts_manager = nullptr);
 
   // Runs a "full" remote bootstrap, copying the physical layout of a tablet
@@ -131,23 +131,16 @@ class RemoteBootstrapClient {
   CHECKED_STATUS VerifyChangeRoleSucceeded(
       const std::shared_ptr<consensus::Consensus>& shared_consensus);
 
+  // Removes session at server.
+  CHECKED_STATUS Remove();
+
  protected:
   FRIEND_TEST(RemoteBootstrapRocksDBClientTest, TestBeginEndSession);
   FRIEND_TEST(RemoteBootstrapRocksDBClientTest, TestDownloadRocksDBFiles);
 
-  // Extract the embedded Status message from the given ErrorStatusPB.
-  // The given ErrorStatusPB must extend RemoteBootstrapErrorPB.
-  static CHECKED_STATUS ExtractRemoteError(const rpc::ErrorStatusPB& remote_error);
-
-  static CHECKED_STATUS UnwindRemoteError(const Status& status,
-                                          const rpc::RpcController& controller);
-
   // Update the bootstrap StatusListener with a message.
   // The string "RemoteBootstrap: " will be prepended to each message.
   void UpdateStatusMessage(const std::string& message);
-
-  // End the remote bootstrap session.
-  CHECKED_STATUS EndRemoteSession();
 
   // Download all WAL files sequentially.
   CHECKED_STATUS DownloadWALs();
@@ -161,16 +154,10 @@ class RemoteBootstrapClient {
   // downloaded as part of initiating the remote bootstrap session.
   CHECKED_STATUS WriteConsensusMetadata();
 
-  // Download a single block.
-  // Data block is opened with options so that it will fsync() on close.
-  //
-  // On success, 'new_block_id' is set to the new ID of the downloaded block.
-  CHECKED_STATUS DownloadBlock(const BlockId& old_block_id, BlockId* new_block_id);
-
   // Download a single remote file. The block and WAL implementations delegate
   // to this method when downloading files.
   //
-  // An Appendable is typically a WritableBlock (block) or WritableFile (WAL).
+  // An Appendable is typically a WritableFile (WAL).
   //
   // Only used in one compilation unit, otherwise the implementation would
   // need to be in the header.
@@ -186,8 +173,13 @@ class RemoteBootstrapClient {
   CHECKED_STATUS DownloadFile(
       const tablet::FilePB& file_pb, const std::string& dir, DataIdPB* data_id);
 
+  // End the remote bootstrap session.
+  CHECKED_STATUS EndRemoteSession();
+
   // Return standard log prefix.
-  std::string LogPrefix();
+  const std::string& LogPrefix() const {
+    return log_prefix_;
+  }
 
   // Set-once members.
   const std::string tablet_id_;
@@ -196,6 +188,9 @@ class RemoteBootstrapClient {
 
   // State flags that enforce the progress of remote bootstrap.
   bool started_;            // Session started.
+  // Total number of remote bootstrap sessions. Used to calculate the transmission rate across all
+  // the sessions.
+  static std::atomic<int32_t> n_started_;
   bool downloaded_wal_;     // WAL segments downloaded.
   bool downloaded_blocks_;  // Data blocks downloaded.
   bool downloaded_rocksdb_files_;
@@ -203,8 +198,10 @@ class RemoteBootstrapClient {
   // Session-specific data items.
   bool replace_tombstoned_tablet_;
 
+  bool remove_required_ = false;
+
   // Local tablet metadata file.
-  scoped_refptr<tablet::TabletMetadata> meta_;
+  scoped_refptr<tablet::RaftGroupMetadata> meta_;
 
   // Local Consensus metadata file. This may initially be NULL if this is
   // bootstrapping a new replica (rather than replacing an old one).
@@ -214,16 +211,21 @@ class RemoteBootstrapClient {
   std::shared_ptr<RemoteBootstrapServiceProxy> proxy_;
   std::string session_id_;
   uint64_t session_idle_timeout_millis_;
-  gscoped_ptr<tablet::TabletSuperBlockPB> superblock_;
-  gscoped_ptr<tablet::TabletSuperBlockPB> new_superblock_;
+  gscoped_ptr<tablet::RaftGroupReplicaSuperBlockPB> superblock_;
+  gscoped_ptr<tablet::RaftGroupReplicaSuperBlockPB> new_superblock_;
   gscoped_ptr<consensus::ConsensusStatePB> remote_committed_cstate_;
   std::vector<uint64_t> wal_seqnos_;
+
+  // First available WAL segment.
+  uint64_t first_wal_seqno_ = 0;
 
   int64_t start_time_micros_;
 
   // We track whether this session succeeded and send this information as part of the
   // EndRemoteBootstrapSessionRequestPB request.
   bool succeeded_;
+
+  const std::string log_prefix_;
 
  private:
   std::unordered_map<uint64_t, std::string> inode2file_;

@@ -35,8 +35,12 @@
 #include <vector>
 
 #include "yb/client/client.h"
+#include "yb/client/error.h"
+#include "yb/client/session.h"
 #include "yb/client/table_handle.h"
 #include "yb/client/yb_op.h"
+
+#include "yb/common/ql_value.h"
 
 #include "yb/gutil/stl_util.h"
 #include "yb/util/test_util.h"

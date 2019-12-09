@@ -124,11 +124,13 @@ static CHECKED_STATUS AppendNoOpsToLogSync(const scoped_refptr<Clock>& clock,
 
   // Account for the entry batch header and wrapper PB.
   if (size) {
-    *size += log::kEntryHeaderSize + 5;
+    *size += log::kEntryHeaderSize + 7;
   }
 
   Synchronizer s;
-  RETURN_NOT_OK(log->AsyncAppendReplicates(replicates, s.AsStatusCallback()));
+  RETURN_NOT_OK(log->AsyncAppendReplicates(
+      replicates, yb::OpId() /* committed_op_id */, RestartSafeCoarseTimePoint::FromUInt64(1),
+      s.AsStatusCallback()));
   RETURN_NOT_OK(s.Wait());
   return Status::OK();
 }
@@ -175,9 +177,9 @@ class LogTestBase : public YBTest {
   void BuildLog() {
     Schema schema_with_ids = SchemaBuilder(schema_).Build();
     ASSERT_OK(Log::Open(options_,
-                       fs_manager_.get(),
                        kTestTablet,
                        tablet_wal_path_,
+                       fs_manager_->uuid(),
                        schema_with_ids,
                        0, // schema_version
                        metric_entity_.get(),
@@ -199,15 +201,6 @@ class LogTestBase : public YBTest {
     ASSERT_EQ(expected, count);
   }
 
-  void EntriesToIdList(vector<uint32_t>* ids) {
-    for (const auto& entry : entries_) {
-      VLOG(2) << "Entry contents: " << entry->DebugString();
-      if (entry->type() == REPLICATE) {
-        ids->push_back(entry->replicate().id().index());
-      }
-    }
-  }
-
   static void CheckReplicateResult(const consensus::ReplicateMsgPtr& msg, const Status& s) {
     ASSERT_OK(s);
   }
@@ -226,8 +219,15 @@ class LogTestBase : public YBTest {
     WriteRequestPB *batch_request = replicate->mutable_write_request();
     if (writes.empty()) {
       const int opid_index_as_int = static_cast<int>(opid.index());
+      // Since OpIds deal with int64 index and term, we are downcasting here. In order to be able
+      // to test with values > INT_MAX, we need to make sure we do not overflow, while still
+      // wanting to add 2 different values here.
+      //
+      // Picking x and x / 2 + 1 as the 2 values.
+      // For small numbers, special casing x <= 2.
+      const int other_int = opid_index_as_int <= 2 ? 3 : opid_index_as_int / 2 + 1;
       writes.emplace_back(opid_index_as_int, 0, "this is a test insert");
-      writes.emplace_back(opid_index_as_int + 1, 0, "this is a test mutate");
+      writes.emplace_back(other_int, 0, "this is a test mutate");
     }
     auto write_batch = batch_request->mutable_write_batch();
     for (const auto &w : writes) {
@@ -243,21 +243,24 @@ class LogTestBase : public YBTest {
                             bool sync = APPEND_SYNC) {
     if (sync) {
       Synchronizer s;
-      ASSERT_OK(log_->AsyncAppendReplicates({ replicate }, s.AsStatusCallback()));
+      ASSERT_OK(log_->AsyncAppendReplicates(
+          { replicate }, yb::OpId() /* committed_op_id */, restart_safe_coarse_mono_clock_.Now(),
+          s.AsStatusCallback()));
       ASSERT_OK(s.Wait());
     } else {
       // AsyncAppendReplicates does not free the ReplicateMsg on completion, so we
       // need to pass it through to our callback.
-      ASSERT_OK(log_->AsyncAppendReplicates({ replicate },
-                                            Bind(&LogTestBase::CheckReplicateResult, replicate)));
+      ASSERT_OK(log_->AsyncAppendReplicates(
+          { replicate }, yb::OpId() /* committed_op_id */, restart_safe_coarse_mono_clock_.Now(),
+          Bind(&LogTestBase::CheckReplicateResult, replicate)));
     }
   }
 
-  // Appends 'count' ReplicateMsgs and the corresponding CommitMsgs to the log
-  void AppendReplicateBatchToLog(int count, TableType table_type, bool sync = true) {
+  // Appends 'count' ReplicateMsgs to the log as committed entries.
+  void AppendReplicateBatchToLog(int count, bool sync = true) {
     for (int i = 0; i < count; i++) {
-      OpId opid = consensus::MakeOpId(1, current_index_);
-      AppendReplicateBatch(opid);
+      consensus::OpId opid = consensus::MakeOpId(1, current_index_);
+      AppendReplicateBatch(opid, opid);
       current_index_ += 1;
     }
   }
@@ -306,13 +309,13 @@ class LogTestBase : public YBTest {
   scoped_refptr<MetricEntity> metric_entity_;
   std::unique_ptr<ThreadPool> append_pool_;
   scoped_refptr<Log> log_;
-  int32_t current_index_;
+  int64_t current_index_;
   LogOptions options_;
   // Reusable entries vector that deletes the entries on destruction.
-  LogEntries entries_;
   scoped_refptr<LogAnchorRegistry> log_anchor_registry_;
   scoped_refptr<Clock> clock_;
   string tablet_wal_path_;
+  RestartSafeCoarseMonoClock restart_safe_coarse_mono_clock_;
 };
 
 // Corrupts the last segment of the provided log by either truncating it

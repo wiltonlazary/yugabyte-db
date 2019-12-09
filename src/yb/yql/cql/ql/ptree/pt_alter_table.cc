@@ -17,6 +17,8 @@
 
 #include "yb/yql/cql/ql/ptree/pt_alter_table.h"
 #include "yb/yql/cql/ql/ptree/sem_context.h"
+#include "yb/client/table.h"
+
 
 namespace yb {
 namespace ql {
@@ -40,11 +42,13 @@ PTAlterTable::~PTAlterTable() {
 
 CHECKED_STATUS PTAlterTable::Analyze(SemContext *sem_context) {
   // Populate internal table_ variable.
-  bool is_system_ignored;
+  bool is_system_ignored = false;
   RETURN_NOT_OK(name_->AnalyzeName(sem_context, OBJECT_TABLE));
+
+  // Permissions check happen in LookupTable if flag use_cassandra_authentication is enabled.
   RETURN_NOT_OK(sem_context->LookupTable(name_->ToTableName(), name_->loc(), true /* write_table */,
-                                         &table_, &is_system_ignored, &table_columns_,
-                                         &num_key_columns_, &num_hash_key_columns_));
+                                         PermissionType::ALTER_PERMISSION,
+                                         &table_, &is_system_ignored, &table_columns_));
 
   // Save context state, and set "this" as current table being altered.
   SymbolEntry cached_entry = *sem_context->current_processing_id();
@@ -82,6 +86,20 @@ CHECKED_STATUS PTAlterTable::AppendModColumn(SemContext *sem_context,
 
     if (desc->is_hash() && column->mod_type() != ALTER_RENAME) {
       return sem_context->Error(this, "Can't alter key column", ErrorCode::ALTER_KEY_COLUMN);
+    }
+
+    if (column->mod_type() == ALTER_DROP) {
+      const ColumnId column_id(desc->id());
+      for (const auto& index_item : table_->index_map()) {
+        const auto& index = index_item.second;
+        if (index.IsColumnCovered(column_id)) {
+          auto index_table = sem_context->GetTableDesc(index.table_id());
+          return sem_context->Error(this,
+              Format("Can't drop indexed column. Remove '$0' index first and try again",
+                  (index_table ? index_table->name().table_name() : "-unknown-")),
+              ErrorCode::FEATURE_NOT_YET_IMPLEMENTED);
+        }
+      }
     }
   }
 

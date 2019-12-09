@@ -21,8 +21,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#ifndef NDEBUG
-
 #include "yb/rocksdb/db/db_impl.h"
 #include "yb/rocksdb/util/thread_status_updater.h"
 
@@ -35,6 +33,21 @@ uint64_t DBImpl::TEST_GetLevel0TotalSize() {
 
 int DBImpl::TEST_NumRunningLargeCompactions() {
   return num_running_large_compactions_;
+}
+
+int DBImpl::TEST_NumTotalRunningCompactions() {
+  InstrumentedMutexLock l(&mutex_);
+  return num_total_running_compactions_;
+}
+
+int DBImpl::TEST_NumRunningFlushes() {
+  InstrumentedMutexLock l(&mutex_);
+  return num_running_flushes_;
+}
+
+int DBImpl::TEST_NumBackgroundCompactionsScheduled() {
+  InstrumentedMutexLock l(&mutex_);
+  return bg_compaction_scheduled_;
 }
 
 int64_t DBImpl::TEST_MaxNextLevelOverlappingBytes(
@@ -173,4 +186,3 @@ Status DBImpl::TEST_GetAllImmutableCFOptions(
 }
 
 }  // namespace rocksdb
-#endif  // NDEBUG

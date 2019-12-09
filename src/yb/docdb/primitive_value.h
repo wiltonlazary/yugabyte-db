@@ -37,6 +37,11 @@
 namespace yb {
 namespace docdb {
 
+// Used for extending a list.
+// PREPEND prepends the arguments one by one (PREPEND a b c) will prepend [c b a] to the list,
+// while PREPEND_BLOCK prepends the arguments together, so it will prepend [a b c] to the list.
+  YB_DEFINE_ENUM(ListExtendOrder, (APPEND)(PREPEND_BLOCK)(PREPEND))
+
 // A necessary use of a forward declaration to avoid circular inclusion.
 class SubDocument;
 
@@ -53,7 +58,7 @@ class PrimitiveValue {
   // Indicates that the stored jsonb is the complete jsonb value and not a partial update to jsonb.
   static constexpr int64_t kCompleteJsonb = 1;
 
-  PrimitiveValue() : type_(ValueType::kNull) {
+  PrimitiveValue() : type_(ValueType::kNullLow) {
   }
 
   explicit PrimitiveValue(ValueType value_type);
@@ -82,7 +87,7 @@ class PrimitiveValue {
       type_ = other.type_;
       frozen_val_ = new FrozenContainer(*(other.frozen_val_));
     } else {
-      memmove(this, &other, sizeof(PrimitiveValue));
+      memmove(static_cast<void*>(this), &other, sizeof(PrimitiveValue));
     }
     ttl_seconds_ = other.ttl_seconds_;
     write_time_ = other.write_time_;
@@ -237,8 +242,10 @@ class PrimitiveValue {
   static PrimitiveValue SystemColumnId(ColumnId column_id);
   static PrimitiveValue SystemColumnId(SystemColumnIds system_column_id);
   static PrimitiveValue Int32(int32_t v, SortOrder sort_order = SortOrder::kAscending);
+  static PrimitiveValue UInt32(uint32_t v, SortOrder sort_order = SortOrder::kAscending);
+  static PrimitiveValue UInt64(uint64_t v, SortOrder sort_order = SortOrder::kAscending);
   static PrimitiveValue TransactionId(Uuid transaction_id);
-  static PrimitiveValue IntentTypeValue(IntentType intent_type);
+  static PrimitiveValue TableId(Uuid table_id);
   static PrimitiveValue Jsonb(const std::string& json);
 
   KeyBytes ToKeyBytes() const;
@@ -257,6 +264,10 @@ class PrimitiveValue {
 
   bool IsTombstoneOrPrimitive() const {
     return IsPrimitiveValueType(type_) || type_ == ValueType::kTombstone;
+  }
+
+  bool IsInfinity() const {
+    return type_ == ValueType::kHighest || type_ == ValueType::kLowest;
   }
 
   int CompareTo(const PrimitiveValue& other) const;
@@ -291,13 +302,26 @@ class PrimitiveValue {
     return int32_val_;
   }
 
+  uint32_t GetUInt32() const {
+    DCHECK(ValueType::kUInt32 == type_ || ValueType::kUInt32Descending == type_);
+    return uint32_val_;
+  }
+
   int64_t GetInt64() const {
     DCHECK(ValueType::kInt64 == type_ || ValueType::kInt64Descending == type_);
     return int64_val_;
   }
 
+  uint64_t GetUInt64() const {
+    DCHECK(ValueType::kUInt64 == type_ || ValueType::kUInt64Descending == type_);
+    return uint64_val_;
+  }
+
   uint16_t GetUInt16() const {
-    DCHECK(ValueType::kUInt16Hash == type_ || ValueType::kIntentType == type_);
+    DCHECK(ValueType::kUInt16Hash == type_ ||
+           ValueType::kObsoleteIntentTypeSet == type_ ||
+           ValueType::kObsoleteIntentType == type_ ||
+           ValueType::kIntentTypeSet == type_);
     return uint16_val_;
   }
 
@@ -338,7 +362,7 @@ class PrimitiveValue {
 
   const Uuid& GetUuid() const {
     DCHECK(type_ == ValueType::kUuid || type_ == ValueType::kUuidDescending ||
-        type_ == ValueType::kTransactionId);
+           type_ == ValueType::kTransactionId || type_ == ValueType::kTableId);
     return uuid_val_;
   }
 
@@ -367,6 +391,10 @@ class PrimitiveValue {
 
   bool operator!=(const PrimitiveValue& other) const { return !(*this == other); }
 
+  ListExtendOrder GetExtendOrder() const {
+    return extend_order_;
+  }
+
   int64_t GetTtl() const {
     return ttl_seconds_;
   }
@@ -384,6 +412,10 @@ class PrimitiveValue {
     ttl_seconds_ = ttl_seconds;
   }
 
+  void SetExtendOrder(const ListExtendOrder extend_order) const {
+    extend_order_ = extend_order;
+  }
+
   void SetWriteTime(const int64_t write_time) {
     write_time_ = write_time;
   }
@@ -397,12 +429,20 @@ class PrimitiveValue {
   int64_t ttl_seconds_ = -1;
   int64_t write_time_ = kUninitializedWriteTime;
 
+  // TODO: make PrimitiveValue extend SubDocument and put this field
+  // in SubDocument.
+  // This field gives the extension order of elements of a list and
+  // is applicable only to SubDocuments of type kArray.
+  mutable ListExtendOrder extend_order_ = ListExtendOrder::APPEND;
+
   ValueType type_;
 
   // TODO: do we have to worry about alignment here?
   union {
     int32_t int32_val_;
+    uint32_t uint32_val_;
     int64_t int64_val_;
+    uint64_t uint64_val_;
     uint16_t uint16_val_;
     DocHybridTime hybrid_time_val_;
     std::string str_val_;
@@ -459,14 +499,14 @@ class PrimitiveValue {
     } else {
       // Non-string primitive values only have plain old data. We are assuming there is no overlap
       // between the two objects, so we're using memcpy instead of memmove.
-      memcpy(this, other, sizeof(PrimitiveValue));
+      memcpy(static_cast<void*>(this), other, sizeof(PrimitiveValue));
 #ifndef NDEBUG
       // We could just leave the old object as is for it to be in a "valid but unspecified" state.
       // However, in debug mode we clear the old object's state to make sure we don't attempt to use
       // it.
-      memset(other, 0xab, sizeof(PrimitiveValue));
+      memset(static_cast<void*>(other), 0xab, sizeof(PrimitiveValue));
       // Restore the type. There should be no deallocation for non-string types anyway.
-      other->type_ = ValueType::kNull;
+      other->type_ = ValueType::kNullLow;
 #endif
     }
   }

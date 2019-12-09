@@ -1,32 +1,17 @@
-#define YBC_CURRENT_CLASS PgApiExample
+// Copyright (c) YugaByte, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+// in compliance with the License.  You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied.  See the License for the specific language governing permissions and limitations
+// under the License.
+//
 
-YBC_CLASS_START
-YBC_CONSTRUCTOR(
-    ((const char*, database_name))
-    ((const char*, table_name))
-    ((const char**, column_names))
-)
-YBC_VIRTUAL_DESTRUCTOR
+// No include guards here because this file is expected to be included multiple times.
 
-YBC_VIRTUAL YBC_METHOD_NO_ARGS(bool, HasNext)
-
-YBC_RESULT_METHOD(int32_t, GetInt32Column,
-    ((int, column_index))
-)
-
-YBC_STATUS_METHOD(GetStringColumn,
-    ((int, column_index))
-    ((const char**, result))
-)
-
-#ifdef YBC_CXX_DECLARATION_MODE
- private:
-  PgSession::SharedPtr pg_session_;
-  std::string database_name_;
-  std::string table_name_;
-  std::vector<std::string> columns_;
-#endif
-
-YBC_CLASS_END
-
-#undef YBC_CURRENT_CLASS
+#include "yb/yql/pggate/pg_api_example_if.h"
+#include "yb/yql/pggate/pg_txn_manager_if.h"

@@ -18,6 +18,7 @@
 #include "yb/yql/cql/ql/ptree/pt_bcall.h"
 
 #include "yb/client/client.h"
+#include "yb/client/table.h"
 
 #include "yb/yql/cql/ql/ptree/sem_context.h"
 #include "yb/util/bfql/bfql.h"
@@ -58,11 +59,44 @@ PTBcall::PTBcall(MemoryContext *memctx,
 PTBcall::~PTBcall() {
 }
 
+string PTBcall::QLName(QLNameOption option) const {
+  string arg_names;
+  string keyspace;
+
+  // cql_cast() is displayed as "cast(<col> as <type>)".
+  if (strcmp(name_->c_str(), bfql::kCqlCastFuncName) == 0) {
+    CHECK_GE(args_->size(), 2);
+    const string column_name = args_->element(0)->QLName(option);
+    const string type =  QLType::ToCQLString(args_->element(1)->ql_type()->type_info()->type());
+    return strings::Substitute("cast($0 as $1)", column_name, type);
+  }
+
+  for (auto arg : args_->node_list()) {
+    if (!arg_names.empty()) {
+      arg_names += ", ";
+    }
+    arg_names += arg->QLName(option);
+  }
+  if (IsAggregateCall()) {
+    // count(*) is displayed as "count".
+    if (arg_names.empty()) {
+      return name_->c_str();
+    }
+    keyspace += "system.";
+  }
+  return strings::Substitute("$0$1($2)", keyspace, name_->c_str(), arg_names);
+}
+
 bool PTBcall::IsAggregateCall() const {
   return is_server_operator_ && BFDecl::is_aggregate_op(static_cast<TSOpcode>(bfopcode_));
 }
 
 CHECKED_STATUS PTBcall::Analyze(SemContext *sem_context) {
+  // Before traversing the expression, check if this whole expression is actually a column.
+  if (CheckIndexColumn(sem_context)) {
+    return Status::OK();
+  }
+
   RETURN_NOT_OK(CheckOperator(sem_context));
 
   // Analyze arguments of the function call.
@@ -77,13 +111,15 @@ CHECKED_STATUS PTBcall::Analyze(SemContext *sem_context) {
   int pindex = 0;
   const MCList<PTExpr::SharedPtr>& exprs = args_->node_list();
   vector<PTExpr::SharedPtr> params(exprs.size());
-  for (const auto& expr : exprs) {
+  for (const PTExpr::SharedPtr& expr : exprs) {
     RETURN_NOT_OK(expr->Analyze(sem_context));
     RETURN_NOT_OK(expr->CheckRhsExpr(sem_context));
 
     params[pindex] = expr;
     pindex++;
   }
+
+  RETURN_NOT_OK(CheckOperatorAfterArgAnalyze(sem_context));
 
   // Reset the semantics state after analyzing the arguments.
   sem_state.ResetContextState();
@@ -114,6 +150,15 @@ CHECKED_STATUS PTBcall::Analyze(SemContext *sem_context) {
     // Use the builtin-function opcode since this is a regular builtin call.
     bfopcode_ = static_cast<int32_t>(bfopcode);
 
+    if (*name_ == "cql_cast" || *name_ == "tojson") {
+      // Argument must be of primitive type for these operators.
+      for (const PTExpr::SharedPtr &expr : exprs) {
+        if (expr->expr_op() == ExprOperator::kCollection) {
+          return sem_context->Error(expr, "Input argument must be of primitive type",
+                                    ErrorCode::INVALID_ARGUMENTS);
+        }
+      }
+    }
   } else {
     // Use the server opcode since this is a server operator. Ignore the BFOpcode.
     is_server_operator_ = true;
@@ -294,6 +339,18 @@ CHECKED_STATUS PTBcall::Analyze(SemContext *sem_context) {
   return CheckExpectedTypeCompatibility(sem_context);
 }
 
+bool PTBcall::HaveColumnRef() const {
+  const MCList<PTExpr::SharedPtr>& exprs = args_->node_list();
+  vector<PTExpr::SharedPtr> params(exprs.size());
+  for (const PTExpr::SharedPtr& expr : exprs) {
+    if (expr->HaveColumnRef()) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 CHECKED_STATUS PTBcall::CheckOperator(SemContext *sem_context) {
   if (sem_context->processing_set_clause() && sem_context->lhs_col() != nullptr) {
     if (sem_context->lhs_col()->ql_type()->IsCollection()) {
@@ -336,6 +393,27 @@ CHECKED_STATUS PTBcall::CheckCounterUpdateSupport(SemContext *sem_context) const
   return Status::OK();
 }
 
+CHECKED_STATUS PTBcall::CheckOperatorAfterArgAnalyze(SemContext *sem_context) {
+  if (*name_ == "tojson") {
+    // The arguments must be analyzed and correct types must be set.
+    const QLType::SharedPtr type = args_->element(0)->ql_type();
+    DCHECK(!type->IsUnknown());
+
+    if (type->main() == TUPLE) {
+      // https://github.com/YugaByte/yugabyte-db/issues/936
+      return sem_context->Error(args_->element(0),
+          "Tuple type not implemented yet", ErrorCode::FEATURE_NOT_YET_IMPLEMENTED);
+    }
+
+    if (type->Contains(FROZEN) || type->Contains(USER_DEFINED_TYPE)) {
+      // Only the server side implementation allows complex types unwrapping based on the schema.
+      name_->insert(0, "server_");
+    }
+  }
+
+  return Status::OK();
+}
+
 //--------------------------------------------------------------------------------------------------
 
 // Collection constants.
@@ -344,7 +422,7 @@ CHECKED_STATUS PTToken::Analyze(SemContext *sem_context) {
   RETURN_NOT_OK(PTBcall::Analyze(sem_context));
 
   // Analyzing the arguments: their types need to be inferred based on table schema (hash columns).
-  size_t size = sem_context->current_table()->schema().num_hash_key_columns();
+  size_t size = sem_context->current_dml_stmt()->table()->schema().num_hash_key_columns();
   if (args().size() != size) {
     return sem_context->Error(
         this,
@@ -380,7 +458,7 @@ CHECKED_STATUS PTToken::Analyze(SemContext *sem_context) {
 
   // Otherwise, it could be a call with literal values to be evaluated.
   size_t index = 0;
-  auto& schema = sem_context->current_table()->schema();
+  auto& schema = sem_context->current_dml_stmt()->table()->schema();
   for (const PTExpr::SharedPtr &arg : args()) {
     if (arg->expr_op() != ExprOperator::kConst &&
         arg->expr_op() != ExprOperator::kUMinus &&

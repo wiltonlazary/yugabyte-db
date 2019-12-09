@@ -17,12 +17,13 @@
 #include <bitset>
 
 #include "yb/docdb/value_type.h"
+#include "yb/util/shared_lock.h"
 
 namespace yb {
 namespace docdb {
 
 class LockBatch;
-typedef std::bitset<kIntentTypeMapSize> LockState;
+typedef uint64_t LockState;
 
 class SharedLockManager;
 

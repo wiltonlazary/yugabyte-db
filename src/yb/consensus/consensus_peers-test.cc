@@ -34,8 +34,6 @@
 
 #include <gtest/gtest.h>
 
-#include <boost/scope_exit.hpp>
-
 #include "yb/common/schema.h"
 #include "yb/common/wire_protocol-test-util.h"
 #include "yb/consensus/consensus_peers.h"
@@ -45,12 +43,14 @@
 #include "yb/consensus/log_util.h"
 #include "yb/consensus/opid_util.h"
 #include "yb/fs/fs_manager.h"
+#include "yb/rpc/messenger.h"
 #include "yb/server/hybrid_clock.h"
 #include "yb/util/metrics.h"
+#include "yb/util/opid.h"
+#include "yb/util/scope_exit.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
 #include "yb/util/threadpool.h"
-#include "yb/util/opid.h"
 
 using namespace std::chrono_literals;
 
@@ -62,6 +62,9 @@ namespace consensus {
 using log::Log;
 using log::LogOptions;
 using log::LogAnchorRegistry;
+using rpc::Messenger;
+using rpc::MessengerBuilder;
+using std::shared_ptr;
 using std::unique_ptr;
 
 const char* kTableId = "test-peers-table";
@@ -78,16 +81,19 @@ class ConsensusPeersTest : public YBTest {
 
   void SetUp() override {
     YBTest::SetUp();
+    MessengerBuilder bld("test");
+    messenger_ = ASSERT_RESULT(bld.Build());
     ASSERT_OK(ThreadPoolBuilder("test-raft-pool").Build(&raft_pool_));
     raft_pool_token_ = raft_pool_->NewToken(ThreadPool::ExecutionMode::CONCURRENT);
     ASSERT_OK(ThreadPoolBuilder("append").Build(&append_pool_));
     fs_manager_.reset(new FsManager(env_.get(), GetTestPath("fs_root"), "tserver_test"));
 
     ASSERT_OK(fs_manager_->CreateInitialFileSystemLayout());
+    ASSERT_OK(fs_manager_->Open());
     ASSERT_OK(Log::Open(options_,
-                       fs_manager_.get(),
                        kTabletId,
                        fs_manager_->GetFirstTabletWalDirOrDie(kTableId, kTabletId),
+                       fs_manager_->uuid(),
                        schema_,
                        0, // schema_version
                        NULL,
@@ -100,9 +106,12 @@ class ConsensusPeersTest : public YBTest {
     message_queue_.reset(new PeerMessageQueue(
         metric_entity_,
         log_.get(),
+        nullptr /* server_tracker */,
+        nullptr /* parent_tracker */,
         FakeRaftPeerPB(kLeaderUuid),
         kTabletId,
         clock_,
+        nullptr /* consensus_context */,
         raft_pool_->NewToken(ThreadPool::ExecutionMode::SERIAL)));
     message_queue_->RegisterObserver(consensus_.get());
 
@@ -114,18 +123,21 @@ class ConsensusPeersTest : public YBTest {
 
   void TearDown() override {
     ASSERT_OK(log_->WaitUntilAllFlushed());
+    append_pool_->Shutdown();
+    raft_pool_->Shutdown();
+    messenger_->Shutdown();
   }
 
   DelayablePeerProxy<NoOpTestPeerProxy>* NewRemotePeer(
       const string& peer_name,
-      std::unique_ptr<Peer>* peer) {
+      std::shared_ptr<Peer>* peer) {
     RaftPeerPB peer_pb;
     peer_pb.set_permanent_uuid(peer_name);
     auto proxy_ptr = new DelayablePeerProxy<NoOpTestPeerProxy>(
         raft_pool_.get(), new NoOpTestPeerProxy(raft_pool_.get(), peer_pb));
     *peer = CHECK_RESULT(Peer::NewRemotePeer(
-        peer_pb, kTabletId, kLeaderUuid, message_queue_.get(), raft_pool_token_.get(),
-        PeerProxyPtr(proxy_ptr), nullptr /* consensus */));
+        peer_pb, kTabletId, kLeaderUuid, PeerProxyPtr(proxy_ptr), message_queue_.get(),
+        raft_pool_token_.get(), nullptr /* consensus */, messenger_.get()));
     return proxy_ptr;
   }
 
@@ -162,8 +174,8 @@ class ConsensusPeersTest : public YBTest {
   LogOptions options_;
   unique_ptr<ThreadPoolToken> raft_pool_token_;
   scoped_refptr<server::Clock> clock_;
+  std::unique_ptr<Messenger> messenger_;
 };
-
 
 // Tests that a remote peer is correctly built and tracked
 // by the message queue.
@@ -174,10 +186,15 @@ TEST_F(ConsensusPeersTest, TestRemotePeer) {
   // We use a majority size of 2 since we make one fake remote peer
   // in addition to our real local log.
 
-  std::unique_ptr<Peer> remote_peer;
+  std::shared_ptr<Peer> remote_peer;
+  auto se = ScopeExit([&remote_peer] {
+    // This guarantees that the Peer object doesn't get destroyed if there is a pending request.
+    remote_peer->Close();
+  });
+
   DelayablePeerProxy<NoOpTestPeerProxy>* proxy = NewRemotePeer(kFollowerUuid, &remote_peer);
 
-  // Append a bunch of messages to the queue
+  // Append a bunch of messages to the queue.
   AppendReplicateMessagesToQueue(message_queue_.get(), clock_, 1, 20);
 
   // The above append ends up appending messages in term 2, so we update the peer's term to match.
@@ -194,22 +211,28 @@ TEST_F(ConsensusPeersTest, TestRemotePeer) {
 }
 
 TEST_F(ConsensusPeersTest, TestLocalAppendAndRemotePeerDelay) {
-  // Create a set of remote peers
-  std::unique_ptr<Peer> remote_peer1;
+  // Create a set of remote peers.
+  std::shared_ptr<Peer> remote_peer1;
   NewRemotePeer("peer-1", &remote_peer1);
 
-  std::unique_ptr<Peer> remote_peer2;
+  std::shared_ptr<Peer> remote_peer2;
   DelayablePeerProxy<NoOpTestPeerProxy>* remote_peer2_proxy =
       NewRemotePeer("peer-2", &remote_peer2);
+
+  auto se = ScopeExit([&remote_peer1, &remote_peer2] {
+    // This guarantees that the Peer objects don't get destroyed if there is a pending request.
+    remote_peer1->Close();
+    remote_peer2->Close();
+  });
 
   // Delay the response from the second remote peer.
   const auto kAppendDelayTime = 1s;
   log_->TEST_SetSleepDuration(kAppendDelayTime);
   remote_peer2_proxy->DelayResponse();
-  BOOST_SCOPE_EXIT(&log_, &remote_peer2_proxy) {
+  auto se2 = ScopeExit([this, &remote_peer2_proxy] {
     log_->TEST_SetSleepDuration(0s);
     remote_peer2_proxy->Respond(TestPeerProxy::kUpdate);
-  } BOOST_SCOPE_EXIT_END
+  });
 
   // Append one message to the queue.
   const auto start_time = MonoTime::Now();
@@ -219,7 +242,7 @@ TEST_F(ConsensusPeersTest, TestLocalAppendAndRemotePeerDelay) {
   ASSERT_OK(remote_peer1->SignalRequest(RequestTriggerMode::kNonEmptyOnly));
   ASSERT_OK(remote_peer2->SignalRequest(RequestTriggerMode::kNonEmptyOnly));
 
-  // Replication should time out, because the time
+  // Replication should time out, because of the delayed response.
   WaitForMajorityReplicatedIndex(first.index());
   const auto elapsed_time = MonoTime::Now() - start_time;
   LOG(INFO) << "Replication elapsed time: " << elapsed_time;
@@ -229,14 +252,20 @@ TEST_F(ConsensusPeersTest, TestLocalAppendAndRemotePeerDelay) {
 }
 
 TEST_F(ConsensusPeersTest, TestRemotePeers) {
-  // Create a set of remote peers
-  std::unique_ptr<Peer> remote_peer1;
+  // Create a set of remote peers.
+  std::shared_ptr<Peer> remote_peer1;
   DelayablePeerProxy<NoOpTestPeerProxy>* remote_peer1_proxy =
       NewRemotePeer("peer-1", &remote_peer1);
 
-  std::unique_ptr<Peer> remote_peer2;
+  std::shared_ptr<Peer> remote_peer2;
   DelayablePeerProxy<NoOpTestPeerProxy>* remote_peer2_proxy =
       NewRemotePeer("peer-2", &remote_peer2);
+
+  auto se = ScopeExit([&remote_peer1, &remote_peer2] {
+    // This guarantees that the Peer objects don't get destroyed if there is a pending request.
+    remote_peer1->Close();
+    remote_peer2->Close();
+  });
 
   // Delay the response from the second remote peer.
   remote_peer2_proxy->DelayResponse();
@@ -271,7 +300,7 @@ TEST_F(ConsensusPeersTest, TestRemotePeers) {
     std::this_thread::sleep_for(1ms);
   }
 
-  // Now append another message to the queue
+  // Now append another message to the queue.
   AppendReplicateMessagesToQueue(message_queue_.get(), clock_, 2, 1);
 
   // We should not see it replicated, even after 10ms,
@@ -291,8 +320,9 @@ TEST_F(ConsensusPeersTest, TestRemotePeers) {
 TEST_F(ConsensusPeersTest, TestCloseWhenRemotePeerDoesntMakeProgress) {
   auto mock_proxy = new MockedPeerProxy(raft_pool_.get());
   auto peer = ASSERT_RESULT(Peer::NewRemotePeer(
-      FakeRaftPeerPB(kFollowerUuid), kTabletId, kLeaderUuid, message_queue_.get(),
-      raft_pool_token_.get(), PeerProxyPtr(mock_proxy), nullptr /* consensus */));
+      FakeRaftPeerPB(kFollowerUuid), kTabletId, kLeaderUuid, PeerProxyPtr(mock_proxy),
+      message_queue_.get(), raft_pool_token_.get(), nullptr /* consensus */,
+      messenger_.get()));
 
   // Make the peer respond without making any progress -- it always returns
   // that it has only replicated op 0.0. When we see the response, we always
@@ -319,8 +349,14 @@ TEST_F(ConsensusPeersTest, TestCloseWhenRemotePeerDoesntMakeProgress) {
 TEST_F(ConsensusPeersTest, TestDontSendOneRpcPerWriteWhenPeerIsDown) {
   auto mock_proxy = new MockedPeerProxy(raft_pool_.get());
   auto peer = ASSERT_RESULT(Peer::NewRemotePeer(
-      FakeRaftPeerPB(kFollowerUuid), kTabletId, kLeaderUuid, message_queue_.get(),
-      raft_pool_token_.get(), PeerProxyPtr(mock_proxy), nullptr /* consensus */));
+      FakeRaftPeerPB(kFollowerUuid), kTabletId, kLeaderUuid, PeerProxyPtr(mock_proxy),
+      message_queue_.get(), raft_pool_token_.get(), nullptr /* consensus */,
+      messenger_.get()));
+
+  auto se = ScopeExit([&peer] {
+    // This guarantees that the Peer object doesn't get destroyed if there is a pending request.
+    peer->Close();
+  });
 
   // Initial response has to be successful -- otherwise we'll consider the peer "new" and only send
   // heartbeat RPCs.

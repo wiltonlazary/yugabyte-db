@@ -36,12 +36,14 @@ static MonoDelta kSessionTimeout = 60s;
 // Class PgStatement
 //--------------------------------------------------------------------------------------------------
 
-PgStatement::PgStatement(PgSession::SharedPtr pg_session, StmtOp stmt_op)
-    : pg_session_(pg_session),
-      stmt_op_(stmt_op) {
+PgStatement::PgStatement(PgSession::ScopedRefPtr pg_session) : pg_session_(std::move(pg_session)) {
 }
 
 PgStatement::~PgStatement() {
+}
+
+void PgStatement::AddExpr(PgExpr::SharedPtr expr) {
+  exprs_.push_back(expr);
 }
 
 }  // namespace pggate

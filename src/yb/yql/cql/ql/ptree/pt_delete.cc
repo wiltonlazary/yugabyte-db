@@ -41,7 +41,7 @@ PTDeleteStmt::~PTDeleteStmt() {
 }
 
 CHECKED_STATUS PTDeleteStmt::Analyze(SemContext *sem_context) {
-
+  // If use_cassandra_authentication is set, permissions are checked in PTDmlStmt::Analyze.
   RETURN_NOT_OK(PTDmlStmt::Analyze(sem_context));
 
   RETURN_NOT_OK(relation_->Analyze(sem_context));
@@ -61,8 +61,8 @@ CHECKED_STATUS PTDeleteStmt::Analyze(SemContext *sem_context) {
   RETURN_NOT_OK(AnalyzeColumnArgs(sem_context));
 
   // Run error checking on the WHERE conditions.
-  RETURN_NOT_OK(AnalyzeWhereClause(sem_context, where_clause_));
-  bool range_key_missing = key_where_ops_.size() < num_key_columns_;
+  RETURN_NOT_OK(AnalyzeWhereClause(sem_context));
+  bool range_key_missing = key_where_ops_.size() < num_key_columns();
 
   // If target columns are given, range key can be omitted only if all columns targeted for
   // deletions are static. Then we must also check there are no extra conditions on the range
@@ -93,7 +93,7 @@ CHECKED_STATUS PTDeleteStmt::Analyze(SemContext *sem_context) {
   }
 
   // Run error checking on the IF conditions.
-  RETURN_NOT_OK(AnalyzeIfClause(sem_context, if_clause_));
+  RETURN_NOT_OK(AnalyzeIfClause(sem_context));
 
   // Run error checking on USING clause.
   RETURN_NOT_OK(AnalyzeUsingClause(sem_context));
@@ -145,6 +145,31 @@ CHECKED_STATUS PTDeleteStmt::AnalyzeTarget(TreeNode *target, SemContext *sem_con
 
 void PTDeleteStmt::PrintSemanticAnalysisResult(SemContext *sem_context) {
   VLOG(3) << "SEMANTIC ANALYSIS RESULT (" << *loc_ << "):\n" << "Not yet avail";
+}
+
+ExplainPlanPB PTDeleteStmt::AnalysisResultToPB() {
+  ExplainPlanPB explain_plan;
+  DeletePlanPB *delete_plan = explain_plan.mutable_delete_plan();
+  delete_plan->set_delete_type("Delete on " + table_name().ToString());
+  if (modifies_multiple_rows_) {
+    delete_plan->set_scan_type("  ->  Range Scan on " + table_name().ToString());
+  } else {
+    delete_plan->set_scan_type("  ->  Primary Key Lookup on " + table_name().ToString());
+  }
+  string key_conditions = "        Key Conditions: " +
+      conditionsToString<MCVector<ColumnOp>>(key_where_ops());
+  delete_plan->set_key_conditions(key_conditions);
+  if (!where_ops().empty()) {
+    string filter = "        Filter: " + conditionsToString < MCList < ColumnOp >> (where_ops());
+    delete_plan->set_filter(filter);
+  }
+  delete_plan->set_output_width(max({
+    delete_plan->delete_type().length(),
+    delete_plan->scan_type().length(),
+    delete_plan->key_conditions().length(),
+    delete_plan->filter().length()
+  }));
+  return explain_plan;
 }
 
 }  // namespace ql

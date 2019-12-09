@@ -11,7 +11,8 @@
 // under the License.
 //
 
-#include "yb/yql/pggate/pggate.h"
+#include "yb/common/ybc-internal.h"
+#include "yb/yql/pggate/pggate_if_cxx_decl.h"
 
 namespace yb {
 namespace pggate {

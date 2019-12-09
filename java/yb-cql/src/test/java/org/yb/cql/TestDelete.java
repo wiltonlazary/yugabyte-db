@@ -15,6 +15,7 @@ package org.yb.cql;
 import java.util.*;
 
 import com.datastax.driver.core.PreparedStatement;
+import com.datastax.driver.core.SimpleStatement;
 import org.junit.Test;
 
 import com.datastax.driver.core.ResultSet;
@@ -22,13 +23,18 @@ import com.datastax.driver.core.Row;
 import com.datastax.driver.core.exceptions.SyntaxError;
 import com.datastax.driver.core.exceptions.InvalidQueryException;
 
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.assertEquals;
+import static org.yb.AssertionWrappers.assertFalse;
+import static org.yb.AssertionWrappers.assertTrue;
+import static org.yb.AssertionWrappers.assertEquals;
 
 import org.junit.rules.ExpectedException;
 import org.junit.Rule;
 
+import org.yb.YBTestRunner;
+
+import org.junit.runner.RunWith;
+
+@RunWith(value=YBTestRunner.class)
 public class TestDelete extends BaseCQLTest {
   @Rule
   public ExpectedException exception = ExpectedException.none();
@@ -128,6 +134,7 @@ public class TestDelete extends BaseCQLTest {
         "INSERT INTO " + tableName + "(h1, h2, r1, r2, s, v) VALUES(" +
             "?, ?, ?, ?, ?, ?);");
 
+    // Insert 100 rows.
     for (int h = 0; h < 10; h++) {
       for (int r = 0; r < 10; r++) {
         session.execute(insert.bind(
@@ -141,21 +148,37 @@ public class TestDelete extends BaseCQLTest {
     final PreparedStatement static_select = session.prepare(
         "SELECT DISTINCT s FROM " + tableName + " WHERE h1 = ? AND h2 = ?");
 
+    final SimpleStatement full_select = new SimpleStatement("SELECT * FROM " + tableName);
+
     //----------------------------------------------------------------------------------------------
     // Test Valid Statements
 
-
     // Test Delete entire hash.
     {
+      // Deleting 10 rows (out of 100).
       session.execute("DELETE FROM " + tableName + " WHERE h1 = 0 and h2 = 'h0'");
 
-      // Check rows.
-      Iterator<Row> rows = session.execute(select.bind(new Integer(0), "h0")).iterator();
-      assertFalse(rows.hasNext());
+      // Check row was removed.
+      List<Row> rows = session.execute(select.bind(new Integer(0), "h0")).all();
+      assertTrue(rows.isEmpty());
 
       // Check that static column is removed.
-      rows = session.execute(static_select.bind(new Integer(0), "h0")).iterator();
-      assertFalse(rows.hasNext());
+      rows = session.execute(static_select.bind(new Integer(0), "h0")).all();
+      assertTrue(rows.isEmpty());
+
+      // Check that no other rows are removed.
+      rows = session.execute(full_select).all();
+      assertEquals(90, rows.size());
+    }
+
+    // Test Delete non-existing hash.
+    {
+      // Deleting 0 rows (out of 90).
+      session.execute("DELETE FROM " + tableName + " WHERE h1 = -1 and h2 = 'h-1'");
+
+      // Check that no rows are removed.
+      List<Row> rows = session.execute(full_select).all();
+      assertEquals(90, rows.size());
     }
 
     // Test Delete with lower bound.
@@ -207,21 +230,41 @@ public class TestDelete extends BaseCQLTest {
       assertFalse(rows.hasNext());
     }
 
+    // Test delete with partial range key (equality condition).
+    {
+      // Delete entry 3.
+      session.execute(
+          "DELETE FROM " + tableName + " WHERE h1 = 4 and h2 = 'h4' " +
+              "AND r1 = 3");
+
+      // Check Rows.
+      Iterator<Row> rows = session.execute(select.bind(new Integer(4), "h4")).iterator();
+      for (int r = 0; r < 3; r++) {
+        assertTrue(rows.hasNext());
+        assertEquals(r, rows.next().getInt("r1"));
+      }
+      for (int r = 4; r < 10; r++) {
+        assertTrue(rows.hasNext());
+        assertEquals(r, rows.next().getInt("r1"));
+      }
+      assertFalse(rows.hasNext());
+    }
+
     // Test static column when deleting all rows.
     {
       // Delete all entries.
       session.execute(
-          "DELETE FROM " + tableName + " WHERE h1 = 4 and h2 = 'h4' " +
+          "DELETE FROM " + tableName + " WHERE h1 = 5 and h2 = 'h5' " +
               "AND r1 >= 0 AND r1 <= 10");
 
       // Check Rows.
-      Iterator<Row> rows = session.execute(select.bind(new Integer(4), "h4")).iterator();
+      Iterator<Row> rows = session.execute(select.bind(new Integer(5), "h5")).iterator();
       // Omer: Changed this to true. Cassandra actually returns the static column if it
       // was not deleted
       assertTrue(rows.hasNext());
 
       // Check that static column is not removed.
-      rows = session.execute(static_select.bind(new Integer(4), "h4")).iterator();
+      rows = session.execute(static_select.bind(new Integer(5), "h5")).iterator();
       assertTrue(rows.hasNext());
       assertEquals(1, rows.next().getInt("s"));
       assertFalse(rows.hasNext());
@@ -231,11 +274,11 @@ public class TestDelete extends BaseCQLTest {
     {
       // Delete some entries but with old timestamp -- should do nothing.
       session.execute(
-          "DELETE FROM " + tableName + " USING TIMESTAMP 1 WHERE h1 = 5 and h2 = 'h5' " +
+          "DELETE FROM " + tableName + " USING TIMESTAMP 1 WHERE h1 = 6 and h2 = 'h6' " +
               "AND r1 >= 0 AND r1 <= 10");
 
       // Check Rows -- all should be there because timestamp was in the past.
-      Iterator<Row> rows = session.execute(select.bind(new Integer(5), "h5")).iterator();
+      Iterator<Row> rows = session.execute(select.bind(new Integer(6), "h6")).iterator();
       for (int r = 0; r < 10; r++) {
         assertTrue(rows.hasNext());
         assertEquals(r, rows.next().getInt("r1"));
@@ -249,10 +292,10 @@ public class TestDelete extends BaseCQLTest {
       // Delete entries 0,1,2,3,4,5,6 using max long as timestamp.
       session.execute(
           "DELETE FROM " + tableName + " USING TIMESTAMP " + Long.MAX_VALUE +
-              " WHERE h1 = 6 AND h2 = 'h6' AND r1 >= 0 AND r1 <= 6");
+              " WHERE h1 = 7 AND h2 = 'h7' AND r1 >= 0 AND r1 <= 6");
 
       // Check Rows -- delete should applied because timestamp was in the future.
-      Iterator<Row> rows = session.execute(select.bind(new Integer(6), "h6")).iterator();
+      Iterator<Row> rows = session.execute(select.bind(new Integer(7), "h7")).iterator();
       for (int r = 7; r < 10; r++) {
         assertTrue(rows.hasNext());
         assertEquals(r, rows.next().getInt("r1"));

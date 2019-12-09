@@ -55,6 +55,7 @@
 #include "yb/rpc/messenger.h"
 #include "yb/rpc/service_if.h"
 #include "yb/rpc/service_pool.h"
+#include "yb/rpc/yb_rpc.h"
 #include "yb/server/rpc_server.h"
 #include "yb/tablet/maintenance_manager.h"
 #include "yb/server/default-path-handlers.h"
@@ -66,6 +67,7 @@
 #include "yb/util/net/sockaddr.h"
 #include "yb/util/status.h"
 #include "yb/util/threadpool.h"
+#include "yb/util/shared_lock.h"
 
 DEFINE_int32(master_rpc_timeout_ms, 1500,
              "Timeout for retrieving master registration over RPC.");
@@ -80,7 +82,7 @@ using std::vector;
 using yb::consensus::RaftPeerPB;
 using yb::rpc::ServiceIf;
 using yb::tserver::ConsensusServiceImpl;
-using yb::tserver::YB_EDITION_NS_PREFIX RemoteBootstrapServiceImpl;
+using yb::tserver::enterprise::RemoteBootstrapServiceImpl;
 using strings::Substitute;
 
 DEFINE_int32(master_tserver_svc_num_threads, 10,
@@ -115,7 +117,6 @@ DEFINE_int32(master_remote_bootstrap_svc_queue_length, 50,
              "RPC queue length for master remote bootstrap service");
 TAG_FLAG(master_remote_bootstrap_svc_queue_length, advanced);
 
-DECLARE_int64(inbound_rpc_block_size);
 DECLARE_int64(inbound_rpc_memory_limit);
 
 namespace yb {
@@ -126,7 +127,7 @@ Master::Master(const MasterOptions& opts)
         "Master", opts, "yb.master", server::CreateMemTrackerForServer()),
     state_(kStopped),
     ts_manager_(new TSManager()),
-    catalog_manager_(new YB_EDITION_NS_PREFIX CatalogManager(this)),
+    catalog_manager_(new enterprise::CatalogManager(this)),
     path_handlers_(new MasterPathHandlers(this)),
     flush_manager_(new FlushManager(this, catalog_manager())),
     opts_(opts),
@@ -134,18 +135,18 @@ Master::Master(const MasterOptions& opts)
     maintenance_manager_(new MaintenanceManager(MaintenanceManager::DEFAULT_OPTIONS)),
     metric_entity_cluster_(METRIC_ENTITY_cluster.Instantiate(metric_registry_.get(),
                                                              "yb.cluster")),
-    master_tablet_server_(new MasterTabletServer(metric_entity())) {
+    master_tablet_server_(new MasterTabletServer(this, metric_entity())) {
   SetConnectionContextFactory(rpc::CreateConnectionContextFactory<rpc::YBInboundConnectionContext>(
-      GetAtomicFlag(&FLAGS_inbound_rpc_block_size),
       GetAtomicFlag(&FLAGS_inbound_rpc_memory_limit),
       mem_tracker()));
+
+  LOG(INFO) << "yb::master::Master created at " << this;
+  LOG(INFO) << "yb::master::TSManager created at " << ts_manager_.get();
+  LOG(INFO) << "yb::master::CatalogManager created at " << catalog_manager_.get();
 }
 
 Master::~Master() {
   Shutdown();
-  if (messenger_) {
-    messenger_->Shutdown();
-  }
 }
 
 string Master::ToString() const {
@@ -189,13 +190,19 @@ Status Master::RegisterServices() {
       new ConsensusServiceImpl(metric_entity(), catalog_manager_.get()));
   RETURN_NOT_OK(RpcAndWebServerBase::RegisterService(FLAGS_master_consensus_svc_queue_length,
                                                      std::move(consensus_service),
-                                                     server::ServicePriority::kHigh));
+                                                     rpc::ServicePriority::kHigh));
 
   std::unique_ptr<ServiceIf> remote_bootstrap_service(
       new RemoteBootstrapServiceImpl(fs_manager_.get(), catalog_manager_.get(), metric_entity()));
   RETURN_NOT_OK(RpcAndWebServerBase::RegisterService(FLAGS_master_remote_bootstrap_svc_queue_length,
                                                      std::move(remote_bootstrap_service)));
   return Status::OK();
+}
+
+void Master::DisplayGeneralInfoIcons(std::stringstream* output) {
+  server::RpcAndWebServerBase::DisplayGeneralInfoIcons(output);
+  // Tasks.
+  DisplayIconTile(output, "fa-list-ul", "Tasks", "/tasks");
 }
 
 Status Master::StartAsync() {
@@ -264,6 +271,10 @@ void Master::Shutdown() {
     string name = ToString();
     LOG(INFO) << name << " shutting down...";
     maintenance_manager_->Shutdown();
+    // We shutdown RpcAndWebServerBase here in order to shutdown messenger and reactor threads
+    // before shutting down catalog manager. This is needed to prevent async calls callbacks
+    // (running on reactor threads) from trying to use catalog manager thread pool which would be
+    // already shutdown.
     RpcAndWebServerBase::Shutdown();
     catalog_manager_->Shutdown();
     LOG(INFO) << name << " shutdown complete.";
@@ -296,26 +307,34 @@ Status Master::InitMasterRegistration() {
 Status Master::ResetMemoryState(const RaftConfigPB& config) {
   LOG(INFO) << "Memory state set to config: " << config.ShortDebugString();
 
-  auto master_addr = std::make_shared<std::vector<HostPort>>();
+  auto master_addr = std::make_shared<server::MasterAddresses>();
   for (const RaftPeerPB& peer : config.peers()) {
-    master_addr->push_back(HostPortFromPB(DesiredHostPort(peer, opts_.MakeCloudInfoPB())));
+    master_addr->push_back({HostPortFromPB(DesiredHostPort(peer, opts_.MakeCloudInfoPB()))});
   }
 
-  SetMasterAddresses(master_addr);
+  SetMasterAddresses(std::move(master_addr));
 
   return Status::OK();
 }
 
 void Master::DumpMasterOptionsInfo(std::ostream* out) {
   *out << "Master options : ";
-  bool need_comma = false;
   auto master_addresses_shared_ptr = opts_.GetMasterAddresses();  // ENG-285
-  for (const HostPort& hp : *master_addresses_shared_ptr) {
-    if (need_comma) {
+  bool first = true;
+  for (const auto& list : *master_addresses_shared_ptr) {
+    if (first) {
+      first = false;
+    } else {
       *out << ", ";
     }
-    need_comma = true;
-    *out << hp.ToString();
+    bool need_comma = false;
+    for (const HostPort& hp : list) {
+      if (need_comma) {
+        *out << "/ ";
+      }
+      need_comma = true;
+      *out << hp.ToString();
+    }
   }
   *out << "\n";
 }
@@ -348,15 +367,15 @@ Status Master::ListMasters(std::vector<ServerEntryPB>* masters) const {
   // vector would sometimes get deallocated by another thread in the middle of that iteration.
   auto master_addresses_shared_ptr = opts_.GetMasterAddresses();
 
-  for (const HostPort& peer_addr : *master_addresses_shared_ptr) {
+  for (const auto& peer_addr : *master_addresses_shared_ptr) {
     ServerEntryPB peer_entry;
-    Status s = GetMasterEntryForHost(
-        proxy_cache_.get(), peer_addr, FLAGS_master_rpc_timeout_ms, &peer_entry);
+    Status s = GetMasterEntryForHosts(
+        proxy_cache_.get(), peer_addr, MonoDelta::FromMilliseconds(FLAGS_master_rpc_timeout_ms),
+        &peer_entry);
     if (!s.ok()) {
       s = s.CloneAndPrepend(
-        Substitute("Unable to get registration information for peer ($0)",
-          peer_addr.ToString()));
-      LOG(WARNING) << s.ToString();
+        Format("Unable to get registration information for peer ($0)", peer_addr));
+      LOG(WARNING) << s;
       StatusToPB(s, peer_entry.mutable_error());
     }
     masters->push_back(peer_entry);
@@ -384,10 +403,6 @@ Status Master::GoIntoShellMode() {
   maintenance_manager_->Shutdown();
   RETURN_NOT_OK(catalog_manager()->GoIntoShellMode());
   return Status::OK();
-}
-
-size_t Master::NumSystemTables() const {
-  return catalog_manager_->NumSystemTables();
 }
 
 } // namespace master

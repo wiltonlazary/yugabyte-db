@@ -3,11 +3,27 @@
  * foreign.c
  *		  support for foreign-data wrappers, servers and user mappings.
  *
- * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  src/backend/foreign/foreign.c
  *
+ * The following only applies to changes made to this file as part of
+ * YugaByte development.
+ *
+ * Portions Copyright (c) YugaByte, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you
+ * may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+ * implied.  See the License for the specific language governing
+ * permissions and limitations under the License.
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -27,6 +43,9 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
+/*  YB includes. */
+#include "pg_yb_utils.h"
+#include "executor/ybc_fdw.h"
 
 /*
  * GetForeignDataWrapper -	look up the foreign-data wrapper by OID.
@@ -399,8 +418,13 @@ GetFdwRoutineForRelation(Relation relation, bool makecopy)
 
 	if (relation->rd_fdwroutine == NULL)
 	{
-		/* Get the info by consulting the catalogs and the FDW code */
-		fdwroutine = GetFdwRoutineByRelId(RelationGetRelid(relation));
+		if (IsYBRelation(relation)) {
+			/* Get the custom YB FDW directly */
+			fdwroutine = (FdwRoutine *) ybc_fdw_handler();
+		} else {
+			/* Get the info by consulting the catalogs and the FDW code */
+			fdwroutine = GetFdwRoutineByRelId(RelationGetRelid(relation));
+		}
 
 		/* Save the data for later reuse in CacheMemoryContext */
 		cfdwroutine = (FdwRoutine *) MemoryContextAlloc(CacheMemoryContext,
@@ -428,7 +452,7 @@ GetFdwRoutineForRelation(Relation relation, bool makecopy)
 /*
  * IsImportableForeignTable - filter table names for IMPORT FOREIGN SCHEMA
  *
- * Returns TRUE if given table name should be imported according to the
+ * Returns true if given table name should be imported according to the
  * statement's import filter options.
  */
 bool
@@ -712,7 +736,7 @@ get_foreign_server_oid(const char *servername, bool missing_ok)
  * path list in RelOptInfo is anyway sorted by total cost we are likely to
  * choose the most efficient path, which is all for the best.
  */
-extern Path *
+Path *
 GetExistingLocalJoinPath(RelOptInfo *joinrel)
 {
 	ListCell   *lc;

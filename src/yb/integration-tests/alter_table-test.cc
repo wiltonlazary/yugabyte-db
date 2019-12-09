@@ -39,9 +39,17 @@
 
 #include "yb/client/client.h"
 #include "yb/client/client-test-util.h"
+#include "yb/client/error.h"
 #include "yb/client/schema.h"
+#include "yb/client/session.h"
+#include "yb/client/table.h"
+#include "yb/client/table_alterer.h"
+#include "yb/client/table_creator.h"
 #include "yb/client/table_handle.h"
 #include "yb/client/yb_op.h"
+
+#include "yb/common/ql_value.h"
+
 #include "yb/gutil/gscoped_ptr.h"
 #include "yb/gutil/stl_util.h"
 #include "yb/gutil/strings/join.h"
@@ -73,6 +81,7 @@ DECLARE_int32(heartbeat_interval_ms);
 DECLARE_bool(use_hybrid_clock);
 DECLARE_int32(ht_lease_duration_ms);
 DECLARE_int32(replication_factor);
+DECLARE_int32(log_min_seconds_to_retain);
 
 namespace yb {
 
@@ -99,7 +108,8 @@ using std::vector;
 using tablet::TabletPeer;
 using tserver::MiniTabletServer;
 
-class AlterTableTest : public YBMiniClusterTestBase<MiniCluster> {
+class AlterTableTest : public YBMiniClusterTestBase<MiniCluster>,
+                       public ::testing::WithParamInterface<int> {
  public:
   AlterTableTest()
     : stop_threads_(false),
@@ -130,12 +140,13 @@ class AlterTableTest : public YBMiniClusterTestBase<MiniCluster> {
     ASSERT_OK(cluster_->Start());
     ASSERT_OK(cluster_->WaitForTabletServerCount(num_replicas()));
 
-    CHECK_OK(YBClientBuilder()
-             .add_master_server_addr(cluster_->mini_master()->bound_rpc_addr_str())
-             .default_admin_operation_timeout(MonoDelta::FromSeconds(60))
-             .Build(&client_));
+    client_ = CHECK_RESULT(YBClientBuilder()
+        .add_master_server_addr(cluster_->mini_master()->bound_rpc_addr_str())
+        .default_admin_operation_timeout(MonoDelta::FromSeconds(60))
+        .Build());
 
-    CHECK_OK(client_->CreateNamespaceIfNotExists(kTableName.namespace_name()));
+    CHECK_OK(client_->CreateNamespaceIfNotExists(kTableName.namespace_name(),
+                                                 kTableName.namespace_type()));
 
     // Add a table, make sure it reports itself.
     gscoped_ptr<YBTableCreator> table_creator(client_->NewTableCreator());
@@ -152,6 +163,7 @@ class AlterTableTest : public YBMiniClusterTestBase<MiniCluster> {
   }
 
   void DoTearDown() override {
+    client_.reset();
     tablet_peer_.reset();
     cluster_->Shutdown();
   }
@@ -191,7 +203,8 @@ class AlterTableTest : public YBMiniClusterTestBase<MiniCluster> {
     int wait_time = 1000;
     for (int i = 0; i < attempts; ++i) {
       bool in_progress;
-      RETURN_NOT_OK(client_->IsAlterTableInProgress(table_name, &in_progress));
+      string table_id;
+      RETURN_NOT_OK(client_->IsAlterTableInProgress(table_name, table_id, &in_progress));
       if (!in_progress) {
         return Status::OK();
       }
@@ -234,7 +247,8 @@ class AlterTableTest : public YBMiniClusterTestBase<MiniCluster> {
   void ScannerThread();
 
   Status CreateTable(const YBTableName& table_name) {
-    RETURN_NOT_OK(client_->CreateNamespaceIfNotExists(table_name.namespace_name()));
+    RETURN_NOT_OK(client_->CreateNamespaceIfNotExists(table_name.namespace_name(),
+                                                      table_name.namespace_type()));
 
     gscoped_ptr<YBTableCreator> table_creator(client_->NewTableCreator());
     return table_creator->table_name(table_name)
@@ -248,7 +262,7 @@ class AlterTableTest : public YBMiniClusterTestBase<MiniCluster> {
 
   static const YBTableName kTableName;
 
-  shared_ptr<YBClient> client_;
+  std::unique_ptr<YBClient> client_;
 
   YBSchema schema_;
 
@@ -268,7 +282,7 @@ class ReplicatedAlterTableTest : public AlterTableTest {
   virtual int num_replicas() const override { return 3; }
 };
 
-const YBTableName AlterTableTest::kTableName("my_keyspace", "fake-table");
+const YBTableName AlterTableTest::kTableName(YQL_DATABASE_CQL, "my_keyspace", "fake-table");
 
 // Simple test to verify that the "alter table" command sent and executed
 // on the TS handling the tablet of the altered table.
@@ -329,9 +343,10 @@ TEST_F(AlterTableTest, TestAlterOnTSRestart) {
   YBSchema schema;
   PartitionSchema partition_schema;
   bool alter_in_progress = false;
+  string table_id;
   ASSERT_OK(client_->GetTableSchema(kTableName, &schema, &partition_schema));
   ASSERT_TRUE(schema_.Equals(schema));
-  ASSERT_OK(client_->IsAlterTableInProgress(kTableName, &alter_in_progress));
+  ASSERT_OK(client_->IsAlterTableInProgress(kTableName, table_id, &alter_in_progress));
   ASSERT_TRUE(alter_in_progress);
 
   // Restart the TS and wait for the new schema
@@ -510,7 +525,7 @@ TEST_F(AlterTableTest, DISABLED_TestCompactionAfterDrop) {
   LOG(INFO) << "Inserting rows";
   InsertRows(0, 3);
 
-  std::string docdb_dump = tablet_peer_->tablet()->DocDBDumpStrInTest();
+  std::string docdb_dump = tablet_peer_->tablet()->TEST_DocDBDumpStr();
   // DocDB should not be empty right now.
   ASSERT_NE(0, docdb_dump.length());
 
@@ -521,7 +536,7 @@ TEST_F(AlterTableTest, DISABLED_TestCompactionAfterDrop) {
   LOG(INFO) << "Forcing compaction";
   tablet_peer_->tablet()->ForceRocksDBCompactInTest();
 
-  docdb_dump = tablet_peer_->tablet()->DocDBDumpStrInTest();
+  docdb_dump = tablet_peer_->tablet()->TEST_DocDBDumpStr();
 
   LOG(INFO) << "Checking that docdb is empty";
   ASSERT_EQ("", docdb_dump);
@@ -569,7 +584,7 @@ TEST_F(AlterTableTest, TestLogSchemaReplay) {
 // over column ids after a table rename.
 TEST_F(AlterTableTest, TestRenameTableAndAdd) {
   gscoped_ptr<YBTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
-  YBTableName new_name(kTableName.namespace_name(), "someothername");
+  YBTableName new_name(kTableName.namespace_type(), kTableName.namespace_name(), "someothername");
   ASSERT_OK(table_alterer->RenameTo(new_name)
             ->Alter());
 
@@ -623,6 +638,32 @@ TEST_F(AlterTableTest, TestBootstrapAfterAlters) {
   ASSERT_EQ(2, rows.size());
   ASSERT_EQ("{ int32:0, null, null }", rows[0]);
   ASSERT_EQ("{ int32:16777216, null, null }", rows[1]);
+}
+
+INSTANTIATE_TEST_CASE_P(TestAlterWalRetentionSecs,
+                        AlterTableTest,
+                        ::testing::Values(FLAGS_log_min_seconds_to_retain / 2,
+                                          FLAGS_log_min_seconds_to_retain * 2));
+
+TEST_P(AlterTableTest, TestAlterWalRetentionSecs) {
+  InsertRows(1, 1000);
+  int kWalRetentionSecs = GetParam();
+
+  LOG(INFO) << "Modifying wal retention time";
+  std::unique_ptr<YBTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+
+  ASSERT_OK(table_alterer->SetWalRetentionSecs(kWalRetentionSecs)->Alter());
+
+  int expected_wal_retention_secs = max(FLAGS_log_min_seconds_to_retain, kWalRetentionSecs);
+
+  ASSERT_EQ(kWalRetentionSecs, tablet_peer_->tablet()->metadata()->wal_retention_secs());
+  ASSERT_EQ(expected_wal_retention_secs, tablet_peer_->log()->wal_retention_secs());
+
+  // Test that the wal retention time gets set correctly in the metadata and in the log objects.
+  ASSERT_NO_FATALS(RestartTabletServer());
+
+  ASSERT_EQ(kWalRetentionSecs, tablet_peer_->tablet()->metadata()->wal_retention_secs());
+  ASSERT_EQ(expected_wal_retention_secs, tablet_peer_->log()->wal_retention_secs());
 }
 
 TEST_F(AlterTableTest, TestCompactAfterUpdatingRemovedColumn) {
@@ -802,7 +843,7 @@ TEST_F(AlterTableTest, TestAlterUnderWriteLoad) {
 }
 
 TEST_F(AlterTableTest, TestInsertAfterAlterTable) {
-  YBTableName kSplitTableName("my_keyspace", "split-table");
+  YBTableName kSplitTableName(YQL_DATABASE_CQL, "my_keyspace", "split-table");
 
   // Create a new table with 10 tablets.
   //
@@ -836,7 +877,7 @@ TEST_F(AlterTableTest, TestInsertAfterAlterTable) {
 // seen in an earlier implementation of "alter table" where these could
 // conflict with each other.
 TEST_F(AlterTableTest, TestMultipleAlters) {
-  YBTableName kSplitTableName("my_keyspace", "split-table");
+  YBTableName kSplitTableName(YQL_DATABASE_CQL, "my_keyspace", "split-table");
   const size_t kNumNewCols = 10;
 
   // Create a new table with 10 tablets.
@@ -877,7 +918,8 @@ TEST_F(ReplicatedAlterTableTest, TestReplicatedAlter) {
   ASSERT_OK(AddNewI32Column(kTableName, "c1"));
 
   bool alter_in_progress;
-  ASSERT_OK(client_->IsAlterTableInProgress(kTableName, &alter_in_progress));
+  string table_id;
+  ASSERT_OK(client_->IsAlterTableInProgress(kTableName, table_id, &alter_in_progress));
   ASSERT_FALSE(alter_in_progress);
 
   LOG(INFO) << "Verifying that the new default shows up";

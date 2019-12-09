@@ -13,6 +13,8 @@
 
 #include "yb/rpc/connection_context.h"
 
+#include "yb/rpc/connection.h"
+
 #include "yb/rpc/growable_buffer.h"
 
 #include "yb/util/env.h"
@@ -28,9 +30,15 @@ DEFINE_int64(read_buffer_memory_limit, -5,
 namespace yb {
 namespace rpc {
 
+void ConnectionContext::UpdateLastRead(const ConnectionPtr& connection) {
+  // By default any read events on connection updates it's last activity. This could be
+  // overriden in subclasses for example in order to not treat application-level heartbeats as
+  // activity preventing connection from being GCed.
+  connection->UpdateLastActivity();
+}
+
 ConnectionContextFactory::ConnectionContextFactory(
-    size_t block_size, int64_t memory_limit,
-    const std::string& name,
+    int64_t memory_limit, const std::string& name,
     const std::shared_ptr<MemTracker>& parent_mem_tracker)
     : parent_tracker_(parent_mem_tracker) {
   int64_t root_limit = AbsRelMemLimit(FLAGS_read_buffer_memory_limit, [] {
@@ -44,11 +52,12 @@ ConnectionContextFactory::ConnectionContextFactory(
   memory_limit = AbsRelMemLimit(memory_limit, [&root_buffer_tracker] {
     return root_buffer_tracker->limit();
   });
-  auto buffer_tracker = MemTracker::FindOrCreateTracker(memory_limit, name, root_buffer_tracker);
-  allocator_ = std::make_unique<GrowableBufferAllocator>(block_size, buffer_tracker);
+  buffer_tracker_ = MemTracker::FindOrCreateTracker(memory_limit, name, root_buffer_tracker);
   auto root_call_tracker = MemTracker::FindOrCreateTracker("Call", parent_mem_tracker);
   call_tracker_ = MemTracker::FindOrCreateTracker(name, root_call_tracker);
 }
+
+ConnectionContextFactory::~ConnectionContextFactory() = default;
 
 } // namespace rpc
 } // namespace yb

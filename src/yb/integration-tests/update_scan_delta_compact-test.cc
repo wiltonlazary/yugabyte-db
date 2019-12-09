@@ -36,6 +36,7 @@
 
 #include "yb/client/callbacks.h"
 #include "yb/client/client.h"
+#include "yb/client/session.h"
 #include "yb/client/table_handle.h"
 #include "yb/client/yb_op.h"
 #include "yb/gutil/strings/strcat.h"
@@ -98,7 +99,8 @@ class UpdateScanDeltaCompactionTest : public YBMiniClusterTestBase<MiniCluster> 
 
   void CreateTable() {
     ASSERT_NO_FATALS(InitCluster());
-    ASSERT_OK(client_->CreateNamespaceIfNotExists(kTableName.namespace_name()));
+    ASSERT_OK(client_->CreateNamespaceIfNotExists(kTableName.namespace_name(),
+                                                  kTableName.namespace_type()));
     ASSERT_OK(table_.Create(kTableName, CalcNumTablets(1), schema_, client_.get()));
   }
 
@@ -122,10 +124,7 @@ class UpdateScanDeltaCompactionTest : public YBMiniClusterTestBase<MiniCluster> 
     // Start mini-cluster with 1 tserver.
     cluster_.reset(new MiniCluster(env_.get(), MiniClusterOptions()));
     ASSERT_OK(cluster_->Start());
-    YBClientBuilder client_builder;
-    client_builder.add_master_server_addr(
-        cluster_->mini_master()->bound_rpc_addr_str());
-    ASSERT_OK(client_builder.Build(&client_));
+    client_ = ASSERT_RESULT(cluster_->CreateClient());
   }
 
   shared_ptr<YBSession> CreateSession() {
@@ -156,11 +155,11 @@ class UpdateScanDeltaCompactionTest : public YBMiniClusterTestBase<MiniCluster> 
 
   YBSchema schema_;
   client::TableHandle table_;
-  shared_ptr<YBClient> client_;
+  std::unique_ptr<YBClient> client_;
 };
 
 const YBTableName UpdateScanDeltaCompactionTest::kTableName(
-    "my_keyspace", "update-scan-delta-compact-tbl");
+    YQL_DATABASE_CQL, "my_keyspace", "update-scan-delta-compact-tbl");
 const int kSessionBatchSize = 1000;
 
 TEST_F(UpdateScanDeltaCompactionTest, TestAll) {
@@ -233,9 +232,7 @@ void UpdateScanDeltaCompactionTest::RunThreads() {
   stop_latch.CountDown();
 
   for (const scoped_refptr<Thread>& thread : threads) {
-    ASSERT_OK(ThreadJoiner(thread.get())
-              .warn_every_ms(500)
-              .Join());
+    ASSERT_OK(ThreadJoiner(thread.get()).warn_every(500ms).Join());
   }
 }
 

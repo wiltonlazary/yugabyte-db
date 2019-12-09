@@ -21,23 +21,25 @@ from build_definitions import *
 
 
 PROJECT_CONFIG = """
-libraries = {4} ;
+libraries = {5} ;
 
-using {0} : :
-    {1} :
-    {2}
-    {3} ;
+using {0} : {1} :
+    {2} :
+    {3}
+    {4} ;
 """
 
 
 class BoostDependency(Dependency):
     def __init__(self):
         super(BoostDependency, self).__init__(
-            'boost', '1.66.0',
+            'boost', '1.69.0',
             'https://dl.bintray.com/boostorg/release/{0}/source/boost_{1}.tar.bz2',
             BUILD_GROUP_INSTRUMENTED)
         self.dir = '{}_{}'.format(self.name, self.underscored_version)
         self.copy_sources = True
+        self.patches = ['boost-1-69-remove-pending-integer_log2-include.patch']
+        self.patch_strip = 1
 
     def build(self, builder):
         libs = ['system', 'thread']
@@ -57,13 +59,19 @@ class BoostDependency(Dependency):
             cxx_flags = builder.compiler_flags + builder.cxx_flags
             if '-nostdinc++' in cxx_flags:
                 cxx_flags.remove('-nostdinc++')
+            compiler_type = builder.compiler_type
+            compiler_version = ''
+            if compiler_type == 'gcc8':
+                compiler_type = 'gcc'
+                compiler_version = '8'
             out.write(PROJECT_CONFIG.format(
-                    builder.compiler_type,
+                    compiler_type,
+                    compiler_version,
                     builder.cxx_wrapper,
                     ' '.join(['<compileflags>' + flag for flag in cxx_flags]),
                     ' '.join(['<linkflags>' + flag for flag in cxx_flags + builder.ld_flags]),
                     ' '.join(['--with-{}'.format(lib) for lib in libs])))
-        log_output(log_prefix, ['./b2', 'install'])
+        log_output(log_prefix, ['./b2', 'install', 'cxxstd=14'])
 
         if is_mac():
             for lib in libs:

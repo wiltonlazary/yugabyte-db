@@ -2,9 +2,11 @@
 // Copyright (c) YugaByte, Inc.
 //--------------------------------------------------------------------------------------------------
 
-#include "yb/common/jsonb.h"
 #include "yb/common/ql_expr.h"
+
 #include "yb/common/ql_bfunc.h"
+#include "yb/common/ql_value.h"
+#include "yb/common/jsonb.h"
 
 namespace yb {
 
@@ -20,14 +22,27 @@ bfql::TSOpcode QLExprExecutor::GetTSWriteInstruction(const QLExpressionPB& ql_ex
 
 CHECKED_STATUS QLExprExecutor::EvalExpr(const QLExpressionPB& ql_expr,
                                         const QLTableRow& table_row,
-                                        QLValue *result) {
+                                        QLValue *result,
+                                        const Schema *schema,
+                                        const QLValuePB** result_ptr) {
   switch (ql_expr.expr_case()) {
     case QLExpressionPB::ExprCase::kValue:
-      *result = ql_expr.value();
+      if (result_ptr) {
+        *result_ptr = &ql_expr.value();
+      } else {
+        *result = ql_expr.value();
+      }
       break;
 
     case QLExpressionPB::ExprCase::kColumnId:
-      RETURN_NOT_OK(table_row.ReadColumn(ql_expr.column_id(), result));
+      if (result_ptr) {
+        *result_ptr = table_row.GetColumn(ql_expr.column_id());
+        if (!*result_ptr) {
+          result->SetNull();
+        }
+      } else {
+        RETURN_NOT_OK(table_row.ReadColumn(ql_expr.column_id(), result));
+      }
       break;
 
     case QLExpressionPB::ExprCase::kJsonColumn: {
@@ -54,7 +69,7 @@ CHECKED_STATUS QLExprExecutor::EvalExpr(const QLExpressionPB& ql_expr,
       return EvalBFCall(ql_expr.bfcall(), table_row, result);
 
     case QLExpressionPB::ExprCase::kTscall:
-      return EvalTSCall(ql_expr.tscall(), table_row, result);
+      return EvalTSCall(ql_expr.tscall(), table_row, result, schema);
 
     case QLExpressionPB::ExprCase::kCondition:
       return EvalCondition(ql_expr.condition(), table_row, result);
@@ -70,10 +85,11 @@ CHECKED_STATUS QLExprExecutor::EvalExpr(const QLExpressionPB& ql_expr,
 //--------------------------------------------------------------------------------------------------
 
 CHECKED_STATUS QLExprExecutor::EvalExpr(QLExpressionPB* ql_expr,
-                                        const QLTableRow& table_row) {
+                                        const QLTableRow& table_row,
+                                        const Schema *schema) {
   if (!ql_expr->has_value()) {
     QLValue temp;
-    RETURN_NOT_OK(EvalExpr(*ql_expr, table_row, &temp));
+    RETURN_NOT_OK(EvalExpr(*ql_expr, table_row, &temp, schema));
     ql_expr->mutable_value()->Swap(temp.mutable_value());
   }
   return Status::OK();
@@ -111,23 +127,25 @@ CHECKED_STATUS QLExprExecutor::EvalBFCall(const QLBCallPB& bfcall,
   //   "AddListList"
   //   "SubListList"
 
+  const bfql::BFOpcode bf_opcode = static_cast<bfql::BFOpcode>(bfcall.opcode());
   // First evaluate the arguments.
   vector<QLValue> args(bfcall.operands().size());
   int arg_index = 0;
   for (auto operand : bfcall.operands()) {
-    RETURN_NOT_OK(EvalExpr(operand, table_row, &args[arg_index]));
-    arg_index++;
+    QLValue* arg = &args[arg_index++];
+    RETURN_NOT_OK(EvalExpr(operand, table_row, arg));
   }
 
   // Execute the builtin call associated with the given opcode.
-  return QLBfunc::Exec(static_cast<bfql::BFOpcode>(bfcall.opcode()), &args, result);
+  return QLBfunc::Exec(bf_opcode, &args, result);
 }
 
 //--------------------------------------------------------------------------------------------------
 
 CHECKED_STATUS QLExprExecutor::EvalTSCall(const QLBCallPB& ql_expr,
                                           const QLTableRow& table_row,
-                                          QLValue *result) {
+                                          QLValue *result,
+                                          const Schema *schema) {
   result->SetNull();
   return STATUS(RuntimeError, "Only tablet server can execute this operator");
 }
@@ -175,7 +193,7 @@ CHECKED_STATUS QLExprExecutor::EvalCondition(const QLConditionPB& condition,
       if (!temp.Comparable(lower) || !temp.Comparable(upper)) {                                    \
         return STATUS(RuntimeError, "values not comparable");                                      \
       }                                                                                            \
-      result->set_bool_value(temp.value() >= lower.value() rel_op temp.value() <= upper.value());  \
+      result->set_bool_value(temp.value() op1 lower.value() rel_op temp.value() op2 upper.value());\
       return Status::OK();                                                                         \
   } while (false)
 
@@ -204,7 +222,7 @@ CHECKED_STATUS QLExprExecutor::EvalCondition(const QLConditionPB& condition,
     case QL_OP_IS_TRUE:
       CHECK_EQ(operands.size(), 1);
       RETURN_NOT_OK(EvalExpr(operands.Get(0), table_row, &temp));
-      if (temp.type() != QLValue::InternalType::kBoolValue)
+      if (temp.type() != InternalType::kBoolValue)
         return STATUS(RuntimeError, "not a bool value");
       result->set_bool_value(!temp.IsNull() && temp.bool_value());
       return Status::OK();
@@ -212,7 +230,7 @@ CHECKED_STATUS QLExprExecutor::EvalCondition(const QLConditionPB& condition,
     case QL_OP_IS_FALSE: {
       CHECK_EQ(operands.size(), 1);
       RETURN_NOT_OK(EvalExpr(operands.Get(0), table_row, &temp));
-      if (temp.type() != QLValue::InternalType::kBoolValue)
+      if (temp.type() != InternalType::kBoolValue)
         return STATUS(RuntimeError, "not a bool value");
       result->set_bool_value(!temp.IsNull() && !temp.bool_value());
       return Status::OK();
@@ -350,18 +368,16 @@ CHECKED_STATUS QLExprExecutor::EvalExpr(const PgsqlExpressionPB& ql_expr,
       break;
 
     case PgsqlExpressionPB::ExprCase::kColumnId:
-      if (table_row == nullptr) {
-        result->SetNull();
-      } else {
-        RETURN_NOT_OK(table_row->ReadColumn(ql_expr.column_id(), result));
-      }
-      break;
+      return EvalColumnRef(ql_expr.column_id(), table_row, result);
 
     case PgsqlExpressionPB::ExprCase::kBfcall:
       return EvalBFCall(ql_expr.bfcall(), table_row, result);
 
     case PgsqlExpressionPB::ExprCase::kTscall:
       return EvalTSCall(ql_expr.tscall(), table_row, result);
+
+    case PgsqlExpressionPB::ExprCase::kCondition:
+      return EvalCondition(ql_expr.condition(), table_row, result);
 
     case PgsqlExpressionPB::ExprCase::kBocall: FALLTHROUGH_INTENDED;
     case PgsqlExpressionPB::ExprCase::kBindId: FALLTHROUGH_INTENDED;
@@ -382,6 +398,19 @@ CHECKED_STATUS QLExprExecutor::ReadExprValue(const PgsqlExpressionPB& ql_expr,
   } else {
     return EvalExpr(ql_expr, table_row, result);
   }
+}
+
+//--------------------------------------------------------------------------------------------------
+
+CHECKED_STATUS QLExprExecutor::EvalColumnRef(ColumnIdRep col_id,
+                                             const QLTableRow::SharedPtrConst& table_row,
+                                             QLValue *result) {
+  if (table_row == nullptr) {
+    result->SetNull();
+  } else {
+    RETURN_NOT_OK(table_row->ReadColumn(col_id, result));
+  }
+  return Status::OK();
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -425,14 +454,213 @@ CHECKED_STATUS QLExprExecutor::ReadTSCallValue(const PgsqlBCallPB& ql_expr,
 
 //--------------------------------------------------------------------------------------------------
 
-CHECKED_STATUS QLTableRow::ReadColumn(ColumnIdRep col_id, QLValue *col_value) const {
+CHECKED_STATUS QLExprExecutor::EvalCondition(const PgsqlConditionPB& condition,
+                                             const QLTableRow::SharedPtrConst& table_row,
+                                             bool* result) {
+  QLValue result_pb;
+  RETURN_NOT_OK(EvalCondition(condition, table_row, &result_pb));
+  *result = result_pb.bool_value();
+  return Status::OK();
+}
+
+CHECKED_STATUS QLExprExecutor::EvalCondition(const PgsqlConditionPB& condition,
+                                             const QLTableRow::SharedPtrConst& table_row,
+                                             QLValue *result) {
+#define QL_EVALUATE_RELATIONAL_OP(op)                                                              \
+  do {                                                                                             \
+    CHECK_EQ(operands.size(), 2);                                                                  \
+    QLValue left, right;                                                                           \
+    RETURN_NOT_OK(EvalExpr(operands.Get(0), table_row, &left));                                    \
+    RETURN_NOT_OK(EvalExpr(operands.Get(1), table_row, &right));                                   \
+    if (!left.Comparable(right))                                                                   \
+      return STATUS(RuntimeError, "values not comparable");                                        \
+    result->set_bool_value(left.value() op right.value());                                         \
+    return Status::OK();                                                                           \
+  } while (false)
+
+#define QL_EVALUATE_BETWEEN(op1, op2, rel_op)                                                      \
+  do {                                                                                             \
+      CHECK_EQ(operands.size(), 3);                                                                \
+      QLValue lower, upper;                                                                        \
+      RETURN_NOT_OK(EvalExpr(operands.Get(0), table_row, &temp));                                  \
+      RETURN_NOT_OK(EvalExpr(operands.Get(1), table_row, &lower));                                 \
+      RETURN_NOT_OK(EvalExpr(operands.Get(2), table_row, &upper));                                 \
+      if (!temp.Comparable(lower) || !temp.Comparable(upper)) {                                    \
+        return STATUS(RuntimeError, "values not comparable");                                      \
+      }                                                                                            \
+      result->set_bool_value(temp.value() op1 lower.value() rel_op temp.value() op2 upper.value());\
+      return Status::OK();                                                                         \
+  } while (false)
+
+  QLValue temp;
+  const auto& operands = condition.operands();
+  switch (condition.op()) {
+    case QL_OP_NOT:
+      CHECK_EQ(operands.size(), 1);
+      CHECK_EQ(operands.Get(0).expr_case(), PgsqlExpressionPB::ExprCase::kCondition);
+      RETURN_NOT_OK(EvalCondition(operands.Get(0).condition(), table_row, &temp));
+      result->set_bool_value(!temp.bool_value());
+      return Status::OK();
+
+    case QL_OP_IS_NULL:
+      CHECK_EQ(operands.size(), 1);
+      RETURN_NOT_OK(EvalExpr(operands.Get(0), table_row, &temp));
+      result->set_bool_value(temp.IsNull());
+      return Status::OK();
+
+    case QL_OP_IS_NOT_NULL:
+      CHECK_EQ(operands.size(), 1);
+      RETURN_NOT_OK(EvalExpr(operands.Get(0), table_row, &temp));
+      result->set_bool_value(!temp.IsNull());
+      return Status::OK();
+
+    case QL_OP_IS_TRUE:
+      CHECK_EQ(operands.size(), 1);
+      RETURN_NOT_OK(EvalExpr(operands.Get(0), table_row, &temp));
+      if (temp.type() != InternalType::kBoolValue)
+        return STATUS(RuntimeError, "not a bool value");
+      result->set_bool_value(!temp.IsNull() && temp.bool_value());
+      return Status::OK();
+
+    case QL_OP_IS_FALSE: {
+      CHECK_EQ(operands.size(), 1);
+      RETURN_NOT_OK(EvalExpr(operands.Get(0), table_row, &temp));
+      if (temp.type() != InternalType::kBoolValue)
+        return STATUS(RuntimeError, "not a bool value");
+      result->set_bool_value(!temp.IsNull() && !temp.bool_value());
+      return Status::OK();
+    }
+
+    case QL_OP_EQUAL:
+      QL_EVALUATE_RELATIONAL_OP(==);
+
+    case QL_OP_LESS_THAN:
+      QL_EVALUATE_RELATIONAL_OP(<);                                                      // NOLINT
+
+    case QL_OP_LESS_THAN_EQUAL:
+      QL_EVALUATE_RELATIONAL_OP(<=);
+
+    case QL_OP_GREATER_THAN:
+      QL_EVALUATE_RELATIONAL_OP(>);                                                      // NOLINT
+
+    case QL_OP_GREATER_THAN_EQUAL:
+      QL_EVALUATE_RELATIONAL_OP(>=);
+
+    case QL_OP_NOT_EQUAL:
+      QL_EVALUATE_RELATIONAL_OP(!=);
+
+    case QL_OP_AND:
+      CHECK_GT(operands.size(), 0);
+      for (const auto &operand : operands) {
+        CHECK_EQ(operand.expr_case(), PgsqlExpressionPB::ExprCase::kCondition);
+        RETURN_NOT_OK(EvalCondition(operand.condition(), table_row, result));
+        if (!result->bool_value()) {
+          break;
+        }
+      }
+      return Status::OK();
+
+    case QL_OP_OR:
+      CHECK_GT(operands.size(), 0);
+      for (const auto &operand : operands) {
+        CHECK_EQ(operand.expr_case(), PgsqlExpressionPB::ExprCase::kCondition);
+        RETURN_NOT_OK(EvalCondition(operand.condition(), table_row, result));
+        if (result->bool_value()) {
+          break;
+        }
+      }
+      return Status::OK();
+
+    case QL_OP_BETWEEN:
+      QL_EVALUATE_BETWEEN(>=, <=, &&);
+
+    case QL_OP_NOT_BETWEEN:
+      QL_EVALUATE_BETWEEN(<, >, ||);
+
+      // When a row exists, the primary key columns are always populated in the row (value-map) by
+      // DocRowwiseIterator and only when it exists. Therefore, the row exists if and only if
+      // the row (value-map) is not empty.
+    case QL_OP_EXISTS:
+      result->set_bool_value(!table_row->IsEmpty());
+      return Status::OK();
+
+    case QL_OP_NOT_EXISTS:
+      result->set_bool_value(table_row->IsEmpty());
+      return Status::OK();
+
+    case QL_OP_IN: {
+      CHECK_EQ(operands.size(), 2);
+      QLValue left, right;
+      RETURN_NOT_OK(EvalExpr(operands.Get(0), table_row, &left));
+      RETURN_NOT_OK(EvalExpr(operands.Get(1), table_row, &right));
+
+      result->set_bool_value(false);
+      for (const QLValuePB& elem : right.list_value().elems()) {
+        if (!Comparable(elem, left)) {
+          return STATUS(RuntimeError, "values not comparable");
+        }
+        if (elem == left) {
+          result->set_bool_value(true);
+          break;
+        }
+      }
+      return Status::OK();
+    }
+
+    case QL_OP_NOT_IN: {
+      CHECK_EQ(operands.size(), 2);
+      QLValue left, right;
+      RETURN_NOT_OK(EvalExpr(operands.Get(0), table_row, &left));
+      RETURN_NOT_OK(EvalExpr(operands.Get(1), table_row, &right));
+
+      result->set_bool_value(true);
+      for (const QLValuePB& elem : right.list_value().elems()) {
+        if (!Comparable(elem, left)) {
+          return STATUS(RuntimeError, "values not comparable");
+        }
+        if (elem == left) {
+          result->set_bool_value(false);
+          break;
+        }
+      }
+      return Status::OK();
+    }
+
+    case QL_OP_LIKE: FALLTHROUGH_INTENDED;
+    case QL_OP_NOT_LIKE:
+      LOG(ERROR) << "Internal error: illegal or unknown operator " << condition.op();
+      break;
+
+    case QL_OP_NOOP:
+      break;
+  }
+
+  result->SetNull();
+  return STATUS(RuntimeError, "Internal error: illegal or unknown operator");
+
+#undef QL_EVALUATE_RELATIONAL_OP
+#undef QL_EVALUATE_BETWEEN
+}
+
+//--------------------------------------------------------------------------------------------------
+
+const QLValuePB* QLTableRow::GetColumn(ColumnIdRep col_id) const {
   const auto& col_iter = col_map_.find(col_id);
   if (col_iter == col_map_.end()) {
+    return nullptr;
+  }
+
+  return &col_iter->second.value;
+}
+
+CHECKED_STATUS QLTableRow::ReadColumn(ColumnIdRep col_id, QLValue *col_value) const {
+  auto value = GetColumn(col_id);
+  if (value == nullptr) {
     col_value->SetNull();
     return Status::OK();
   }
 
-  *col_value = col_iter->second.value;
+  *col_value = *value;
   return Status::OK();
 }
 
@@ -503,6 +731,10 @@ boost::optional<const QLValuePB&> QLTableRow::GetValue(ColumnIdRep col_id) const
     return boost::none;
   }
   return col_iter->second.value;
+}
+
+bool QLTableRow::IsColumnSpecified(ColumnIdRep col_id) const {
+  return col_map_.find(col_id) != col_map_.end();
 }
 
 void QLTableRow::ClearValue(ColumnIdRep col_id) {

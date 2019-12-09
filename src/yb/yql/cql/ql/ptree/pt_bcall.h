@@ -19,6 +19,8 @@
 #define YB_YQL_CQL_QL_PTREE_PT_BCALL_H_
 
 #include "yb/yql/cql/ql/ptree/pt_expr.h"
+#include "yb/util/bfql/gen_opcodes.h"
+#include "yb/util/bfql/bfunc_names.h"
 
 namespace yb {
 namespace ql {
@@ -90,31 +92,16 @@ class PTBcall : public PTExpr {
 
   virtual CHECKED_STATUS CheckCounterUpdateSupport(SemContext *sem_context) const override;
 
-  virtual string QLName() const override {
-    string arg_names;
-    string keyspace;
+  CHECKED_STATUS CheckOperatorAfterArgAnalyze(SemContext *sem_context);
 
-    for (auto arg : args_->node_list()) {
-      if (!arg_names.empty()) {
-        arg_names += ", ";
-      }
-      arg_names += arg->QLName();
-    }
-    if (IsAggregateCall()) {
-      // count(*) is displayed as count
-      if (arg_names.empty()) {
-        return strings::Substitute("$0", name_->c_str());
-      }
-      keyspace += "system.";
-    }
-    return strings::Substitute("$0$1$2$3$4", keyspace, name_->c_str(), "(", arg_names, ")");
-  }
-
+  virtual string QLName(QLNameOption option = QLNameOption::kUserOriginalName) const override;
   virtual bool IsAggregateCall() const override;
   virtual yb::bfql::TSOpcode aggregate_opcode() const override {
     return is_server_operator_ ? static_cast<yb::bfql::TSOpcode>(bfopcode_)
                                : yb::bfql::TSOpcode::kNoOp;
   }
+
+  virtual bool HaveColumnRef() const override;
 
  private:
   // Builtin function name.

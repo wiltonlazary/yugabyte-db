@@ -16,6 +16,8 @@
 //--------------------------------------------------------------------------------------------------
 
 #include "yb/client/client.h"
+#include "yb/client/table.h"
+
 #include "yb/yql/cql/ql/ptree/sem_context.h"
 #include "yb/yql/cql/ql/ptree/list_node.h"
 #include "yb/yql/cql/ql/ptree/pt_dml.h"
@@ -68,7 +70,6 @@ Status PTListNode::AnalyzeStatementBlock(SemContext *sem_context) {
       }
       dml = static_cast<const PTDmlStmt*>(tnode.get());
     }
-    sem_context->Reset();
     RETURN_NOT_OK(tnode->Analyze(sem_context));
     if (dml != nullptr) {
       if (!dml->table()->schema().table_properties().is_transactional()) {

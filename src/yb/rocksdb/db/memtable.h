@@ -34,7 +34,7 @@
 #include <vector>
 
 #include "yb/rocksdb/db/dbformat.h"
-#include "yb/rocksdb/db/skiplist.h"
+#include "yb/rocksdb/db/file_numbers.h"
 #include "yb/rocksdb/db/version_edit.h"
 #include "yb/rocksdb/db.h"
 #include "yb/rocksdb/env.h"
@@ -45,6 +45,12 @@
 #include "yb/rocksdb/util/dynamic_bloom.h"
 #include "yb/rocksdb/util/instrumented_mutex.h"
 #include "yb/rocksdb/util/mutable_cf_options.h"
+
+namespace yb {
+
+class MemTracker;
+
+}
 
 namespace rocksdb {
 
@@ -74,6 +80,7 @@ struct MemTableOptions {
   Statistics* statistics;
   MergeOperator* merge_operator;
   Logger* info_log;
+  std::shared_ptr<yb::MemTracker> mem_tracker;
 };
 
 YB_DEFINE_ENUM(FlushState, (kNotRequested)(kRequested)(kScheduled));
@@ -130,7 +137,7 @@ class MemTable {
   // operations on the same MemTable.
   MemTable* Unref() {
     --refs_;
-    assert(refs_ >= 0);
+    DCHECK_GE(refs_, 0);
     if (refs_ <= 0) {
       return this;
     }
@@ -218,6 +225,8 @@ class MemTable {
   void Update(SequenceNumber seq,
               const Slice& key,
               const Slice& value);
+
+  bool Erase(const Slice& key);
 
   // If prev_value for key exists, attempts to update it inplace.
   // else returns false
@@ -334,15 +343,24 @@ class MemTable {
   const MemTableOptions* GetMemTableOptions() const { return &moptions_; }
 
   void UpdateFrontiers(const UserFrontiers& value) {
+    std::lock_guard<SpinMutex> l(frontiers_mutex_);
     if (frontiers_) {
-      frontiers_->Merge(value);
+      frontiers_->MergeFrontiers(value);
     } else {
       frontiers_ = value.Clone();
     }
   }
+
+  UserFrontierPtr GetFrontier(UpdateUserValueType type) const;
+
   const UserFrontiers* Frontiers() const { return frontiers_.get(); }
 
   std::string ToString() const;
+
+  bool FullyErased() const {
+    return num_entries_.load(std::memory_order_acquire) ==
+           num_erased_.load(std::memory_order_acquire);
+  }
 
  private:
 
@@ -362,11 +380,15 @@ class MemTable {
   std::atomic<uint64_t> data_size_;
   std::atomic<uint64_t> num_entries_;
   std::atomic<uint64_t> num_deletes_;
+  std::atomic<uint64_t> num_erased_{0};
 
   // These are used to manage memtable flushes to storage
-  bool flush_in_progress_; // started the flush
-  bool flush_completed_;   // finished the flush
-  uint64_t file_number_;    // filled up after flush is complete
+  bool flush_in_progress_;        // started the flush
+  bool flush_completed_;          // finished the flush
+  uint64_t file_number_;          // filled up after flush is complete
+  // Filled up after flush is complete to prevent file from being deleted util it is added into the
+  // VersionSet.
+  FileNumbersHolder file_number_holder_;
 
   // The updates to be applied to the transaction log when this
   // memtable is flushed to storage.
@@ -394,6 +416,7 @@ class MemTable {
 
   Env* env_;
 
+  mutable SpinMutex frontiers_mutex_;
   std::unique_ptr<UserFrontiers> frontiers_;
 
   // Returns a heuristic flush decision
@@ -401,6 +424,8 @@ class MemTable {
 
   // Updates flush_state_ using ShouldFlushNow()
   void UpdateFlushState();
+
+  std::vector<char> erase_key_buffer_;
 
   // No copying allowed
   MemTable(const MemTable&) = delete;

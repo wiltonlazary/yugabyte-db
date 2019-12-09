@@ -356,7 +356,7 @@ class AtomicUniquePtr {
     return ptr_.load(memory_order);
   }
 
-  void reset(T* ptr, std::memory_order memory_order = std::memory_order_acq_rel) {
+  void reset(T* ptr = nullptr, std::memory_order memory_order = std::memory_order_acq_rel) {
     delete ptr_.exchange(ptr, memory_order);
   }
 
@@ -379,11 +379,37 @@ T GetAtomicFlag(T* flag) {
   return atomic_flag.load(std::memory_order::memory_order_relaxed);
 }
 
+template <class U, class T>
+void SetAtomicFlag(U value, T* flag) {
+  std::atomic<T>& atomic_flag = *pointer_cast<std::atomic<T>*>(flag);
+  atomic_flag.store(value);
+}
+
 template<typename T>
 void UpdateAtomicMax(std::atomic<T>* max_holder, T new_value) {
   auto current_max = max_holder->load(std::memory_order_acquire);
   while (new_value > current_max && !max_holder->compare_exchange_weak(current_max, new_value)) {}
 }
+
+class AtomicTryMutex {
+ public:
+  void unlock() {
+    auto value = locked_.exchange(false, std::memory_order_acq_rel);
+    DCHECK(value);
+  }
+
+  bool try_lock() {
+    bool expected = false;
+    return locked_.compare_exchange_strong(expected, true, std::memory_order_acq_rel);
+  }
+
+  bool is_locked() const {
+    return locked_.load(std::memory_order_acquire);
+  }
+
+ private:
+  std::atomic<bool> locked_{false};
+};
 
 } // namespace yb
 #endif /* YB_UTIL_ATOMIC_H */

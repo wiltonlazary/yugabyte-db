@@ -19,9 +19,10 @@
 
 #include <vector>
 
+#include "yb/client/client_fwd.h"
+
 #include "yb/yql/cql/cqlserver/cql_message.h"
 #include "yb/yql/cql/cqlserver/cql_processor.h"
-#include "yb/yql/cql/cqlserver/cql_rpcserver_env.h"
 #include "yb/yql/cql/cqlserver/cql_statement.h"
 #include "yb/yql/cql/cqlserver/cql_service.service.h"
 #include "yb/yql/cql/cqlserver/cql_server_options.h"
@@ -32,12 +33,6 @@
 #include "yb/client/async_initializer.h"
 
 namespace yb {
-
-namespace client {
-class YBClient;
-class YBTable;
-class YBSession;
-}  // namespace client
 
 namespace cqlserver {
 
@@ -54,7 +49,8 @@ class CQLServiceImpl : public CQLServerServiceIf,
  public:
   // Constructor.
   CQLServiceImpl(CQLServer* server, const CQLServerOptions& opts,
-                 client::LocalTabletFilter local_tablet_filter);
+                 ql::TransactionPoolProvider transaction_pool_provider);
+  ~CQLServiceImpl();
 
   void CompleteInit();
 
@@ -84,7 +80,7 @@ class CQLServiceImpl : public CQLServerServiceIf,
   }
 
   // Return the YBClient to communicate with either master or tserver.
-  const std::shared_ptr<client::YBClient>& client() const;
+  client::YBClient* client() const;
 
   // Return the YBClientCache.
   const std::shared_ptr<client::YBMetaDataCache>& metadata_cache() const;
@@ -93,14 +89,13 @@ class CQLServiceImpl : public CQLServerServiceIf,
   std::shared_ptr<CQLMetrics> cql_metrics() const { return cql_metrics_; }
 
   // Return the messenger.
-  std::weak_ptr<rpc::Messenger> messenger() { return messenger_; }
-
-  // Return the CQL RPC environment.
-  CQLRpcServerEnv* cql_rpc_env() { return cql_rpcserver_env_.get(); }
-
-  client::TransactionManager* GetTransactionManager();
+  rpc::Messenger* messenger() { return messenger_; }
 
   server::Clock* clock();
+
+  const ql::TransactionPoolProvider& transaction_pool_provider() const {
+    return transaction_pool_provider_;
+  }
 
  private:
   constexpr static int kRpcTimeoutSec = 5;
@@ -163,16 +158,9 @@ class CQLServiceImpl : public CQLServerServiceIf,
 
   std::shared_ptr<CQLMetrics> cql_metrics_;
   // Used to requeue the cql_inbound call to handle the response callback(s).
-  std::weak_ptr<rpc::Messenger> messenger_;
+  rpc::Messenger* messenger_ = nullptr;
 
-  // RPC environment for CQL proxy.
-  std::unique_ptr<CQLRpcServerEnv> cql_rpcserver_env_;
-
-  client::LocalTabletFilter local_tablet_filter_;
-
-  std::atomic<client::TransactionManager*> transaction_manager_{nullptr};
-  std::mutex transaction_manager_mutex_;
-  std::unique_ptr<client::TransactionManager> transaction_manager_holder_;
+  ql::TransactionPoolProvider transaction_pool_provider_;
 };
 
 }  // namespace cqlserver

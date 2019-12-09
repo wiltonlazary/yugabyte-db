@@ -18,11 +18,20 @@
 // under the License.
 //
 
+#ifndef YB_ROCKSDB_IMMUTABLE_OPTIONS_H
+#define YB_ROCKSDB_IMMUTABLE_OPTIONS_H
+
 #pragma once
 
 #include <string>
 #include <vector>
 #include "yb/rocksdb/options.h"
+
+namespace yb {
+
+class MemTracker;
+
+}
 
 namespace rocksdb {
 
@@ -46,7 +55,7 @@ struct ImmutableCFOptions {
 
   MergeOperator* merge_operator;
 
-  const CompactionFilter* compaction_filter;
+  CompactionFilter* compaction_filter;
 
   CompactionFilterFactory* compaction_filter_factory;
 
@@ -119,6 +128,12 @@ struct ImmutableCFOptions {
   std::vector<std::shared_ptr<EventListener>> listeners;
 
   std::shared_ptr<Cache> row_cache;
+
+  std::shared_ptr<yb::MemTracker> mem_tracker;
+
+  std::shared_ptr<yb::MemTracker> block_based_table_mem_tracker;
 };
 
 }  // namespace rocksdb
+
+#endif // YB_ROCKSDB_IMMUTABLE_OPTIONS_H

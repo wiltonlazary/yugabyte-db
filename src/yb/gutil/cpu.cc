@@ -102,7 +102,7 @@ uint64 _xgetbv(uint32 xcr) {
 #endif  // !_MSC_VER
 #endif  // __x86_64__
 
-#if defined(ARCH_CPU_ARM_FAMILY) && (defined(OS_ANDROID) || defined(OS_LINUX))
+#if defined(ARCH_CPU_ARM_FAMILY) && (defined(OS_ANDROID) || defined(__linux__))
 class LazyCpuInfoValue {
  public:
   LazyCpuInfoValue() : has_broken_neon_(false) {
@@ -157,8 +157,8 @@ class LazyCpuInfoValue {
             continue;
           }
 
-          const StringPiece line_sp(line);
-          StringPiece value_sp = line_sp.substr(colon_pos + 1);
+          const GStringPiece line_sp(line);
+          GStringPiece value_sp = line_sp.substr(colon_pos + 1);
           while (!value_sp.empty() &&
                  (value_sp[0] == ' ' || value_sp[0] == '\t')) {
             value_sp = value_sp.substr(1);
@@ -197,7 +197,7 @@ base::LazyInstance<LazyCpuInfoValue>::Leaky g_lazy_cpuinfo =
     LAZY_INSTANCE_INITIALIZER;
 
 #endif  // defined(ARCH_CPU_ARM_FAMILY) && (defined(OS_ANDROID) ||
-        // defined(OS_LINUX))
+        // defined(__linux__))
 
 }  // anonymous namespace
 
@@ -281,7 +281,7 @@ void CPU::Initialize() {
     __cpuid(cpu_info, parameter_containing_non_stop_time_stamp_counter);
     has_non_stop_time_stamp_counter_ = (cpu_info[3] & (1 << 8)) != 0;
   }
-#elif defined(ARCH_CPU_ARM_FAMILY) && (defined(OS_ANDROID) || defined(OS_LINUX))
+#elif defined(ARCH_CPU_ARM_FAMILY) && (defined(OS_ANDROID) || defined(__linux__))
   cpu_brand_.assign(g_lazy_cpuinfo.Get().brand());
   has_broken_neon_ = g_lazy_cpuinfo.Get().has_broken_neon();
 #else

@@ -18,6 +18,8 @@
 #include "yb/yql/cql/ql/ptree/pt_create_type.h"
 #include "yb/yql/cql/ql/ptree/sem_context.h"
 
+DECLARE_bool(use_cassandra_authentication);
+
 namespace yb {
 namespace ql {
 
@@ -53,8 +55,8 @@ CHECKED_STATUS PTTypeField::Analyze(SemContext *sem_context) {
                               ErrorCode::INVALID_TYPE_DEFINITION);
   }
 
-  if (!datatype_->ql_type()->GetUserDefinedTypeIds().empty()) {
-    return sem_context->Error(this, "UDT field types cannot refer to other user-defined types",
+  if (!datatype_->ql_type()->GetUserDefinedTypeIds().empty() && !datatype_->ql_type()->IsFrozen()) {
+    return sem_context->Error(this, "A user-defined type cannot contain non-frozen UDTs",
                               ErrorCode::FEATURE_NOT_SUPPORTED);
   }
 
@@ -85,6 +87,14 @@ CHECKED_STATUS PTCreateType::Analyze(SemContext *sem_context) {
 
   // Processing type name.
   RETURN_NOT_OK(name_->AnalyzeName(sem_context, OBJECT_TYPE));
+
+  if (FLAGS_use_cassandra_authentication) {
+    if (!sem_context->CheckHasAllKeyspacesPermission(loc(),
+        PermissionType::CREATE_PERMISSION).ok()) {
+      RETURN_NOT_OK(sem_context->CheckHasKeyspacePermission(loc(),
+          PermissionType::CREATE_PERMISSION, yb_type_name().namespace_name()));
+    }
+  }
 
   // Save context state, and set "this" as current column in the context.
   SymbolEntry cached_entry = *sem_context->current_processing_id();

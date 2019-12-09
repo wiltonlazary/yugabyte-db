@@ -17,7 +17,11 @@
 
 #include <iostream>
 
+#include <boost/functional/hash.hpp>
+
 #include <glog/logging.h>
+
+#include "yb/util/stol_utils.h"
 
 namespace yb {
 
@@ -49,8 +53,31 @@ void OpId::MakeAtMost(const OpId& rhs) {
   }
 }
 
+std::string OpId::ToString() const {
+  return Format("$0.$1", term, index);
+}
+
+Result<OpId> OpId::FromString(Slice input) {
+  auto pos = std::find(input.cdata(), input.cend(), '.');
+  if (pos == input.cend()) {
+    return STATUS(InvalidArgument, "OpId should contain '.'", input);
+  }
+  auto term = VERIFY_RESULT(CheckedStoll(Slice(input.cdata(), pos)));
+  auto index = VERIFY_RESULT(CheckedStoll(Slice(pos + 1, input.cend())));
+  return OpId(term, index);
+}
+
 std::ostream& operator<<(std::ostream& out, const OpId& op_id) {
   return out << "{ term: " << op_id.term << " index: " << op_id.index << " }";
+}
+
+size_t hash_value(const OpId& op_id) noexcept {
+  size_t result = 0;
+
+  boost::hash_combine(result, op_id.term);
+  boost::hash_combine(result, op_id.index);
+
+  return result;
 }
 
 } // namespace yb

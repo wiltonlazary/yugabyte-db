@@ -25,10 +25,12 @@
 
 #include "yb/common/ql_protocol.pb.h"
 
+#include "yb/util/enums.h"
 #include "yb/util/status.h"
 
-// Return the given status if it is not OK.
-#define RETURN_NOT_AUTH(s)  do { \
+// Return an unauthorized error if authentication is not enabled through the flag
+// use_cassandra_authentication.
+#define RETURN_NOT_AUTH_ENABLED(s)  do { \
   if (!FLAGS_use_cassandra_authentication) {                                                      \
     return s->Error(this, "You have to be logged in and not anonymous to perform this request",   \
                     ErrorCode::UNAUTHORIZED);                                                     \
@@ -87,7 +89,7 @@ enum class ErrorCode : int64_t {
   // Semantic errors [-200, -300).
   SEM_ERROR = -200,
   DATATYPE_MISMATCH = -201,
-  DUPLICATE_TABLE = -202,
+  DUPLICATE_OBJECT = -202,
   UNDEFINED_COLUMN = -203,
   DUPLICATE_COLUMN = -204,
   MISSING_PRIMARY_KEY = -205,
@@ -113,7 +115,7 @@ enum class ErrorCode : int64_t {
   //------------------------------------------------------------------------------------------------
   // Execution errors [-300, x).
   EXEC_ERROR = -300,
-  TABLE_NOT_FOUND = -301,
+  OBJECT_NOT_FOUND = -301,
   INVALID_TABLE_DEFINITION = -302,
   WRONG_METADATA_VERSION = -303,
   INVALID_ARGUMENTS = -304,
@@ -129,6 +131,7 @@ enum class ErrorCode : int64_t {
   ROLE_NOT_FOUND = -314,
   RESOURCE_NOT_FOUND = -315,
   INVALID_REQUEST = -316,
+  PERMISSION_NOT_FOUND = -317,
 
 };
 
@@ -147,6 +150,17 @@ constexpr const char *kErrorFontEnd = "\033[0m";
 
 std::string FormatForComparisonFailureMessage(ErrorCode op, ErrorCode other);
 ErrorCode QLStatusToErrorCode(QLResponsePB::QLStatus status);
+
+struct QLErrorTag : IntegralErrorTag<ErrorCode> {
+  // This category id is part of the wire protocol and should not be changed once released.
+  static constexpr uint8_t kCategory = 4;
+
+  static std::string ToMessage(Value code) {
+    return ErrorText(code);
+  }
+};
+
+typedef StatusErrorCodeImpl<QLErrorTag> QLError;
 
 }  // namespace ql
 }  // namespace yb

@@ -64,9 +64,10 @@ ConsensusRound::ConsensusRound(Consensus* consensus,
   DCHECK_NOTNULL(replicate_msg_.get());
 }
 
-void ConsensusRound::NotifyReplicationFinished(const Status& status) {
+void ConsensusRound::NotifyReplicationFinished(
+    const Status& status, int64_t leader_term, OpIds* applied_op_ids) {
   if (PREDICT_FALSE(replicated_cb_ == nullptr)) return;
-  replicated_cb_(status);
+  replicated_cb_(status, leader_term, applied_op_ids);
 }
 
 Status ConsensusRound::CheckBoundTerm(int64_t current_term) const {
@@ -78,6 +79,14 @@ Status ConsensusRound::CheckBoundTerm(int64_t current_term) const {
         bound_term_, current_term));
   }
   return Status::OK();
+}
+
+LeaderStatus Consensus::GetLeaderStatus(bool allow_stale) const {
+  return GetLeaderState(allow_stale).status;
+}
+
+int64_t Consensus::LeaderTerm() const {
+  return GetLeaderState().term;
 }
 
 scoped_refptr<ConsensusRound> Consensus::NewRound(
@@ -112,5 +121,48 @@ Status Consensus::ExecuteHook(HookPoint point) {
   }
   return Status::OK();
 }
+
+Result<yb::OpId> Consensus::GetLastOpId(OpIdType type) {
+  switch (type) {
+    case OpIdType::RECEIVED_OPID:
+      return GetLastReceivedOpId();
+    case OpIdType::COMMITTED_OPID:
+      return GetLastCommittedOpId();
+    case OpIdType::UNKNOWN_OPID_TYPE:
+      break;
+  }
+  return STATUS(InvalidArgument, "Unsupported OpIdType", OpIdType_Name(type));
+}
+
+LeaderState& LeaderState::MakeNotReadyLeader(LeaderStatus status_) {
+  status = status_;
+  term = yb::OpId::kUnknownTerm;
+  return *this;
+}
+
+Status LeaderState::CreateStatus() const {
+  switch (status) {
+    case consensus::LeaderStatus::NOT_LEADER:
+      return STATUS(IllegalState, "Not the leader");
+
+    case consensus::LeaderStatus::LEADER_BUT_NO_OP_NOT_COMMITTED:
+        return STATUS(LeaderNotReadyToServe,
+                      "Leader not yet replicated NoOp to be ready to serve requests");
+
+    case consensus::LeaderStatus::LEADER_BUT_OLD_LEADER_MAY_HAVE_LEASE:
+        return STATUS_FORMAT(LeaderNotReadyToServe,
+                             "Previous leader's lease might still be active ($0 remaining).",
+                             remaining_old_leader_lease);
+
+    case consensus::LeaderStatus::LEADER_BUT_NO_MAJORITY_REPLICATED_LEASE:
+        return STATUS(LeaderHasNoLease, "This leader has not yet acquired a lease.");
+
+    case consensus::LeaderStatus::LEADER_AND_READY:
+      return Status::OK();
+  }
+
+  FATAL_INVALID_ENUM_VALUE(consensus::LeaderStatus, status);
+}
+
 } // namespace consensus
 } // namespace yb

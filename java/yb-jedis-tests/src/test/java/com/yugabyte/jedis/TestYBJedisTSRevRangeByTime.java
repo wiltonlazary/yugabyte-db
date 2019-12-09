@@ -26,9 +26,11 @@ import static junit.framework.TestCase.assertFalse;
 import static junit.framework.TestCase.assertNotNull;
 import static junit.framework.TestCase.assertNull;
 import static junit.framework.TestCase.assertTrue;
-import static org.junit.Assert.fail;
+import static org.yb.AssertionWrappers.fail;
 
-@RunWith(Parameterized.class)
+import org.yb.YBParameterizedTestRunner;
+
+@RunWith(YBParameterizedTestRunner.class)
 public class TestYBJedisTSRevRangeByTime extends BaseJedisTest {
 
   private static final Logger LOG = LoggerFactory.getLogger(TestYBJedis.class);

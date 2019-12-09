@@ -16,7 +16,9 @@
 #include <thread>
 #include <cmath>
 
+#include "yb/client/table.h"
 #include "yb/common/jsonb.h"
+#include "yb/common/ql_value.h"
 #include "yb/gutil/strings/substitute.h"
 #include "yb/master/master.h"
 #include "yb/master/ts_manager.h"
@@ -143,7 +145,7 @@ class TestQLQuery : public QLTestBase {
     CHECK_OK(processor->Run("CREATE TABLE scan_bounds_test (h1 int, h2 text, r1 int, v1 int,"
                                 " PRIMARY KEY((h1, h2), r1));"));
 
-    client::YBTableName name(kDefaultKeyspaceName, "scan_bounds_test");
+    client::YBTableName name(YQL_DATABASE_CQL, kDefaultKeyspaceName, "scan_bounds_test");
     shared_ptr<client::YBTable> table;
 
     ASSERT_OK(client_->OpenTable(name, &table));
@@ -444,10 +446,32 @@ class TestQLQuery : public QLTestBase {
     ASSERT_EQ(1, row_block->row_count());
 
     //----------------------------------------------------------------------------------------------
-    // Testing parametric types (i.e. with frozen)
+    // Testing separate UDT type.
     //----------------------------------------------------------------------------------------------
     CHECK_OK(processor->Run("CREATE TYPE udt_partition_hash_test(a int, b text)"));
 
+    CHECK_OK(processor->Run(
+        "CREATE TABLE partition_hash_bcall_udt_test("
+        " h frozen<udt_partition_hash_test>, r int, v int, PRIMARY KEY ((h), r))"));
+
+    // Sample values to check hash value computation
+    key_values = "{a : 1, b : 'foo'}";
+
+    insert_stmt = Substitute("INSERT INTO partition_hash_bcall_udt_test "
+                             "(h, r, v) VALUES ($0, 1, 1);", key_values);
+    CHECK_OK(processor->Run(insert_stmt));
+
+    select_stmt = Substitute("SELECT * FROM partition_hash_bcall_udt_test WHERE "
+                                 "$0(h) = $1($2)", func_name, func_name, key_values);
+    CHECK_OK(processor->Run(select_stmt));
+
+    // Checking result.
+    row_block = processor->row_block();
+    ASSERT_EQ(1, row_block->row_count());
+
+    //----------------------------------------------------------------------------------------------
+    // Testing parametric types (i.e. with frozen)
+    //----------------------------------------------------------------------------------------------
     CHECK_OK(processor->Run(
         "CREATE TABLE partition_hash_bcall_frozen_test("
         " h1 frozen<map<int,text>>, h2 frozen<set<text>>, h3 frozen<list<int>>, "
@@ -703,7 +727,7 @@ TEST_F(TestQLQuery, TestPagingState) {
       if (processor->rows_result()->paging_state().empty()) {
         break;
       }
-      CHECK_OK(params.set_paging_state(processor->rows_result()->paging_state()));
+      CHECK_OK(params.SetPagingState(processor->rows_result()->paging_state()));
     } while (true);
     CHECK_EQ(page_count, kNumRows / kPageSize);
   }
@@ -732,7 +756,7 @@ TEST_F(TestQLQuery, TestPagingState) {
         break;
       }
       CHECK_EQ(row_block->row_count(), kPageSize);
-      CHECK_OK(params.set_paging_state(processor->rows_result()->paging_state()));
+      CHECK_OK(params.SetPagingState(processor->rows_result()->paging_state()));
     } while (true);
     CHECK_EQ(i, kLimit);
     CHECK_EQ(page_count, static_cast<int>(ceil(static_cast<double>(kLimit) /
@@ -772,7 +796,7 @@ TEST_F(TestQLQuery, TestPagingState) {
       if (processor->rows_result()->paging_state().empty()) {
         break;
       }
-      CHECK_OK(params.set_paging_state(processor->rows_result()->paging_state()));
+      CHECK_OK(params.SetPagingState(processor->rows_result()->paging_state()));
     } while (true);
     CHECK_EQ(row_count, kNumRows);
     // Page count should be at least "kNumRows / kPageSize". Can be more because some pages may not
@@ -804,7 +828,7 @@ TEST_F(TestQLQuery, TestPagingState) {
       if (processor->rows_result()->paging_state().empty()) {
         break;
       }
-      CHECK_OK(params.set_paging_state(processor->rows_result()->paging_state()));
+      CHECK_OK(params.SetPagingState(processor->rows_result()->paging_state()));
     } while (true);
     CHECK_EQ(row_count, kLimit);
     // Page count should be at least "kLimit / kPageSize". Can be more because some pages may not
@@ -876,7 +900,7 @@ do {                                                                            
     if (processor->rows_result()->paging_state().empty()) {                                        \
       break;                                                                                       \
     }                                                                                              \
-    CHECK_OK(params.set_paging_state(processor->rows_result()->paging_state()));                   \
+    CHECK_OK(params.SetPagingState(processor->rows_result()->paging_state()));                   \
   } while (true);                                                                                  \
   /* Page count should be at least "<nrRowsRead> / kPageSize". */                                  \
   /* Can be more since some pages may not be fully filled depending on hash key distribution. */   \
@@ -1393,7 +1417,7 @@ TEST_F(TestQLQuery, TestCollectionTypes) {
   EXPECT_EQ(3, map_row.column(1).int32_value());
   EXPECT_EQ("x", map_row.column(3).string_value());
   // check map
-  EXPECT_EQ(QLValue::InternalType::kMapValue, map_row.column(2).type());
+  EXPECT_EQ(InternalType::kMapValue, map_row.column(2).type());
   QLMapValuePB map_value = map_row.column(2).map_value();
   // check keys
   EXPECT_EQ(3, map_value.keys_size());
@@ -1435,7 +1459,7 @@ TEST_F(TestQLQuery, TestCollectionTypes) {
   EXPECT_EQ(3, set_row.column(1).int32_value());
   EXPECT_EQ("x", set_row.column(3).string_value());
   // check set
-  EXPECT_EQ(QLValue::InternalType::kSetValue, set_row.column(2).type());
+  EXPECT_EQ(InternalType::kSetValue, set_row.column(2).type());
   QLSeqValuePB set_value = set_row.column(2).set_value();
   // check elems
   // returned set should have no duplicates
@@ -1475,7 +1499,7 @@ TEST_F(TestQLQuery, TestCollectionTypes) {
   EXPECT_EQ(3, list_row.column(1).int32_value());
   EXPECT_EQ("x", list_row.column(3).string_value());
   // check set
-  EXPECT_EQ(QLValue::InternalType::kListValue, list_row.column(2).type());
+  EXPECT_EQ(InternalType::kListValue, list_row.column(2).type());
   QLSeqValuePB list_value = list_row.column(2).list_value();
   // check elems
   // lists should preserve input length (keep duplicates if any)
@@ -1533,7 +1557,7 @@ TEST_F(TestQLQuery, TestInvalidPeerTableEntries) {
   TestQLProcessor* processor = GetQLProcessor();
   ASSERT_OK(processor->Run("SELECT * FROM system.peers"));
   std::shared_ptr<QLRowBlock> row_block = processor->row_block();
-  ASSERT_EQ(num_tservers, row_block->row_count());
+  ASSERT_EQ(num_tservers - 1, row_block->row_count()) << row_block->ToString();
 
   auto ts_manager = cluster_->leader_mini_master()->master()->ts_manager();
   NodeInstancePB instance;
@@ -1547,13 +1571,12 @@ TEST_F(TestQLQuery, TestInvalidPeerTableEntries) {
   hostport_pb->set_host(invalid_host);
   hostport_pb->set_port(123);
 
-  std::shared_ptr<master::TSDescriptor> desc;
-  ASSERT_OK(ts_manager->RegisterTS(instance, registration, CloudInfoPB(), nullptr, &desc));
+  ASSERT_OK(ts_manager->RegisterTS(instance, registration, CloudInfoPB(), nullptr));
 
   // Verify the peers table and ensure the invalid host is not present.
   ASSERT_OK(processor->Run("SELECT * FROM system.peers"));
   row_block = processor->row_block();
-  ASSERT_EQ(num_tservers, row_block->row_count());
+  ASSERT_EQ(num_tservers - 1, row_block->row_count()) << row_block->ToString();
   for (const auto& row : row_block->rows()) {
     ASSERT_NE(invalid_host, row.column(0).inetaddress_value().ToString());
   }
@@ -1655,7 +1678,7 @@ TEST_F(TestQLQuery, TestDeleteColumn) {
   CHECK_OK(processor->Run("CREATE TABLE delete_column (h int, v1 int, v2 int,"
                             " PRIMARY KEY(h));"));
 
-  client::YBTableName name(kDefaultKeyspaceName, "delete_column");
+  client::YBTableName name(YQL_DATABASE_CQL, kDefaultKeyspaceName, "delete_column");
 
   for (int i = 0; i < 2; i++) {
     string stmt = Substitute("INSERT INTO delete_column (h, v1, v2) VALUES "
@@ -1696,7 +1719,7 @@ TEST_F(TestQLQuery, TestTtlWritetimeInWhereClauseOfSelectStatements) {
   CHECK_OK(
       processor->Run("CREATE TABLE ttl_writetime_test (h int, v1 int, v2 int, PRIMARY KEY(h))"));
 
-  client::YBTableName name(kDefaultKeyspaceName, "ttl_writetime_test");
+  client::YBTableName name(YQL_DATABASE_CQL, kDefaultKeyspaceName, "ttl_writetime_test");
 
   shared_ptr<client::YBTable> table;
 
@@ -1905,6 +1928,31 @@ TEST_F(TestQLQuery, TestJson) {
   ASSERT_NOK(processor->Run("CREATE TABLE test_json1 (k1 jsonb PRIMARY KEY, data jsonb)"));
   ASSERT_NOK(processor->Run("CREATE TABLE test_json2 (h1 int, r1 jsonb, c1 int, PRIMARY KEY ((h1)"
                                 ", r1))"));
+}
+
+TEST_F(TestQLQuery, TestJsonUpdate) {
+  // Init the simulated cluster.
+  ASSERT_NO_FATALS(CreateSimulatedCluster());
+
+  // Get a processor.
+  TestQLProcessor *processor = GetQLProcessor();
+  ASSERT_OK(processor->Run("CREATE TABLE test_json (k1 int PRIMARY KEY, data jsonb)"));
+  ASSERT_OK(processor->Run(
+      "INSERT INTO test_json (k1, data) values (1, '{ \"a\" : 1, \"b\" : 2 }')"));
+  ASSERT_OK(processor->Run("SELECT * FROM test_json"));
+  verifyJson(processor->row_block());
+
+  ASSERT_OK(processor->Run("UPDATE test_json SET data->'a' = '100' WHERE k1 = 1"));
+  ASSERT_NOK(processor->Run("UPDATE test_json SET data->'new-field'->'c' = '100' WHERE k1 = 1"));
+  ASSERT_OK(processor->Run("UPDATE test_json SET data->'new-field' = '100' WHERE k1 = 1"));
+
+  ASSERT_OK(processor->Run("UPDATE test_json SET data =  '{ \"a\": 2, \"b\": 4 }' WHERE k1 = 2"));
+  ASSERT_NOK(processor->Run("UPDATE test_json SET data->'a' = '3' WHERE k1 = 3"));
+
+  // Setting primitive value in JSON column should work
+  ASSERT_OK(processor->Run("UPDATE test_json SET data='true' WHERE k1 = 1"));
+  // Trying to update primitive value in JSON column using field name should error out
+  ASSERT_NOK(processor->Run("UPDATE test_json SET data->'a' WHERE k1 = 1"));
 }
 
 } // namespace ql

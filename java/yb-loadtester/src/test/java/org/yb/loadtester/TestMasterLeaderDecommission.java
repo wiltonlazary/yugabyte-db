@@ -12,6 +12,10 @@
 //
 package org.yb.loadtester;
 
+import static org.yb.AssertionWrappers.assertEquals;
+import static org.yb.AssertionWrappers.assertFalse;
+import static org.yb.AssertionWrappers.assertTrue;
+
 import com.google.common.net.HostAndPort;
 
 import org.junit.Test;
@@ -24,6 +28,11 @@ import java.util.*;
 /**
  * This is an integration test that ensures we can do a master decommission.
  */
+import org.yb.YBTestRunner;
+
+import org.junit.runner.RunWith;
+
+@RunWith(value=YBTestRunner.class)
 public class TestMasterLeaderDecommission extends TestClusterBase {
   @Test(timeout = TEST_TIMEOUT_SEC * 1000) // 20 minutes.
   public void testMasterLeaderDecommission() throws Exception {
@@ -31,38 +40,38 @@ public class TestMasterLeaderDecommission extends TestClusterBase {
     loadTesterRunnable.waitNumOpsIncrement(NUM_OPS_INCREMENT);
     // Disable heartbeats for all tservers.
     for (HostAndPort hp : miniCluster.getTabletServers().keySet()) {
-      boolean status = client.setFlag(hp, "tserver_disable_heartbeat_test_only", "true");
-      assert(status);
+      assertTrue(client.setFlag(hp, "tserver_disable_heartbeat_test_only", "true"));
     }
 
     // Disable becoming leader in 2 master followers.
     HostAndPort leaderMasterHp = client.getLeaderMasterHostAndPort();
     for (HostAndPort hp : miniCluster.getMasters().keySet()) {
       if (!hp.equals(leaderMasterHp)) {
-        boolean status = client.setFlag(hp, "do_not_start_election_test_only", "true");
-        assert(status);
+        assertTrue(client.setFlag(hp, "do_not_start_election_test_only", "true"));
       }
     }
 
     // Add a new master to the config.
-    createAndAddNewMasters(1);
+    Set<HostAndPort> newMaster = createAndAddNewMasters(1);
 
     // Decomission master leader, after this, the added master should become leader.
     removeMaster(leaderMasterHp);
 
     // Enable heartbeats for all tservers.
     for (HostAndPort hp : miniCluster.getTabletServers().keySet()) {
-      boolean status = client.setFlag(hp, "tserver_disable_heartbeat_test_only", "false");
-      assert(status);
+      assertTrue(client.setFlag(hp, "tserver_disable_heartbeat_test_only", "false"));
     }
 
     // Wait for tservers to find and heartbeat to new master.
-    Thread.sleep(MiniYBCluster.TSERVER_HEARTBEAT_TIMEOUT_MS * 2);
+    Thread.sleep(MiniYBCluster.TSERVER_HEARTBEAT_TIMEOUT_MS * 5);
 
     for (HostAndPort hp : miniCluster.getTabletServers().keySet()) {
       String masters = client.getMasterAddresses(hp);
-      // Assert each tserver knows about the full list of all 4 masters.
-      assert(masters.split(",").length == 4);
+      // Assert each tserver knows only the list of all 3 masters
+      // as it should have heartbeated to master leader.
+      assertEquals(3, masters.split(",").length);
+      assertFalse(masters.contains(leaderMasterHp.getHostText()));
+      assertTrue(masters.contains(newMaster.iterator().next().getHostText()));
     }
 
     // Wait for some ops and verify no failures in load tester.

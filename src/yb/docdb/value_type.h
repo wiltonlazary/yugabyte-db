@@ -14,6 +14,7 @@
 #ifndef YB_DOCDB_VALUE_TYPE_H_
 #define YB_DOCDB_VALUE_TYPE_H_
 
+#include <bitset>
 #include <string>
 
 #include <boost/preprocessor/seq/for_each.hpp>
@@ -32,10 +33,19 @@ namespace docdb {
     ((kLowest, 0)) \
     /* Obsolete intent prefix. Should be deleted when DBs in old format are gone. */ \
     ((kObsoleteIntentPrefix, 10)) \
-    /* We use ASCII code 20 in order to have it before all other value types which can occur in */ \
+    /* We use ASCII code 13 in order to have it before all other value types which can occur in */ \
     /* key, so intents will be written in the same order as original keys for which intents are */ \
     /* written. */ \
-    ((kIntentType, 20)) \
+    ((kIntentTypeSet, 13)) \
+    /* Obsolete intent prefix. Should be deleted when DBs in old format are gone. */ \
+    /* It has different values to intent type set entries, that was not optimised for RocksDB */ \
+    /* lookup. */ \
+    /* I.e. strong/weak and read/write bits are swapped. */ \
+    ((kObsoleteIntentTypeSet, 15)) \
+    /* Obsolete intent prefix. Should be deleted when DBs in old format are gone. */ \
+    /* Old intent type had 6 different types of intents, one for each possible intent. */ \
+    /* Intent type set has 4 different types of intents, but allow their combinations. */ \
+    ((kObsoleteIntentType, 20)) \
     /* This indicates the end of the "hashed" or "range" group of components of the primary */ \
     /* key. This needs to sort before all other value types, so that a DocKey that has a prefix */ \
     /* of the sequence of components of another key sorts before the other key. kGroupEnd is */ \
@@ -52,13 +62,14 @@ namespace docdb {
     /* Null must be lower than the other primitive types so that it compares as smaller than */ \
     /* them. It is used for frozen CQL user-defined types (which can contain null elements) on */ \
     /* ASC columns. */ \
-    ((kNull, '$')) /* ASCII code 36 */ \
+    ((kNullLow, '$')) /* ASCII code 36 */ \
     /* Counter to check cardinality. */ \
     ((kCounter, '%')) /* ASCII code 37 */ \
     /* Forward and reverse mappings for sorted sets. */ \
     ((kSSForward, '&')) /* ASCII code 38 */ \
     ((kSSReverse, '\'')) /* ASCII code 39 */ \
     ((kRedisSet, '(')) /* ASCII code 40 */ \
+    ((kRedisList, ')')) /* ASCII code 41*/ \
     /* This is the redis timeseries type. */ \
     ((kRedisTS, '+')) /* ASCII code 43 */ \
     ((kRedisSortedSet, ',')) /* ASCII code 44 */ \
@@ -80,8 +91,10 @@ namespace docdb {
     ((kColumnId, 'K'))  /* ASCII code 75 */ \
     ((kDoubleDescending, 'L'))  /* ASCII code 76 */ \
     ((kFloatDescending, 'M')) /* ASCII code 77 */ \
+    ((kUInt32, 'O'))  /* ASCII code 78 */ \
     ((kString, 'S'))  /* ASCII code 83 */ \
     ((kTrue, 'T'))  /* ASCII code 84 */ \
+    ((kUInt64, 'U')) /* ASCII code 85 */ \
     ((kTombstone, 'X'))  /* ASCII code 88 */ \
     ((kArrayIndex, '['))  /* ASCII code 91 */ \
     \
@@ -96,7 +109,15 @@ namespace docdb {
     ((kDecimalDescending, 'd'))  /* ASCII code 100 */ \
     ((kInt32Descending, 'e'))  /* ASCII code 101 */ \
     ((kVarIntDescending, 'f'))  /* ASCII code 102 */ \
+    ((kUInt32Descending, 'g'))  /* ASCII code 103 */ \
+    ((kTrueDescending, 'h'))  /* ASCII code 104 */ \
+    ((kFalseDescending, 'i'))  /* ASCII code 105 */ \
+    ((kUInt64Descending, 'j')) /* ASCII code 106 */ \
     \
+    /* Flag type for merge record flags */ \
+    ((kMergeFlags, 'k')) /* ASCII code 107 */ \
+    /* Indicator for whether an intent is for a row lock. */ \
+    ((kRowLock, 'l'))  /* ASCII code 108 */ \
     /* Timestamp value in microseconds */ \
     ((kTimestamp, 's'))  /* ASCII code 115 */ \
     /* TTL value in milliseconds, optionally present at the start of a value. */ \
@@ -104,13 +125,14 @@ namespace docdb {
     ((kUserTimestamp, 'u'))  /* ASCII code 117 */ \
     ((kWriteId, 'w')) /* ASCII code 119 */ \
     ((kTransactionId, 'x')) /* ASCII code 120 */ \
+    ((kTableId, 'y')) /* ASCII code 121 */ \
     \
     ((kObject, '{'))  /* ASCII code 123 */ \
     \
     /* Null desc must be higher than the other descending primitive types so that it compares */ \
     /* as bigger than them. It is used for frozen CQL user-defined types (which can contain */ \
     /* null elements) on DESC columns. */ \
-    ((kNullDescending, '|')) /* ASCII code 124 */ \
+    ((kNullHigh, '|')) /* ASCII code 124 */ \
     \
     /* This is only needed when used as the end marker for a frozen value on a DESC column. */ \
     ((kGroupEndDescending, '}')) /* ASCII code 125 -- we pick the highest value below kHighest. */ \
@@ -118,7 +140,7 @@ namespace docdb {
     /* This ValueType is used as +infinity for scanning purposes only. */ \
     ((kHighest, '~')) /* ASCII code 126 */ \
     \
-    /* This is used for sanity checking. TODO: rename to kInvalid since this is an enum class. */ \
+    /* This is used for sanity checking. */ \
     ((kInvalid, 127)) \
     \
     /* ValueType which lexicographically higher than any other byte and is not used for */ \
@@ -147,64 +169,40 @@ constexpr int kWeakIntentFlag         = 0b000;
 
 // "Strong" intents are obtained on the node that an operation is working with. See the example
 // above.
-constexpr int kStrongIntentFlag       = 0b001;
+constexpr int kStrongIntentFlag       = 0b010;
 
 constexpr int kReadIntentFlag         = 0b000;
-constexpr int kWriteIntentFlag        = 0b010;
+constexpr int kWriteIntentFlag        = 0b001;
 
-constexpr int kSerializableIntentFlag = 0b000;
-constexpr int kSnapshotIntentFlag     = 0b100;
-
-constexpr int kStrongWriteIntentFlags = kStrongIntentFlag | kWriteIntentFlag;
-
+// We put weak intents before strong intents to be able to skip weak intents while checking for
+// conflicts.
+//
+// This was not always the case.
+// kObsoleteIntentTypeSet corresponds to intent type set values stored in such a way that
+// strong/weak and read/write bits are swapped compared to the current format.
 YB_DEFINE_ENUM(IntentType,
-    ((kStrongSnapshotWrite,     kStrongIntentFlag | kWriteIntentFlag | kSnapshotIntentFlag))
-    ((kWeakSnapshotWrite,       kWeakIntentFlag   | kWriteIntentFlag | kSnapshotIntentFlag))
-    ((kStrongSerializableWrite, kStrongIntentFlag | kWriteIntentFlag | kSerializableIntentFlag))
-    ((kWeakSerializableWrite,   kWeakIntentFlag   | kWriteIntentFlag | kSerializableIntentFlag))
-    ((kStrongSerializableRead,  kStrongIntentFlag | kReadIntentFlag  | kSerializableIntentFlag))
-    ((kWeakSerializableRead,    kWeakIntentFlag   | kReadIntentFlag  | kSerializableIntentFlag))
+    ((kWeakRead,      kWeakIntentFlag |  kReadIntentFlag))
+    ((kWeakWrite,     kWeakIntentFlag | kWriteIntentFlag))
+    ((kStrongRead,  kStrongIntentFlag |  kReadIntentFlag))
+    ((kStrongWrite, kStrongIntentFlag | kWriteIntentFlag))
 );
 
-inline bool IsStrongIntent(IntentType intent) {
-  return (static_cast<int>(intent) & kStrongIntentFlag) != 0;
-}
-
-inline bool IsStrongWriteIntent(IntentType intent_type) {
-  return (static_cast<int>(intent_type) & kStrongWriteIntentFlags) == kStrongWriteIntentFlags;
-}
-
-inline bool IsWeakIntent(IntentType intent) {
-  return !IsStrongIntent(intent);
-}
-
-inline bool IsWriteIntent(IntentType intent) {
-  return (static_cast<int>(intent) & kWriteIntentFlag) != 0;
-}
-
-inline bool IsReadIntent(IntentType intent) {
-  return !IsWriteIntent(intent);
-}
-
-inline bool IsSnapshotIntent(IntentType intent) {
-  return (static_cast<int>(intent) & kSnapshotIntentFlag) != 0;
-}
-
-inline bool IsSerializableIntent(IntentType intent) {
-  return !IsSnapshotIntent(intent);
-}
+constexpr int kIntentTypeSetMapSize = 1 << kIntentTypeMapSize;
+typedef EnumBitSet<IntentType> IntentTypeSet;
 
 // All primitive value types fall into this range, but not all value types in this range are
 // primitive (e.g. object and tombstone are not).
 
-constexpr ValueType kMinPrimitiveValueType = ValueType::kNull;
-constexpr ValueType kMaxPrimitiveValueType = ValueType::kNullDescending;
+constexpr ValueType kMinPrimitiveValueType = ValueType::kNullLow;
+constexpr ValueType kMaxPrimitiveValueType = ValueType::kNullHigh;
 
-// kArray is handled slightly differently and hence we only have kObject, kRedisTS and kRedisSet.
+// kArray is handled slightly differently and hence we only have
+// kObject, kRedisTS, kRedisSet, and kRedisList.
 constexpr inline bool IsObjectType(const ValueType value_type) {
   return value_type == ValueType::kRedisTS || value_type == ValueType::kObject ||
       value_type == ValueType::kRedisSet || value_type == ValueType::kRedisSortedSet ||
-      value_type == ValueType::kSSForward || value_type == ValueType::kSSReverse;
+      value_type == ValueType::kSSForward || value_type == ValueType::kSSReverse ||
+      value_type == ValueType::kRedisList;
 }
 
 constexpr inline bool IsCollectionType(const ValueType value_type) {
@@ -215,6 +213,14 @@ constexpr inline bool IsPrimitiveValueType(const ValueType value_type) {
   return kMinPrimitiveValueType <= value_type && value_type <= kMaxPrimitiveValueType &&
          !IsCollectionType(value_type) &&
          value_type != ValueType::kTombstone;
+}
+
+constexpr inline bool IsSpecialValueType(ValueType value_type) {
+  return value_type == ValueType::kLowest || value_type == ValueType::kHighest;
+}
+
+constexpr inline bool IsPrimitiveOrSpecialValueType(ValueType value_type) {
+  return IsPrimitiveValueType(value_type) || IsSpecialValueType(value_type);
 }
 
 // Decode the first byte of the given slice as a ValueType.
@@ -230,6 +236,14 @@ inline ValueType ConsumeValueType(rocksdb::Slice* slice) {
 
 inline ValueType DecodeValueType(char value_type_byte) {
   return static_cast<ValueType>(value_type_byte);
+}
+
+// Checks if a value is a merge record, meaning it begins with the
+// kMergeFlags value type. Currently, the only merge records supported are
+// TTL records, when the flags value is 0x1. In the future, value
+// merge records may be implemented, such as a +1 merge record for INCR.
+inline bool IsMergeRecord(const rocksdb::Slice& value) {
+  return DecodeValueType(value) == ValueType::kMergeFlags;
 }
 
 }  // namespace docdb

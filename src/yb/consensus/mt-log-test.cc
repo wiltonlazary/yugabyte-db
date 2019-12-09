@@ -123,8 +123,7 @@ class MultiThreadedLogTest : public LogTestBase {
           batch_replicates.push_back(replicate);
         }
 
-        log::LogEntryBatchPB entry_batch_pb;
-        CreateBatchFromAllocatedOperations(batch_replicates, &entry_batch_pb);
+        auto entry_batch_pb = CreateBatchFromAllocatedOperations(batch_replicates);
 
         ASSERT_OK(log_->Reserve(REPLICATE, &entry_batch_pb, &entry_batch));
       } // lock_guard scope
@@ -170,17 +169,23 @@ TEST_F(MultiThreadedLogTest, TestAppends) {
   ASSERT_OK(log_->Close());
 
   std::unique_ptr<LogReader> reader;
-  ASSERT_OK(LogReader::Open(fs_manager_.get(), NULL, kTestTablet,
+  ASSERT_OK(LogReader::Open(fs_manager_->env(), NULL, kTestTablet,
                             fs_manager_->GetFirstTabletWalDirOrDie(kTestTable, kTestTablet),
+                            fs_manager_->uuid(),
                             NULL, &reader));
   SegmentSequence segments;
   ASSERT_OK(reader->GetSegmentsSnapshot(&segments));
 
+  std::vector<int64_t> ids;
   for (const SegmentSequence::value_type& entry : segments) {
-    ASSERT_OK(entry->ReadEntries(&entries_));
+    auto read_entries = entry->ReadEntries();
+    ASSERT_OK(read_entries.status);
+    for (const auto& entry : read_entries.entries) {
+      if (entry->type() == REPLICATE) {
+        ids.push_back(entry->replicate().id().index());
+      }
+    }
   }
-  vector<uint32_t> ids;
-  EntriesToIdList(&ids);
   DVLOG(1) << "Wrote total of " << current_index_ - start_current_id << " ops";
   ASSERT_EQ(current_index_ - start_current_id, ids.size());
   ASSERT_TRUE(std::is_sorted(ids.begin(), ids.end()));

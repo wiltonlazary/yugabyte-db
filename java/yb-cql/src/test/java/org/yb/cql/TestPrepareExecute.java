@@ -27,12 +27,17 @@ import com.datastax.driver.core.exceptions.QueryValidationException;
 
 import org.junit.BeforeClass;
 import org.junit.Test;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
+import static org.yb.AssertionWrappers.assertEquals;
+import static org.yb.AssertionWrappers.assertNotNull;
+import static org.yb.AssertionWrappers.assertNull;
+import static org.yb.AssertionWrappers.assertTrue;
+import static org.yb.AssertionWrappers.fail;
 
+import org.yb.YBTestRunner;
+import org.yb.minicluster.BaseMiniClusterTest;
+import org.junit.runner.RunWith;
+
+@RunWith(value=YBTestRunner.class)
 public class TestPrepareExecute extends BaseCQLTest {
 
   @BeforeClass
@@ -41,7 +46,8 @@ public class TestPrepareExecute extends BaseCQLTest {
     // memory page for the parse tree and two for semantic analysis results). A 64kB cache
     // should be small enough to force prepared statements to be freed and reprepared.
     // Note: add "--v=1" below to see the prepared statement cache usage in trace output.
-    BaseCQLTest.tserverArgs = Arrays.asList("--cql_service_max_prepared_statement_size_bytes=65536");
+    BaseMiniClusterTest.tserverArgs.add(
+        "--cql_service_max_prepared_statement_size_bytes=65536");
     BaseCQLTest.setUpBeforeClass();
   }
 

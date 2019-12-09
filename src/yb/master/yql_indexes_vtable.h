@@ -23,8 +23,7 @@ namespace master {
 class YQLIndexesVTable : public YQLVirtualTable {
  public:
   explicit YQLIndexesVTable(const Master* const master);
-  CHECKED_STATUS RetrieveData(const QLReadRequestPB& request,
-                              std::unique_ptr<QLRowBlock>* vtable) const;
+  Result<std::shared_ptr<QLRowBlock>> RetrieveData(const QLReadRequestPB& request) const override;
 
  protected:
   Schema CreateSchema() const;
@@ -36,6 +35,8 @@ class YQLIndexesVTable : public YQLVirtualTable {
   static constexpr const char* const kOptions = "options";
   static constexpr const char* const kTableId = "table_id";
   static constexpr const char* const kIndexId = "index_id";
+  static constexpr const char* const kTransactions = "transactions";
+  static constexpr const char* const kIsUnique = "is_unique";
 };
 
 }  // namespace master

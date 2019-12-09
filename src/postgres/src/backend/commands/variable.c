@@ -4,7 +4,7 @@
  *		Routines for handling specialized SET variables.
  *
  *
- * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -32,6 +32,8 @@
 #include "utils/timestamp.h"
 #include "utils/varlena.h"
 #include "mb/pg_wchar.h"
+
+#include "pg_yb_utils.h"
 
 /*
  * DATESTYLE
@@ -513,6 +515,16 @@ check_transaction_read_only(bool *newval, void **extra, GucSource source)
 	return true;
 }
 
+void
+assign_transaction_read_only(bool newval, void *extra)
+{
+	XactReadOnly = newval;
+	if (YBTransactionsEnabled())
+	{
+		YBCPgTxnManager_SetReadOnly(YBCGetPgTxnManager(), XactReadOnly);
+	}
+}
+
 /*
  * SET TRANSACTION ISOLATION LEVEL
  *
@@ -586,6 +598,10 @@ void
 assign_XactIsoLevel(const char *newval, void *extra)
 {
 	XactIsoLevel = *((int *) extra);
+	if (YBTransactionsEnabled())
+	{
+		YBCPgTxnManager_SetIsolationLevel(YBCGetPgTxnManager(), XactIsoLevel);
+	}
 }
 
 const char *
@@ -628,6 +644,16 @@ check_transaction_deferrable(bool *newval, void **extra, GucSource source)
 	}
 
 	return true;
+}
+
+void
+assign_transaction_deferrable(bool newval, void *extra)
+{
+  XactDeferrable = newval;
+	if (YBTransactionsEnabled())
+	{
+		YBCPgTxnManager_SetDeferrable(YBCGetPgTxnManager(), XactDeferrable);
+	}
 }
 
 /*

@@ -96,13 +96,16 @@ target_link_libraries(ysck
   tserver_service_proto
   ${YB_BASE_LIBS}
 )
+add_dependencies(
+  ysck
+  gen_src_yb_consensus_log_proto)
 
 add_executable(yb-ysck yb-ysck.cc)
 target_link_libraries(yb-ysck
   ysck
 )
 
-add_library(yb-generate_partitions yb-generate_partitions.cc)
+add_library(yb-generate_partitions bulk_load_utils.cc yb-generate_partitions.cc)
 target_link_libraries(yb-generate_partitions
   yb_client
   yb_util

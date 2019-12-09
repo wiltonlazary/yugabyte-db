@@ -12,8 +12,13 @@
 //
 
 #include "yb/master/yql_virtual_table.h"
+
+#include "yb/common/ql_value.h"
+
+#include "yb/master/catalog_manager.h"
 #include "yb/master/ts_manager.h"
 #include "yb/master/yql_vtable_iterator.h"
+#include "yb/util/shared_lock.h"
 
 namespace yb {
 namespace master {
@@ -31,33 +36,18 @@ CHECKED_STATUS YQLVirtualTable::GetIterator(
     const Schema& projection,
     const Schema& schema,
     const TransactionOperationContextOpt& txn_op_context,
-    MonoTime deadline,
+    CoarseTimePoint deadline,
     const ReadHybridTime& read_time,
     const common::QLScanSpec& spec,
     std::unique_ptr<common::YQLRowwiseIteratorIf>* iter)
     const {
-  std::unique_ptr<QLRowBlock> vtable;
-  RETURN_NOT_OK(RetrieveData(request, &vtable));
+  // Acquire shared lock on catalog manager to verify it is still the leader and metadata will
+  // not change.
+  CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
+  RETURN_NOT_OK(l.first_failed_status());
 
-  // If hashed column values are specified, filter by the hash key.
-  if (!request.hashed_column_values().empty()) {
-    const size_t num_hash_key_columns = schema_.num_hash_key_columns();
-    const auto& hashed_column_values = request.hashed_column_values();
-    std::vector<QLRow>& rows = vtable->rows();
-    auto excluded_rows = std::remove_if(
-        rows.begin(), rows.end(),
-        [num_hash_key_columns, &hashed_column_values](const QLRow& row) -> bool {
-          for (size_t i = 0; i < num_hash_key_columns; i++) {
-            if (hashed_column_values.Get(i).value() != row.column(i)) {
-              return true;
-            }
-          }
-          return false;
-        });
-    rows.erase(excluded_rows, rows.end());
-  }
-
-  iter->reset(new YQLVTableIterator(std::move(vtable)));
+  iter->reset(new YQLVTableIterator(
+      VERIFY_RESULT(RetrieveData(request)), request.hashed_column_values()));
   return Status::OK();
 }
 
@@ -68,16 +58,15 @@ CHECKED_STATUS YQLVirtualTable::BuildYQLScanSpec(
     const bool include_static_columns,
     const Schema& static_projection,
     std::unique_ptr<common::QLScanSpec>* spec,
-    std::unique_ptr<common::QLScanSpec>* static_row_spec,
-    ReadHybridTime* req_read_time) const {
+    std::unique_ptr<common::QLScanSpec>* static_row_spec) const {
   // There should be no static columns in system tables so we are not handling it.
   if (include_static_columns) {
     return STATUS(IllegalState, "system table contains no static columns");
   }
   spec->reset(new common::QLScanSpec(
       request.has_where_expr() ? &request.where_expr().condition() : nullptr,
+      request.has_if_expr() ? &request.if_expr().condition() : nullptr,
       request.is_forward_scan()));
-  *req_read_time = read_time;
   return Status::OK();
 }
 

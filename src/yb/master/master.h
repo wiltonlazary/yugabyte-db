@@ -68,7 +68,6 @@ struct RpcServerOptions;
 namespace master {
 
 class CatalogManager;
-class TSDescriptor;
 class TSManager;
 class MasterPathHandlers;
 class FlushManager;
@@ -97,14 +96,14 @@ class Master : public server::RpcAndWebServerBase {
 
   TSManager* ts_manager() const { return ts_manager_.get(); }
 
-  YB_EDITION_NS_PREFIX CatalogManager* catalog_manager() const { return catalog_manager_.get(); }
+  enterprise::CatalogManager* catalog_manager() const { return catalog_manager_.get(); }
 
   FlushManager* flush_manager() const { return flush_manager_.get(); }
 
   scoped_refptr<MetricEntity> metric_entity_cluster() { return metric_entity_cluster_; }
 
-  void SetMasterAddresses(std::shared_ptr<std::vector<HostPort>> master_addresses) {
-    opts_.SetMasterAddresses(master_addresses);
+  void SetMasterAddresses(std::shared_ptr<server::MasterAddresses> master_addresses) {
+    opts_.SetMasterAddresses(std::move(master_addresses));
   }
 
   const MasterOptions& opts() { return opts_; }
@@ -147,14 +146,10 @@ class Master : public server::RpcAndWebServerBase {
   // Called currently by cluster master leader which is removing this master from the quorum.
   CHECKED_STATUS GoIntoShellMode();
 
-  // Returns the number of system tables (used only for testing currently).
-  size_t NumSystemTables() const;
-
-  // Called by MasterService on every TS heartbeat.
-  virtual void OnTSHeartbeat(const std::vector<std::shared_ptr<TSDescriptor>>& live_tservers) {}
-
  protected:
   virtual CHECKED_STATUS RegisterServices();
+
+  void DisplayGeneralInfoIcons(std::stringstream* output);
 
  private:
   friend class MasterTest;
@@ -175,7 +170,7 @@ class Master : public server::RpcAndWebServerBase {
   MasterState state_;
 
   gscoped_ptr<TSManager> ts_manager_;
-  gscoped_ptr<YB_EDITION_NS_PREFIX CatalogManager> catalog_manager_;
+  gscoped_ptr<enterprise::CatalogManager> catalog_manager_;
   gscoped_ptr<MasterPathHandlers> path_handlers_;
   gscoped_ptr<FlushManager> flush_manager_;
 

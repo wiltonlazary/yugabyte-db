@@ -14,7 +14,10 @@
 #include "yb/client/ql-dml-test-base.h"
 
 #include "yb/client/client.h"
+#include "yb/client/session.h"
 #include "yb/client/table_handle.h"
+
+#include "yb/common/ql_value.h"
 
 #include "yb/yql/cql/ql/util/statement_result.h"
 
@@ -49,10 +52,10 @@ class QLDmlTTLTest : public QLDmlTestBase {
 };
 
 TEST_F(QLDmlTTLTest, TestInsertWithTTL) {
-  const shared_ptr<YBSession> session(NewSession());
+  const YBSessionPtr session(NewSession());
   {
     // insert into t (k, c1, c2) values (1, 1, "yuga-hello") using ttl 2;
-    const shared_ptr<YBqlWriteOp> op = table_.NewWriteOp(QLWriteRequestPB::QL_STMT_INSERT);
+    const YBqlWriteOpPtr op = table_.NewWriteOp(QLWriteRequestPB::QL_STMT_INSERT);
     auto* const req = op->mutable_request();
     QLAddInt32HashValue(req, 1);
     table_.AddInt32ColumnValue(req, "c1", 1);
@@ -65,7 +68,7 @@ TEST_F(QLDmlTTLTest, TestInsertWithTTL) {
 
   {
     // insert into t (k, c3, c4) values (1, 2, "yuga-hi") using ttl 4;
-    const shared_ptr<YBqlWriteOp> op = table_.NewWriteOp(QLWriteRequestPB::QL_STMT_INSERT);
+    const YBqlWriteOpPtr op = table_.NewWriteOp(QLWriteRequestPB::QL_STMT_INSERT);
     auto* const req = op->mutable_request();
     QLAddInt32HashValue(req, 1);
     table_.AddInt32ColumnValue(req, "c3", 2);
@@ -78,7 +81,7 @@ TEST_F(QLDmlTTLTest, TestInsertWithTTL) {
 
   {
     // select * from t where k = 1;
-    const shared_ptr<YBqlReadOp> op = table_.NewReadOp();
+    const YBqlReadOpPtr op = table_.NewReadOp();
     auto* const req = op->mutable_request();
     QLAddInt32HashValue(req, 1);
     table_.AddColumns(kAllColumns, req);
@@ -87,7 +90,7 @@ TEST_F(QLDmlTTLTest, TestInsertWithTTL) {
 
     // Expect all 4 columns (c1, c2, c3, c4) to be valid right now.
     EXPECT_EQ(op->response().status(), QLResponsePB::YQL_STATUS_OK);
-    unique_ptr<QLRowBlock> rowblock(RowsResult(op.get()).GetRowBlock());
+    auto rowblock = RowsResult(op.get()).GetRowBlock();
     EXPECT_EQ(rowblock->row_count(), 1);
     const auto& row = rowblock->row(0);
     EXPECT_EQ(row.column(0).int32_value(), 1);
@@ -102,7 +105,7 @@ TEST_F(QLDmlTTLTest, TestInsertWithTTL) {
 
   {
     // select * from t where k = 1;
-    const shared_ptr<YBqlReadOp> op = table_.NewReadOp();
+    const YBqlReadOpPtr op = table_.NewReadOp();
     auto* const req = op->mutable_request();
     QLAddInt32HashValue(req, 1);
     table_.AddColumns(kAllColumns, req);
@@ -111,7 +114,7 @@ TEST_F(QLDmlTTLTest, TestInsertWithTTL) {
 
     // Expect columns (c1, c2) to be null and (c3, c4) to be valid right now.
     EXPECT_EQ(op->response().status(), QLResponsePB::YQL_STATUS_OK);
-    unique_ptr<QLRowBlock> rowblock(RowsResult(op.get()).GetRowBlock());
+    auto rowblock = RowsResult(op.get()).GetRowBlock();
     EXPECT_EQ(rowblock->row_count(), 1);
     const auto& row = rowblock->row(0);
     EXPECT_EQ(row.column(0).int32_value(), 1);
@@ -126,7 +129,7 @@ TEST_F(QLDmlTTLTest, TestInsertWithTTL) {
 
   {
     // select * from t where k = 1;
-    const shared_ptr<YBqlReadOp> op = table_.NewReadOp();
+    const YBqlReadOpPtr op = table_.NewReadOp();
     auto* const req = op->mutable_request();
     QLAddInt32HashValue(req, 1);
     table_.AddColumns(kAllColumns, req);
@@ -135,7 +138,7 @@ TEST_F(QLDmlTTLTest, TestInsertWithTTL) {
 
     // Expect all 4 columns (c1, c2, c3, c4) to be null.
     EXPECT_EQ(op->response().status(), QLResponsePB::YQL_STATUS_OK);
-    unique_ptr<QLRowBlock> rowblock(RowsResult(op.get()).GetRowBlock());
+    auto rowblock = RowsResult(op.get()).GetRowBlock();
     EXPECT_EQ(rowblock->row_count(), 0);
   }
 }

@@ -50,13 +50,11 @@ Result<PhysicalTime> CheckClockSyncError(PhysicalTime time) {
   return time;
 }
 
-#if defined(__APPLE__)
-
 class WallClockImpl : public PhysicalClock {
   Result<PhysicalTime> Now() override {
-    // We use a fixed small clock error for Mac OS X builds.
-    const MicrosTime kFixedError = 1000;
-    return CheckClockSyncError({ static_cast<MicrosTime>(GetCurrentTimeMicros()), kFixedError });
+    return CheckClockSyncError(
+        { static_cast<MicrosTime>(GetCurrentTimeMicros()),
+          GetAtomicFlag(&FLAGS_max_clock_skew_usec) });
   }
 
   MicrosTime MaxGlobalTime(PhysicalTime time) override {
@@ -64,7 +62,8 @@ class WallClockImpl : public PhysicalClock {
   }
 };
 
-#else
+#if !defined(__APPLE__)
+
 CHECKED_STATUS CallAdjTime(timex* tx) {
   // Set mode to 0 to query the current time.
   tx->modes = 0;
@@ -94,7 +93,7 @@ CHECKED_STATUS CallAdjTime(timex* tx) {
   }
 }
 
-class WallClockImpl : public PhysicalClock {
+class AdjTimeClockImpl : public PhysicalClock {
   Result<PhysicalTime> Now() override {
     const MicrosTime kMicrosPerSec = 1000000;
 
@@ -115,6 +114,7 @@ class WallClockImpl : public PhysicalClock {
     return time.time_point + GetAtomicFlag(&FLAGS_max_clock_skew_usec);
   }
 };
+
 #endif
 
 } // namespace
@@ -124,12 +124,19 @@ const PhysicalClockPtr& WallClock() {
   return instance;
 }
 
+#if !defined(__APPLE__)
+const PhysicalClockPtr& AdjTimeClock() {
+  static PhysicalClockPtr instance = std::make_shared<AdjTimeClockImpl>();
+  return instance;
+}
+#endif
+
 Result<PhysicalTime> MockClock::Now() {
-  return CheckClockSyncError(value_.load(std::memory_order_acquire));
+  return CheckClockSyncError(value_.load(boost::memory_order_acquire));
 }
 
 void MockClock::Set(const PhysicalTime& value) {
-  value_.store(value, std::memory_order_release);
+  value_.store(value, boost::memory_order_release);
 }
 
 PhysicalClockPtr MockClock::AsClock() {

@@ -31,12 +31,14 @@
 
 #include <algorithm>
 #include <vector>
+#include <chrono>
 
 #include "yb/rocksdb/db/builder.h"
 #include "yb/rocksdb/db/db_iter.h"
 #include "yb/rocksdb/db/dbformat.h"
 #include "yb/rocksdb/db/event_helpers.h"
 #include "yb/rocksdb/db/filename.h"
+#include "yb/rocksdb/db/file_numbers.h"
 #include "yb/rocksdb/db/log_reader.h"
 #include "yb/rocksdb/db/log_writer.h"
 #include "yb/rocksdb/db/memtable.h"
@@ -58,7 +60,6 @@
 #include "yb/rocksdb/util/coding.h"
 #include "yb/rocksdb/util/event_logger.h"
 #include "yb/rocksdb/util/file_util.h"
-#include "yb/rocksdb/util/iostats_context_imp.h"
 #include "yb/rocksdb/util/log_buffer.h"
 #include "yb/rocksdb/util/logging.h"
 #include "yb/rocksdb/util/mutexlock.h"
@@ -66,6 +67,18 @@
 #include "yb/rocksdb/util/stop_watch.h"
 #include "yb/rocksdb/util/sync_point.h"
 #include "yb/rocksdb/util/thread_status_util.h"
+
+#include "yb/util/atomic.h"
+#include "yb/util/flag_tags.h"
+#include "yb/util/logging.h"
+#include "yb/util/stats/iostats_context_imp.h"
+
+DEFINE_int32(rocksdb_nothing_in_memtable_to_flush_sleep_ms, 10,
+    "Used for a temporary workaround for http://bit.ly/ybissue437. How long to wait (ms) in case "
+    "we could not flush any memtables, usually due to filters preventing us from doing so.");
+
+DEFINE_test_flag(bool, TEST_rocksdb_crash_on_flush, false,
+                 "When set, memtable flush in rocksdb crashes.");
 
 namespace rocksdb {
 
@@ -78,6 +91,7 @@ FlushJob::FlushJob(const std::string& dbname, ColumnFamilyData* cfd,
                    std::vector<SequenceNumber> existing_snapshots,
                    SequenceNumber earliest_write_conflict_snapshot,
                    MemTableFilter mem_table_flush_filter,
+                   FileNumbersProvider* file_numbers_provider,
                    JobContext* job_context, LogBuffer* log_buffer,
                    Directory* db_directory, Directory* output_file_directory,
                    CompressionType output_compression, Statistics* stats,
@@ -93,6 +107,7 @@ FlushJob::FlushJob(const std::string& dbname, ColumnFamilyData* cfd,
       existing_snapshots_(std::move(existing_snapshots)),
       earliest_write_conflict_snapshot_(earliest_write_conflict_snapshot),
       mem_table_flush_filter_(std::move(mem_table_flush_filter)),
+      file_numbers_provider_(file_numbers_provider),
       job_context_(job_context),
       log_buffer_(log_buffer),
       db_directory_(db_directory),
@@ -134,7 +149,11 @@ void FlushJob::RecordFlushIOStats() {
       ThreadStatus::FLUSH_BYTES_WRITTEN, IOSTATS(bytes_written));
 }
 
-Status FlushJob::Run(FileMetaData* file_meta) {
+Result<FileNumbersHolder> FlushJob::Run(FileMetaData* file_meta) {
+  if (PREDICT_FALSE(yb::GetAtomicFlag(&FLAGS_TEST_rocksdb_crash_on_flush))) {
+    CHECK(false) << "a flush should not have been scheduled.";
+  }
+
   AutoThreadOperationStageUpdater stage_run(
       ThreadStatus::STAGE_FLUSH_RUN);
   // Save the contents of the earliest memtable as a new Table
@@ -142,9 +161,17 @@ Status FlushJob::Run(FileMetaData* file_meta) {
   autovector<MemTable*> mems;
   cfd_->imm()->PickMemtablesToFlush(&mems, mem_table_flush_filter_);
   if (mems.empty()) {
-    LOG_TO_BUFFER(log_buffer_, "[%s] Nothing in memtable to flush",
-                cfd_->GetName().c_str());
-    return Status::OK();
+    // A temporary workaround for repeated "Nothing in memtable to flush" messages in a
+    // transactional workload due to the flush filter preventing us from flushing any memtables in
+    // the provisional records RocksDB.
+    //
+    // See https://github.com/yugabyte/yugabyte-db/issues/437 for more details.
+    YB_LOG_EVERY_N_SECS(WARNING, 1)
+        << db_options_.log_prefix
+        << "[" << cfd_->GetName() << "] Nothing in memtable to flush.";
+    std::this_thread::sleep_for(std::chrono::milliseconds(
+        FLAGS_rocksdb_nothing_in_memtable_to_flush_sleep_ms));
+    return FileNumbersHolder();
   }
 
   ReportFlushInputSize(mems);
@@ -161,26 +188,29 @@ Status FlushJob::Run(FileMetaData* file_meta) {
   edit->SetColumnFamily(cfd_->GetID());
 
   // This will release and re-acquire the mutex.
-  Status s = WriteLevel0Table(mems, edit, &meta);
+  auto fnum = WriteLevel0Table(mems, edit, &meta);
 
-  if (s.ok() &&
+  if (fnum.ok() &&
       (shutting_down_->load(std::memory_order_acquire) || cfd_->IsDropped())) {
-    s = STATUS(ShutdownInProgress,
+    fnum = STATUS(ShutdownInProgress,
         "Database shutdown or Column family drop during flush");
   }
 
-  if (!s.ok()) {
+  if (!fnum.ok()) {
     cfd_->imm()->RollbackMemtableFlush(mems, meta.fd.GetNumber());
   } else {
     TEST_SYNC_POINT("FlushJob::InstallResults");
     // Replace immutable memtable with the generated Table
-    s = cfd_->imm()->InstallMemtableFlushResults(
+    Status s = cfd_->imm()->InstallMemtableFlushResults(
         cfd_, mutable_cf_options_, mems, versions_, db_mutex_,
         meta.fd.GetNumber(), &job_context_->memtables_to_free, db_directory_,
-        log_buffer_);
+        log_buffer_, *fnum);
+    if (!s.ok()) {
+      fnum = s;
+    }
   }
 
-  if (s.ok() && file_meta != nullptr) {
+  if (fnum.ok() && file_meta != nullptr) {
     *file_meta = meta;
   }
   RecordFlushIOStats();
@@ -196,20 +226,20 @@ Status FlushJob::Run(FileMetaData* file_meta) {
   }
   stream.EndArray();
 
-  return s;
+  return fnum;
 }
 
-Status FlushJob::WriteLevel0Table(const autovector<MemTable*>& mems,
-                                  VersionEdit* edit, FileMetaData* meta) {
+Result<FileNumbersHolder> FlushJob::WriteLevel0Table(
+    const autovector<MemTable*>& mems, VersionEdit* edit, FileMetaData* meta) {
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_FLUSH_WRITE_L0);
   db_mutex_->AssertHeld();
   const uint64_t start_micros = db_options_.env->NowMicros();
+  auto file_number_holder = file_numbers_provider_->NewFileNumber();
+  auto file_number = file_number_holder.Last();
   // path 0 for level 0 file.
-  meta->fd = FileDescriptor(versions_->NewFileNumber(), 0, 0, 0);
+  meta->fd = FileDescriptor(file_number, 0, 0, 0);
 
-  Version* base = cfd_->current();
-  base->Ref();  // it is likely that we do not need this reference
   Status s;
   {
     db_mutex_->Unlock();
@@ -308,10 +338,6 @@ Status FlushJob::WriteLevel0Table(const autovector<MemTable*>& mems,
     TEST_SYNC_POINT("FlushJob::WriteLevel0Table");
     db_mutex_->Lock();
   }
-  base->Unref();
-
-  // re-acquire the most current version
-  base = cfd_->current();
 
   // Note that if total_file_size is zero, the file has been deleted and
   // should not be added to the manifest.
@@ -331,7 +357,11 @@ Status FlushJob::WriteLevel0Table(const autovector<MemTable*>& mems,
   cfd_->internal_stats()->AddCFStats(InternalStats::BYTES_FLUSHED,
       meta->fd.GetTotalFileSize());
   RecordTick(stats_, COMPACT_WRITE_BYTES, meta->fd.GetTotalFileSize());
-  return s;
+  if (s.ok()) {
+    return file_number_holder;
+  } else {
+    return s;
+  }
 }
 
 }  // namespace rocksdb

@@ -3,7 +3,7 @@
  * lmgr.c
  *	  POSTGRES lock manager code
  *
- * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -24,6 +24,7 @@
 #include "storage/procarray.h"
 #include "utils/inval.h"
 
+#include "pg_yb_utils.h"
 
 /*
  * Per-backend counter for generating speculative insertion tokens.
@@ -105,11 +106,12 @@ void
 LockRelationOid(Oid relid, LOCKMODE lockmode)
 {
 	LOCKTAG		tag;
+	LOCALLOCK  *locallock;
 	LockAcquireResult res;
 
 	SetLocktagRelationOid(&tag, relid);
 
-	res = LockAcquire(&tag, lockmode, false, false);
+	res = LockAcquireExtended(&tag, lockmode, false, false, true, &locallock);
 
 	/*
 	 * Now that we have the lock, check for invalidation messages, so that we
@@ -120,16 +122,25 @@ LockRelationOid(Oid relid, LOCKMODE lockmode)
 	 * relcache entry in an undesirable way.  (In the case where our own xact
 	 * modifies the rel, the relcache update happens via
 	 * CommandCounterIncrement, not here.)
+	 *
+	 * However, in corner cases where code acts on tables (usually catalogs)
+	 * recursively, we might get here while still processing invalidation
+	 * messages in some outer execution of this function or a sibling.  The
+	 * "cleared" status of the lock tells us whether we really are done
+	 * absorbing relevant inval messages.
 	 */
-	if (res != LOCKACQUIRE_ALREADY_HELD)
+	if (res != LOCKACQUIRE_ALREADY_CLEAR)
+	{
 		AcceptInvalidationMessages();
+		MarkLockClear(locallock);
+	}
 }
 
 /*
  *		ConditionalLockRelationOid
  *
  * As above, but only lock if we can get the lock without blocking.
- * Returns TRUE iff the lock was acquired.
+ * Returns true iff the lock was acquired.
  *
  * NOTE: we do not currently need conditional versions of all the
  * LockXXX routines in this file, but they could easily be added if needed.
@@ -138,11 +149,12 @@ bool
 ConditionalLockRelationOid(Oid relid, LOCKMODE lockmode)
 {
 	LOCKTAG		tag;
+	LOCALLOCK  *locallock;
 	LockAcquireResult res;
 
 	SetLocktagRelationOid(&tag, relid);
 
-	res = LockAcquire(&tag, lockmode, false, true);
+	res = LockAcquireExtended(&tag, lockmode, false, true, true, &locallock);
 
 	if (res == LOCKACQUIRE_NOT_AVAIL)
 		return false;
@@ -151,8 +163,11 @@ ConditionalLockRelationOid(Oid relid, LOCKMODE lockmode)
 	 * Now that we have the lock, check for invalidation messages; see notes
 	 * in LockRelationOid.
 	 */
-	if (res != LOCKACQUIRE_ALREADY_HELD)
+	if (res != LOCKACQUIRE_ALREADY_CLEAR)
+	{
 		AcceptInvalidationMessages();
+		MarkLockClear(locallock);
+	}
 
 	return true;
 }
@@ -199,20 +214,24 @@ void
 LockRelation(Relation relation, LOCKMODE lockmode)
 {
 	LOCKTAG		tag;
+	LOCALLOCK  *locallock;
 	LockAcquireResult res;
 
 	SET_LOCKTAG_RELATION(tag,
 						 relation->rd_lockInfo.lockRelId.dbId,
 						 relation->rd_lockInfo.lockRelId.relId);
 
-	res = LockAcquire(&tag, lockmode, false, false);
+	res = LockAcquireExtended(&tag, lockmode, false, false, true, &locallock);
 
 	/*
 	 * Now that we have the lock, check for invalidation messages; see notes
 	 * in LockRelationOid.
 	 */
-	if (res != LOCKACQUIRE_ALREADY_HELD)
+	if (res != LOCKACQUIRE_ALREADY_CLEAR)
+	{
 		AcceptInvalidationMessages();
+		MarkLockClear(locallock);
+	}
 }
 
 /*
@@ -226,13 +245,14 @@ bool
 ConditionalLockRelation(Relation relation, LOCKMODE lockmode)
 {
 	LOCKTAG		tag;
+	LOCALLOCK  *locallock;
 	LockAcquireResult res;
 
 	SET_LOCKTAG_RELATION(tag,
 						 relation->rd_lockInfo.lockRelId.dbId,
 						 relation->rd_lockInfo.lockRelId.relId);
 
-	res = LockAcquire(&tag, lockmode, false, true);
+	res = LockAcquireExtended(&tag, lockmode, false, true, true, &locallock);
 
 	if (res == LOCKACQUIRE_NOT_AVAIL)
 		return false;
@@ -241,8 +261,11 @@ ConditionalLockRelation(Relation relation, LOCKMODE lockmode)
 	 * Now that we have the lock, check for invalidation messages; see notes
 	 * in LockRelationOid.
 	 */
-	if (res != LOCKACQUIRE_ALREADY_HELD)
+	if (res != LOCKACQUIRE_ALREADY_CLEAR)
+	{
 		AcceptInvalidationMessages();
+		MarkLockClear(locallock);
+	}
 
 	return true;
 }
@@ -344,7 +367,7 @@ LockRelationForExtension(Relation relation, LOCKMODE lockmode)
  *		ConditionalLockRelationForExtension
  *
  * As above, but only lock if we can get the lock without blocking.
- * Returns TRUE iff the lock was acquired.
+ * Returns true iff the lock was acquired.
  */
 bool
 ConditionalLockRelationForExtension(Relation relation, LOCKMODE lockmode)
@@ -413,7 +436,7 @@ LockPage(Relation relation, BlockNumber blkno, LOCKMODE lockmode)
  *		ConditionalLockPage
  *
  * As above, but only lock if we can get the lock without blocking.
- * Returns TRUE iff the lock was acquired.
+ * Returns true iff the lock was acquired.
  */
 bool
 ConditionalLockPage(Relation relation, BlockNumber blkno, LOCKMODE lockmode)
@@ -469,7 +492,7 @@ LockTuple(Relation relation, ItemPointer tid, LOCKMODE lockmode)
  *		ConditionalLockTuple
  *
  * As above, but only lock if we can get the lock without blocking.
- * Returns TRUE iff the lock was acquired.
+ * Returns true iff the lock was acquired.
  */
 bool
 ConditionalLockTuple(Relation relation, ItemPointer tid, LOCKMODE lockmode)
@@ -492,6 +515,10 @@ void
 UnlockTuple(Relation relation, ItemPointer tid, LOCKMODE lockmode)
 {
 	LOCKTAG		tag;
+	if (!YBIsPgLockingEnabled()) {
+		/* Locking is handled separately by YugaByte. */
+		return;
+	}
 
 	SET_LOCKTAG_TUPLE(tag,
 					  relation->rd_lockInfo.lockRelId.dbId,
@@ -513,6 +540,10 @@ void
 XactLockTableInsert(TransactionId xid)
 {
 	LOCKTAG		tag;
+	if (!YBIsPgLockingEnabled()) {
+		/* Locking is handled separately by YugaByte. */
+		return;
+	}
 
 	SET_LOCKTAG_TRANSACTION(tag, xid);
 
@@ -530,6 +561,10 @@ void
 XactLockTableDelete(TransactionId xid)
 {
 	LOCKTAG		tag;
+	if (!YBIsPgLockingEnabled()) {
+		/* Locking is handled separately by YugaByte. */
+		return;
+	}
 
 	SET_LOCKTAG_TRANSACTION(tag, xid);
 
@@ -558,6 +593,11 @@ XactLockTableWait(TransactionId xid, Relation rel, ItemPointer ctid,
 	XactLockTableWaitInfo info;
 	ErrorContextCallback callback;
 	bool		first = true;
+
+	if (!YBIsPgLockingEnabled()) {
+		/* Locking is handled separately by YugaByte. */
+		return;
+	}
 
 	/*
 	 * If an operation is specified, set up our verbose error context
@@ -621,13 +661,19 @@ XactLockTableWait(TransactionId xid, Relation rel, ItemPointer ctid,
  *		ConditionalXactLockTableWait
  *
  * As above, but only lock if we can get the lock without blocking.
- * Returns TRUE if the lock was acquired.
+ * Returns true if the lock was acquired.
  */
 bool
 ConditionalXactLockTableWait(TransactionId xid)
 {
 	LOCKTAG		tag;
 	bool		first = true;
+
+	if (!YBIsPgLockingEnabled()) {
+		/* Locking is handled separately by YugaByte. */
+		/* Pretend the lock has been acquired. */
+		return true;
+	}
 
 	for (;;)
 	{
@@ -696,6 +742,11 @@ SpeculativeInsertionLockRelease(TransactionId xid)
 {
 	LOCKTAG		tag;
 
+	if (!YBIsPgLockingEnabled()) {
+		/* Locking is handled separately by YugaByte. */
+		return;
+	}
+
 	SET_LOCKTAG_SPECULATIVE_INSERTION(tag, xid, speculativeInsertionToken);
 
 	LockRelease(&tag, ExclusiveLock, false);
@@ -711,6 +762,10 @@ void
 SpeculativeInsertionWait(TransactionId xid, uint32 token)
 {
 	LOCKTAG		tag;
+
+	if (!YBIsPgLockingEnabled()) {
+		return;
+	}
 
 	SET_LOCKTAG_SPECULATIVE_INSERTION(tag, xid, token);
 
@@ -794,6 +849,10 @@ WaitForLockersMultiple(List *locktags, LOCKMODE lockmode)
 {
 	List	   *holders = NIL;
 	ListCell   *lc;
+	if (!YBIsPgLockingEnabled()) {
+		/* Locking is handled separately by YugaByte. */
+		return;
+	}
 
 	/* Done if no locks to wait for */
 	if (list_length(locktags) == 0)
@@ -837,6 +896,10 @@ void
 WaitForLockers(LOCKTAG heaplocktag, LOCKMODE lockmode)
 {
 	List	   *l;
+	if (!YBIsPgLockingEnabled()) {
+		/* Locking is handled separately by YugaByte. */
+		return;
+	}
 
 	l = list_make1(&heaplocktag);
 	WaitForLockersMultiple(l, lockmode);
@@ -857,6 +920,10 @@ LockDatabaseObject(Oid classid, Oid objid, uint16 objsubid,
 				   LOCKMODE lockmode)
 {
 	LOCKTAG		tag;
+	if (!YBIsPgLockingEnabled()) {
+		/* Locking is handled separately by YugaByte. */
+		return;
+	}
 
 	SET_LOCKTAG_OBJECT(tag,
 					   MyDatabaseId,
@@ -878,6 +945,10 @@ UnlockDatabaseObject(Oid classid, Oid objid, uint16 objsubid,
 					 LOCKMODE lockmode)
 {
 	LOCKTAG		tag;
+	if (!YBIsPgLockingEnabled()) {
+		/* Locking is handled separately by YugaByte. */
+		return;
+	}
 
 	SET_LOCKTAG_OBJECT(tag,
 					   MyDatabaseId,
@@ -898,6 +969,10 @@ LockSharedObject(Oid classid, Oid objid, uint16 objsubid,
 				 LOCKMODE lockmode)
 {
 	LOCKTAG		tag;
+	if (!YBIsPgLockingEnabled()) {
+		/* Locking is handled separately by YugaByte. */
+		return;
+	}
 
 	SET_LOCKTAG_OBJECT(tag,
 					   InvalidOid,
@@ -919,6 +994,10 @@ UnlockSharedObject(Oid classid, Oid objid, uint16 objsubid,
 				   LOCKMODE lockmode)
 {
 	LOCKTAG		tag;
+	if (!YBIsPgLockingEnabled()) {
+		/* Locking is handled separately by YugaByte. */
+		return;
+	}
 
 	SET_LOCKTAG_OBJECT(tag,
 					   InvalidOid,
@@ -940,6 +1019,10 @@ LockSharedObjectForSession(Oid classid, Oid objid, uint16 objsubid,
 						   LOCKMODE lockmode)
 {
 	LOCKTAG		tag;
+	if (!YBIsPgLockingEnabled()) {
+		/* Locking is handled separately by YugaByte. */
+		return;
+	}
 
 	SET_LOCKTAG_OBJECT(tag,
 					   InvalidOid,
@@ -958,6 +1041,10 @@ UnlockSharedObjectForSession(Oid classid, Oid objid, uint16 objsubid,
 							 LOCKMODE lockmode)
 {
 	LOCKTAG		tag;
+	if (!YBIsPgLockingEnabled()) {
+		/* Locking is handled separately by YugaByte. */
+		return;
+	}
 
 	SET_LOCKTAG_OBJECT(tag,
 					   InvalidOid,

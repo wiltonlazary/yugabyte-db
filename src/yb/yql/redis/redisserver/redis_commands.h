@@ -16,12 +16,15 @@
 
 #include <functional>
 #include <string>
+#include <vector>
 
 #include <boost/function.hpp>
 
 #include "yb/client/client_fwd.h"
 
+#include "yb/rpc/rpc_fwd.h"
 #include "yb/rpc/service_if.h"
+#include "yb/util/result.h"
 
 #include "yb/yql/redis/redisserver/redis_fwd.h"
 #include "yb/yql/redis/redisserver/redis_server.h"
@@ -30,14 +33,60 @@
 namespace yb {
 namespace redisserver {
 
+typedef boost::function<void(const Status&)> StatusFunctor;
+typedef boost::function<void(int i)> IntFunctor;
+
+class RedisConnectionContext;
+
+YB_STRONGLY_TYPED_BOOL(AsPattern);
+
+class RedisServiceData {
+ public:
+  // Used for Monitor.
+  virtual void AppendToMonitors(rpc::Connection* conn) = 0;
+  virtual void RemoveFromMonitors(rpc::Connection* conn) = 0;
+  virtual void LogToMonitors(
+      const std::string& end, const std::string& db, const RedisClientCommand& cmd) = 0;
+
+  // Used for PubSub.
+  virtual void AppendToSubscribers(
+      AsPattern type, const std::vector<std::string>& channels, rpc::Connection* conn,
+      std::vector<int>* subs) = 0;
+  virtual void RemoveFromSubscribers(
+      AsPattern type, const std::vector<std::string>& channels, rpc::Connection* conn,
+      std::vector<int>* subs) = 0;
+  virtual int NumSubscribers(AsPattern type, const std::string& channel) = 0;
+  virtual void CleanUpSubscriptions(rpc::Connection* conn) = 0;
+  virtual std::unordered_set<std::string> GetSubscriptions(
+      AsPattern type, rpc::Connection* conn) = 0;
+  virtual std::unordered_set<std::string> GetAllSubscriptions(AsPattern type) = 0;
+  virtual void ForwardToInterestedProxies(
+      const std::string& channel, const std::string& message, const IntFunctor& f) = 0;
+
+  // Used for Auth.
+  virtual CHECKED_STATUS GetRedisPasswords(std::vector<std::string>* passwords) = 0;
+
+  // Used for Select.
+  virtual yb::Result<std::shared_ptr<client::YBTable>> GetYBTableForDB(
+      const std::string& db_name) = 0;
+
+  static client::YBTableName GetYBTableNameForRedisDatabase(const std::string& db_name);
+
+  virtual ~RedisServiceData() {}
+};
+
+YB_STRONGLY_TYPED_BOOL(ManualResponse);
+
 // Context for batch of Redis commands.
 class BatchContext : public RefCountedThreadSafe<BatchContext> {
  public:
-  virtual const std::shared_ptr<client::YBTable>& table() const = 0;
+  virtual std::shared_ptr<client::YBTable> table() = 0;
   virtual const RedisClientCommand& command(size_t idx) const = 0;
   virtual const std::shared_ptr<RedisInboundCall>& call() const = 0;
-  virtual const std::shared_ptr<client::YBClient>& client() const = 0;
+  virtual client::YBClient* client() const = 0;
   virtual const RedisServer* server() = 0;
+  virtual RedisServiceData* service_data() = 0;
+  virtual void CleanYBTableFromCache() = 0;
 
   virtual void Apply(
       size_t index,
@@ -51,9 +100,10 @@ class BatchContext : public RefCountedThreadSafe<BatchContext> {
 
   virtual void Apply(
       size_t index,
-      std::function<bool(const StatusFunctor&)> functor,
+      std::function<bool(client::YBSession*, const StatusFunctor&)> functor,
       std::string partition_key,
-      const rpc::RpcMethodMetrics& metrics) = 0;
+      const rpc::RpcMethodMetrics& metrics,
+      ManualResponse manual_response) = 0;
 
   virtual ~BatchContext() {}
 };

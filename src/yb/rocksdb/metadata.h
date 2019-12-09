@@ -35,6 +35,7 @@
 
 #include "yb/util/clone_ptr.h"
 #include "yb/util/slice.h"
+#include "yb/util/enums.h"
 
 #include "yb/rocksdb/types.h"
 
@@ -83,14 +84,22 @@ struct LevelMetaData {
 
 class UserFrontier;
 
-// Frontier should be able to be copied preserving its virtual nature.
-// We cannot use shared_ptr here, because we are planning to change cloned value,
-// with shared_ptr original would also be changed.
+// Frontier should be copyable, but should still preserve its polymorphic nature. We cannot use
+// shared_ptr here, because we are planning to modify the copied value. If we used shared_ptr and
+// modified the copied value, the original value would also change.
 typedef yb::clone_ptr<UserFrontier> UserFrontierPtr;
 
-// When writing a batch user could specify frontier values of that batch.
-// So we would maintain those values for each SST file and whole DB.
-// This class defines an abstract interface for single user frontier.
+void UpdateUserFrontier(UserFrontierPtr* value, const UserFrontierPtr& update,
+                        UpdateUserValueType type);
+void UpdateUserFrontier(UserFrontierPtr* value, UserFrontierPtr&& update,
+                        UpdateUserValueType type);
+
+// When writing a batch of RocksDB records, the user could specify "frontier" values of that batch,
+// such as smallest/largest Raft OpId or smallest/largest HybridTime of records in that batch. We
+// maintain these values for each SSTable file and whole DB. This class defines an abstract
+// interface for a single user frontier, i.e. only smallest values or only largest values, but all
+// types of these values together as a tuple (e.g. OpId / hybrid time / etc.) See
+// consensus_frontier.h for a concrete example.
 class UserFrontier {
  public:
   virtual std::unique_ptr<UserFrontier> Clone() const = 0;
@@ -98,7 +107,20 @@ class UserFrontier {
   virtual void ToPB(google::protobuf::Any* pb) const = 0;
   virtual bool Equals(const UserFrontier& rhs) const = 0;
 
+  // Updates the user frontier with the new values from rhs.
   virtual void Update(const UserFrontier& rhs, UpdateUserValueType type) = 0;
+
+  // Checks if the given update is valid, i.e. that it does not move the fields of the frontier
+  // (such as OpId / hybrid time) in the direction opposite to that indicated by
+  // UpdateUserValueType. A "largest" update should only increase fields, and a "smallest" should
+  // only decrease them. Fields that are not set in rhs are not checked.
+  virtual bool IsUpdateValid(const UserFrontier& rhs, UpdateUserValueType type) const = 0;
+
+  // Returns true if this frontier dominates another frontier, i.e. if we update this frontier
+  // with the values from the other one in the direction specified by update_type, nothing will
+  // change. This is used to check invariants.
+  bool Dominates(const UserFrontier& rhs, UpdateUserValueType update_type) const;
+
   virtual void FromOpIdPBDeprecated(const yb::OpIdPB& op_id) = 0;
   virtual void FromPB(const google::protobuf::Any& pb) = 0;
 
@@ -127,7 +149,7 @@ class UserFrontiers {
   virtual const UserFrontier& Smallest() const = 0;
   virtual const UserFrontier& Largest() const = 0;
 
-  virtual void Merge(const UserFrontiers& rhs) = 0;
+  virtual void MergeFrontiers(const UserFrontiers& rhs) = 0;
 
   virtual ~UserFrontiers() {}
 };
@@ -149,7 +171,7 @@ class UserFrontiersBase : public rocksdb::UserFrontiers {
     return std::make_unique<UserFrontiersBase>(*this);
   }
 
-  void Merge(const UserFrontiers& pre_rhs) override {
+  void MergeFrontiers(const UserFrontiers& pre_rhs) override {
     const auto& rhs = down_cast<const UserFrontiersBase&>(pre_rhs);
     smallest_.Update(rhs.smallest_, rocksdb::UpdateUserValueType::kSmallest);
     largest_.Update(rhs.largest_, rocksdb::UpdateUserValueType::kLargest);
@@ -226,10 +248,12 @@ struct SstFileMetaData {
                   const std::string& _path,
                   uint64_t _total_size,
                   uint64_t _base_size,
+                  uint64_t _uncompressed_size,
                   const BoundaryValues& _smallest,
                   const BoundaryValues& _largest,
                   bool _being_compacted) :
-    total_size(_total_size), base_size(_base_size), name(_file_name),
+    total_size(_total_size), base_size(_base_size),
+    uncompressed_size(_uncompressed_size), name(_file_name),
     db_path(_path), smallest(_smallest), largest(_largest),
     being_compacted(_being_compacted) {
   }
@@ -238,6 +262,8 @@ struct SstFileMetaData {
   uint64_t total_size;
   // Base file size in bytes.
   uint64_t base_size;
+  // Total uncompressed size in bytes.
+  uint64_t uncompressed_size;
   // The name of the file.
   std::string name;
   // The full path where the file locates.
@@ -255,11 +281,11 @@ struct LiveFileMetaData : SstFileMetaData {
   int level;                       // Level at which this file resides.
 
   std::string ToString() const {
-    return yb::Format("{ total_size: $0 base_size: $1 name: \"$2\" db_path: \"$3\" imported: $4 "
-                      "being_compacted: $5 column_family_name: $6 level: $7 smallest: $8 "
-                      "largest: $9 }",
-                      total_size, base_size, name, db_path, imported, being_compacted,
-                      column_family_name, level, smallest, largest);
+    return yb::Format("{ total_size: $0 base_size: $1 uncompressed_size: $2 name: \"$3\" "
+                      "db_path: \"$4\" imported: $5 being_compacted: $6 column_family_name: $7 "
+                      "level: $8 smallest: $9 largest: $10 }",
+                      total_size, base_size, uncompressed_size, name, db_path, imported,
+                      being_compacted, column_family_name, level, smallest, largest);
   }
 };
 

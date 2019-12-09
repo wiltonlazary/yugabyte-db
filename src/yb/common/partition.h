@@ -88,6 +88,14 @@ class Partition {
     return partition_key_end_;
   }
 
+  void TEST_set_partition_key_start(const std::string& partition_key_start) {
+    partition_key_start_ = partition_key_start;
+  }
+
+  void TEST_set_partition_key_end(const std::string& partition_key_end) {
+    partition_key_end_ = partition_key_end;
+  }
+
   // Serializes a partition into a protobuf message.
   void ToPB(PartitionPB* pb) const;
 
@@ -191,8 +199,13 @@ class PartitionSchema {
                                   std::vector<Partition>* partitions,
                                   int32_t max_partition_key = kMaxPartitionKey) const;
 
+  bool IsHashPartitioning() const {
+    return hash_schema_ != boost::none;
+  }
+
   YBHashSchema hash_schema() const {
-    return hash_schema_;
+    CHECK(hash_schema_);
+    return *hash_schema_;
   }
 
   // Encodes the given uint16 value into a 2 byte string.
@@ -294,7 +307,7 @@ class PartitionSchema {
   // If any columns of the range partition do not exist in the partial row,
   // processing stops and the provided default string piece is appended to the vector.
   void AppendRangeDebugStringComponentsOrString(const YBPartialRow& row,
-                                                StringPiece default_string,
+                                                GStringPiece default_string,
                                                 std::vector<std::string>* components) const;
 
   // Appends the stringified range partition components of a partial row to a
@@ -326,7 +339,7 @@ class PartitionSchema {
 
   std::vector<HashBucketSchema> hash_bucket_schemas_;
   RangeSchema range_schema_;
-  YBHashSchema hash_schema_ = YBHashSchema::kMultiColumnHash;
+  boost::optional<YBHashSchema> hash_schema_; // Defined only for table that is hash-partitioned.
 };
 
 } // namespace yb

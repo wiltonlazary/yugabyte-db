@@ -92,11 +92,18 @@ class YBOperation {
 
   const YBTable* table() const { return table_.get(); }
 
+  void ResetTable(std::shared_ptr<YBTable> new_table);
+
   virtual std::string ToString() const = 0;
   virtual Type type() const = 0;
   virtual bool read_only() = 0;
   virtual bool succeeded() = 0;
   virtual bool returns_sidecar() = 0;
+
+  virtual bool wrote_data(IsolationLevel isolation_level) {
+    return succeeded() &&
+           (!read_only() || isolation_level == IsolationLevel::SERIALIZABLE_ISOLATION);
+  }
 
   virtual void SetHashCode(uint16_t hash_code) = 0;
 
@@ -109,10 +116,14 @@ class YBOperation {
   // Returns the partition key of the operation.
   virtual CHECKED_STATUS GetPartitionKey(std::string* partition_key) const = 0;
 
+  // Returns whether this operation is being performed on a table where distributed transactions
+  // are enabled.
+  virtual bool IsTransactional() const;
+
  protected:
   explicit YBOperation(const std::shared_ptr<YBTable>& table);
 
-  std::shared_ptr<YBTable> const table_;
+  std::shared_ptr<YBTable> table_;
 
  private:
   friend class internal::AsyncRpc;
@@ -232,7 +243,7 @@ class YBqlOp : public YBOperation {
 
   QLResponsePB* mutable_response() { return ql_response_.get(); }
 
-  std::string&& rows_data() { return std::move(rows_data_); }
+  const std::string& rows_data() { return rows_data_; }
 
   std::string* mutable_rows_data() { return &rows_data_; }
 
@@ -411,9 +422,19 @@ class YBPgsqlWriteOp : public YBPgsqlOp {
   // TODO check for e.g. returning clause.
   bool returns_sidecar() override { return true; }
 
-  virtual void SetHashCode(uint16_t hash_code) override;
+  void SetHashCode(uint16_t hash_code) override;
 
-  virtual CHECKED_STATUS GetPartitionKey(std::string* partition_key) const override;
+  CHECKED_STATUS GetPartitionKey(std::string* partition_key) const override;
+
+  bool IsTransactional() const override;
+
+  void set_is_single_row_txn(bool is_single_row_txn) {
+    is_single_row_txn_ = is_single_row_txn;
+  }
+
+  bool wrote_data(IsolationLevel isolation_level) override {
+    return YBOperation::wrote_data(isolation_level) && !response().skipped();
+  }
 
  protected:
   virtual Type type() const override {
@@ -425,7 +446,11 @@ class YBPgsqlWriteOp : public YBPgsqlOp {
   static YBPgsqlWriteOp *NewInsert(const std::shared_ptr<YBTable>& table);
   static YBPgsqlWriteOp *NewUpdate(const std::shared_ptr<YBTable>& table);
   static YBPgsqlWriteOp *NewDelete(const std::shared_ptr<YBTable>& table);
+  static YBPgsqlWriteOp *NewUpsert(const std::shared_ptr<YBTable>& table);
   std::unique_ptr<PgsqlWriteRequestPB> write_request_;
+  // Whether this operation should be run as a single row txn.
+  // Else could be distributed transaction (or non-transactional) depending on target table type.
+  bool is_single_row_txn_ = false;
 };
 
 class YBPgsqlReadOp : public YBPgsqlOp {
@@ -481,6 +506,24 @@ class YBPgsqlReadOp : public YBPgsqlOp {
   std::unique_ptr<PgsqlReadRequestPB> read_request_;
   YBConsistencyLevel yb_consistency_level_;
   ReadHybridTime read_time_;
+};
+
+// This class is not thread-safe, though different YBNoOp objects on
+// different threads may share a single YBTable object.
+class YBNoOp {
+ public:
+  // Initialize the NoOp request object. The given 'table' object must remain valid
+  // for the lifetime of this object.
+  explicit YBNoOp(YBTable* table);
+  ~YBNoOp();
+
+  // Executes a no-op request against the tablet server on which the row specified
+  // by "key" lives.
+  CHECKED_STATUS Execute(const YBPartialRow& key);
+ private:
+  YBTable* table_;
+
+  DISALLOW_COPY_AND_ASSIGN(YBNoOp);
 };
 
 }  // namespace client

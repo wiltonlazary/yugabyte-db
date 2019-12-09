@@ -12,8 +12,10 @@
 //
 
 #include <boost/uuid/random_generator.hpp>
+#include <boost/uuid/detail/sha1.hpp>
 #include "yb/util/uuid.h"
 #include "yb/util/random_util.h"
+#include "yb/gutil/endian.h"
 
 namespace yb {
 
@@ -55,21 +57,16 @@ CHECKED_STATUS Uuid::ToString(std::string *strval) const {
   return Status::OK();
 }
 
-CHECKED_STATUS Uuid::EncodeToComparable(std::string* bytes) const {
-  try {
-    uint8_t output[kUuidSize];
-    if (boost_uuid_.version() == boost::uuids::uuid::version_time_based) {
-      // Take the MSB of the UUID and get the timestamp ordered bytes.
-      toTimestampBytes(output);
-    } else {
-      toVersionFirstBytes(output);
-    }
-    memcpy(output + kUuidMsbSize, boost_uuid_.data + kUuidMsbSize, kUuidLsbSize);
-    bytes->assign(reinterpret_cast<char *>(output), kUuidSize);
-  } catch (std::exception& e) {
-    return STATUS(Corruption, "Couldn't serialize Uuid to raw bytes!");
+void Uuid::EncodeToComparable(std::string* bytes) const {
+  uint8_t output[kUuidSize];
+  if (boost_uuid_.version() == boost::uuids::uuid::version_time_based) {
+    // Take the MSB of the UUID and get the timestamp ordered bytes.
+    ToTimestampBytes(output);
+  } else {
+    ToVersionFirstBytes(output);
   }
-  return Status::OK();
+  memcpy(output + kUuidMsbSize, boost_uuid_.data + kUuidMsbSize, kUuidLsbSize);
+  bytes->assign(reinterpret_cast<char *>(output), kUuidSize);
 }
 
 CHECKED_STATUS Uuid::ToBytes(std::string* bytes) const {
@@ -90,7 +87,7 @@ CHECKED_STATUS Uuid::FromSlice(const Slice& slice, size_t size_hint) {
   if (expected_size != kUuidSize) {
     return STATUS_SUBSTITUTE(InvalidArgument, "Size of slice is invalid: $0", expected_size);
   }
-  memcpy(boost_uuid_.begin(), slice.data(), kUuidSize);
+  memcpy(boost_uuid_.data, slice.data(), kUuidSize);
   return Status::OK();
 }
 
@@ -139,38 +136,64 @@ CHECKED_STATUS Uuid::DecodeFromComparableSlice(const Slice& slice, size_t size_h
   const uint8_t* bytes = slice.data();
   if ((bytes[0] & 0xF0) == 0x10) {
     // Check the first byte to see if it is version 1.
-    fromTimestampBytes(bytes);
+    FromTimestampBytes(bytes);
   } else {
-    fromVersionFirstBytes(bytes);
+    FromVersionFirstBytes(bytes);
   }
   memcpy(boost_uuid_.data + kUuidMsbSize, bytes + kUuidMsbSize, kUuidLsbSize);
   return Status::OK();
 }
 
 CHECKED_STATUS Uuid::DecodeFromComparable(const std::string& bytes) {
-  Slice slice (bytes.data(), bytes.size());
+  Slice slice(bytes.data(), bytes.size());
   return DecodeFromComparableSlice(slice);
 }
 
-CHECKED_STATUS Uuid::HashMACAddress() const {
+CHECKED_STATUS Uuid::HashMACAddress() {
   RETURN_NOT_OK(IsTimeUuid());
   boost::uuids::detail::sha1 sha1;
   unsigned int hash[kShaDigestSize];
-  sha1.process_bytes(boost_uuid_.begin() + kTimeUUIDMacOffset, kTimeUUIDTotalMacBytes);
+  sha1.process_bytes(boost_uuid_.data + kTimeUUIDMacOffset, kTimeUUIDTotalMacBytes);
   uint8_t tmp[kTimeUUIDTotalMacBytes];
   sha1.get_digest(hash);
   for (int i = 0; i < kTimeUUIDTotalMacBytes; i ++) {
     tmp[i] = (hash[i % kShaDigestSize] & 255);
     hash[i % kShaDigestSize] = hash[i % kShaDigestSize] >> 8;
   }
-  memcpy((void *) (boost_uuid_.begin() + kTimeUUIDMacOffset), tmp, kTimeUUIDTotalMacBytes);
+  memcpy(boost_uuid_.data + kTimeUUIDMacOffset, tmp, kTimeUUIDTotalMacBytes);
   return Status::OK();
 }
 
-CHECKED_STATUS Uuid::toUnixTimestamp(int64_t* timestamp_ms) {
+void Uuid::FromTimestamp(int64_t ts_hnanos) {
+  uint64_t ts_byte_data = BigEndian::FromHost64((uint64_t)ts_hnanos);
+  auto* ts_bytes = reinterpret_cast<uint8_t *>(&ts_byte_data);
+  ts_bytes[0] = ((ts_bytes[0] & 0x0F) | 0x10); // Set the version to 1.
+  FromTimestampBytes(ts_bytes);
+}
+
+CHECKED_STATUS Uuid::MaxFromUnixTimestamp(int64_t timestamp_ms) {
+  // Since we are converting to a finer-grained precision (milliseconds to 100's nanoseconds) the
+  // input milliseconds really corresponds to a range in 100's nanoseconds precision.
+  // So, to get a logically correct max timeuuid, we need to use the upper bound of that range
+  // (i.e. add '9999' at the end not '0000').
+  int64_t ts_hnanos = (timestamp_ms + 1 - kGregorianOffsetMillis) * kMillisPerHundredNanos - 1;
+
+  FromTimestamp(ts_hnanos); // Set most-significant bits (i.e. timestamp).
+  memset(boost_uuid_.data + kUuidMsbSize, 0xFF, kUuidLsbSize); // Set least-significant bits.
+  return Status::OK();
+}
+
+CHECKED_STATUS Uuid::MinFromUnixTimestamp(int64_t timestamp_ms) {
+  int64_t timestamp = (timestamp_ms - kGregorianOffsetMillis) * kMillisPerHundredNanos;
+  FromTimestamp(timestamp); // Set most-significant bits (i.e. timestamp).
+  memset(boost_uuid_.data + kUuidMsbSize, 0x00, kUuidLsbSize); // Set least-significant bits.
+  return Status::OK();
+}
+
+CHECKED_STATUS Uuid::ToUnixTimestamp(int64_t* timestamp_ms) const {
   RETURN_NOT_OK(IsTimeUuid());
   uint8_t output[kUuidMsbSize];
-  toTimestampBytes(output);
+  ToTimestampBytes(output);
   output[0] = (output[0] & 0x0f);
   *timestamp_ms = 0;
   for (int i = 0; i < kUuidMsbSize; i++) {

@@ -36,12 +36,16 @@ import com.google.protobuf.ByteString;
 import com.stumbleupon.async.Deferred;
 import org.junit.Ignore;
 import org.junit.Test;
+import org.junit.runner.RunWith;
 import org.yb.Common;
 import org.yb.consensus.Metadata;
 import org.yb.master.Master;
 
-import static org.junit.Assert.*;
+import static org.yb.AssertionWrappers.*;
 
+import org.yb.YBTestRunner;
+
+@RunWith(value=YBTestRunner.class)
 public class TestAsyncYBClient extends BaseYBClientTest {
 
   private static final String TABLE_NAME =
@@ -52,7 +56,7 @@ public class TestAsyncYBClient extends BaseYBClientTest {
   protected void afterStartingMiniCluster() throws Exception {
     super.afterStartingMiniCluster();
     CreateTableOptions options = new CreateTableOptions();
-    table = createTable(TABLE_NAME, basicSchema, options);
+    table = createTable(TABLE_NAME, hashKeySchema, options);
   }
 
   @Test

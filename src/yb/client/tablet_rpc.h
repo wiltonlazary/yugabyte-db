@@ -29,6 +29,7 @@
 #include "yb/util/result.h"
 #include "yb/util/status.h"
 #include "yb/util/trace.h"
+#include "yb/util/net/net_util.h"
 
 namespace yb {
 
@@ -43,7 +44,9 @@ class TabletRpc {
  public:
   virtual const tserver::TabletServerErrorPB* response_error() const = 0;
   virtual void Failed(const Status& status) = 0;
-  virtual void SendRpcToTserver() = 0;
+
+  // attempt_num starts with 1.
+  virtual void SendRpcToTserver(int attempt_num) = 0;
  protected:
   ~TabletRpc() {}
 };
@@ -63,17 +66,23 @@ class TabletInvoker {
   virtual ~TabletInvoker();
 
   void Execute(const std::string& tablet_id, bool leader_only = false);
+
+  // Returns true when whole operation is finished, false otherwise.
   bool Done(Status* status);
 
   bool IsLocalCall() const;
 
   const RemoteTabletPtr& tablet() const { return tablet_; }
   std::shared_ptr<tserver::TabletServerServiceProxy> proxy() const;
+  ::yb::HostPort ProxyEndpoint() const;
   YBClient& client() const { return *client_; }
   const RemoteTabletServer& current_ts() { return *current_ts_; }
   bool local_tserver_only() const { return local_tserver_only_; }
 
  private:
+  friend class TabletRpcTest;
+  FRIEND_TEST(TabletRpcTest, TabletInvokerSelectTabletServerRace);
+
   void SelectTabletServer();
 
   // This is an implementation of ReadRpc with consistency level as CONSISTENT_PREFIX. As a result,
@@ -86,14 +95,14 @@ class TabletInvoker {
 
   // Marks all replicas on current_ts_ as failed and retries the write on a
   // new replica.
-  void FailToNewReplica(const Status& reason,
-                        const tserver::TabletServerErrorPB* error_code = nullptr);
+  CHECKED_STATUS FailToNewReplica(const Status& reason,
+                                  const tserver::TabletServerErrorPB* error_code = nullptr);
 
   // Called when we finish a lookup (to find the new consensus leader). Retries
   // the rpc after a short delay.
-  void LookupTabletCb(const Status& status);
+  void LookupTabletCb(const Result<RemoteTabletPtr>& result);
 
-  void InitialLookupTabletDone(const Status& status);
+  void InitialLookupTabletDone(const Result<RemoteTabletPtr>& result);
 
   // If we receive TABLET_NOT_FOUND and current_ts_ is set, that means we contacted a tserver
   // with a tablet_id, but the tserver no longer has that tablet.
@@ -104,7 +113,7 @@ class TabletInvoker {
         current_ts_ != nullptr;
   }
 
-  YBClient* client_;
+  YBClient* const client_;
 
   rpc::RpcCommand* const command_;
 
@@ -134,8 +143,6 @@ class TabletInvoker {
   // RemoteTabletServer is taken from YBClient cache, so it is guaranteed that those objects are
   // alive while YBClient is alive. Because we don't delete them, but only add and update.
   RemoteTabletServer* current_ts_ = nullptr;
-
-  MonoTime last_tablet_refresh_time_ = MonoTime::kUninitialized;
 };
 
 CHECKED_STATUS ErrorStatus(const tserver::TabletServerErrorPB* error);

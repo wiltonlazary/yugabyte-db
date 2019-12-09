@@ -30,76 +30,12 @@ using std::string;
 using std::make_shared;
 using std::endl;
 using strings::Substitute;
-using yb::util::FormatBytesAsStr;
+using yb::FormatBytesAsStr;
 using yb::util::ApplyEagerLineContinuation;
 using std::vector;
 
 namespace yb {
 namespace docdb {
-
-// Add primary key column values to the component group. Verify that they are in the same order
-// as in the table schema.
-CHECKED_STATUS QLKeyColumnValuesToPrimitiveValues(
-    const google::protobuf::RepeatedPtrField<QLExpressionPB> &column_values,
-    const Schema &schema, size_t column_idx, const size_t column_count,
-    vector<PrimitiveValue> *components) {
-  for (const auto& column_value : column_values) {
-    if (!schema.is_key_column(column_idx)) {
-      auto status = STATUS_FORMAT(
-          Corruption, "Column at $0 is not key column in $1", column_idx, schema.ToString());
-      LOG(DFATAL) << status;
-      return status;
-    }
-
-    if (!column_value.has_value() || IsNull(column_value.value())) {
-      components->push_back(PrimitiveValue(ValueType::kNull));
-    } else {
-      components->push_back(PrimitiveValue::FromQLValuePB(
-          column_value.value(), schema.column(column_idx).sorting_type()));
-    }
-    column_idx++;
-  }
-  return Status::OK();
-}
-
-// ------------------------------------------------------------------------------------------------
-
-CHECKED_STATUS InitKeyColumnPrimitiveValues(
-    const google::protobuf::RepeatedPtrField<PgsqlExpressionPB> &column_values,
-    const Schema &schema,
-    size_t start_idx,
-    vector<PrimitiveValue> *components) {
-  size_t column_idx = start_idx;
-  for (const auto& column_value : column_values) {
-    if (!schema.is_key_column(column_idx)) {
-      auto status = STATUS_FORMAT(
-          Corruption, "Column at $0 is not key column in $1", column_idx, schema.ToString());
-      LOG(DFATAL) << status;
-      return status;
-    }
-
-    if (column_value.has_value() && !IsNull(column_value.value())) {
-      components->push_back(PrimitiveValue::FromQLValuePB(
-          column_value.value(), schema.column(column_idx).sorting_type()));
-    } else {
-      // TODO(neil) The current setup only works for CQL as it assumes primary key value must not
-      // be dependent on any column values. This needs to be fixed as PostgreSQL expression might
-      // require a read from a table.
-      //
-      // Use regular executor for now.
-      QLExprExecutor executor;
-      QLValue result;
-      RETURN_NOT_OK(executor.EvalExpr(column_value, nullptr, &result));
-
-      components->push_back(PrimitiveValue::FromQLValuePB(
-          result.value(), schema.column(column_idx).sorting_type()));
-    }
-    column_idx++;
-  }
-  return Status::OK();
-}
-
-// ------------------------------------------------------------------------------------------------
 
 rocksdb::DB* DocDBRocksDBUtil::rocksdb() {
   return DCHECK_NOTNULL(rocksdb_.get());
@@ -155,7 +91,8 @@ Status DocDBRocksDBUtil::PopulateRocksDBWriteBatch(
     rocksdb::WriteBatch *rocksdb_write_batch,
     HybridTime hybrid_time,
     bool decode_dockey,
-    bool increment_write_id) const {
+    bool increment_write_id,
+    PartialRangeKeyIntents partial_range_key_intents) const {
   for (const auto& entry : dwb.key_value_pairs()) {
     if (decode_dockey) {
       SubDocKey subdoc_key;
@@ -175,7 +112,7 @@ Status DocDBRocksDBUtil::PopulateRocksDBWriteBatch(
     dwb.TEST_CopyToWriteBatchPB(&kv_write_batch);
     PrepareTransactionWriteBatch(
         kv_write_batch, hybrid_time, rocksdb_write_batch, *current_txn_id_, txn_isolation_level_,
-        &intra_txn_write_id_);
+        partial_range_key_intents, &intra_txn_write_id_);
   } else {
     // TODO: this block has common code with docdb::PrepareNonTransactionWriteBatch and probably
     // can be refactored, so common code is reused.
@@ -205,7 +142,8 @@ Status DocDBRocksDBUtil::WriteToRocksDB(
     const DocWriteBatch& doc_write_batch,
     const HybridTime& hybrid_time,
     bool decode_dockey,
-    bool increment_write_id) {
+    bool increment_write_id,
+    PartialRangeKeyIntents partial_range_key_intents) {
   if (doc_write_batch.IsEmpty()) {
     return Status::OK();
   }
@@ -224,7 +162,8 @@ Status DocDBRocksDBUtil::WriteToRocksDB(
   }
 
   RETURN_NOT_OK(PopulateRocksDBWriteBatch(
-      doc_write_batch, &rocksdb_write_batch, hybrid_time, decode_dockey, increment_write_id));
+      doc_write_batch, &rocksdb_write_batch, hybrid_time, decode_dockey, increment_write_id,
+      partial_range_key_intents));
 
   rocksdb::DB* db = current_txn_id_ ? intents_db_.get() : rocksdb_.get();
   rocksdb::Status rocksdb_write_status = db->Write(write_options(), &rocksdb_write_batch);
@@ -246,11 +185,12 @@ Status DocDBRocksDBUtil::InitCommonRocksDBOptions() {
 
   tablet::TabletOptions tablet_options;
   tablet_options.block_cache = block_cache_;
-  docdb::InitRocksDBOptions(&rocksdb_options_, tablet_id(), rocksdb::CreateDBStatistics(),
+  docdb::InitRocksDBOptions(&rocksdb_options_, "" /* log_prefix */, rocksdb::CreateDBStatistics(),
                             tablet_options);
   InitRocksDBWriteOptions(&write_options_);
   rocksdb_options_.compaction_filter_factory =
-      std::make_shared<docdb::DocDBCompactionFilterFactory>(retention_policy_);
+      std::make_shared<docdb::DocDBCompactionFilterFactory>(
+          retention_policy_, &KeyBounds::kNoBounds);
   return Status::OK();
 }
 
@@ -280,26 +220,30 @@ string DocDBRocksDBUtil::DocDBDebugDumpToStr() {
 Status DocDBRocksDBUtil::SetPrimitive(
     const DocPath& doc_path,
     const Value& value,
-    const HybridTime hybrid_time) {
+    const HybridTime hybrid_time,
+    const ReadHybridTime& read_ht) {
   auto dwb = MakeDocWriteBatch();
-  RETURN_NOT_OK(dwb.SetPrimitive(doc_path, value));
+  RETURN_NOT_OK(dwb.SetPrimitive(doc_path, value, read_ht));
   return WriteToRocksDB(dwb, hybrid_time);
 }
 
 Status DocDBRocksDBUtil::SetPrimitive(
     const DocPath& doc_path,
     const PrimitiveValue& primitive_value,
-    const HybridTime hybrid_time) {
-  return SetPrimitive(doc_path, Value(primitive_value), hybrid_time);
+    const HybridTime hybrid_time,
+    const ReadHybridTime& read_ht) {
+  return SetPrimitive(doc_path, Value(primitive_value), hybrid_time, read_ht);
 }
 
 Status DocDBRocksDBUtil::InsertSubDocument(
     const DocPath& doc_path,
     const SubDocument& value,
     const HybridTime hybrid_time,
-    MonoDelta ttl) {
+    MonoDelta ttl,
+    const ReadHybridTime& read_ht) {
   auto dwb = MakeDocWriteBatch();
-  RETURN_NOT_OK(dwb.InsertSubDocument(doc_path, value, rocksdb::kDefaultQueryId, ttl));
+  RETURN_NOT_OK(dwb.InsertSubDocument(doc_path, value, read_ht,
+                                      CoarseTimePoint::max(), rocksdb::kDefaultQueryId, ttl));
   return WriteToRocksDB(dwb, hybrid_time);
 }
 
@@ -307,19 +251,21 @@ Status DocDBRocksDBUtil::ExtendSubDocument(
     const DocPath& doc_path,
     const SubDocument& value,
     const HybridTime hybrid_time,
-    MonoDelta ttl) {
+    MonoDelta ttl,
+    const ReadHybridTime& read_ht) {
   auto dwb = MakeDocWriteBatch();
-  RETURN_NOT_OK(dwb.ExtendSubDocument(doc_path, value, rocksdb::kDefaultQueryId, ttl));
+  RETURN_NOT_OK(dwb.ExtendSubDocument(doc_path, value, read_ht,
+                                      CoarseTimePoint::max(), rocksdb::kDefaultQueryId, ttl));
   return WriteToRocksDB(dwb, hybrid_time);
 }
 
 Status DocDBRocksDBUtil::ExtendList(
     const DocPath& doc_path,
     const SubDocument& value,
-    const ListExtendOrder extend_order,
-    HybridTime hybrid_time) {
+    HybridTime hybrid_time,
+    const ReadHybridTime& read_ht) {
   auto dwb = MakeDocWriteBatch();
-  RETURN_NOT_OK(dwb.ExtendList(doc_path, value, extend_order));
+  RETURN_NOT_OK(dwb.ExtendList(doc_path, value, read_ht, CoarseTimePoint::max()));
   return WriteToRocksDB(dwb, hybrid_time);
 }
 
@@ -327,23 +273,24 @@ Status DocDBRocksDBUtil::ReplaceInList(
     const DocPath &doc_path,
     const std::vector<int>& indexes,
     const std::vector<SubDocument>& values,
-    const HybridTime& current_time,
+    const ReadHybridTime& read_ht,
     const HybridTime& hybrid_time,
     const rocksdb::QueryId query_id,
-    MonoDelta table_ttl,
+    MonoDelta default_ttl,
     MonoDelta ttl,
     UserTimeMicros user_timestamp) {
   auto dwb = MakeDocWriteBatch();
-  RETURN_NOT_OK(dwb.ReplaceInList(
-      doc_path, indexes, values, current_time, query_id, table_ttl, ttl));
+  RETURN_NOT_OK(dwb.ReplaceCqlInList(
+      doc_path, indexes, values, read_ht, CoarseTimePoint::max(), query_id, default_ttl, ttl));
   return WriteToRocksDB(dwb, hybrid_time);
 }
 
 Status DocDBRocksDBUtil::DeleteSubDoc(
     const DocPath& doc_path,
-    HybridTime hybrid_time) {
+    HybridTime hybrid_time,
+    const ReadHybridTime& read_ht) {
   auto dwb = MakeDocWriteBatch();
-  RETURN_NOT_OK(dwb.DeleteSubDoc(doc_path));
+  RETURN_NOT_OK(dwb.DeleteSubDoc(doc_path, read_ht));
   return WriteToRocksDB(dwb, hybrid_time);
 }
 
@@ -359,19 +306,19 @@ Status DocDBRocksDBUtil::FlushRocksDbAndWait() {
 
 Status DocDBRocksDBUtil::ReinitDBOptions() {
   tablet::TabletOptions tablet_options;
-  docdb::InitRocksDBOptions(&rocksdb_options_, tablet_id(), rocksdb_options_.statistics,
+  docdb::InitRocksDBOptions(&rocksdb_options_, "" /* log_prefix */, rocksdb_options_.statistics,
                             tablet_options);
   return ReopenRocksDB();
 }
 
 DocWriteBatch DocDBRocksDBUtil::MakeDocWriteBatch() {
   return DocWriteBatch(
-      {rocksdb_.get(), nullptr /* intents_db */}, init_marker_behavior_, &monotonic_counter_);
+      DocDB::FromRegularUnbounded(rocksdb_.get()), init_marker_behavior_, &monotonic_counter_);
 }
 
 DocWriteBatch DocDBRocksDBUtil::MakeDocWriteBatch(InitMarkerBehavior init_marker_behavior) {
   return DocWriteBatch(
-      {rocksdb_.get(), nullptr /* intents_db */}, init_marker_behavior, &monotonic_counter_);
+      DocDB::FromRegularUnbounded(rocksdb_.get()), init_marker_behavior, &monotonic_counter_);
 }
 
 void DocDBRocksDBUtil::SetInitMarkerBehavior(InitMarkerBehavior init_marker_behavior) {

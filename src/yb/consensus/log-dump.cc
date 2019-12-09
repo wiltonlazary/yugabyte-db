@@ -68,7 +68,7 @@ using std::string;
 using std::vector;
 using std::cout;
 using std::endl;
-using tablet::TabletMetadata;
+using tablet::RaftGroupMetadata;
 using tserver::WriteRequestPB;
 
 enum PrintEntryType {
@@ -146,15 +146,15 @@ Status PrintSegment(const scoped_refptr<ReadableLogSegment>& segment) {
   if (FLAGS_print_headers) {
     cout << "Header:\n" << segment->header().DebugString();
   }
-  LogEntries entries;
-  RETURN_NOT_OK(segment->ReadEntries(&entries));
+  auto read_entries = segment->ReadEntries();
+  RETURN_NOT_OK(read_entries.status);
 
   if (print_type == DONT_PRINT) return Status::OK();
 
   Schema tablet_schema;
   RETURN_NOT_OK(SchemaFromPB(segment->header().schema(), &tablet_schema));
 
-  for (const auto& entry : entries) {
+  for (const auto& entry : read_entries.entries) {
 
     if (print_type == PRINT_PB) {
       if (FLAGS_truncate_data > 0) {
@@ -183,10 +183,11 @@ Status DumpLog(const string& tablet_id, const string& tablet_wal_path) {
 
   RETURN_NOT_OK(fs_manager.Open());
   std::unique_ptr<LogReader> reader;
-  RETURN_NOT_OK(LogReader::Open(&fs_manager,
+  RETURN_NOT_OK(LogReader::Open(env,
                                 scoped_refptr<LogIndex>(),
                                 tablet_id,
                                 tablet_wal_path,
+                                fs_manager.uuid(),
                                 scoped_refptr<MetricEntity>(),
                                 &reader));
 

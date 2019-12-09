@@ -17,6 +17,8 @@
 
 #include <thread>
 
+#include "yb/rpc/yb_rpc.h"
+
 #include "yb/util/random_util.h"
 
 using namespace std::chrono_literals;
@@ -53,13 +55,12 @@ using yb::rpc_test_diff_package::RespDiffPackagePB;
 
 namespace {
 
-constexpr size_t kQueueLength = 50;
+constexpr size_t kQueueLength = 1000;
 
 Slice GetSidecarPointer(const RpcController& controller, int idx, int expected_size) {
-  Slice sidecar;
-  CHECK_OK(controller.GetSidecar(idx, &sidecar));
+  Slice sidecar = CHECK_RESULT(controller.GetSidecar(idx));
   CHECK_EQ(expected_size, sidecar.size());
-  return Slice(sidecar.data(), expected_size);
+  return sidecar;
 }
 
 MessengerBuilder CreateMessengerBuilder(const std::string& name,
@@ -67,9 +68,12 @@ MessengerBuilder CreateMessengerBuilder(const std::string& name,
                                         const MessengerOptions& options) {
   MessengerBuilder bld(name);
   bld.set_num_reactors(options.n_reactors);
+  if (options.num_connections_to_server >= 0) {
+    bld.set_num_connections_to_server(options.num_connections_to_server);
+  }
   static constexpr std::chrono::milliseconds kMinCoarseTimeGranularity(1);
   static constexpr std::chrono::milliseconds kMaxCoarseTimeGranularity(100);
-  auto coarse_time_granularity = std::max(std::min(options.keep_alive_timeout,
+  auto coarse_time_granularity = std::max(std::min(options.keep_alive_timeout / 10,
                                                    kMaxCoarseTimeGranularity),
                                           kMinCoarseTimeGranularity);
   VLOG(1) << "Creating a messenger with connection keep alive time: "
@@ -79,12 +83,12 @@ MessengerBuilder CreateMessengerBuilder(const std::string& name,
   bld.set_coarse_timer_granularity(coarse_time_granularity);
   bld.set_metric_entity(metric_entity);
   bld.CreateConnectionContextFactory<YBOutboundConnectionContext>(
-      FLAGS_outbound_rpc_block_size, FLAGS_outbound_rpc_memory_limit,
+      FLAGS_outbound_rpc_memory_limit,
       MemTracker::FindOrCreateTracker(name));
   return bld;
 }
 
-std::shared_ptr<Messenger> CreateMessenger(const std::string& name,
+std::unique_ptr<Messenger> CreateMessenger(const std::string& name,
                                            const scoped_refptr<MetricEntity>& metric_entity,
                                            const MessengerOptions& options) {
   return EXPECT_RESULT(CreateMessengerBuilder(name, metric_entity, options).Build());
@@ -101,23 +105,14 @@ constexpr std::chrono::milliseconds kDefaultKeepAlive = 1s;
 const MessengerOptions kDefaultClientMessengerOptions = {1, kDefaultKeepAlive};
 const MessengerOptions kDefaultServerMessengerOptions = {3, kDefaultKeepAlive};
 
-const char* GenericCalculatorService::kFullServiceName = "yb.rpc.GenericCalculatorService";
-const char* GenericCalculatorService::kAddMethodName = "Add";
-const char* GenericCalculatorService::kSleepMethodName = "Sleep";
-const char* GenericCalculatorService::kSendStringsMethodName = "SendStrings";
-const char* GenericCalculatorService::kDisconnectMethodName = "Disconnect";
-
-const char* GenericCalculatorService::kFirstString =
-    "1111111111111111111111111111111111111111111111111111111111";
-const char* GenericCalculatorService::kSecondString =
-    "2222222222222222222222222222222222222222222222222222222222222222222222";
-
 void GenericCalculatorService::Handle(InboundCallPtr incoming) {
-  if (incoming->method_name() == kAddMethodName) {
+  if (incoming->method_name() == CalculatorServiceMethods::kAddMethodName) {
     DoAdd(incoming.get());
-  } else if (incoming->method_name() == kSleepMethodName) {
+  } else if (incoming->method_name() == CalculatorServiceMethods::kSleepMethodName) {
     DoSleep(incoming.get());
-  } else if (incoming->method_name() == kSendStringsMethodName) {
+  } else if (incoming->method_name() == CalculatorServiceMethods::kEchoMethodName) {
+    DoEcho(incoming.get());
+  } else if (incoming->method_name() == CalculatorServiceMethods::kSendStringsMethodName) {
     DoSendStrings(incoming.get());
   } else {
     incoming->RespondFailure(ErrorStatusPB::ERROR_NO_SUCH_METHOD,
@@ -177,6 +172,21 @@ void GenericCalculatorService::DoSleep(InboundCall* incoming) {
   down_cast<YBInboundCall*>(incoming)->RespondSuccess(resp);
 }
 
+void GenericCalculatorService::DoEcho(InboundCall* incoming) {
+  Slice param(incoming->serialized_request());
+  EchoRequestPB req;
+  if (!req.ParseFromArray(param.data(), param.size())) {
+    incoming->RespondFailure(ErrorStatusPB::ERROR_INVALID_REQUEST,
+        STATUS(InvalidArgument, "Couldn't parse pb",
+            req.InitializationErrorString()));
+    return;
+  }
+
+  EchoResponsePB resp;
+  resp.set_data(std::move(*req.mutable_data()));
+  down_cast<YBInboundCall*>(incoming)->RespondSuccess(resp);
+}
+
 namespace {
 
 class CalculatorService: public CalculatorServiceIf {
@@ -186,7 +196,7 @@ class CalculatorService: public CalculatorServiceIf {
       : CalculatorServiceIf(entity), name_(std::move(name)) {
   }
 
-  void SetMessenger(const std::weak_ptr<Messenger>& messenger) {
+  void SetMessenger(Messenger* messenger) {
     messenger_ = messenger;
   }
 
@@ -207,8 +217,8 @@ class CalculatorService: public CalculatorServiceIf {
     // Respond w/ error if the RPC specifies that the client deadline is set,
     // but it isn't.
     if (req->client_timeout_defined()) {
-      MonoTime deadline = context.GetClientDeadline();
-      if (deadline.Equals(MonoTime::Max())) {
+      auto deadline = context.GetClientDeadline();
+      if (deadline == CoarseTimePoint::max()) {
         CalculatorError my_error;
         my_error.set_extra_error_data("Timeout not set");
         context.RespondApplicationError(CalculatorError::app_error_ext.number(),
@@ -267,11 +277,8 @@ class CalculatorService: public CalculatorServiceIf {
       context.RespondSuccess();
       return;
     }
-    auto messenger = messenger_.lock();
-    YB_ASSERT_TRUE(messenger);
-    boost::system::error_code ec;
     HostPort hostport(req->host(), req->port());
-    ProxyCache cache(messenger);
+    ProxyCache cache(messenger_);
     rpc_test::CalculatorServiceProxy proxy(&cache, hostport);
 
     ForwardRequestPB forwarded_req;
@@ -293,7 +300,7 @@ class CalculatorService: public CalculatorServiceIf {
   }
 
   std::string name_;
-  std::weak_ptr<Messenger> messenger_;
+  Messenger* messenger_ = nullptr;
 };
 
 } // namespace
@@ -304,20 +311,21 @@ std::unique_ptr<ServiceIf> CreateCalculatorService(
 }
 
 TestServer::TestServer(std::unique_ptr<ServiceIf> service,
-                       const std::shared_ptr<Messenger>& messenger,
+                       std::unique_ptr<Messenger>&& messenger,
                        const TestServerOptions& options)
     : service_name_(service->service_name()),
-      messenger_(messenger),
+      messenger_(std::move(messenger)),
       thread_pool_("rpc-test", kQueueLength, options.n_worker_threads) {
 
   // If it is CalculatorService then we should set messenger for it.
   CalculatorService* calculator_service = dynamic_cast<CalculatorService*>(service.get());
   if (calculator_service) {
-    calculator_service->SetMessenger(messenger_);
+    calculator_service->SetMessenger(messenger_.get());
   }
 
   service_pool_.reset(new ServicePool(kQueueLength,
                                       &thread_pool_,
+                                      &messenger_->scheduler(),
                                       std::move(service),
                                       messenger_->metric_entity()));
 
@@ -337,9 +345,7 @@ TestServer::~TestServer() {
     }
     service_pool_->Shutdown();
   }
-  if (messenger_) {
-    messenger_->Shutdown();
-  }
+  messenger_->Shutdown();
 }
 
 void TestServer::Shutdown() {
@@ -386,7 +392,7 @@ void RpcTestBase::DoTestSidecar(Proxy* proxy,
   RpcController controller;
   controller.set_timeout(MonoDelta::FromMilliseconds(10000));
   auto status = proxy->SyncRequest(
-      GenericCalculatorService::SendStringsMethod(), req, &resp, &controller);
+      CalculatorServiceMethods::SendStringsMethod(), req, &resp, &controller);
 
   ASSERT_EQ(expected_code, status.code()) << "Invalid status received: " << status.ToString();
 
@@ -414,7 +420,7 @@ void RpcTestBase::DoTestExpectTimeout(Proxy* proxy, const MonoDelta& timeout) {
   c.set_timeout(timeout);
   Stopwatch sw;
   sw.start();
-  Status s = proxy->SyncRequest(GenericCalculatorService::SleepMethod(), req, &resp, &c);
+  Status s = proxy->SyncRequest(CalculatorServiceMethods::SleepMethod(), req, &resp, &c);
   ASSERT_FALSE(s.ok());
   sw.stop();
 
@@ -451,9 +457,17 @@ TestServer RpcTestBase::StartTestServer(const std::string& name, const IpAddress
 
 void RpcTestBase::StartTestServerWithGeneratedCode(HostPort* server_hostport,
                                                    const TestServerOptions& options) {
-  auto messenger = options.messenger ? options.messenger
-                                     : CreateMessenger("TestServer", options.messenger_options);
-  server_.reset(new TestServer(CreateCalculatorService(metric_entity_), messenger, options));
+  server_.reset(new TestServer(
+      CreateCalculatorService(metric_entity_),
+      CreateMessenger("TestServer", options.messenger_options), options));
+  *server_hostport = HostPort::FromBoundEndpoint(server_->bound_endpoint());
+}
+
+void RpcTestBase::StartTestServerWithGeneratedCode(std::unique_ptr<Messenger>&& messenger,
+                                                   HostPort* server_hostport,
+                                                   const TestServerOptions& options) {
+  server_.reset(new TestServer(
+      CreateCalculatorService(metric_entity_), std::move(messenger), options));
   *server_hostport = HostPort::FromBoundEndpoint(server_->bound_endpoint());
 }
 
@@ -467,9 +481,14 @@ CHECKED_STATUS RpcTestBase::StartFakeServer(Socket* listen_sock, HostPort* liste
   return Status::OK();
 }
 
-std::shared_ptr<Messenger> RpcTestBase::CreateMessenger(const string &name,
-                                                        const MessengerOptions& options) {
+std::unique_ptr<Messenger> RpcTestBase::CreateMessenger(
+    const string &name, const MessengerOptions& options) {
   return yb::rpc::CreateMessenger(name, metric_entity_, options);
+}
+
+AutoShutdownMessengerHolder RpcTestBase::CreateAutoShutdownMessengerHolder(
+    const string &name, const MessengerOptions& options) {
+  return rpc::CreateAutoShutdownMessengerHolder(CreateMessenger(name, options));
 }
 
 MessengerBuilder RpcTestBase::CreateMessengerBuilder(const string &name,

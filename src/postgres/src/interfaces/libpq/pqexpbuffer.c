@@ -15,7 +15,7 @@
  * a usable vsnprintf(), then a copy of our own implementation of it will
  * be linked into libpq.
  *
- * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/interfaces/libpq/pqexpbuffer.c
@@ -36,8 +36,6 @@
 
 /* All "broken" PQExpBuffers point to this string. */
 static const char oom_buffer[1] = "";
-
-static bool appendPQExpBufferVA(PQExpBuffer str, const char *fmt, va_list args) pg_attribute_printf(2, 0);
 
 
 /*
@@ -282,7 +280,7 @@ appendPQExpBuffer(PQExpBuffer str, const char *fmt,...)
  * Attempt to format data and append it to str.  Returns true if done
  * (either successful or hard failure), false if need to retry.
  */
-static bool
+bool
 appendPQExpBufferVA(PQExpBuffer str, const char *fmt, va_list args)
 {
 	size_t		avail;

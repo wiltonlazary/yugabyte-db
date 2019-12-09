@@ -22,6 +22,7 @@ add_dependencies(ql_test ql_api)
 set(YB_TEST_LINK_LIBS ql_test ${YB_MIN_TEST_LIBS})
 ADD_YB_TEST(ql-parser-test)
 ADD_YB_TEST(ql-create-table-test)
+ADD_YB_TEST(ql-create-index-test)
 ADD_YB_TEST(ql-drop-stmt-test)
 ADD_YB_TEST(ql-query-test)
 ADD_YB_TEST(ql-insert-table-test)
@@ -36,6 +37,7 @@ ADD_YB_TEST(ql-static-column-test)
 ADD_YB_TEST(ql-arith-test)
 ADD_YB_TEST(ql-select-expr-test)
 ADD_YB_TEST(ql-role-test)
+ADD_YB_TEST(ql-alter-table-test)
 
 # Due to some reasons ybcmd is implemented as a gtest, although it is really a tool and not
 # intended to be run as a test. So, we put it in usual binary directory and don't add as a test.

@@ -50,7 +50,7 @@ class LibCXXDependency(Dependency):
     def build(self, builder):
         log_prefix = builder.log_prefix(self)
         prefix = os.path.join(builder.prefix, 'libcxx')
-        os.environ["YB_REMOTE_BUILD"] = "0"
+        os.environ["YB_REMOTE_COMPILATION"] = "0"
 
         remove_path('CMakeCache.txt')
         remove_path('CMakeFiles')
@@ -77,5 +77,5 @@ class LibCXXDependency(Dependency):
                 "cp projects/libcxx/include/c++build/* {}/include/c++/v1".format(prefix),
                 shell=True)
 
-    def should_build(self, instrumented):
-        return instrumented
+    def should_build(self, builder):
+        return builder.building_with_clang()

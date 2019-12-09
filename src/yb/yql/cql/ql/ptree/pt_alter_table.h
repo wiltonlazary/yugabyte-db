@@ -61,6 +61,11 @@ class PTAlterColumnDefinition : public TreeNode {
               AlterColumnType type);
   virtual ~PTAlterColumnDefinition();
 
+  // Node type.
+  virtual TreeNodeOpcode opcode() const override {
+    return TreeNodeOpcode::kPTAlterColumnDefinition;
+  }
+
   template<typename... TypeArgs>
   inline static PTAlterColumnDefinition::SharedPtr MakeShared(MemoryContext *memctx,
                                                   TypeArgs&& ... args) {
@@ -125,6 +130,10 @@ class PTAlterTable : public TreeNode {
     return MCMakeShared<PTAlterTable>(memctx, std::forward<TypeArgs>(args)...);
   }
 
+  const PTQualifiedName::SharedPtr& table_name() const {
+    return name_;
+  }
+
   // Table name.
   client::YBTableName yb_table_name() const {
     return name_->ToTableName();
@@ -138,6 +147,10 @@ class PTAlterTable : public TreeNode {
   // Table property modifications to be made.
   const MCList<PTTableProperty* >& mod_props() const {
     return mod_props_;
+  }
+
+  const std::shared_ptr<client::YBTable>& table() const {
+    return table_;
   }
 
   // Node semantics analysis.
@@ -159,9 +172,6 @@ class PTAlterTable : public TreeNode {
   MCVector<ColumnDesc> table_columns_;
   MCList<PTAlterColumnDefinition *> mod_columns_;
   MCList<PTTableProperty *> mod_props_;
-
-  int num_key_columns_;
-  int num_hash_key_columns_;
 };
 
 }  // namespace ql

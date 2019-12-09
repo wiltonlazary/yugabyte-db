@@ -18,6 +18,8 @@
 namespace yb {
 namespace ql {
 
+using client::YBColumnSpec;
+
 CHECKED_STATUS Executor::PTUMinusToPB(const PTOperator1 *op_pt, QLExpressionPB *op_pb) {
   return PTUMinusToPB(op_pt, op_pb->mutable_value());
 }
@@ -45,7 +47,6 @@ CHECKED_STATUS Executor::PTJsonOperatorToPB(const PTJsonOperator::SharedPtr& jso
   }
   return PTExprToPB(json_pt->arg(), op_pb->mutable_operand());
 }
-
 
 }  // namespace ql
 }  // namespace yb

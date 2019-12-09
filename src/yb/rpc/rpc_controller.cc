@@ -69,6 +69,7 @@ void RpcController::Swap(RpcController* other) {
   std::swap(timeout_, other->timeout_);
   std::swap(allow_local_calls_in_curr_thread_, other->allow_local_calls_in_curr_thread_);
   std::swap(call_, other->call_);
+  std::swap(invoke_callback_mode_, other->invoke_callback_mode_);
 }
 
 void RpcController::Reset() {
@@ -100,18 +101,22 @@ const ErrorStatusPB* RpcController::error_response() const {
   return nullptr;
 }
 
-Status RpcController::GetSidecar(int idx, Slice* sidecar) const {
-  return call_->GetSidecar(idx, sidecar);
+Result<Slice> RpcController::GetSidecar(int idx) const {
+  return call_->GetSidecar(idx);
 }
 
 void RpcController::set_timeout(const MonoDelta& timeout) {
   std::lock_guard<simple_spinlock> l(lock_);
-  DCHECK(!call_ || call_->state() == OutboundCall::READY);
+  DCHECK(!call_ || call_->state() == RpcCallState::READY);
   timeout_ = timeout;
 }
 
 void RpcController::set_deadline(const MonoTime& deadline) {
   set_timeout(deadline.GetDeltaSince(MonoTime::Now()));
+}
+
+void RpcController::set_deadline(CoarseTimePoint deadline) {
+  set_timeout(deadline - CoarseMonoClock::now());
 }
 
 MonoDelta RpcController::timeout() const {

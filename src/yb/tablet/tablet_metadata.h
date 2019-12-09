@@ -39,11 +39,11 @@
 
 #include <boost/optional/optional_fwd.hpp>
 
+#include "yb/common/entity_ids.h"
 #include "yb/common/index.h"
 #include "yb/common/partition.h"
 #include "yb/common/schema.h"
 #include "yb/consensus/opid_util.h"
-#include "yb/fs/block_id.h"
 #include "yb/fs/fs_manager.h"
 #include "yb/gutil/callback.h"
 #include "yb/gutil/dynamic_annotations.h"
@@ -51,6 +51,7 @@
 #include "yb/gutil/ref_counted.h"
 
 #include "yb/tablet/metadata.pb.h"
+#include "yb/tablet/tablet_fwd.h"
 
 #include "yb/util/mutex.h"
 #include "yb/util/opid.h"
@@ -63,50 +64,145 @@ namespace tablet {
 
 extern const int64 kNoDurableMemStore;
 
-// Manages the "blocks tracking" for the specified tablet.
+  // Table info.
+struct TableInfo {
+  // Table id, name and type.
+  std::string table_id;
+  std::string table_name;
+  TableType table_type;
+
+  // The table schema, secondary index map, index info (for index table only) and schema version.
+  Schema schema;
+  IndexMap index_map;
+  std::unique_ptr<IndexInfo> index_info;
+  uint32_t schema_version = 0;
+
+  // Partition schema of the table.
+  PartitionSchema partition_schema;
+
+  // A vector of column IDs that have been deleted, so that the compaction filter can free the
+  // associated memory. As of 01/2019, deleted column IDs are persisted forever, even if all the
+  // associated data has been discarded. In the future, we can garbage collect such column IDs to
+  // make sure this vector doesn't grow too large.
+  std::vector<DeletedColumn> deleted_cols;
+
+  // We use the retention time from the primary table.
+  uint32_t wal_retention_secs = 0;
+
+  TableInfo() = default;
+  TableInfo(std::string table_id,
+            std::string table_name,
+            TableType table_type,
+            const Schema& schema,
+            const IndexMap& index_map,
+            const boost::optional<IndexInfo>& index_info,
+            uint32_t schema_version,
+            PartitionSchema partition_schema);
+  TableInfo(const TableInfo& other,
+            const Schema& schema,
+            const IndexMap& index_map,
+            const std::vector<DeletedColumn>& deleted_cols,
+            uint32_t schema_version);
+
+  CHECKED_STATUS LoadFromPB(const TableInfoPB& pb);
+  void ToPB(TableInfoPB* pb) const;
+
+  std::string ToString() const {
+    TableInfoPB pb;
+    ToPB(&pb);
+    return pb.ShortDebugString();
+  }
+};
+
+// Describes KV-store. Single KV-store is backed by one or two RocksDB instances, depending on
+// whether distributed transactions are enabled for the table. KV-store for sys catalog could
+// contain multiple tables.
+struct KvStoreInfo {
+  explicit KvStoreInfo(const KvStoreId& kv_store_id_) : kv_store_id(kv_store_id_) {}
+
+  KvStoreInfo(const KvStoreId& kv_store_id_, const std::string& rocksdb_dir_)
+      : kv_store_id(kv_store_id_),
+        rocksdb_dir(rocksdb_dir_) {}
+
+  CHECKED_STATUS LoadFromPB(const KvStoreInfoPB& pb, TableId primary_table_id);
+
+  CHECKED_STATUS LoadTablesFromPB(
+      google::protobuf::RepeatedPtrField<TableInfoPB> pbs, TableId primary_table_id);
+
+  void ToPB(TableId primary_table_id, KvStoreInfoPB* pb) const;
+
+  KvStoreId kv_store_id;
+
+  // The directory where the regular RocksDB data for this KV-store is stored. For KV-stores having
+  // tables with distributed transactions enabled an additional RocksDB is created in directory at
+  // `rocksdb_dir + kIntentsDBSuffix` path.
+  std::string rocksdb_dir;
+
+  // Optional inclusive lower bound and exclusive upper bound for keys served by this KV-store.
+  // See docdb::KeyBounds.
+  std::string lower_bound_key;
+  std::string upper_bound_key;
+
+  // Map of tables sharing this KV-store indexed by the table id.
+  // If pieces of the same table live in the same Raft group they should be located in different
+  // KV-stores.
+  std::unordered_map<TableId, std::unique_ptr<TableInfo>> tables;
+
+  // Old versions of TableInfo that have since been altered. They are kept alive so that callers of
+  // schema() and index_map(), etc don't need to worry about reference counting or locking.
+  //
+  // TODO: These TableInfo's are currently kept alive forever, under the assumption that a given
+  // tablet won't have thousands of "alter table" calls. Replace the raw pointer with shared_ptr and
+  // modify the callers to hold the shared_ptr at the top of the calls (e.g. tserver rpc calls).
+  std::vector<std::unique_ptr<TableInfo>> old_tables;
+};
+
+// Manages the "blocks tracking" for the specified Raft group.
 //
-// TabletMetadata is owned by the Tablet. As new blocks are written to store
-// the tablet's data, the Tablet calls Flush() to persist the block list
+// RaftGroupMetadata is owned by the Raft group. As new blocks are written to store
+// the Raft group's data, the Tablet calls Flush() to persist the block list
 // on disk.
 //
-// At startup, the TSTabletManager will load a TabletMetadata for each
+// At startup, the TSTabletManager will load a RaftGroupMetadata for each
 // super block found in the tablets/ directory, and then instantiate
-// tablets from this data.
-class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
+// Raft groups from this data.
+class RaftGroupMetadata : public RefCountedThreadSafe<RaftGroupMetadata> {
  public:
-  // Create metadata for a new tablet. This assumes that the given superblock
+  // Create metadata for a new Raft group. This assumes that the given superblock
   // has not been written before, and writes out the initial superblock with
   // the provided parameters.
-  // data_root_dir and wal_root_dir dictates which disk this tablet will
+  // data_root_dir and wal_root_dir dictates which disk this Raft group will
   // use in the respective directories.
   // If empty string is passed in, it will be randomly chosen.
   static CHECKED_STATUS CreateNew(FsManager* fs_manager,
                                   const std::string& table_id,
-                                  const std::string& tablet_id,
+                                  const RaftGroupId& raft_group_id,
                                   const std::string& table_name,
                                   const TableType table_type,
                                   const Schema& schema,
+                                  const IndexMap& index_map,
                                   const PartitionSchema& partition_schema,
                                   const Partition& partition,
                                   const boost::optional<IndexInfo>& index_info,
+                                  const uint32_t schema_version,
                                   const TabletDataState& initial_tablet_data_state,
-                                  scoped_refptr<TabletMetadata>* metadata,
+                                  RaftGroupMetadataPtr* metadata,
                                   const std::string& data_root_dir = std::string(),
                                   const std::string& wal_root_dir = std::string());
 
   // Load existing metadata from disk.
   static CHECKED_STATUS Load(FsManager* fs_manager,
-                             const std::string& tablet_id,
-                             scoped_refptr<TabletMetadata>* metadata);
+                             const RaftGroupId& raft_group_id,
+                             RaftGroupMetadataPtr* metadata);
 
-  // Try to load an existing tablet. If it does not exist, create it.
-  // If it already existed, verifies that the schema of the tablet matches the
+  // Try to load an existing Raft group. If it does not exist, create it.
+  // If it already existed, verifies that the schema of the Raft group matches the
   // provided 'schema'.
   //
-  // This is mostly useful for tests which instantiate tablets directly.
+  // This is mostly useful for tests which instantiate Raft groups directly.
   static CHECKED_STATUS LoadOrCreate(FsManager* fs_manager,
                                      const std::string& table_id,
-                                     const std::string& tablet_id,
+                                     const RaftGroupId& raft_group_id,
                                      const std::string& table_name,
                                      const TableType table_type,
                                      const Schema& schema,
@@ -114,115 +210,143 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
                                      const Partition& partition,
                                      const boost::optional<IndexInfo>& index_info,
                                      const TabletDataState& initial_tablet_data_state,
-                                     scoped_refptr<TabletMetadata>* metadata);
+                                     RaftGroupMetadataPtr* metadata);
 
-  const std::string& tablet_id() const {
+  Result<const TableInfo*> GetTableInfo(const TableId& table_id) const;
+
+  Result<TableInfo*> GetTableInfo(const TableId& table_id);
+
+  const RaftGroupId& raft_group_id() const {
     DCHECK_NE(state_, kNotLoadedYet);
-    return tablet_id_;
+    return raft_group_id_;
   }
 
-  // Returns the partition of the tablet.
+  // Returns the partition of the Raft group.
   const Partition& partition() const {
+    DCHECK_NE(state_, kNotLoadedYet);
     return partition_;
   }
 
-  const std::string& table_id() const {
+  // Returns the primary table id. For co-located tables, the primary table is the table this Raft
+  // group was first created for. For single-tenant table, it is the primary table.
+  const TableId& table_id() const {
     DCHECK_NE(state_, kNotLoadedYet);
-    return table_id_;
+    return primary_table_id_;
   }
 
-  std::string table_name() const;
+  // Returns the name, type, schema, index map, schema, etc of the primary table.
+  std::string table_name() const {
+    DCHECK_NE(state_, kNotLoadedYet);
+    return primary_table_info_guarded().first->table_name;
+  }
 
   TableType table_type() const {
     DCHECK_NE(state_, kNotLoadedYet);
-    return table_type_;
+    return primary_table_info_guarded().first->table_type;
+  }
+
+  const Schema& schema() const {
+    DCHECK_NE(state_, kNotLoadedYet);
+    return primary_table_info_guarded().first->schema;
+  }
+
+  const IndexMap& index_map() const {
+    DCHECK_NE(state_, kNotLoadedYet);
+    return primary_table_info_guarded().first->index_map;
+  }
+
+  uint32_t schema_version() const {
+    DCHECK_NE(state_, kNotLoadedYet);
+    return primary_table_info_guarded().first->schema_version;
   }
 
   const std::string& indexed_tablet_id() const {
     DCHECK_NE(state_, kNotLoadedYet);
     static const std::string kEmptyString = "";
-    return index_info_ ? index_info_->indexed_table_id() : kEmptyString;
+    std::lock_guard<MutexType> lock(data_mutex_);
+    const auto* index_info = primary_table_info_unlocked()->index_info.get();
+    return index_info ? index_info->indexed_table_id() : kEmptyString;
   }
 
   bool is_local_index() const {
     DCHECK_NE(state_, kNotLoadedYet);
-    return index_info_ && index_info_->is_local();
+    std::lock_guard<MutexType> lock(data_mutex_);
+    const auto* index_info = primary_table_info_unlocked()->index_info.get();
+    return index_info && index_info->is_local();
   }
 
   bool is_unique_index() const {
     DCHECK_NE(state_, kNotLoadedYet);
-    return index_info_ && index_info_->is_unique();
+    std::lock_guard<MutexType> lock(data_mutex_);
+    const auto* index_info = primary_table_info_unlocked()->index_info.get();
+    return index_info && index_info->is_unique();
   }
 
   std::vector<ColumnId> index_key_column_ids() const {
     DCHECK_NE(state_, kNotLoadedYet);
-    return index_info_ ? index_info_->index_key_column_ids() : std::vector<ColumnId>();
+    std::lock_guard<MutexType> lock(data_mutex_);
+    const auto* index_info = primary_table_info_unlocked()->index_info.get();
+    return index_info ? index_info->index_key_column_ids() : std::vector<ColumnId>();
   }
 
-  std::string rocksdb_dir() const { return rocksdb_dir_; }
+  // Returns the partition schema of the Raft group's tables.
+  const PartitionSchema& partition_schema() const {
+    DCHECK_NE(state_, kNotLoadedYet);
+    return primary_table_info_guarded().first->partition_schema;
+  }
+
+  const std::vector<DeletedColumn>& deleted_cols() const {
+    DCHECK_NE(state_, kNotLoadedYet);
+    return primary_table_info_guarded().first->deleted_cols;
+  }
+
+  std::string rocksdb_dir() const { return kv_store_.rocksdb_dir; }
+
+  std::string lower_bound_key() const { return kv_store_.lower_bound_key; }
+  std::string upper_bound_key() const { return kv_store_.upper_bound_key; }
 
   std::string wal_dir() const { return wal_dir_; }
 
-  // Given the data directory of a tablet, returns the data root dir for that tablet.
-  // For example,
-  //  Given /mnt/d0/tserver/data1/data/rocksdb/0c966bbae43f470f8afbb3de648ed46a
-  //  Returns /mnt/d0/tserver/data1/data
+  // Set the WAL retention time for the primary table.
+  void set_wal_retention_secs(uint32 wal_retention_secs);
+
+  // Returns the wal retention time for the primary table.
+  uint32_t wal_retention_secs() const;
+
+  // Returns the data root dir for this Raft group, for example:
+  // /mnt/d0/yb-data/tserver/data
+  // TODO(#79): rework when we have more than one KV-store (and data roots) per Raft group.
   std::string data_root_dir() const;
 
-  // Given the WAL directory of a tablet, returns the wal root dir for that tablet.
-  // For example,
-  //  Given /mnt/d0/tserver/wal1/wals/0c966bbae43f470f8afbb3de648ed46a
-  //  Returns /mnt/d0/tserver/wal1/wals
+  // Returns the WAL root dir for this Raft group, for example:
+  // /mnt/d0/yb-data/tserver/wals
   std::string wal_root_dir() const;
 
-  uint32_t schema_version() const;
+  void SetSchema(const Schema& schema,
+                 const IndexMap& index_map,
+                 const std::vector<DeletedColumn>& deleted_cols,
+                 const uint32_t version);
 
-  void SetSchema(const Schema& schema, uint32_t version);
-
-  const IndexMap& index_map() const { return index_map_; }
-  void SetIndexMap(IndexMap&& index_map);
+  void SetPartitionSchema(const PartitionSchema& partition_schema);
 
   void SetTableName(const std::string& table_name);
 
-  // Return a reference to the current schema.
-  // This pointer will be valid until the TabletMetadata is destructed,
-  // even if the schema is changed.
-  const Schema& schema() const {
-    const Schema* s = reinterpret_cast<const Schema*>(
-        base::subtle::Acquire_Load(reinterpret_cast<const AtomicWord*>(&schema_)));
-    return *s;
-  }
+  void AddTable(const std::string& table_id,
+                const std::string& table_name,
+                const TableType table_type,
+                const Schema& schema,
+                const IndexMap& index_map,
+                const PartitionSchema& partition_schema,
+                const boost::optional<IndexInfo>& index_info,
+                const uint32_t schema_version);
 
-  // Returns the partition schema of the tablet's table.
-  const PartitionSchema& partition_schema() const {
-    return partition_schema_;
-  }
+  void RemoveTable(const std::string& table_id);
 
   // Set / get the remote bootstrap / tablet data state.
   void set_tablet_data_state(TabletDataState state);
   TabletDataState tablet_data_state() const;
 
-  // Increments flush pin count by one: if flush pin count > 0,
-  // metadata will _not_ be flushed to disk during Flush().
-  void PinFlush();
-
-  // Decrements flush pin count by one: if flush pin count is zero,
-  // metadata will be flushed to disk during the next call to Flush()
-  // or -- if Flush() had been called after a call to PinFlush() but
-  // before this method was called -- Flush() will be called inside
-  // this method.
-  CHECKED_STATUS UnPinFlush();
-
   CHECKED_STATUS Flush();
-
-  // Adds the blocks referenced by 'block_ids' to 'orphaned_blocks_'.
-  //
-  // This set will be written to the on-disk metadata in any subsequent
-  // flushes.
-  //
-  // Blocks are removed from this set after they are successfully deleted
-  // in a call to DeleteOrphanedBlocks().
-  void AddOrphanedBlocks(const std::vector<BlockId>& block_ids);
 
   // Mark the superblock to be in state 'delete_type', sync it to disk, and
   // then delete all of the rowsets in this tablet.
@@ -250,85 +374,86 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
 
   FsManager *fs_manager() const { return fs_manager_; }
 
-  int64_t last_durable_mrs_id() const { return last_durable_mrs_id_; }
-
-  void SetLastDurableMrsIdForTests(int64_t mrs_id) { last_durable_mrs_id_ = mrs_id; }
-
   yb::OpId tombstone_last_logged_opid() const { return tombstone_last_logged_opid_; }
 
   // Loads the currently-flushed superblock from disk into the given protobuf.
-  CHECKED_STATUS ReadSuperBlockFromDisk(TabletSuperBlockPB* superblock) const;
+  CHECKED_STATUS ReadSuperBlockFromDisk(RaftGroupReplicaSuperBlockPB* superblock) const;
 
-  // Sets *super_block to the serialized form of the current metadata.
-  CHECKED_STATUS ToSuperBlock(TabletSuperBlockPB* super_block) const;
+  // Sets *superblock to the serialized form of the current metadata.
+  void ToSuperBlock(RaftGroupReplicaSuperBlockPB* superblock) const;
 
   // Fully replace a superblock (used for bootstrap).
-  CHECKED_STATUS ReplaceSuperBlock(const TabletSuperBlockPB &pb);
+  CHECKED_STATUS ReplaceSuperBlock(const RaftGroupReplicaSuperBlockPB &pb);
 
-  const std::vector<DeletedColumn>& GetDeletedColumns() const {
-    return deleted_cols_;
-  }
-
-  void AddDeletedColumn(const DeletedColumn& col) {
-    deleted_cols_.push_back(col);
-  }
+  // Creates a new Raft group metadata for the part of existing tablet contained in this Raft group.
+  // Assigns specified Raft group ID, partition and key bounds for a new tablet.
+  Result<RaftGroupMetadataPtr> CreateSubtabletMetadata(
+      const RaftGroupId& raft_group_id, const Partition& partition,
+      const std::string& lower_bound_key, const std::string& upper_bound_key) const;
 
  private:
-  friend class RefCountedThreadSafe<TabletMetadata>;
+  typedef simple_spinlock MutexType;
+
+  friend class RefCountedThreadSafe<RaftGroupMetadata>;
   friend class MetadataTest;
 
-  // Compile time assert that no one deletes TabletMetadata objects.
-  ~TabletMetadata();
+  // Compile time assert that no one deletes RaftGroupMetadata objects.
+  ~RaftGroupMetadata();
 
-  // Constructor for creating a new tablet.
+  // Constructor for creating a new Raft group.
   //
   // TODO: get rid of this many-arg constructor in favor of just passing in a
   // SuperBlock, which already contains all of these fields.
-  TabletMetadata(FsManager* fs_manager,
-                 std::string table_id,
-                 std::string tablet_id,
-                 std::string table_name,
-                 TableType table_type,
-                 const std::string rocksdb_dir,
-                 const std::string wal_dir,
-                 const Schema& schema,
-                 PartitionSchema partition_schema,
-                 Partition partition,
-                 const boost::optional<IndexInfo>& index_info,
-                 const TabletDataState& tablet_data_state);
+  RaftGroupMetadata(FsManager* fs_manager,
+                    TableId table_id,
+                    RaftGroupId raft_group_id,
+                    std::string table_name,
+                    TableType table_type,
+                    const std::string rocksdb_dir,
+                    const std::string wal_dir,
+                    const Schema& schema,
+                    const IndexMap& index_map,
+                    PartitionSchema partition_schema,
+                    Partition partition,
+                    const boost::optional<IndexInfo>& index_info,
+                    const uint32_t schema_version,
+                    const TabletDataState& tablet_data_state);
 
-  // Constructor for loading an existing tablet.
-  TabletMetadata(FsManager* fs_manager, std::string tablet_id);
-
-  void SetSchemaUnlocked(gscoped_ptr<Schema> schema, uint32_t version);
+  // Constructor for loading an existing Raft group.
+  RaftGroupMetadata(FsManager* fs_manager, RaftGroupId raft_group_id);
 
   CHECKED_STATUS LoadFromDisk();
 
   // Update state of metadata to that of the given superblock PB.
-  CHECKED_STATUS LoadFromSuperBlock(const TabletSuperBlockPB& superblock);
+  CHECKED_STATUS LoadFromSuperBlock(const RaftGroupReplicaSuperBlockPB& superblock);
 
-  CHECKED_STATUS ReadSuperBlock(TabletSuperBlockPB *pb);
+  CHECKED_STATUS ReadSuperBlock(RaftGroupReplicaSuperBlockPB *pb);
 
   // Fully replace superblock.
   // Requires 'flush_lock_'.
-  CHECKED_STATUS ReplaceSuperBlockUnlocked(const TabletSuperBlockPB &pb);
+  CHECKED_STATUS ReplaceSuperBlockUnlocked(const RaftGroupReplicaSuperBlockPB &pb);
 
-  // Requires 'data_lock_'.
-  CHECKED_STATUS ToSuperBlockUnlocked(TabletSuperBlockPB* super_block) const;
-
-  // Requires 'data_lock_'.
-  void AddOrphanedBlocksUnlocked(const std::vector<BlockId>& block_ids);
-
-  // Deletes the provided 'blocks' on disk.
-  //
-  // All blocks that are successfully deleted are removed from the
-  // 'orphaned_blocks_' set.
-  //
-  // Failures are logged, but are not fatal.
-  void DeleteOrphanedBlocks(const std::vector<BlockId>& blocks);
+  // Requires 'data_mutex_'.
+  void ToSuperBlockUnlocked(RaftGroupReplicaSuperBlockPB* superblock) const;
 
   // Return standard "T xxx P yyy" log prefix.
   std::string LogPrefix() const;
+
+  // Return a pointer to the primary table info. This pointer will be valid until the
+  // RaftGroupMetadata is destructed, even if the schema is changed.
+  const TableInfo* primary_table_info_unlocked() const {
+    const auto& tables = kv_store_.tables;
+    const auto itr = tables.find(primary_table_id_);
+    DCHECK(itr != tables.end());
+    return itr->second.get();
+  }
+
+  // Return a pair of a pointer to the primary table info and lock guard. The pointer will be valid
+  // until the RaftGroupMetadata is destructed, even if the schema is changed.
+  std::pair<const TableInfo*, std::unique_lock<MutexType>> primary_table_info_guarded() const {
+    std::unique_lock<MutexType> lock(data_mutex_);
+    return { primary_table_info_unlocked(), std::move(lock) };
+  }
 
   enum State {
     kNotLoadedYet,
@@ -338,73 +463,38 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
   State state_;
 
   // Lock protecting the underlying data.
-  typedef simple_spinlock LockType;
-  mutable LockType data_lock_;
+  mutable MutexType data_mutex_;
 
   // Lock protecting flushing the data to disk.
-  // If taken together with 'data_lock_', must be acquired first.
+  // If taken together with 'data_mutex_', must be acquired first.
   mutable Mutex flush_lock_;
 
-  std::string table_id_;
-  const std::string tablet_id_;
-
+  RaftGroupId raft_group_id_;
   Partition partition_;
+
+  // The primary table id. Primary table is the first table this Raft group is created for.
+  // Additional tables can be added to this Raft group to co-locate with this table.
+  TableId primary_table_id_;
+
+  // KV-store for this Raft group.
+  KvStoreInfo kv_store_;
 
   FsManager* const fs_manager_;
 
-  int64_t last_durable_mrs_id_;
-
-  // The current schema version. This is owned by this class.
-  // We don't use gscoped_ptr so that we can do an atomic swap.
-  Schema* schema_;
-  IndexMap index_map_;
-  uint32_t schema_version_;
-  std::string table_name_;
-  TableType table_type_;
-  boost::optional<IndexInfo> index_info_;
-
-  // The directory where the RocksDB data for this tablet is stored.
-  std::string rocksdb_dir_;
-
-  // The directory where the write-ahead log for this tablet is stored.
+  // The directory where the write-ahead log for this Raft group is stored.
   std::string wal_dir_;
-
-  PartitionSchema partition_schema_;
-
-  // Previous values of 'schema_'.
-  // These are currently kept alive forever, under the assumption that
-  // a given tablet won't have thousands of "alter table" calls.
-  // They are kept alive so that callers of schema() don't need to
-  // worry about reference counting or locking.
-  std::vector<Schema*> old_schemas_;
-
-  // Protected by 'data_lock_'.
-  std::unordered_set<BlockId, BlockIdHash, BlockIdEqual> orphaned_blocks_;
 
   // The current state of remote bootstrap for the tablet.
   TabletDataState tablet_data_state_;
 
-  // Record of the last opid logged by the tablet before it was last
-  // tombstoned. Has no meaning for non-tombstoned tablets.
+  // Record of the last opid logged by the tablet before it was last tombstoned. Has no meaning for
+  // non-tombstoned tablets.
   yb::OpId tombstone_last_logged_opid_;
 
-  // If this counter is > 0 then Flush() will not write any data to
-  // disk.
-  int32_t num_flush_pins_ = 0;
-
-  // Set if Flush() is called when num_flush_pins_ is > 0; if true,
-  // then next UnPinFlush will call Flush() again to ensure the
-  // metadata is persisted.
-  bool needs_flush_ = false;
-
-  // A vector of column IDs that have been deleted, so that the compaction filter can free the
-  // associated memory. At present, deleted column IDs are persisted forever, even if all the
-  // associated data has been discarded. In the future, we can garbage collect such column IDs
-  // to make sure this vector doesn't grow too large.
-  std::vector<DeletedColumn> deleted_cols_;
-
-  DISALLOW_COPY_AND_ASSIGN(TabletMetadata);
+  DISALLOW_COPY_AND_ASSIGN(RaftGroupMetadata);
 };
+
+CHECKED_STATUS MigrateSuperblock(RaftGroupReplicaSuperBlockPB* superblock);
 
 extern const std::string kIntentsSubdir;
 extern const std::string kIntentsDBSuffix;

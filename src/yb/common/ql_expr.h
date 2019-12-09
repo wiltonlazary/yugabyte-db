@@ -7,11 +7,39 @@
 #ifndef YB_COMMON_QL_EXPR_H_
 #define YB_COMMON_QL_EXPR_H_
 
-#include "yb/common/ql_value.h"
+#include "yb/common/common_fwd.h"
 #include "yb/common/schema.h"
-#include "yb/common/ql_bfunc.h"
+#include "yb/util/bfql/tserver_opcodes.h"
+#include "yb/util/bfpg/tserver_opcodes.h"
 
 namespace yb {
+
+// In addition to regular columns, YB support for postgres also have virtual columns.
+// Virtual columns are just expression that is evaluated by DocDB in "doc_expr.cc".
+enum class PgSystemAttrNum : int {
+  // Postgres system columns.
+  kSelfItemPointer      = -1, // ctid.
+  kObjectId             = -2, // oid.
+  kMinTransactionId     = -3, // xmin
+  kMinCommandId         = -4, // cmin
+  kMaxTransactionId     = -5, // xmax
+  kMaxCommandId         = -6, // cmax
+  kTableOid             = -7, // tableoid
+
+  // YugaByte system columns.
+  kYBTupleId            = -8, // ybctid: virtual column representing DocDB-encoded key.
+                              // YB analogue of Postgres's SelfItemPointer/ctid column.
+
+  // The following attribute numbers are stored persistently in the table schema. For this reason,
+  // they are chosen to avoid potential conflict with Postgres' own sys attributes now and future.
+  kYBRowId              = -100, // ybrowid: auto-generated key-column for tables without pkey.
+  kYBIdxBaseTupleId     = -101, // ybidxbasectid: for indexes ybctid of the indexed table row.
+  kYBUniqueIdxKeySuffix = -102, // ybuniqueidxkeysuffix: extra key column for unique indexes, used
+                                // to ensure SQL semantics for null (null != null) in DocDB
+                                // (where null == null). For each index row will be set to:
+                                //  - the base table ctid when one or more indexed cols are null
+                                //  - to null otherwise (all indexed cols are non-null).
+};
 
 // TODO(neil)
 // - This should be maping directly from "int32_t" to QLValue.
@@ -104,6 +132,10 @@ class QLTableRow {
     return GetValue(col.rep());
   }
 
+  // Predicate if given column is specified in the row.
+  // NOTE: This returns true if column is specified even when its value is NULL.
+  bool IsColumnSpecified(ColumnIdRep col_id) const;
+
   // Clear the column value.
   void ClearValue(ColumnIdRep col_id);
   void ClearValue(const ColumnId& col) {
@@ -112,6 +144,7 @@ class QLTableRow {
 
   // Get the column value in PB format.
   CHECKED_STATUS ReadColumn(ColumnIdRep col_id, QLValue *col_value) const;
+  const QLValuePB* GetColumn(ColumnIdRep col_id) const;
   CHECKED_STATUS ReadSubscriptedColumn(const QLSubscriptedColPB& subcol,
                                        const QLValue& index,
                                        QLValue *col_value) const;
@@ -155,16 +188,24 @@ class QLExprExecutor {
   // Evaluate the given QLExpressionPB.
   CHECKED_STATUS EvalExpr(const QLExpressionPB& ql_expr,
                           const QLTableRow& table_row,
-                          QLValue *result);
+                          QLValue *result,
+                          const Schema *schema = nullptr,
+                          const QLValuePB** result_ptr = nullptr);
 
   // Evaluate the given QLExpressionPB (if needed) and replace its content with the result.
   CHECKED_STATUS EvalExpr(QLExpressionPB* ql_expr,
-                          const QLTableRow& table_row);
+                          const QLTableRow& table_row,
+                          const Schema *schema = nullptr);
 
   // Read evaluated value from an expression. This is only useful for aggregate function.
   CHECKED_STATUS ReadExprValue(const QLExpressionPB& ql_expr,
                                const QLTableRow& table_row,
                                QLValue *result);
+
+  // Evaluate column reference.
+  virtual CHECKED_STATUS EvalColumnRef(ColumnIdRep col_id,
+                                       const QLTableRow::SharedPtrConst& table_row,
+                                       QLValue *result);
 
   // Evaluate call to regular builtin operator.
   virtual CHECKED_STATUS EvalBFCall(const QLBCallPB& ql_expr,
@@ -174,7 +215,8 @@ class QLExprExecutor {
   // Evaluate call to tablet-server builtin operator.
   virtual CHECKED_STATUS EvalTSCall(const QLBCallPB& ql_expr,
                                     const QLTableRow& table_row,
-                                    QLValue *result);
+                                    QLValue *result,
+                                    const Schema *schema = nullptr);
 
   virtual CHECKED_STATUS ReadTSCallValue(const QLBCallPB& ql_expr,
                                          const QLTableRow& table_row,
@@ -217,6 +259,14 @@ class QLExprExecutor {
   virtual CHECKED_STATUS ReadTSCallValue(const PgsqlBCallPB& ql_expr,
                                          const QLTableRow::SharedPtrConst& table_row,
                                          QLValue *result);
+
+  // Evaluate a boolean condition for the given row.
+  virtual CHECKED_STATUS EvalCondition(const PgsqlConditionPB& condition,
+                                       const QLTableRow::SharedPtrConst& table_row,
+                                       bool* result);
+  virtual CHECKED_STATUS EvalCondition(const PgsqlConditionPB& condition,
+                                       const QLTableRow::SharedPtrConst& table_row,
+                                       QLValue *result);
 };
 
 } // namespace yb

@@ -16,6 +16,7 @@
 #ifndef YB_COMMON_TRANSACTION_H
 #define YB_COMMON_TRANSACTION_H
 
+#include <boost/container/small_vector.hpp>
 #include <boost/functional/hash.hpp>
 #include <boost/optional.hpp>
 #include <boost/uuid/uuid.hpp>
@@ -25,10 +26,12 @@
 #include "yb/common/entity_ids.h"
 #include "yb/common/hybrid_time.h"
 
+#include "yb/util/async_util.h"
 #include "yb/util/enums.h"
 #include "yb/util/monotime.h"
 #include "yb/util/logging.h"
 #include "yb/util/result.h"
+#include "yb/util/strongly_typed_bool.h"
 #include "yb/util/uuid.h"
 
 namespace rocksdb {
@@ -41,13 +44,9 @@ namespace yb {
 
 using TransactionId = boost::uuids::uuid;
 typedef boost::hash<TransactionId> TransactionIdHash;
+using TransactionIdSet = std::unordered_set<TransactionId, TransactionIdHash>;
 
 inline TransactionId GenerateTransactionId() { return Uuid::Generate(); }
-
-// Processing mode:
-//   LEADER - processing in leader.
-//   NON_LEADER - processing in non leader.
-YB_DEFINE_ENUM(ProcessingMode, (NON_LEADER)(LEADER));
 
 // Decodes transaction id from its binary representation.
 // Checks that slice contains only TransactionId.
@@ -66,10 +65,28 @@ struct TransactionStatusResult {
   // COMMITTED - status_time is a commit time.
   // ABORTED - not used.
   HybridTime status_time;
+
+  TransactionStatusResult(TransactionStatus status_, HybridTime status_time_);
+
+  static TransactionStatusResult Aborted() {
+    return TransactionStatusResult(TransactionStatus::ABORTED, HybridTime());
+  }
+
+  std::string ToString() const {
+    return Format("{ status: $0 status_time: $1 }", status, status_time);
+  }
 };
+
+inline std::ostream& operator<<(std::ostream& out, const TransactionStatusResult& result) {
+  return out << "{ status: " << TransactionStatus_Name(result.status)
+             << " status_time: " << result.status_time << " }";
+}
 
 typedef std::function<void(Result<TransactionStatusResult>)> TransactionStatusCallback;
 struct TransactionMetadata;
+
+YB_DEFINE_ENUM(TransactionLoadFlag, (kMustExist)(kCleanup));
+typedef EnumBitSet<TransactionLoadFlag> TransactionLoadFlags;
 
 // Used by RequestStatusAt.
 struct StatusRequest {
@@ -77,7 +94,14 @@ struct StatusRequest {
   HybridTime read_ht;
   HybridTime global_limit_ht;
   int64_t serial_no;
+  const std::string* reason;
+  TransactionLoadFlags flags;
   TransactionStatusCallback callback;
+
+  std::string ToString() const {
+    return Format("{ id: $0 read_ht: $1 global_limit_ht: $2 serial_no: $3 reason: $4 flags: $5}",
+                  *id, read_ht, global_limit_ht, serial_no, *reason, flags);
+  }
 };
 
 class RequestScope;
@@ -102,9 +126,17 @@ class TransactionStatusManager {
   // 4. Any kind of network/timeout errors would be reflected in error passed to callback.
   virtual void RequestStatusAt(const StatusRequest& request) = 0;
 
-  virtual boost::optional<TransactionMetadata> Metadata(const TransactionId& id) = 0;
+  // Prepares metadata for provided protobuf. Either trying to extract it from pb, or fetch
+  // from existing metadatas.
+  virtual Result<TransactionMetadata> PrepareMetadata(const TransactionMetadataPB& pb) = 0;
 
   virtual void Abort(const TransactionId& id, TransactionStatusCallback callback) = 0;
+
+  virtual void Cleanup(TransactionIdSet&& set) = 0;
+
+  // For each pair fills second with priority of transaction with id equals to first.
+  virtual void FillPriorities(
+      boost::container::small_vector_base<std::pair<TransactionId, uint64_t>>* inout) = 0;
 
  private:
   friend class RequestScope;
@@ -189,11 +221,20 @@ struct TransactionMetadata {
   uint64_t priority;
 
   // Used for snapshot isolation (as read time and for conflict resolution).
-  HybridTime start_time;
+  // start_time is used only for backward compability during rolling update.
+  HybridTime DEPRECATED_start_time;
 
   static Result<TransactionMetadata> FromPB(const TransactionMetadataPB& source);
 
   void ToPB(TransactionMetadataPB* dest) const;
+
+  // Fill dest with full metadata even when isolation is non transactional.
+  void ForceToPB(TransactionMetadataPB* dest) const;
+
+  std::string ToString() const {
+    return Format("{ transaction_id: $0 isolation: $1 status_tablet: $2 priority: $3 }",
+                  transaction_id, isolation, status_tablet, priority);
+  }
 };
 
 bool operator==(const TransactionMetadata& lhs, const TransactionMetadata& rhs);
@@ -204,7 +245,11 @@ inline bool operator!=(const TransactionMetadata& lhs, const TransactionMetadata
 
 std::ostream& operator<<(std::ostream& out, const TransactionMetadata& metadata);
 
-MonoTime TransactionRpcDeadline();
+MonoDelta TransactionRpcTimeout();
+CoarseTimePoint TransactionRpcDeadline();
+
+extern const std::string kTransactionsTableName;
+extern const std::string kMetricsSnapshotsTableName;
 
 } // namespace yb
 

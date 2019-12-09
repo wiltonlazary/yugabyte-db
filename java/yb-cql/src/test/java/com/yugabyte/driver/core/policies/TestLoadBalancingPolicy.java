@@ -15,6 +15,7 @@ package com.yugabyte.driver.core.policies;
 import com.google.common.reflect.TypeToken;
 import org.junit.Test;
 
+import com.datastax.driver.core.LocalDate;
 import com.datastax.driver.core.BatchStatement;
 import com.datastax.driver.core.BoundStatement;
 import com.datastax.driver.core.PreparedStatement;
@@ -30,12 +31,13 @@ import org.yb.minicluster.MiniYBDaemon;
 
 import org.apache.commons.lang3.RandomStringUtils;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertTrue;
+import static org.yb.AssertionWrappers.assertEquals;
+import static org.yb.AssertionWrappers.assertNotNull;
+import static org.yb.AssertionWrappers.assertTrue;
 
 import java.nio.ByteBuffer;
 import java.net.InetAddress;
+import java.util.Arrays;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.Map;
@@ -46,6 +48,11 @@ import java.util.LinkedList;
 import java.util.Random;
 import java.util.UUID;
 
+import org.yb.YBTestRunner;
+
+import org.junit.runner.RunWith;
+
+@RunWith(value=YBTestRunner.class)
 public class TestLoadBalancingPolicy extends BaseCQLTest {
 
   // Test hash-key function in PartitionAwarePolicy to verify it is consistent with the hash
@@ -211,25 +218,34 @@ public class TestLoadBalancingPolicy extends BaseCQLTest {
           "v int, primary key ((h1, h2, h3, h4)));");
 
       Map<Integer, String> map = new HashMap<>();
+      // TODO @Oleg uncomment the code below when #2860 is fixed.
+      /*
       int map_size = rand.nextInt(10);
       for (int i = 0; i < map_size; i++) {
         map.put(rand.nextInt(), RandomStringUtils.random(rand.nextInt(64)));
       }
+      */
 
       Set<Double> set = new HashSet<>();
+      // TODO @Oleg uncomment the code below when #2860 is fixed.
+      /*
       int set_size = rand.nextInt(10);
       for (int i = 0; i < set_size; i++) {
         set.add(rand.nextDouble());
       }
+      */
 
       List<Set<String>> list = new LinkedList<>();
       int list_size = rand.nextInt(5);
       for (int i = 0; i < list_size; i++) {
         Set<String> list_set = new HashSet<>();
+        // TODO @Oleg uncomment the code below when #2860 is fixed.
+        /*
         int list_set_size = rand.nextInt(5);
         for (int j = 0; j < list_set_size; j++) {
           list_set.add(RandomStringUtils.random(rand.nextInt(32)));
         }
+         */
 
         list.add(list_set);
       }
@@ -261,7 +277,47 @@ public class TestLoadBalancingPolicy extends BaseCQLTest {
       assertEquals(list, row.getList("h3", new TypeToken<Set<String>>() {}));
       assertEquals(udt, row.getUDTValue("h4"));
     }
-  }
+
+    // Test hash key composed of date and time.
+    {
+      session.execute("create table t6 (h1 date, h2 time, primary key ((h1, h2)));");
+
+      // Insert a row with random hash column values.
+      LocalDate h1 = LocalDate.fromDaysSinceEpoch(rand.nextInt());
+      long h2 = rand.nextLong();
+      LOG.info("h1 = " + h1 + ", h2 = " + h2);
+      BoundStatement stmt = session.prepare("insert into t6 (h1, h2) values (?, ?);").bind(h1, h2);
+      session.execute(stmt);
+
+      // Select the row back using the hash key value and verify the row.
+      Row row = session.execute("select * from t6 where token(h1, h2) = ?;",
+              PartitionAwarePolicy.YBToCqlHashCode(PartitionAwarePolicy.getKey(stmt))).one();
+      assertNotNull(row);
+      assertEquals(h1, row.getDate("h1"));
+      assertEquals(h2, row.getTime("h2"));
+
+      session.execute("drop table t6;");
+    }
+
+    // Test hash key composed of boolean.
+    {
+      session.execute("create table t7 (h boolean, primary key ((h)));");
+
+      for (Boolean h : Arrays.asList(false, true)) {
+        LOG.info("h = " + h);
+        BoundStatement stmt = session.prepare("insert into t7 (h) values (?);").bind(h);
+        session.execute(stmt);
+
+        // Select the row back using the hash key value and verify the row.
+        Row row = session.execute("select * from t7 where token(h) = ?;",
+              PartitionAwarePolicy.YBToCqlHashCode(PartitionAwarePolicy.getKey(stmt))).one();
+        assertNotNull(row);
+        assertEquals(h, row.getBool("h"));
+      }
+
+      session.execute("drop table t7;");
+    }
+ }
 
   private void waitForMetadataRefresh() throws Exception {
     // Since partition metadata is refreshed asynchronously after a new table is created, let's
@@ -329,10 +385,12 @@ public class TestLoadBalancingPolicy extends BaseCQLTest {
     final int NUM_KEYS = 100;
 
     // Create test table.
-    session.execute("create table test_lb_idx (h1 int, h2 text, c int, primary key ((h1, h2))) " +
+    session.execute("create table test_lb_idx " +
+                    "(h1 int, h2 text, c int, j jsonb, primary key ((h1, h2))) " +
                     "with transactions = { 'enabled' : true };");
     session.execute("create index test_lb_idx_1 on test_lb_idx (h1) include (c);");
     session.execute("create index test_lb_idx_2 on test_lb_idx (c);");
+    session.execute("create index test_lb_idx_3 on test_lb_idx (j->>'a');");
 
     waitForMetadataRefresh();
 
@@ -341,9 +399,10 @@ public class TestLoadBalancingPolicy extends BaseCQLTest {
 
     PreparedStatement stmt;
 
-    stmt = session.prepare("insert into test_lb_idx (h1, h2, c) values (?, ?, ?);");
+    stmt = session.prepare("insert into test_lb_idx (h1, h2, c, j) values (?, ?, ?, ?);");
     for (int i = 1; i <= NUM_KEYS; i++) {
-      session.execute(stmt.bind(Integer.valueOf(i), "v" + i, Integer.valueOf(i)));
+      String jvalue = String.format("{ \"a\" : \"json_%d\" }", i);
+      session.execute(stmt.bind(Integer.valueOf(i), "v" + i, Integer.valueOf(i), jvalue));
     }
 
     stmt = session.prepare("select c from test_lb_idx where h1 = ?;");
@@ -361,6 +420,15 @@ public class TestLoadBalancingPolicy extends BaseCQLTest {
       assertEquals("v" + i, row.getString("h2"));
     }
 
+    stmt = session.prepare("select h1, h2 from test_lb_idx where j->>'a' = ?;");
+    for (int i = 1; i <= NUM_KEYS; i++) {
+      String jvalue = String.format("json_%d", i);
+      Row row = session.execute(stmt.bind(jvalue)).one();
+      assertNotNull(row);
+      assertEquals(i, row.getInt("h1"));
+      assertEquals("v" + i, row.getString("h2"));
+    }
+
     // Check the metrics again.
     IOMetrics totalMetrics = getCombinedMetrics(initialMetrics);
 
@@ -370,9 +438,15 @@ public class TestLoadBalancingPolicy extends BaseCQLTest {
     // because as soon as the test table has been created and the partition metadata has been
     // loaded, the cluster's load-balancer may still be rebalancing the leaders.
     assertTrue("Local Read Count: " + totalMetrics.localReadCount,
-               totalMetrics.localReadCount >= NUM_KEYS * 2 * 0.7);
+               totalMetrics.localReadCount >= NUM_KEYS * 3 * 0.7);
     assertTrue("Local Write Count: " + totalMetrics.localWriteCount,
                totalMetrics.localWriteCount >= NUM_KEYS * 0.7);
+
+    // Should use percentage to check? Remove the following check if it fails.
+    // Use 60% as limit (Assuming 100% local write for UserTable and 50% for each IndexTable).
+    double fraction = (1.0 * totalMetrics.localWriteCount) /
+                      (totalMetrics.localWriteCount + totalMetrics.remoteWriteCount);
+    assertTrue("Local/total write: " + fraction, fraction > 0.60);
   }
 
   // Test load-balancing policy with BatchStatement

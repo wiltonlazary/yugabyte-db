@@ -15,9 +15,13 @@
 
 #include "yb/tablet/operations/update_txn_operation.h"
 
+#include "yb/consensus/consensus.h"
+
 #include "yb/tablet/tablet.h"
 #include "yb/tablet/tablet_peer.h"
 #include "yb/tablet/transaction_coordinator.h"
+
+#include "yb/util/scope_exit.h"
 
 using namespace std::literals;
 
@@ -25,6 +29,7 @@ namespace yb {
 namespace tablet {
 
 void UpdateTxnOperationState::UpdateRequestFromConsensusRound() {
+  VLOG_WITH_PREFIX(2) << "UpdateRequestFromConsensusRound";
   request_.store(consensus_round()->replicate_msg()->mutable_transaction_state(),
                  std::memory_order_release);
 }
@@ -42,47 +47,78 @@ consensus::ReplicateMsgPtr UpdateTxnOperation::NewReplicateMsg() {
 }
 
 Status UpdateTxnOperation::Prepare() {
+  VLOG_WITH_PREFIX(2) << "Prepare";
   return Status::OK();
 }
 
 void UpdateTxnOperation::DoStart() {
-  state()->TrySetHybridTimeFromClock();
+  VLOG_WITH_PREFIX(2) << "DoStart";
+
+  HybridTime ht = state()->hybrid_time_even_if_unset();
+  bool was_valid = ht.is_valid();
+  if (!was_valid) {
+    // Add only leader operation here, since follower operations are already registered in MVCC,
+    // as soon as they received.
+    state()->tablet()->mvcc_manager()->AddPending(&ht);
+    state()->set_hybrid_time(ht);
+  }
 }
 
 TransactionCoordinator& UpdateTxnOperation::transaction_coordinator() const {
   return *state()->tablet()->transaction_coordinator();
 }
 
-ProcessingMode UpdateTxnOperation::mode() const {
-  return type() == consensus::LEADER ? ProcessingMode::LEADER : ProcessingMode::NON_LEADER;
-}
+Status UpdateTxnOperation::DoReplicated(int64_t leader_term, Status* complete_status) {
+  VLOG_WITH_PREFIX(2) << "Replicated";
 
-Status UpdateTxnOperation::Apply() {
   auto* state = this->state();
-  TransactionCoordinator::ReplicatedData data = {
-      mode(),
-      state->tablet(),
-      *state->request(),
-      state->op_id(),
-      state->hybrid_time()
-  };
-  return transaction_coordinator().ProcessReplicated(data);
+  auto scope_exit = ScopeExit([state] {
+    state->tablet()->mvcc_manager()->Replicated(state->hybrid_time());
+  });
+
+  // APPLYING is handled separately, because it is received for transactions not managed by
+  // this tablet as a transaction status tablet, but tablets that are involved in the data
+  // path (receive write intents) for this transaction.
+  if (state->request()->status() == TransactionStatus::APPLYING) {
+    TransactionParticipant::ReplicatedData data = {
+        leader_term,
+        *state->request(),
+        state->op_id(),
+        state->hybrid_time(),
+        false /* already_applied */
+    };
+    return state->tablet()->transaction_participant()->ProcessReplicated(data);
+  } else {
+    TransactionCoordinator::ReplicatedData data = {
+        leader_term,
+        *state->request(),
+        state->op_id(),
+        state->hybrid_time()
+    };
+    return transaction_coordinator().ProcessReplicated(data);
+  }
 }
 
 string UpdateTxnOperation::ToString() const {
-  return Format("UpdateTxnOperation [state=$0]", state()->ToString());
+  return Format("UpdateTxnOperation { state: $0 }", *state());
 }
 
-void UpdateTxnOperation::Finish(OperationResult result) {
-  if (result == OperationResult::ABORTED) {
-    LOG(INFO) << "Aborted: " << state()->request()->ShortDebugString();
-    TransactionCoordinator:: AbortedData data = {
-      mode(),
+Status UpdateTxnOperation::DoAborted(const Status& status) {
+  auto hybrid_time = state()->hybrid_time_even_if_unset();
+  if (hybrid_time.is_valid()) {
+    state()->tablet()->mvcc_manager()->Aborted(hybrid_time);
+  }
+
+  if (state()->tablet()->transaction_coordinator()) {
+    LOG_WITH_PREFIX(INFO) << "Aborted";
+    TransactionCoordinator::AbortedData data = {
       *state()->request(),
       state()->op_id(),
     };
     transaction_coordinator().ProcessAborted(data);
   }
+
+  return status;
 }
 
 } // namespace tablet

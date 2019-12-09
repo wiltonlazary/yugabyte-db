@@ -11,10 +11,10 @@
 // under the License.
 //
 
-#include "yb/common/redis_constants_common.h"
+#include "yb/master/yql_tables_vtable.h"
+
 #include "yb/common/ql_value.h"
 #include "yb/master/catalog_manager.h"
-#include "yb/master/yql_tables_vtable.h"
 
 namespace yb {
 namespace master {
@@ -23,12 +23,17 @@ YQLTablesVTable::YQLTablesVTable(const Master* const master)
     : YQLVirtualTable(master::kSystemSchemaTablesTableName, master, CreateSchema()) {
 }
 
-Status YQLTablesVTable::RetrieveData(const QLReadRequestPB& request,
-                                     std::unique_ptr<QLRowBlock>* vtable) const {
-  vtable->reset(new QLRowBlock(schema_));
+Result<std::shared_ptr<QLRowBlock>> YQLTablesVTable::RetrieveData(
+    const QLReadRequestPB& request) const {
+  auto vtable = std::make_shared<QLRowBlock>(schema_);
   std::vector<scoped_refptr<TableInfo> > tables;
   master_->catalog_manager()->GetAllTables(&tables, true);
   for (scoped_refptr<TableInfo> table : tables) {
+
+    // Skip non-YQL tables.
+    if (!CatalogManager::IsYcqlTable(*table)) {
+      continue;
+    }
 
     // Skip index table.
     if (!table->indexed_table_id().empty()) {
@@ -41,13 +46,8 @@ Status YQLTablesVTable::RetrieveData(const QLReadRequestPB& request,
     scoped_refptr<NamespaceInfo> nsInfo;
     RETURN_NOT_OK(master_->catalog_manager()->FindNamespace(nsId, &nsInfo));
 
-    // Hide non-YQL tables.
-    if (table->GetTableType() != TableType::YQL_TABLE_TYPE) {
-      continue;
-    }
-
     // Create appropriate row for the table;
-    QLRow& row = (*vtable)->Extend();
+    QLRow& row = vtable->Extend();
     RETURN_NOT_OK(SetColumnValue(kKeyspaceName, nsInfo->name(), &row));
     RETURN_NOT_OK(SetColumnValue(kTableName, table->name(), &row));
 
@@ -76,15 +76,15 @@ Status YQLTablesVTable::RetrieveData(const QLReadRequestPB& request,
         schema.table_properties().DefaultTimeToLive() / MonoTime::kMillisecondsPerSecond);
     RETURN_NOT_OK(SetColumnValue(kDefaultTimeToLive, cql_ttl, &row));
 
-    QLValue dtxn;
-    dtxn.set_map_value();
-    dtxn.add_map_key()->set_string_value("enabled");
-    dtxn.add_map_value()->set_string_value(schema.table_properties().is_transactional() ?
-                                           "true" : "false");
-    RETURN_NOT_OK(SetColumnValue(kTransactions, dtxn.value(), &row));
+    QLValue txn;
+    txn.set_map_value();
+    txn.add_map_key()->set_string_value("enabled");
+    txn.add_map_value()->set_string_value(schema.table_properties().is_transactional() ?
+                                          "true" : "false");
+    RETURN_NOT_OK(SetColumnValue(kTransactions, txn.value(), &row));
   }
 
-  return Status::OK();
+  return vtable;
 }
 
 Schema YQLTablesVTable::CreateSchema() const {

@@ -20,15 +20,38 @@
 
 #include "yb/util/string_util.h"
 
-#include <sstream>
+#include <regex>
+#include <boost/algorithm/string/predicate.hpp>
 
 #include "yb/util/logging.h"
 
 using std::vector;
+using std::regex;
+using std::regex_match;
 using std::string;
 using std::stringstream;
+using boost::algorithm::iequals;
 
 namespace yb {
+
+bool IsBigInteger(const Slice& s) {
+  static const regex int_regex("[+-]?[0-9]+");
+  return regex_match(s.cdata(), int_regex);
+}
+
+bool IsDecimal(const Slice& s) {
+  // Regexes are based (but do not match exactly) the definition of Decimal::FromString
+  static const string optional_exp_suffix = "([eE][+-]?[0-9]+)?";
+  static const regex decimal_regex_1("[+-]?[0-9]*\\.[0-9]+" + optional_exp_suffix);
+  static const regex decimal_regex_2("[+-]?[0-9]+\\.?" + optional_exp_suffix);
+  return IsBigInteger(s)
+      || regex_match(s.cdata(), decimal_regex_1)
+      || regex_match(s.cdata(), decimal_regex_2);
+}
+
+bool IsBoolean(const Slice& s) {
+  return iequals(s.cdata(), "true") || iequals(s.cdata(), "false");
+}
 
 vector<string> StringSplit(const string& arg, char delim) {
   vector<string> splits;
@@ -76,9 +99,6 @@ void AppendWithSeparator(const char* to_append, string* dest, const char* separa
     *dest += separator;
   }
   *dest += to_append;
-}
-
-void FooBar() {
 }
 
 }  // namespace yb

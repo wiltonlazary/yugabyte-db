@@ -72,13 +72,13 @@ class RpcCommand : public std::enable_shared_from_this<RpcCommand> {
 
   virtual void Abort() = 0;
 
-  virtual MonoTime deadline() const = 0;
+  virtual CoarseTimePoint deadline() const = 0;
 
  protected:
   ~RpcCommand() {}
 };
 
-YB_DEFINE_ENUM(RpcRetrierState, (kIdle)(kRunning)(kWaiting)(kFinished));
+YB_DEFINE_ENUM(RpcRetrierState, (kIdle)(kRunning)(kScheduling)(kWaiting)(kFinished));
 YB_DEFINE_ENUM(BackoffStrategy, (kLinear)(kExponential));
 YB_STRONGLY_TYPED_BOOL(RetryWhenBusy);
 
@@ -87,12 +87,7 @@ YB_STRONGLY_TYPED_BOOL(RetryWhenBusy);
 // All RPCs should use HandleResponse() to retry certain generic errors.
 class RpcRetrier {
  public:
-  RpcRetrier(MonoTime deadline, std::shared_ptr<Messenger> messenger, ProxyCache *proxy_cache)
-      : deadline_(std::move(deadline)),
-        messenger_(std::move(messenger)),
-        proxy_cache_(*proxy_cache) {
-    controller_.Reset();
-  }
+  RpcRetrier(CoarseTimePoint deadline, Messenger* messenger, ProxyCache *proxy_cache);
 
   ~RpcRetrier();
 
@@ -121,6 +116,9 @@ class RpcRetrier {
       RpcCommand* rpc, const Status& why_status,
       BackoffStrategy strategy = BackoffStrategy::kLinear);
 
+  CHECKED_STATUS DelayedRetry(
+      RpcCommand* rpc, const Status& why_status, MonoDelta add_delay);
+
   RpcController* mutable_controller() { return &controller_; }
   const RpcController& controller() const { return controller_; }
 
@@ -128,9 +126,9 @@ class RpcRetrier {
   // Do not forget that setting deadline in RpcController is NOT thread safe.
   RpcController* PrepareController(MonoDelta single_call_timeout);
 
-  MonoTime deadline() const { return deadline_; }
+  CoarseTimePoint deadline() const { return deadline_; }
 
-  const std::shared_ptr<Messenger>& messenger() const {
+  rpc::Messenger* messenger() const {
     return messenger_;
   }
 
@@ -149,20 +147,27 @@ class RpcRetrier {
   }
 
  private:
+  CHECKED_STATUS DoDelayedRetry(RpcCommand* rpc, const Status& why_status);
+
   // Called when an RPC comes up for retrying. Actually sends the RPC.
   void DoRetry(RpcCommand* rpc, const Status& status);
 
   // The next sent rpc will be the nth attempt (indexed from 1).
   int attempt_num_ = 1;
 
+  // Delay used for the last DelayedRetry. Depends on argument history of DelayedRetry calls.
+  MonoDelta retry_delay_ = MonoDelta::kZero;
+
+  const CoarseTimePoint start_;
+
   // If the remote end is busy, the RPC will be retried (with a small
   // delay) until this deadline is reached.
   //
   // May be uninitialized.
-  const MonoTime deadline_;
+  const CoarseTimePoint deadline_;
 
   // Messenger to use when sending the RPC.
-  std::shared_ptr<Messenger> messenger_;
+  Messenger* messenger_ = nullptr;
 
   ProxyCache& proxy_cache_;
 
@@ -173,7 +178,7 @@ class RpcRetrier {
   // Errors from the server take precedence over timeout errors.
   Status last_error_;
 
-  std::atomic<int64_t> task_id_{-1};
+  std::atomic<ScheduledTaskId> task_id_{kInvalidTaskId};
 
   std::atomic<RpcRetrierState> state_{RpcRetrierState::kIdle};
 
@@ -183,9 +188,7 @@ class RpcRetrier {
 // An in-flight remote procedure call to some server.
 class Rpc : public RpcCommand {
  public:
-  Rpc(const MonoTime& deadline,
-      const std::shared_ptr<Messenger>& messenger,
-      ProxyCache* proxy_cache)
+  Rpc(CoarseTimePoint deadline, Messenger* messenger, ProxyCache* proxy_cache)
       : retrier_(deadline, messenger, proxy_cache) {
   }
 
@@ -194,11 +197,13 @@ class Rpc : public RpcCommand {
   // Returns the number of times this RPC has been sent. Will always be at
   // least one.
   int num_attempts() const { return retrier().attempt_num(); }
-  MonoTime deadline() const override { return retrier_.deadline(); }
+  CoarseTimePoint deadline() const override { return retrier_.deadline(); }
 
   void Abort() override {
     retrier_.Abort();
   }
+
+  void ScheduleRetry(const Status& status);
 
  protected:
   const RpcRetrier& retrier() const { return retrier_; }
@@ -216,6 +221,8 @@ class Rpc : public RpcCommand {
   DISALLOW_COPY_AND_ASSIGN(Rpc);
 };
 
+YB_STRONGLY_TYPED_BOOL(RequestShutdown);
+
 class Rpcs {
  public:
   explicit Rpcs(std::mutex* mutex = nullptr);
@@ -230,6 +237,8 @@ class Rpcs {
   void RegisterAndStart(RpcCommandPtr call, Handle* handle);
   RpcCommandPtr Unregister(Handle* handle);
   void Abort(std::initializer_list<Handle*> list);
+  // Request all active calls to abort.
+  void RequestAbortAll();
   Rpcs::Handle Prepare();
 
   RpcCommandPtr Unregister(Handle handle) {
@@ -239,6 +248,10 @@ class Rpcs {
   Handle InvalidHandle() { return calls_.end(); }
 
  private:
+  // Requests all active calls to abort. Returns deadline for waiting on abort completion.
+  // If shutdown is true - switches Rpcs to shutting down state.
+  CoarseTimePoint DoRequestAbortAll(RequestShutdown shutdown);
+
   boost::optional<std::mutex> mutex_holder_;
   std::mutex* mutex_;
   std::condition_variable cond_;

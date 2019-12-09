@@ -12,7 +12,6 @@ SUBDIRS = \
 		bloom		\
 		btree_gin	\
 		btree_gist	\
-		chkpass		\
 		citext		\
 		cube		\
 		dblink		\
@@ -49,8 +48,8 @@ SUBDIRS = \
 		tsm_system_rows \
 		tsm_system_time \
 		unaccent	\
-		vacuumlo	\
-		yb_fdw
+		vacuumlo    \
+		yb_pg_metrics
 
 ifeq ($(with_openssl),yes)
 SUBDIRS += sslinfo
@@ -77,15 +76,15 @@ ALWAYS_SUBDIRS += sepgsql
 endif
 
 ifeq ($(with_perl),yes)
-SUBDIRS += hstore_plperl
+SUBDIRS += hstore_plperl jsonb_plperl
 else
-ALWAYS_SUBDIRS += hstore_plperl
+ALWAYS_SUBDIRS += hstore_plperl jsonb_plperl
 endif
 
 ifeq ($(with_python),yes)
-SUBDIRS += hstore_plpython ltree_plpython
+SUBDIRS += hstore_plpython jsonb_plpython ltree_plpython
 else
-ALWAYS_SUBDIRS += hstore_plpython ltree_plpython
+ALWAYS_SUBDIRS += hstore_plpython jsonb_plpython ltree_plpython
 endif
 
 # Missing:

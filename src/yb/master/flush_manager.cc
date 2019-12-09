@@ -89,10 +89,12 @@ Status FlushManager::FlushTables(const FlushTablesRequestPB* req,
 
   DCHECK_ONLY_NOTNULL(table.get());
 
+  const bool is_compaction = req->is_compaction();
+
   // Send FlushTablets requests to all Tablet Servers (one TS - one request).
   for (const auto& ts : ts_tablet_map) {
     // Using last table async task queue.
-    SendFlushTabletsRequest(ts.first, table, ts.second, flush_id);
+    SendFlushTabletsRequest(ts.first, table, ts.second, flush_id, is_compaction);
   }
 
   resp->set_flush_request_id(flush_id);
@@ -131,9 +133,10 @@ Status FlushManager::IsFlushTablesDone(const IsFlushTablesDoneRequestPB* req,
 void FlushManager::SendFlushTabletsRequest(const TabletServerId& ts_uuid,
                                            const scoped_refptr<TableInfo>& table,
                                            const vector<TabletId>& tablet_ids,
-                                           const FlushRequestId& flush_id) {
+                                           const FlushRequestId& flush_id,
+                                           const bool is_compaction) {
   auto call = std::make_shared<AsyncFlushTablets>(
-      master_, catalog_manager_->WorkerPool(), ts_uuid, table, tablet_ids, flush_id);
+      master_, catalog_manager_->WorkerPool(), ts_uuid, table, tablet_ids, flush_id, is_compaction);
   table->AddTask(call);
   WARN_NOT_OK(call->Run(), "Failed to send flush tablets request");
 }
@@ -142,7 +145,7 @@ void FlushManager::HandleFlushTabletsResponse(const FlushRequestId& flush_id,
                                               const TabletServerId& ts_uuid,
                                               const Status& status) {
   LOG(INFO) << "Handling Flush Tablets Response from TS " << ts_uuid
-            << " Status:" << status << " Flush request id: " << flush_id;
+            << ". Status: " << status << ". Flush request id: " << flush_id;
 
   std::lock_guard<LockType> l(lock_);
   TRACE("Acquired flush manager lock");

@@ -43,7 +43,9 @@
 #include <gtest/gtest.h>
 
 #include "yb/common/partial_row.h"
+#include "yb/common/ql_expr.h"
 #include "yb/common/ql_protocol_util.h"
+#include "yb/common/ql_value.h"
 #include "yb/common/row.h"
 #include "yb/common/schema.h"
 #include "yb/gutil/strings/substitute.h"
@@ -394,7 +396,7 @@ class TabletTestBase : public YBTabletTest {
 
     QLTableRow row;
     QLValue value;
-    while ((**iter).HasNext()) {
+    while (ASSERT_RESULT((**iter).HasNext())) {
       ASSERT_OK_FAST((**iter).NextRow(&row));
 
       if (VLOG_IS_ON(2)) {

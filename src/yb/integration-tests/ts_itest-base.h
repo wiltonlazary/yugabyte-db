@@ -40,6 +40,7 @@
 #include "yb/client/client.h"
 #include "yb/client/client-test-util.h"
 #include "yb/client/schema-internal.h"
+#include "yb/client/table.h"
 #include "yb/client/table_handle.h"
 
 #include "yb/consensus/quorum_util.h"
@@ -88,10 +89,6 @@ class TabletServerIntegrationTestBase : public TabletServerTestBase {
  public:
   TabletServerIntegrationTestBase() : random_(SeedRandom()) {}
 
-  void SetUp() override {
-    TabletServerTestBase::SetUp();
-  }
-
   void AddExtraFlags(const std::string& flags_str, std::vector<std::string>* flags) {
     if (flags_str.empty()) {
       return;
@@ -103,8 +100,8 @@ class TabletServerIntegrationTestBase : public TabletServerTestBase {
   }
 
   void CreateCluster(const std::string& data_root_path,
-                     const std::vector<std::string>& non_default_ts_flags,
-                     const std::vector<std::string>& non_default_master_flags) {
+                     const std::vector<std::string>& non_default_ts_flags = {},
+                     const std::vector<std::string>& non_default_master_flags = {}) {
 
     LOG(INFO) << "Starting cluster with:";
     LOG(INFO) << "--------------";
@@ -137,7 +134,7 @@ class TabletServerIntegrationTestBase : public TabletServerTestBase {
     AddExtraFlags(FLAGS_ts_flags, &opts.extra_tserver_flags);
     AddExtraFlags(FLAGS_master_flags, &opts.extra_master_flags);
 
-    cluster_.reset(new ExternalMiniClusterClass(opts));
+    cluster_.reset(new ExternalMiniCluster(opts));
     ASSERT_OK(cluster_->Start());
     inspect_.reset(new itest::ExternalMiniClusterFsInspector(cluster_.get()));
     CreateTSProxies();
@@ -417,22 +414,25 @@ class TabletServerIntegrationTestBase : public TabletServerTestBase {
   }
 
   virtual void TearDown() override {
+    client_.reset();
     if (cluster_) {
       cluster_->Shutdown();
     }
     tablet_servers_.clear();
+    TabletServerTestBase::TearDown();
   }
 
-  void CreateClient(std::shared_ptr<client::YBClient>* client) {
+  Result<std::unique_ptr<client::YBClient>> CreateClient() {
     // Connect to the cluster.
-    ASSERT_OK(client::YBClientBuilder()
-                     .add_master_server_addr(yb::ToString(cluster_->master()->bound_rpc_addr()))
-                     .Build(client));
+    return client::YBClientBuilder()
+               .add_master_server_addr(yb::ToString(cluster_->master()->bound_rpc_addr()))
+               .Build();
   }
 
   // Create a table with a single tablet.
   void CreateTable() {
-    ASSERT_OK(client_->CreateNamespaceIfNotExists(kTableName.namespace_name()));
+    ASSERT_OK(client_->CreateNamespaceIfNotExists(kTableName.namespace_name(),
+                                                  kTableName.namespace_type()));
 
     ASSERT_OK(table_.Create(kTableName, 1, client::YBSchema(schema_), client_.get()));
   }
@@ -443,7 +443,7 @@ class TabletServerIntegrationTestBase : public TabletServerTestBase {
   void BuildAndStart(const std::vector<std::string>& ts_flags = std::vector<std::string>(),
                      const std::vector<std::string>& master_flags = std::vector<std::string>()) {
     CreateCluster("raft_consensus-itest-cluster", ts_flags, master_flags);
-    ASSERT_NO_FATALS(CreateClient(&client_));
+    client_ = ASSERT_RESULT(CreateClient());
     ASSERT_NO_FATALS(CreateTable());
     WaitForTSAndReplicas();
     CHECK_GT(tablet_replicas_.size(), 0);
@@ -462,8 +462,7 @@ class TabletServerIntegrationTestBase : public TabletServerTestBase {
   }
 
  protected:
-  typedef YB_EDITION_NS_PREFIX ExternalMiniCluster ExternalMiniClusterClass;
-  gscoped_ptr<ExternalMiniClusterClass> cluster_;
+  std::unique_ptr<ExternalMiniCluster> cluster_;
   gscoped_ptr<itest::ExternalMiniClusterFsInspector> inspect_;
 
   // Maps server uuid to TServerDetails
@@ -471,7 +470,7 @@ class TabletServerIntegrationTestBase : public TabletServerTestBase {
   // Maps tablet to all replicas.
   TabletReplicaMap tablet_replicas_;
 
-  std::shared_ptr<client::YBClient> client_;
+  std::unique_ptr<client::YBClient> client_;
   client::TableHandle table_;
   std::string tablet_id_;
 

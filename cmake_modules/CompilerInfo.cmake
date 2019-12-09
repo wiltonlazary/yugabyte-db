@@ -31,9 +31,11 @@
 #
 # Sets COMPILER_FAMILY to 'clang' or 'gcc'
 # Sets COMPILER_VERSION to the version
+message("YB_COMPILER_TYPE env var: $ENV{YB_COMPILER_TYPE}")
+message("CMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}")
 execute_process(COMMAND "${CMAKE_CXX_COMPILER}" -v
                 ERROR_VARIABLE COMPILER_VERSION_FULL)
-message(INFO " ${COMPILER_VERSION_FULL}")
+message("Compiler version information:\n${COMPILER_VERSION_FULL}")
 
 # clang on Linux and Mac OS X before 10.9
 if("${COMPILER_VERSION_FULL}" MATCHES ".*clang version.*")
@@ -58,6 +60,10 @@ elseif("${COMPILER_VERSION_FULL}" MATCHES ".*[(]clang-[0-9.]+[)].*")
     COMPILER_VERSION "${COMPILER_VERSION_FULL}")
 
 # gcc
+elseif("${COMPILER_VERSION_FULL}" MATCHES ".*gcc version 8.*")
+  set(COMPILER_FAMILY "gcc8")
+  string(REGEX REPLACE ".*gcc version ([0-9\\.]+).*" "\\1"
+    COMPILER_VERSION "${COMPILER_VERSION_FULL}")
 elseif("${COMPILER_VERSION_FULL}" MATCHES ".*gcc version.*")
   set(COMPILER_FAMILY "gcc")
   string(REGEX REPLACE ".*gcc version ([0-9\\.]+).*" "\\1"
@@ -66,4 +72,3 @@ else()
   message(FATAL_ERROR "Unknown compiler. Version info:\n${COMPILER_VERSION_FULL}")
 endif()
 message("Selected compiler family '${COMPILER_FAMILY}', version '${COMPILER_VERSION}'")
-

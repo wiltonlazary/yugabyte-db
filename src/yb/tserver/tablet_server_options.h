@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "yb/server/server_base_options.h"
+#include "yb/rocksdb/listener.h"
 
 namespace yb {
 namespace tserver {
@@ -51,8 +52,10 @@ class TabletServerOptions : public yb::server::ServerBaseOptions {
 
   static const char* kServerType;
 
+  std::vector<std::shared_ptr<rocksdb::EventListener>> listeners;
+
  private:
-  explicit TabletServerOptions(server::ServerBaseOptions::addresses_shared_ptr master_addresses);
+  explicit TabletServerOptions(server::MasterAddressesPtr master_addresses);
 
   void ValidateMasterAddresses() const;
 };

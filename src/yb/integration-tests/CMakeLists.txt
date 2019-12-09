@@ -48,8 +48,6 @@ set(INTEGRATION_TESTS_SRCS
 
 add_library(integration-tests ${INTEGRATION_TESTS_SRCS})
 target_link_libraries(integration-tests
-  cpp_redis
-  tacopie
   tserver
   tserver_test_util
   master
@@ -58,15 +56,23 @@ target_link_libraries(integration-tests
   yb_client
   yb_client_test_util
   yb_fs
+  yb-redisserver-test
   yb_test_util
-  yb-redis)
+  yb-redis
+  yb_pgwrapper
+  ${INTEGRATION_TESTS_LIB_EXTENSIONS})
+
 add_dependencies(integration-tests
   yb-tserver
   yb-master)
 
+add_library(cdc_test_util cdc_test_util.cc)
+target_link_libraries(cdc_test_util yb_test_util cdc_service_proto tserver)
+
 # Tests
 set(YB_TEST_LINK_LIBS
-    integration-tests yb_client yb_tools_util ql-dml-test-base ${YB_MIN_TEST_LIBS})
+    integration-tests yb_client yb_tools_util ql-dml-test-base rpc_test_util ${YB_MIN_TEST_LIBS})
+
 ADD_YB_TEST(alter_table-test)
 ADD_YB_TEST(alter_table-randomized-test)
 ADD_YB_TEST(registration-test)
@@ -74,12 +80,14 @@ ADD_YB_TEST(clock_synchronization-itest)
 ADD_YB_TEST(client_failover-itest)
 ADD_YB_TEST(client-stress-test)
 ADD_YB_TEST(cluster_trace-test)
+ADD_YB_TEST(tablet_server-itest)
 # Tests which fail on purpose for checking Jenkins test failures reporting, disabled
 # (commented out) by default:
 # ADD_YB_TEST(test_failures-test)
 # ADD_YB_TEST(non_gtest_failures-test.sh)
 
 # Not sure if we really need RUN_SERIAL here as this might not be a resource-intensive test.
+ADD_YB_TEST(compaction-test)
 ADD_YB_TEST(master_replication-itest)
 ADD_YB_TEST(master_sysnamespace-itest)
 ADD_YB_TEST(master_path_handlers-itest)
@@ -91,6 +99,7 @@ ADD_YB_TEST(flush-test)
 ADD_YB_TEST(ts_tablet_manager-itest)
 ADD_YB_TEST(ts_recovery-itest)
 ADD_YB_TEST(create-table-stress-test)
+ADD_YB_TEST(master-partitioned-test)
 ADD_YB_TEST(delete_table-test)
 ADD_YB_TEST(external_mini_cluster-test)
 ADD_YB_TEST(linked_list-test)
@@ -101,11 +110,28 @@ ADD_YB_TEST(create-table-itest)
 ADD_YB_TEST(placement_info-itest)
 ADD_YB_TEST(kv_table-test)
 ADD_YB_TEST(kv_table_ts_failover-test)
+ADD_YB_TEST(kv_table_ts_failover_write_if-test)
 ADD_YB_TEST(flush_under_load-test)
 ADD_YB_TEST(stepdown_under_load-test)
 ADD_YB_TEST(full_stack-insert-scan-test)
 ADD_YB_TEST(redis_table-test)
 ADD_YB_TEST(update_scan_delta_compact-test)
+ADD_YB_TEST(log_version-test)
+
+set(YB_TEST_LINK_LIBS_SAVED ${YB_TEST_LINK_LIBS})
+set(YB_TEST_LINK_LIBS ${YB_TEST_LINK_LIBS} cassandra)
+set(CASS_DRIVER_VERSION "2.9.0-yb-4")
+set(CASS_DRIVER_INTERNAL_INCLUDE "${YB_THIRDPARTY_DIR}/src/cassandra-cpp-driver-${CASS_DRIVER_VERSION}/src")
+ADD_YB_TEST(cassandra_cpp_driver-test)
+target_include_directories(cassandra_cpp_driver-test PUBLIC
+  ${CASS_DRIVER_INTERNAL_INCLUDE}
+  "${CASS_DRIVER_INTERNAL_INCLUDE}/third_party/sparsehash/src")
+
+if("${COMPILER_FAMILY}" STREQUAL "gcc8")
+  target_compile_options(cassandra_cpp_driver-test PUBLIC "-Wno-class-memaccess")
+endif()
+
+set(YB_TEST_LINK_LIBS ${YB_TEST_LINK_LIBS_SAVED})
 
 # Additional tests
 if(YB_ENT_CURRENT_SOURCE_DIR)

@@ -38,10 +38,13 @@
 #include <string>
 
 #include <glog/logging.h>
+#include <boost/container/small_vector.hpp>
 
 #include "yb/gutil/casts.h"
+#include "yb/util/flags.h"
 
 #include "yb/rocksdb/db/filename.h"
+#include "yb/rocksdb/db/file_numbers.h"
 #include "yb/rocksdb/db/internal_stats.h"
 #include "yb/rocksdb/db/log_reader.h"
 #include "yb/rocksdb/db/log_writer.h"
@@ -333,6 +336,14 @@ SstFileMetaData::BoundaryValues ConvertBoundaryValues(const FileMetaData::Bounda
 
 VersionStorageInfo::~VersionStorageInfo() { delete[] files_; }
 
+uint64_t VersionStorageInfo::NumFiles() const {
+  uint64_t result = 0;
+  for (int level = num_non_empty_levels_; level-- > 0;) {
+    result += files_[level].size();
+  }
+  return result;
+}
+
 Version::~Version() {
   assert(refs_ == 0);
 
@@ -345,14 +356,7 @@ Version::~Version() {
     for (size_t i = 0; i < storage_info_.files_[level].size(); i++) {
       FileMetaData* f = storage_info_.files_[level][i];
       assert(f->refs > 0);
-      f->refs--;
-      if (f->refs <= 0) {
-        if (f->table_reader_handle) {
-          cfd_->table_cache()->ReleaseHandle(f->table_reader_handle);
-          f->table_reader_handle = nullptr;
-        }
-        vset_->obsolete_files_.push_back(f);
-      }
+      vset_->UnrefFile(cfd_, f);
     }
   }
 }
@@ -747,6 +751,8 @@ void Version::GetColumnFamilyMetaData(ColumnFamilyMetaData* cf_meta) {
           file_path,
           file->fd.GetTotalFileSize(),
           file->fd.GetBaseFileSize(),
+          file->fd.GetBaseFileSize() +
+              file->raw_key_size + file->raw_value_size,
           ConvertBoundaryValues(file->smallest),
           ConvertBoundaryValues(file->largest),
           file->being_compacted);
@@ -2050,15 +2056,7 @@ std::string Version::DebugString(bool hex) const {
     r.append(" ---\n");
     const std::vector<FileMetaData*>& files = storage_info_.files_[level];
     for (size_t i = 0; i < files.size(); i++) {
-      r.push_back(' ');
-      AppendNumberTo(&r, files[i]->fd.GetNumber());
-      r.push_back(':');
-      AppendNumberTo(&r, files[i]->fd.GetTotalFileSize());
-      r.append("[");
-      r.append(files[i]->smallest.key.DebugString(hex));
-      r.append(" .. ");
-      r.append(files[i]->largest.key.DebugString(hex));
-      r.append("]\n");
+      r.append(files[i]->ToString());
     }
   }
   return r;
@@ -2169,12 +2167,14 @@ Status VersionSet::LogAndApply(ColumnFamilyData* column_family_data,
   Version* v = nullptr;
   std::unique_ptr<BaseReferencedVersionBuilder> builder_guard(nullptr);
 
-  // process all requests in the queue
+  // Process all requests in the queue.
   ManifestWriter* last_writer = &w;
   assert(!manifest_writers_.empty());
   assert(manifest_writers_.front() == &w);
+
+  UserFrontierPtr flushed_frontier_override;
   if (edit->IsColumnFamilyManipulation()) {
-    // no group commits for column family add or drop
+    // No group commits for column family add or drop.
     LogAndApplyCFHelper(edit);
     batch_edits.push_back(edit);
   } else {
@@ -2184,14 +2184,31 @@ Status VersionSet::LogAndApply(ColumnFamilyData* column_family_data,
     for (const auto& writer : manifest_writers_) {
       if (writer->edit->IsColumnFamilyManipulation() ||
           writer->cfd->GetID() != column_family_data->GetID()) {
-        // no group commits for column family add or drop
-        // also, group commits across column families are not supported
+        // No group commits for column family add or drop.
+        // Also, group commits across column families are not supported.
         break;
       }
+      FrontierModificationMode frontier_mode = FrontierModificationMode::kUpdate;
+      const bool force_flushed_frontier = writer->edit->force_flushed_frontier_;
+      if (force_flushed_frontier) {
+        if (writer != &w) {
+          // No group commit for edits that force a particular value of flushed frontier, either.
+          // (Also see the logic at the end of the for loop body.)
+          break;
+        }
+        new_descriptor_log = true;
+        flushed_frontier_override = edit->flushed_frontier_;
+      }
       last_writer = writer;
-      LogAndApplyHelper(column_family_data, builder, v, last_writer->edit, mu);
+      LogAndApplyHelper(column_family_data, builder, last_writer->edit, mu);
       batch_edits.push_back(last_writer->edit);
+
+      if (force_flushed_frontier) {
+        // This is also needed to disable group commit for flushed-frontier-forcing edits.
+        break;
+      }
     }
+
     builder->SaveTo(v->storage_info());
   }
 
@@ -2211,7 +2228,7 @@ Status VersionSet::LogAndApply(ColumnFamilyData* column_family_data,
   }
 
   if (new_descriptor_log) {
-    // if we're writing out new snapshot make sure to persist max column family
+    // If we're writing out new snapshot make sure to persist max column family.
     if (column_family_set_->GetMaxColumnFamily() > 0) {
       edit->SetMaxColumnFamily(column_family_set_->GetMaxColumnFamily());
     }
@@ -2234,15 +2251,16 @@ Status VersionSet::LogAndApply(ColumnFamilyData* column_family_data,
     }
 
     // This is fine because everything inside of this block is serialized --
-    // only one thread can be here at the same time
+    // only one thread can be here at the same time.
     if (new_descriptor_log) {
-      // create manifest file
+      // Create a new manifest file.
       RLOG(InfoLogLevel::INFO_LEVEL, db_options_->info_log,
           "Creating manifest %" PRIu64 "\n", pending_manifest_file_number_);
       unique_ptr<WritableFile> descriptor_file;
       EnvOptions opt_env_opts = env_->OptimizeForManifestWrite(env_options_);
+      descriptor_log_file_name_ = DescriptorFileName(dbname_, pending_manifest_file_number_);
       s = NewWritableFile(
-          env_, DescriptorFileName(dbname_, pending_manifest_file_number_),
+          env_, descriptor_log_file_name_,
           &descriptor_file, opt_env_opts);
       if (s.ok()) {
         descriptor_file->SetPreallocationBlockSize(
@@ -2250,8 +2268,14 @@ Status VersionSet::LogAndApply(ColumnFamilyData* column_family_data,
 
         unique_ptr<WritableFileWriter> file_writer(
             new WritableFileWriter(std::move(descriptor_file), opt_env_opts));
-        descriptor_log_.reset(new log::Writer(std::move(file_writer), 0, false));
-        s = WriteSnapshot(descriptor_log_.get());
+        descriptor_log_.reset(new log::Writer(
+            std::move(file_writer), /* log_number */ 0, /* recycle_log_files */ false));
+        // This will write a snapshot containing metadata for all files in this DB. If we are
+        // forcing a particular value of the flushed frontier, we need to set it in this snapshot
+        // version edit as well.
+        s = WriteSnapshot(descriptor_log_.get(), flushed_frontier_override);
+      } else {
+        descriptor_log_file_name_ = "";
       }
     }
 
@@ -2260,7 +2284,7 @@ Status VersionSet::LogAndApply(ColumnFamilyData* column_family_data,
       v->PrepareApply(mutable_cf_options, true);
     }
 
-    // Write new record to MANIFEST log
+    // Write new records to MANIFEST log.
     if (s.ok()) {
       for (auto& e : batch_edits) {
         std::string record;
@@ -2285,6 +2309,7 @@ Status VersionSet::LogAndApply(ColumnFamilyData* column_family_data,
       }
     }
 
+    std::string obsolete_manifest;
     // If we just created a new descriptor file, install it by writing a
     // new CURRENT file that points to it.
     if (s.ok() && new_descriptor_log) {
@@ -2292,13 +2317,13 @@ Status VersionSet::LogAndApply(ColumnFamilyData* column_family_data,
         db_options_->disableDataSync);
       // Leave the old file behind since PurgeObsoleteFiles will take care of it
       // later. It's unsafe to delete now since file deletion may be disabled.
-      obsolete_manifests_.emplace_back(
-          DescriptorFileName("", manifest_file_number_));
+      obsolete_manifest = DescriptorFileName("", manifest_file_number_);
     }
 
     if (s.ok()) {
       // find offset in manifest file where this version is stored.
-      new_manifest_file_size = descriptor_log_->file()->GetFileSize();
+      s = db_options_->get_checkpoint_env()->GetFileSize(
+          descriptor_log_file_name_, &new_manifest_file_size);
     }
 
     if (edit->is_column_family_drop_) {
@@ -2310,6 +2335,10 @@ Status VersionSet::LogAndApply(ColumnFamilyData* column_family_data,
     LogFlush(db_options_->info_log);
     TEST_SYNC_POINT("VersionSet::LogAndApply:WriteManifestDone");
     mu->Lock();
+
+    if (!obsolete_manifest.empty()) {
+      obsolete_manifests_.push_back(std::move(obsolete_manifest));
+    }
   }
 
   // Install the new version
@@ -2343,8 +2372,10 @@ Status VersionSet::LogAndApply(ColumnFamilyData* column_family_data,
     manifest_file_number_ = pending_manifest_file_number_;
     manifest_file_size_ = new_manifest_file_size;
     prev_log_number_ = edit->prev_log_number_.get_value_or(0);
-    if (edit->flushed_frontier_) {
-      SetFlushedFrontier(edit->flushed_frontier_);
+    if (flushed_frontier_override) {
+      flushed_frontier_ = flushed_frontier_override;
+    } else if (edit->flushed_frontier_) {
+      UpdateFlushedFrontier(edit->flushed_frontier_);
     }
   } else {
     RLOG(InfoLogLevel::ERROR_LEVEL, db_options_->info_log,
@@ -2393,9 +2424,11 @@ void VersionSet::LogAndApplyCFHelper(VersionEdit* edit) {
   }
 }
 
-void VersionSet::LogAndApplyHelper(ColumnFamilyData* cfd,
-                                   VersionBuilder* builder, Version* v,
-                                   VersionEdit* edit, InstrumentedMutex* mu) {
+void VersionSet::LogAndApplyHelper(
+    ColumnFamilyData* cfd,
+    VersionBuilder* builder,
+    VersionEdit* edit,
+    InstrumentedMutex* mu) {
   mu->AssertHeld();
   assert(!edit->IsColumnFamilyManipulation());
 
@@ -2409,6 +2442,10 @@ void VersionSet::LogAndApplyHelper(ColumnFamilyData* cfd,
   }
   edit->SetNextFile(next_file_number_.load());
   edit->SetLastSequence(LastSequence());
+
+  if (flushed_frontier_ && !edit->force_flushed_frontier_) {
+    edit->UpdateFlushedFrontier(flushed_frontier_);
+  }
 
   builder->Apply(edit);
 }
@@ -2424,9 +2461,10 @@ struct LogReporter : public log::Reader::Reporter {
 
 class ManifestReader {
  public:
-  ManifestReader(Env* env, const EnvOptions& env_options, BoundaryValuesExtractor* extractor,
-                 const std::string& dbname)
-      : env_(env), env_options_(env_options), extractor_(extractor), dbname_(dbname) {}
+  ManifestReader(Env* env, Env* checkpoint_env, const EnvOptions& env_options,
+                 BoundaryValuesExtractor* extractor, const std::string& dbname)
+      : env_(env), checkpoint_env_(checkpoint_env), env_options_(env_options),
+        extractor_(extractor), dbname_(dbname) {}
 
   Status OpenManifest() {
     auto status = ReadManifestFilename();
@@ -2449,7 +2487,7 @@ class ManifestReader {
       }
       manifest_file_reader.reset(new SequentialFileReader(std::move(manifest_file)));
     }
-    status = env_->GetFileSize(manifest_filename_, &current_manifest_file_size_);
+    status = checkpoint_env_->GetFileSize(manifest_filename_, &current_manifest_file_size_);
     if (!status.ok()) {
       return status;
     }
@@ -2494,7 +2532,12 @@ class ManifestReader {
     return Status::OK();
   }
 
+  // In plaintext cluster, this is a default env, but in encrypted cluster, this encrypts on write
+  // and decrypts on read.
   Env* const env_;
+  // Default env used to checkpoint files. In encrypted cluster, we don't want to decrypt
+  // checkpointed files, so using the default env preserves file encryption.
+  Env* const checkpoint_env_;
   const EnvOptions& env_options_;
   BoundaryValuesExtractor* extractor_;
   std::string dbname_;
@@ -2550,8 +2593,8 @@ Status VersionSet::Recover(
   uint64_t current_manifest_file_size;
   std::string current_manifest_filename;
   {
-    ManifestReader manifest_reader(env_, env_options_, db_options_->boundary_extractor.get(),
-                                   dbname_);
+    ManifestReader manifest_reader(env_, db_options_->get_checkpoint_env(), env_options_,
+                                   db_options_->boundary_extractor.get(), dbname_);
     auto status = manifest_reader.OpenManifest();
     if (!status.ok()) {
       return status;
@@ -2682,7 +2725,13 @@ Status VersionSet::Recover(
       }
 
       if (edit.flushed_frontier_) {
-        flushed_frontier = std::move(edit.flushed_frontier_);
+        UpdateUserFrontier(
+            &flushed_frontier, edit.flushed_frontier_, UpdateUserValueType::kLargest);
+        VLOG(1) << "Updating flushed frontier with that from edit: "
+                << edit.flushed_frontier_->ToString()
+                << ", new flushed froniter: " << flushed_frontier->ToString();
+      } else {
+        VLOG(1) << "No flushed frontier found in edit";
       }
     }
     if (s.IsEndOfFile()) {
@@ -2752,7 +2801,7 @@ Status VersionSet::Recover(
     SetLastSequenceNoSanityChecking(last_sequence);
     prev_log_number_ = previous_log_number;
     if (flushed_frontier) {
-      SetFlushedFrontierNoSanityChecking(std::move(flushed_frontier));
+      UpdateFlushedFrontierNoSanityChecking(std::move(flushed_frontier));
     }
 
     RLOG(InfoLogLevel::INFO_LEVEL, db_options_->info_log,
@@ -2783,8 +2832,8 @@ Status VersionSet::Recover(
 Status VersionSet::Import(const std::string& source_dir,
                           SequenceNumber seqno,
                           VersionEdit* edit) {
-  ManifestReader manifest_reader(env_, env_options_, db_options_->boundary_extractor.get(),
-                                 source_dir);
+  ManifestReader manifest_reader(env_, db_options_->get_checkpoint_env(), env_options_,
+                                 db_options_->boundary_extractor.get(), source_dir);
   auto status = manifest_reader.OpenManifest();
   if (!status.ok()) {
     return status;
@@ -2902,12 +2951,12 @@ Status VersionSet::ListColumnFamilies(std::vector<std::string>* column_families,
 
   unique_ptr<SequentialFileReader> file_reader;
   {
-  unique_ptr<SequentialFile> file;
-  s = env->NewSequentialFile(dscname, &file, soptions);
-  if (!s.ok()) {
-    return s;
-  }
-  file_reader.reset(new SequentialFileReader(std::move(file)));
+    unique_ptr<SequentialFile> file;
+    s = env->NewSequentialFile(dscname, &file, soptions);
+    if (!s.ok()) {
+      return s;
+    }
+    file_reader.reset(new SequentialFileReader(std::move(file)));
   }
 
   std::map<uint32_t, std::string> column_family_names;
@@ -3236,6 +3285,25 @@ Status VersionSet::DumpManifest(const Options& options, const std::string& dscna
 }
 #endif  // ROCKSDB_LITE
 
+// Set the last sequence number to s.
+void VersionSet::SetLastSequence(SequenceNumber s) {
+#ifndef NDEBUG
+  EnsureNonDecreasingLastSequence(LastSequence(), s);
+#endif
+  SetLastSequenceNoSanityChecking(s);
+}
+
+// Set last sequence number without verifying that it always keeps increasing.
+void VersionSet::SetLastSequenceNoSanityChecking(SequenceNumber s) {
+  last_sequence_.store(s, std::memory_order_release);
+}
+
+// Set the last flushed op id / hybrid time / history cutoff to the specified set of values.
+void VersionSet::UpdateFlushedFrontier(UserFrontierPtr values) {
+  EnsureNonDecreasingFlushedFrontier(FlushedFrontier(), *values);
+  UpdateFlushedFrontierNoSanityChecking(std::move(values));
+}
+
 void VersionSet::MarkFileNumberUsedDuringRecovery(uint64_t number) {
   // only called during recovery which is single threaded, so this works because
   // there can't be concurrent calls
@@ -3259,10 +3327,10 @@ CHECKED_STATUS AddEdit(const VersionEdit& edit, const DBOptions* db_options, log
 
 } // namespace
 
-Status VersionSet::WriteSnapshot(log::Writer* log) {
+Status VersionSet::WriteSnapshot(log::Writer* log, UserFrontierPtr flushed_frontier_override) {
   // TODO: Break up into multiple records to reduce memory usage on recovery?
 
-  // WARNING: This method doesn't hold a mutex!!
+  // WARNING: This method doesn't hold a mutex!
 
   // This is done without DB mutex lock held, but only within single-threaded
   // LogAndApply. Column family manipulations can only happen within LogAndApply
@@ -3290,13 +3358,20 @@ Status VersionSet::WriteSnapshot(log::Writer* log) {
       VersionEdit edit;
       edit.SetColumnFamily(cfd->GetID());
 
+      const bool frontier_overridden = !!flushed_frontier_override;
       for (int level = 0; level < cfd->NumberLevels(); level++) {
         for (const auto& f :
              cfd->current()->storage_info()->LevelFiles(level)) {
-          edit.AddCleanedFile(level, *f);
+
+          edit.AddCleanedFile(level, *f, /* suppress_frontiers */ frontier_overridden);
         }
       }
       edit.SetLogNumber(cfd->GetLogNumber());
+      if (flushed_frontier_override) {
+        edit.flushed_frontier_ = flushed_frontier_override;
+      } else {
+        edit.flushed_frontier_ = flushed_frontier_;
+      }
       RETURN_NOT_OK(AddEdit(edit, db_options_, log));
     }
   }
@@ -3506,7 +3581,7 @@ bool VersionSet::VerifyCompactionFileConsistency(Compaction* c) {
 #ifndef NDEBUG
   Version* version = c->column_family_data()->current();
   const VersionStorageInfo* vstorage = version->storage_info();
-  if (c->input_version() != version) {
+  if (c->input_version_number() != version->GetVersionNumber()) {
     RLOG(InfoLogLevel::INFO_LEVEL, db_options_->info_log,
         "[%s] compaction output being applied to a different base version from"
         " input version",
@@ -3589,6 +3664,10 @@ void VersionSet::GetLiveFilesMetaData(std::vector<LiveFileMetaData>* metadata) {
         filemetadata.level = level;
         filemetadata.total_size = file->fd.GetTotalFileSize();
         filemetadata.base_size = file->fd.GetBaseFileSize();
+        // TODO: replace base_size with an accurate metadata size for
+        // uncompressed data. Look into: BlockBasedTableBuilder
+        filemetadata.uncompressed_size = filemetadata.base_size +
+            file->raw_key_size + file->raw_value_size;
         filemetadata.smallest = ConvertBoundaryValues(file->smallest);
         filemetadata.largest = ConvertBoundaryValues(file->largest);
         filemetadata.imported = file->imported;
@@ -3598,14 +3677,14 @@ void VersionSet::GetLiveFilesMetaData(std::vector<LiveFileMetaData>* metadata) {
   }
 }
 
-void VersionSet::GetObsoleteFiles(std::vector<FileMetaData*>* files,
-                                  std::vector<std::string>* manifest_filenames,
-                                  uint64_t min_pending_output) {
+void VersionSet::GetObsoleteFiles(const FileNumbersProvider& pending_outputs,
+                                  std::vector<FileMetaData*>* files,
+                                  std::vector<std::string>* manifest_filenames) {
   assert(manifest_filenames->empty());
   obsolete_manifests_.swap(*manifest_filenames);
   std::vector<FileMetaData*> pending_files;
   for (auto f : obsolete_files_) {
-    if (f->fd.GetNumber() < min_pending_output) {
+    if (!pending_outputs.HasFileNumber(f->fd.GetNumber())) {
       files->push_back(f);
     } else {
       pending_files.push_back(f);
@@ -3642,6 +3721,12 @@ ColumnFamilyData* VersionSet::CreateColumnFamily(
   return new_cfd;
 }
 
+void VersionSet::UnrefFile(ColumnFamilyData* cfd, FileMetaData* f) {
+  if (f->Unref(cfd->table_cache())) {
+    obsolete_files_.push_back(f);
+  }
+}
+
 uint64_t VersionSet::GetNumLiveVersions(Version* dummy_versions) {
   uint64_t count = 0;
   for (Version* v = dummy_versions->next_; v != dummy_versions; v = v->next_) {
@@ -3668,28 +3753,29 @@ uint64_t VersionSet::GetTotalSstFilesSize(Version* dummy_versions) {
   return total_files_size;
 }
 
-#ifndef NDEBUG
 void VersionSet::EnsureNonDecreasingLastSequence(
     SequenceNumber prev_last_seq,
     SequenceNumber new_last_seq) {
   if (new_last_seq < prev_last_seq) {
-    LOG(FATAL) << "New last sequence id " << new_last_seq << " is lower than "
-               << "the previous last sequence " << prev_last_seq;
+    LOG(DFATAL) << "New last sequence id " << new_last_seq << " is lower than "
+                << "the previous last sequence " << prev_last_seq;
   }
 }
 
-void VersionSet::EnsureNonDecreasingFlushedFrontier(const UserFrontier* prev_value,
-                                                  const UserFrontier& new_value) {
+void VersionSet::EnsureNonDecreasingFlushedFrontier(
+    const UserFrontier* prev_value,
+    const UserFrontier& new_value) {
   if (!prev_value) {
     return;
   }
-  auto temp = prev_value->Clone();
-  temp->Update(new_value, UpdateUserValueType::kLargest);
-  if (*temp != new_value) {
-    LOG(FATAL) << "Flushed frontier decreased from " << prev_value->ToString() << " to "
-               << new_value.ToString();
+  if (!prev_value->IsUpdateValid(new_value, UpdateUserValueType::kLargest)) {
+    LOG(DFATAL) << "Attempt to decrease flushed frontier " << prev_value->ToString() << " to "
+                << new_value.ToString();
   }
 }
-#endif
+
+void VersionSet::UpdateFlushedFrontierNoSanityChecking(UserFrontierPtr value) {
+  UpdateUserFrontier(&flushed_frontier_, std::move(value), UpdateUserValueType::kLargest);
+}
 
 }  // namespace rocksdb

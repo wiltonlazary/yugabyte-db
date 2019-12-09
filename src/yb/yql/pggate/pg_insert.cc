@@ -24,14 +24,6 @@ using std::shared_ptr;
 using std::string;
 using namespace std::literals;  // NOLINT
 
-using client::YBClient;
-using client::YBSession;
-using client::YBMetaDataCache;
-using client::YBTable;
-using client::YBTableName;
-using client::YBTableType;
-using client::YBPgsqlWriteOp;
-
 // TODO(neil) This should be derived from a GFLAGS.
 static MonoDelta kSessionTimeout = 60s;
 
@@ -39,107 +31,24 @@ static MonoDelta kSessionTimeout = 60s;
 // PgInsert
 //--------------------------------------------------------------------------------------------------
 
-PgInsert::PgInsert(PgSession::SharedPtr pg_session,
-                   const char *database_name,
-                   const char *schema_name,
-                   const char *table_name)
-    : PgStatement(pg_session, StmtOp::STMT_INSERT),
-      table_name_(database_name, table_name) {
+PgInsert::PgInsert(PgSession::ScopedRefPtr pg_session,
+                   const PgObjectId& table_id,
+                   bool is_single_row_txn)
+    : PgDmlWrite(pg_session, table_id, is_single_row_txn) {
 }
 
 PgInsert::~PgInsert() {
 }
 
-Status PgInsert::Prepare() {
-  RETURN_NOT_OK(pg_session_->LoadTable(table_name_, true, &table_, &col_descs_, &key_col_count_,
-                                       &partition_col_count_));
-  op_.reset(table_->NewPgsqlInsert());
-  req_ = op_->mutable_request();
+void PgInsert::AllocWriteRequest() {
+  // Allocate WRITE operation.
+  client::YBPgsqlWriteOp *insert_op = table_desc_->NewPgsqlInsert();
+  insert_op->set_is_single_row_txn(is_single_row_txn_);
+  auto doc_op = make_shared<PgDocWriteOp>(pg_session_, insert_op);
+  write_req_ = doc_op->write_op()->mutable_request();
 
-  col_values_.resize(col_descs_.size());
-  for (ColumnDesc col : col_descs_) {
-    if (col.is_partition()) {
-      col_values_[col.id()] = req_->add_partition_column_values();
-    } else if (col.is_primary()) {
-      col_values_[col.id()] = req_->add_range_column_values();
-    } else {
-      col_values_[col.id()] = nullptr;
-    }
-  }
-  return Status::OK();
-}
-
-PgsqlExpressionPB *PgInsert::AllocColumnPB(int attr_num) {
-  for (ColumnDesc col : col_descs_) {
-    if (col.attr_num() == attr_num) {
-      if (!col.is_partition() && !col.is_primary()) {
-        PgsqlColumnValuePB* col_pb = req_->add_column_values();
-        col_pb->set_column_id(col.id());
-        col_values_[col.id()] = col_pb->mutable_expr();
-      }
-
-      // Return the reserved space for the value / expression.
-      return col_values_[col.id()];
-    }
-  }
-
-  LOG(FATAL) << "Invalid attr_num (" << attr_num << ") was passed to PGGate";
-  return nullptr;
-}
-
-Status PgInsert::SetColumnInt2(int attr_num, int16_t value) {
-  PgsqlExpressionPB *expr_pb = AllocColumnPB(attr_num);
-  QLValuePB *const_pb = expr_pb->mutable_value();
-  const_pb->set_int16_value(value);
-  return Status::OK();
-}
-
-Status PgInsert::SetColumnInt4(int attr_num, int32_t value) {
-  PgsqlExpressionPB *expr_pb = AllocColumnPB(attr_num);
-  QLValuePB *const_pb = expr_pb->mutable_value();
-  const_pb->set_int32_value(value);
-  return Status::OK();
-}
-
-Status PgInsert::SetColumnInt8(int attr_num, int64_t value) {
-  PgsqlExpressionPB *expr_pb = AllocColumnPB(attr_num);
-  QLValuePB *const_pb = expr_pb->mutable_value();
-  const_pb->set_int64_value(value);
-  return Status::OK();
-}
-
-Status PgInsert::SetColumnFloat4(int attr_num, float value) {
-  PgsqlExpressionPB *expr_pb = AllocColumnPB(attr_num);
-  QLValuePB *const_pb = expr_pb->mutable_value();
-  const_pb->set_float_value(value);
-  return Status::OK();
-}
-
-Status PgInsert::SetColumnFloat8(int attr_num, double value) {
-  PgsqlExpressionPB *expr_pb = AllocColumnPB(attr_num);
-  QLValuePB *const_pb = expr_pb->mutable_value();
-  const_pb->set_double_value(value);
-  return Status::OK();
-}
-
-Status PgInsert::SetColumnText(int attr_num, const char *attr_value, int attr_bytes) {
-  PgsqlExpressionPB *expr_pb = AllocColumnPB(attr_num);
-  QLValuePB *const_pb = expr_pb->mutable_value();
-
-  if (!attr_value || attr_bytes == 0) {
-    const_pb->set_string_value(string());
-  } else {
-    const_pb->set_string_value(string(attr_value, attr_bytes));
-  }
-  return Status::OK();
-}
-
-Status PgInsert::SetColumnSerializedData(int attr_num, const char *attr_value, int attr_bytes) {
-  return STATUS(NotSupported, "Setting serialized values is not yet supported");
-}
-
-Status PgInsert::Exec() {
-  return pg_session_->Apply(op_);
+  // Preparation complete.
+  doc_op_ = doc_op;
 }
 
 }  // namespace pggate

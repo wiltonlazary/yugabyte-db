@@ -16,7 +16,9 @@
 
 #include <memory>
 
+#include "yb/util/result.h"
 #include "yb/util/status.h"
+#include "yb/docdb/doc_key.h"
 
 namespace yb {
 
@@ -39,7 +41,7 @@ class YQLRowwiseIteratorIf {
   // Pure virtual API methods.
   //------------------------------------------------------------------------------------------------
   // Checks whether next row exists.
-  virtual bool HasNext() const = 0;
+  virtual Result<bool> HasNext() const = 0;
 
   // Skip the current row.
   virtual void SkipRow() = 0;
@@ -63,16 +65,19 @@ class YQLRowwiseIteratorIf {
     return false;
   }
 
-  // Checks whether we have processed enough rows for a page and sets the appropriate paging
-  // state in the response object.
-  virtual CHECKED_STATUS SetPagingStateIfNecessary(const QLReadRequestPB& request,
-                                                   const size_t num_rows_skipped,
-                                                   QLResponsePB* response) const {
+  // Retrieves the next key to read after the iterator finishes for the given page.
+  virtual CHECKED_STATUS GetNextReadSubDocKey(docdb::SubDocKey* sub_doc_key) const {
     return Status::OK();
   }
-  virtual CHECKED_STATUS SetPagingStateIfNecessary(const PgsqlReadRequestPB& request,
-                                                   PgsqlResponsePB* response) const {
-    return Status::OK();
+
+  // Returns the tuple id of the current tuple. See DocRowwiseIterator for details.
+  virtual Result<Slice> GetTupleId() const {
+    return STATUS(NotSupported, "This iterator does not provide tuple id");
+  }
+
+  // Seeks to the given tuple by its id. See DocRowwiseIterator for details.
+  virtual Result<bool> SeekTuple(const Slice& tuple_id) {
+    return STATUS(NotSupported, "This iterator cannot seek by tuple id");
   }
 
   //------------------------------------------------------------------------------------------------

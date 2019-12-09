@@ -68,7 +68,7 @@ class MonoDelta {
   static const MonoDelta kMax;
   static const MonoDelta kZero;
 
-  MonoDelta();
+  MonoDelta() noexcept;
 
   template<class Rep, class Period>
   MonoDelta(const std::chrono::duration<Rep, Period>& duration) // NOLINT
@@ -78,6 +78,7 @@ class MonoDelta {
   bool LessThan(const MonoDelta &rhs) const;
   bool MoreThan(const MonoDelta &rhs) const;
   bool Equals(const MonoDelta &rhs) const;
+  bool IsNegative() const;
   std::string ToString() const;
   double ToSeconds() const;
   int64_t ToMilliseconds() const;
@@ -86,6 +87,9 @@ class MonoDelta {
   std::chrono::steady_clock::duration ToSteadyDuration() const;
 
   MonoDelta& operator+=(const MonoDelta& rhs);
+  MonoDelta& operator-=(const MonoDelta& rhs);
+  MonoDelta& operator*=(int64_t mul);
+  MonoDelta& operator/=(int64_t mul);
 
   // Update struct timeval to current value of delta, with microsecond accuracy.
   // Note that if MonoDelta::IsPositive() returns true, the struct timeval
@@ -122,6 +126,11 @@ inline bool operator!=(MonoDelta lhs, MonoDelta rhs) { return !(rhs == lhs); }
 
 std::string FormatForComparisonFailureMessage(const MonoDelta& op, const MonoDelta& other);
 
+inline MonoDelta operator-(MonoDelta lhs, MonoDelta rhs) { return lhs -= rhs; }
+inline MonoDelta operator+(MonoDelta lhs, MonoDelta rhs) { return lhs += rhs; }
+inline MonoDelta operator*(MonoDelta lhs, int64_t rhs) { return lhs *= rhs; }
+inline MonoDelta operator/(MonoDelta lhs, int64_t rhs) { return lhs /= rhs; }
+
 inline std::ostream& operator<<(std::ostream& out, MonoDelta delta) {
   return out << delta.ToString();
 }
@@ -133,12 +142,18 @@ inline std::ostream& operator<<(std::ostream& out, MonoDelta delta) {
 // clock, the monotime does not change.
 class MonoTime {
  public:
-  static constexpr int64_t kNanosecondsPerSecond = 1000000000L;
-  static constexpr int64_t kNanosecondsPerMillisecond = 1000000L;
   static constexpr int64_t kNanosecondsPerMicrosecond = 1000L;
-
-  static constexpr int64_t kMicrosecondsPerSecond = 1000000L;
+  static constexpr int64_t kMicrosecondsPerMillisecond = 1000L;
   static constexpr int64_t kMillisecondsPerSecond = 1000L;
+
+  static constexpr int64_t kNanosecondsPerMillisecond =
+      kNanosecondsPerMicrosecond * kMicrosecondsPerMillisecond;
+
+  static constexpr int64_t kMicrosecondsPerSecond =
+      kMillisecondsPerSecond * kMicrosecondsPerMillisecond;
+
+  static constexpr int64_t kNanosecondsPerSecond =
+      kNanosecondsPerMillisecond * kMillisecondsPerSecond;
 
   static const MonoTime kMin;
   static const MonoTime kMax;
@@ -165,6 +180,7 @@ class MonoTime {
   MonoDelta GetDeltaSince(const MonoTime &rhs) const;
   MonoDelta GetDeltaSinceMin() const { return GetDeltaSince(Min()); }
   void AddDelta(const MonoDelta &delta);
+  void SubtractDelta(const MonoDelta &delta);
   bool ComesBefore(const MonoTime &rhs) const;
   std::string ToString() const;
   bool Equals(const MonoTime& other) const;
@@ -212,6 +228,11 @@ inline MonoDelta operator-(const MonoTime& lhs, const MonoTime& rhs) {
   return lhs.GetDeltaSince(rhs);
 }
 
+inline MonoTime& operator-=(MonoTime& lhs, const MonoDelta& rhs) { // NOLINT
+  lhs.SubtractDelta(rhs);
+  return lhs;
+}
+
 inline MonoTime operator-(const MonoTime& lhs, const MonoDelta& rhs) {
   MonoTime result = lhs;
   result.AddDelta(-rhs);
@@ -247,6 +268,9 @@ class CoarseMonoClock {
   static TimePoint Now() { return now(); }
 };
 
+typedef CoarseMonoClock::TimePoint CoarseTimePoint;
+typedef CoarseMonoClock::Duration CoarseDuration;
+
 template <class Rep, class Period>
 int64_t ToMilliseconds(const std::chrono::duration<Rep, Period>& duration) {
   return std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
@@ -272,6 +296,11 @@ double ToSeconds(const std::chrono::duration<Rep, Period>& duration) {
 inline double ToSeconds(MonoDelta delta) {
   return delta.ToSeconds();
 }
+
+std::string ToString(CoarseMonoClock::TimePoint value);
+
+CoarseTimePoint ToCoarse(MonoTime monotime);
+std::chrono::steady_clock::time_point ToSteady(CoarseTimePoint time_point);
 
 } // namespace yb
 

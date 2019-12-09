@@ -40,11 +40,14 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <fstream>
 
+#include <boost/algorithm/string/predicate.hpp>
 #include <boost/preprocessor/seq/for_each.hpp>
 
 #include "yb/client/meta_cache.h"
-#include "yb/client/table-internal.h"
+#include "yb/client/table.h"
+
 #include "yb/common/index.h"
 #include "yb/common/schema.h"
 #include "yb/common/wire_protocol.h"
@@ -57,11 +60,13 @@
 #include "yb/gutil/sysinfo.h"
 #include "yb/master/master_defaults.h"
 #include "yb/master/master_rpc.h"
+#include "yb/master/master_util.h"
 #include "yb/master/master.pb.h"
 #include "yb/master/master.proxy.h"
 #include "yb/yql/redis/redisserver/redis_constants.h"
 #include "yb/rpc/rpc.h"
 #include "yb/rpc/rpc_controller.h"
+#include "yb/rpc/messenger.h"
 #include "yb/tserver/tserver_flags.h"
 #include "yb/util/net/dns_resolver.h"
 #include "yb/util/curl_util.h"
@@ -69,6 +74,8 @@
 #include "yb/util/flag_tags.h"
 #include "yb/util/net/net_util.h"
 #include "yb/util/thread_restrictions.h"
+
+using namespace std::literals;
 
 DEFINE_test_flag(bool, assert_local_tablet_server_selected, false, "Verify that SelectTServer "
                  "selected the local tablet server. Also verify that ReplicaSelection is equal "
@@ -104,46 +111,35 @@ using internal::RemoteTabletServer;
 using internal::UpdateLocalTsState;
 
 Status RetryFunc(
-    const MonoTime& deadline, const string& retry_msg, const string& timeout_msg,
-    const std::function<Status(const MonoTime&, bool*)>& func) {
-  DCHECK(deadline.Initialized());
+    CoarseTimePoint deadline, const string& retry_msg, const string& timeout_msg,
+    const std::function<Status(CoarseTimePoint, bool*)>& func) {
+  DCHECK(deadline != CoarseTimePoint());
 
-  MonoTime now = MonoTime::Now();
-  if (deadline.ComesBefore(now)) {
+  if (deadline < CoarseMonoClock::Now()) {
     return STATUS(TimedOut, timeout_msg);
   }
 
-  double wait_secs = 0.001;
-  const double kMaxSleepSecs = 2;
-  while (1) {
-    MonoTime func_stime = now;
+  MonoDelta wait_time = 1ms;
+  MonoDelta kMaxSleep = 2s;
+  for (;;) {
     bool retry = true;
     Status s = func(deadline, &retry);
     if (!retry) {
       return s;
     }
-    now = MonoTime::Now();
-    MonoDelta func_time = now.GetDeltaSince(func_stime);
 
     VLOG(1) << retry_msg << " status=" << s.ToString();
-    double secs_remaining = std::numeric_limits<double>::max();
-    if (deadline.Initialized()) {
-      secs_remaining = deadline.GetDeltaSince(now).ToSeconds();
-    }
-    wait_secs = std::min(wait_secs * 1.25, kMaxSleepSecs);
+    wait_time = std::min(wait_time * 5 / 4, kMaxSleep);
 
     // We assume that the function will take the same amount of time to run
     // as it did in the previous attempt. If we don't have enough time left
     // to sleep and run it again, we don't bother sleeping and retrying.
-    if (wait_secs + func_time.ToSeconds() > secs_remaining) {
+    if (CoarseMonoClock::Now() + wait_time > deadline) {
       break;
     }
 
-    VLOG(1) << "Waiting for " << HumanReadableElapsedTime::ToShortString(wait_secs)
-            << " before retrying...";
-    SleepFor(MonoDelta::FromSeconds(wait_secs));
-    now = MonoTime::Now();
-
+    VLOG(1) << "Waiting for " << wait_time << " before retrying...";
+    SleepFor(wait_time);
   }
 
   return STATUS(TimedOut, timeout_msg);
@@ -151,20 +147,25 @@ Status RetryFunc(
 
 template <class ReqClass, class RespClass>
 Status YBClient::Data::SyncLeaderMasterRpc(
-    const MonoTime& deadline, YBClient* client, const ReqClass& req, RespClass* resp,
+    CoarseTimePoint deadline, YBClient* client, const ReqClass& req, RespClass* resp,
     int* num_attempts, const char* func_name,
     const std::function<Status(MasterServiceProxy*, const ReqClass&, RespClass*, RpcController*)>&
         func) {
-  DCHECK(deadline.Initialized());
+  DSCHECK(deadline != CoarseTimePoint(), InvalidArgument, "Deadline is not set");
+  CoarseTimePoint start_time;
 
   while (true) {
     RpcController rpc;
 
     // Have we already exceeded our deadline?
-    MonoTime now = MonoTime::Now();
-    if (deadline.ComesBefore(now)) {
-      return STATUS(TimedOut, Substitute("$0 timed out after deadline expired",
-                                         func_name));
+    auto now = CoarseMonoClock::Now();
+    if (start_time == CoarseTimePoint()) {
+      start_time = now;
+    }
+    if (deadline < now) {
+      return STATUS_FORMAT(TimedOut,
+          "$0 timed out after deadline expired. Time elapsed: $1, allowed: $2",
+          func_name, now - start_time, deadline - start_time);
     }
 
     // The RPC's deadline is intentionally earlier than the overall
@@ -172,41 +173,50 @@ Status YBClient::Data::SyncLeaderMasterRpc(
     // leader master and retry before the overall deadline expires.
     //
     // TODO: KUDU-683 tracks cleanup for this.
-    MonoTime rpc_deadline = now;
-    rpc_deadline.AddDelta(client->default_rpc_timeout());
-    rpc.set_deadline(MonoTime::Earliest(rpc_deadline, deadline));
+    auto rpc_deadline = now + client->default_rpc_timeout();
+    rpc.set_deadline(std::min(rpc_deadline, deadline));
 
     if (num_attempts != nullptr) {
       ++*num_attempts;
     }
-    Status s = func(master_proxy_.get(), req, resp, &rpc);
-    if (s.IsNetworkError()) {
-      LOG(WARNING) << "Unable to send the request (" << req.ShortDebugString()
-                   << ") to leader Master (" << leader_master_hostport().ToString()
-                   << "): " << s.ToString();
+
+    std::shared_ptr<MasterServiceProxy> master_proxy;
+    {
+      std::lock_guard<simple_spinlock> l(leader_master_lock_);
+      master_proxy = master_proxy_;
+    }
+    Status s = func(master_proxy.get(), req, resp, &rpc);
+    if (s.IsNetworkError() || s.IsServiceUnavailable()) {
+      YB_LOG_EVERY_N_SECS(WARNING, 1)
+          << "Unable to send the request " << req.GetTypeName() << " (" << req.ShortDebugString()
+          << ") to leader Master (" << leader_master_hostport().ToString()
+          << "): " << s;
       if (client->IsMultiMaster()) {
-        LOG(INFO) << "Determining the new leader Master and retrying...";
+        YB_LOG_EVERY_N_SECS(INFO, 1) << "Determining the new leader Master and retrying...";
         WARN_NOT_OK(SetMasterServerProxy(client, deadline),
                     "Unable to determine the new leader Master");
-        continue;
       }
+      continue;
     }
 
     if (s.IsTimedOut()) {
-      if (MonoTime::Now().ComesBefore(deadline)) {
-        LOG(WARNING) << "Unable to send the request (" << req.ShortDebugString()
-                     << ") to leader Master (" << leader_master_hostport().ToString()
-                     << "): " << s.ToString();
+      now = CoarseMonoClock::Now();
+      if (now < deadline) {
+        YB_LOG_EVERY_N_SECS(WARNING, 1)
+            << "Unable to send the request (" << req.ShortDebugString()
+            << ") to leader Master (" << leader_master_hostport().ToString()
+            << "): " << s.ToString();
         if (client->IsMultiMaster()) {
-          LOG(INFO) << "Determining the new leader Master and retrying...";
+          YB_LOG_EVERY_N_SECS(INFO, 1) << "Determining the new leader Master and retrying...";
           WARN_NOT_OK(SetMasterServerProxy(client, deadline),
                       "Unable to determine the new leader Master");
-          continue;
         }
+        continue;
       } else {
         // Operation deadline expired during this latest RPC.
-        s = s.CloneAndPrepend(Substitute("$0 timed out after deadline expired",
-                                         func_name));
+        s = s.CloneAndPrepend(Format(
+            "$0 timed out after deadline expired. Time elapsed: $1, allowed: $2",
+            func_name, now - start_time, deadline - start_time));
       }
     }
 
@@ -214,11 +224,13 @@ Status YBClient::Data::SyncLeaderMasterRpc(
       if (resp->error().code() == MasterErrorPB::NOT_THE_LEADER ||
           resp->error().code() == MasterErrorPB::CATALOG_MANAGER_NOT_INITIALIZED) {
         if (client->IsMultiMaster()) {
-          LOG(INFO) << "Determining the new leader Master and retrying...";
+          YB_LOG_EVERY_N_SECS(INFO, 1) << "Determining the new leader Master and retrying...";
           WARN_NOT_OK(SetMasterServerProxy(client, deadline),
                       "Unable to determine the new leader Master");
-          continue;
         }
+        continue;
+      } else {
+        return StatusFromPB(resp->error().status());
       }
     }
     return s;
@@ -229,7 +241,7 @@ Status YBClient::Data::SyncLeaderMasterRpc(
     using yb::master::RequestTypePB; \
     using yb::master::ResponseTypePB; \
     template Status YBClient::Data::SyncLeaderMasterRpc( \
-        const MonoTime& deadline, YBClient* client, const RequestTypePB& req, \
+        CoarseTimePoint deadline, YBClient* client, const RequestTypePB& req, \
         ResponseTypePB* resp, int* num_attempts, const char* func_name, \
         const std::function<Status( \
             MasterServiceProxy*, const RequestTypePB&, ResponseTypePB*, RpcController*)>& \
@@ -246,7 +258,10 @@ YB_CLIENT_SPECIALIZE_SIMPLE(GetTabletLocations);
 YB_CLIENT_SPECIALIZE_SIMPLE(ListMasters);
 YB_CLIENT_SPECIALIZE_SIMPLE(CreateNamespace);
 YB_CLIENT_SPECIALIZE_SIMPLE(DeleteNamespace);
+YB_CLIENT_SPECIALIZE_SIMPLE(AlterNamespace);
 YB_CLIENT_SPECIALIZE_SIMPLE(ListNamespaces);
+YB_CLIENT_SPECIALIZE_SIMPLE(ReservePgsqlOids);
+YB_CLIENT_SPECIALIZE_SIMPLE(GetYsqlCatalogConfig);
 YB_CLIENT_SPECIALIZE_SIMPLE(CreateUDType);
 YB_CLIENT_SPECIALIZE_SIMPLE(DeleteUDType);
 YB_CLIENT_SPECIALIZE_SIMPLE(ListUDTypes);
@@ -254,10 +269,15 @@ YB_CLIENT_SPECIALIZE_SIMPLE(GetUDTypeInfo);
 YB_CLIENT_SPECIALIZE_SIMPLE(CreateRole);
 YB_CLIENT_SPECIALIZE_SIMPLE(AlterRole);
 YB_CLIENT_SPECIALIZE_SIMPLE(DeleteRole);
-YB_CLIENT_SPECIALIZE_SIMPLE(GrantRole);
-YB_CLIENT_SPECIALIZE_SIMPLE(GrantPermission);
+YB_CLIENT_SPECIALIZE_SIMPLE(GrantRevokeRole);
+YB_CLIENT_SPECIALIZE_SIMPLE(GrantRevokePermission);
+YB_CLIENT_SPECIALIZE_SIMPLE(GetPermissions);
 YB_CLIENT_SPECIALIZE_SIMPLE(RedisConfigSet);
 YB_CLIENT_SPECIALIZE_SIMPLE(RedisConfigGet);
+YB_CLIENT_SPECIALIZE_SIMPLE(CreateCDCStream);
+YB_CLIENT_SPECIALIZE_SIMPLE(DeleteCDCStream);
+YB_CLIENT_SPECIALIZE_SIMPLE(ListCDCStreams);
+YB_CLIENT_SPECIALIZE_SIMPLE(GetCDCStream);
 // These are not actually exposed outside, but it's nice to auto-add using directive.
 YB_CLIENT_SPECIALIZE_SIMPLE(AlterTable);
 YB_CLIENT_SPECIALIZE_SIMPLE(ChangeMasterClusterConfig);
@@ -270,19 +290,14 @@ YB_CLIENT_SPECIALIZE_SIMPLE(IsAlterTableDone);
 YB_CLIENT_SPECIALIZE_SIMPLE(IsCreateTableDone);
 YB_CLIENT_SPECIALIZE_SIMPLE(IsTruncateTableDone);
 YB_CLIENT_SPECIALIZE_SIMPLE(IsDeleteTableDone);
+YB_CLIENT_SPECIALIZE_SIMPLE(IsLoadBalanced);
 
 YBClient::Data::Data()
     : leader_master_rpc_(rpcs_.InvalidHandle()),
-      latest_observed_hybrid_time_(YBClient::kNoHybridTime) {}
+      latest_observed_hybrid_time_(YBClient::kNoHybridTime),
+      id_(ClientId::GenerateRandom()) {}
 
 YBClient::Data::~Data() {
-  // Workaround for KUDU-956: the user may close a YBClient while a flush
-  // is still outstanding. In that case, the flush's callback will be the last
-  // holder of the client reference, causing it to shut down on the reactor
-  // thread. This triggers a ThreadRestrictions crash. It's not critical to
-  // fix urgently, because typically once a client is shutting down, latency
-  // jitter on the reactor is not a big deal (and DNS resolutions are not in flight).
-  ThreadRestrictions::ScopedAllowWait allow_wait;
   dns_resolver_.reset();
   rpcs_.Shutdown();
 }
@@ -312,7 +327,12 @@ RemoteTabletServer* YBClient::Data::SelectTServer(RemoteTablet* rt,
     }
     case CLOSEST_REPLICA:
     case FIRST_REPLICA: {
-      rt->GetRemoteTabletServers(candidates, UpdateLocalTsState::kTrue);
+      if (PREDICT_TRUE(FLAGS_assert_tablet_server_select_is_in_zone.empty())) {
+        rt->GetRemoteTabletServers(candidates);
+      } else {
+        rt->GetRemoteTabletServers(candidates, internal::IncludeFailedReplicas::kTrue);
+      }
+
       // Filter out all the blacklisted candidates.
       vector<RemoteTabletServer*> filtered;
       for (RemoteTabletServer* rts : *candidates) {
@@ -334,18 +354,19 @@ RemoteTabletServer* YBClient::Data::SelectTServer(RemoteTablet* rt,
             ret = rts;
             // If the tserver is local, we are done here.
             break;
-          } else if (cloud_info_pb_.has_placement_zone() && rts->cloud_info().has_placement_zone()
-              && cloud_info_pb_.placement_zone() == rts->cloud_info().placement_zone()) {
-            // Note down that we have found a zone local tserver and continue looking for node
-            // local tserver.
-            ret = rts;
-            local_zone_ts = true;
           } else if (cloud_info_pb_.has_placement_region() &&
-              rts->cloud_info().has_placement_region() &&
-              cloud_info_pb_.placement_region() == rts->cloud_info().placement_region() &&
-              !local_zone_ts) {
-            // Look for a region local tserver only if we haven't found a zone local tserver yet.
-            ret = rts;
+                     rts->cloud_info().has_placement_region() &&
+                     cloud_info_pb_.placement_region() == rts->cloud_info().placement_region()) {
+            if (cloud_info_pb_.has_placement_zone() && rts->cloud_info().has_placement_zone() &&
+                cloud_info_pb_.placement_zone() == rts->cloud_info().placement_zone()) {
+              // Note down that we have found a zone local tserver and continue looking for node
+              // local tserver.
+              ret = rts;
+              local_zone_ts = true;
+            } else if (!local_zone_ts) {
+              // Look for a region local tserver only if we haven't found a zone local tserver yet.
+              ret = rts;
+            }
           }
         }
 
@@ -376,6 +397,7 @@ RemoteTabletServer* YBClient::Data::SelectTServer(RemoteTablet* rt,
                  << " instead of the expected zone "
                  << FLAGS_assert_tablet_server_select_is_in_zone
                  << " Cloud info: " << cloud_info_pb_.ShortDebugString()
+                 << " for selection policy " << selection
                  << msg;
     }
   }
@@ -384,11 +406,11 @@ RemoteTabletServer* YBClient::Data::SelectTServer(RemoteTablet* rt,
 }
 
 Status YBClient::Data::GetTabletServer(YBClient* client,
-                                         const scoped_refptr<RemoteTablet>& rt,
-                                         ReplicaSelection selection,
-                                         const set<string>& blacklist,
-                                         vector<RemoteTabletServer*>* candidates,
-                                         RemoteTabletServer** ts) {
+                                       const scoped_refptr<RemoteTablet>& rt,
+                                       ReplicaSelection selection,
+                                       const set<string>& blacklist,
+                                       vector<RemoteTabletServer*>* candidates,
+                                       RemoteTabletServer** ts) {
   // TODO: write a proper async version of this for async client.
   RemoteTabletServer* ret = SelectTServer(rt.get(), selection, blacklist, candidates);
   if (PREDICT_FALSE(ret == nullptr)) {
@@ -409,37 +431,43 @@ Status YBClient::Data::GetTabletServer(YBClient* client,
   return Status::OK();
 }
 
-Status YBClient::Data::CreateTable(
-    YBClient* client,
-    const CreateTableRequestPB& req,
-    const YBSchema& schema,
-    const MonoTime& deadline) {
+Status YBClient::Data::CreateTable(YBClient* client,
+                                   const CreateTableRequestPB& req,
+                                   const YBSchema& schema,
+                                   CoarseTimePoint deadline,
+                                   string* table_id) {
   CreateTableResponsePB resp;
 
   int attempts = 0;
   Status s = SyncLeaderMasterRpc<CreateTableRequestPB, CreateTableResponsePB>(
       deadline, client, req, &resp, &attempts, "CreateTable", &MasterServiceProxy::CreateTable);
+  // Set the table id even if there was an error. This is useful when the error is IsAlreadyPresent
+  // so that we can wait for the existing table to be available to receive requests.
+  *table_id = resp.table_id();
   RETURN_NOT_OK(s);
   if (resp.has_error()) {
-    if (resp.error().code() == MasterErrorPB::TABLE_ALREADY_PRESENT && attempts > 1) {
+    if (resp.error().code() == MasterErrorPB::OBJECT_ALREADY_PRESENT && attempts > 1) {
       // If the table already exists and the number of attempts is >
       // 1, then it means we may have succeeded in creating the
       // table, but client didn't receive the successful
       // response (e.g., due to failure before the successful
       // response could be sent back, or due to a I/O pause or a
       // network blip leading to a timeout, etc...)
-      YBTable::Info info;
-      string keyspace = req.has_namespace_() ? req.namespace_().name() :
-                        (req.name() == common::kRedisTableName ? common::kRedisKeyspaceName : "");
-      const YBTableName table_name(!keyspace.empty()
-          ? YBTableName(keyspace, req.name()) : YBTableName(req.name()));
+      YBTableInfo info;
+      const string keyspace = req.has_namespace_()
+          ? req.namespace_().name()
+          : (req.name() == common::kRedisTableName ? common::kRedisKeyspaceName : "");
+      const YQLDatabase db_type = req.has_namespace_() && req.namespace_().has_database_type()
+          ? req.namespace_().database_type()
+          : (keyspace.empty() ? YQL_DATABASE_CQL : master::GetDefaultDatabaseType(keyspace));
+      const YBTableName table_name(db_type, req.name());
 
       // A fix for https://yugabyte.atlassian.net/browse/ENG-529:
       // If we've been retrying table creation, and the table is now in the process is being
       // created, we can sometimes see an empty schema. Wait until the table is fully created
       // before we compare the schema.
       RETURN_NOT_OK_PREPEND(
-          WaitForCreateTableToFinish(client, table_name, deadline),
+          WaitForCreateTableToFinish(client, table_name, resp.table_id(), deadline),
           Substitute("Failed waiting for table $0 to finish being created", table_name.ToString()));
 
       RETURN_NOT_OK_PREPEND(
@@ -480,12 +508,18 @@ Status YBClient::Data::CreateTable(
 
 Status YBClient::Data::IsCreateTableInProgress(YBClient* client,
                                                const YBTableName& table_name,
-                                               const MonoTime& deadline,
+                                               const string& table_id,
+                                               CoarseTimePoint deadline,
                                                bool* create_in_progress) {
   DCHECK_ONLY_NOTNULL(create_in_progress);
   IsCreateTableDoneRequestPB req;
   IsCreateTableDoneResponsePB resp;
-  table_name.SetIntoTableIdentifierPB(req.mutable_table());
+  if (table_name.has_table()) {
+    table_name.SetIntoTableIdentifierPB(req.mutable_table());
+  }
+  if (!table_id.empty()) {
+    req.mutable_table()->set_table_id(table_id);
+  }
 
   const Status s =
       SyncLeaderMasterRpc<IsCreateTableDoneRequestPB, IsCreateTableDoneResponsePB>(
@@ -510,23 +544,31 @@ Status YBClient::Data::IsCreateTableInProgress(YBClient* client,
 
 Status YBClient::Data::WaitForCreateTableToFinish(YBClient* client,
                                                   const YBTableName& table_name,
-                                                  const MonoTime& deadline) {
+                                                  const string& table_id,
+                                                  CoarseTimePoint deadline) {
   return RetryFunc(
       deadline, "Waiting on Create Table to be completed", "Timed out waiting for Table Creation",
-      std::bind(&YBClient::Data::IsCreateTableInProgress, this, client, table_name, _1, _2));
+      std::bind(&YBClient::Data::IsCreateTableInProgress, this, client,
+                table_name, table_id, _1, _2));
 }
 
 Status YBClient::Data::DeleteTable(YBClient* client,
                                    const YBTableName& table_name,
+                                   const string& table_id,
                                    const bool is_index_table,
-                                   const MonoTime& deadline,
+                                   CoarseTimePoint deadline,
                                    YBTableName* indexed_table_name,
                                    bool wait) {
   DeleteTableRequestPB req;
   DeleteTableResponsePB resp;
   int attempts = 0;
 
-  table_name.SetIntoTableIdentifierPB(req.mutable_table());
+  if (table_name.has_table()) {
+    table_name.SetIntoTableIdentifierPB(req.mutable_table());
+  }
+  if (!table_id.empty()) {
+    req.mutable_table()->set_table_id(table_id);
+  }
   req.set_is_index_table(is_index_table);
   const Status s = SyncLeaderMasterRpc<DeleteTableRequestPB, DeleteTableResponsePB>(
       deadline, client, req, &resp,
@@ -534,7 +576,7 @@ Status YBClient::Data::DeleteTable(YBClient* client,
   RETURN_NOT_OK(s);
 
   if (resp.has_error()) {
-    if (resp.error().code() == MasterErrorPB::TABLE_NOT_FOUND && attempts > 1) {
+    if (resp.error().code() == MasterErrorPB::OBJECT_NOT_FOUND && attempts > 1) {
       // A prior attempt to delete the table has succeeded, but
       // appeared as a failure to the client due to, e.g., an I/O or
       // network issue.
@@ -549,8 +591,8 @@ Status YBClient::Data::DeleteTable(YBClient* client,
     RETURN_NOT_OK(WaitForDeleteTableToFinish(client, resp.table_id(), deadline));
   }
 
-  if (resp.has_indexed_table()) {
-    DCHECK(indexed_table_name != nullptr);
+  // Return indexed table name if requested.
+  if (resp.has_indexed_table() && indexed_table_name != nullptr) {
     indexed_table_name->GetFromTableIdentifierPB(resp.indexed_table());
   }
 
@@ -559,13 +601,13 @@ Status YBClient::Data::DeleteTable(YBClient* client,
 }
 
 Status YBClient::Data::IsDeleteTableInProgress(YBClient* client,
-                                               const std::string& deleted_table_id,
-                                               const MonoTime& deadline,
+                                               const std::string& table_id,
+                                               CoarseTimePoint deadline,
                                                bool* delete_in_progress) {
   DCHECK_ONLY_NOTNULL(delete_in_progress);
   IsDeleteTableDoneRequestPB req;
   IsDeleteTableDoneResponsePB resp;
-  req.set_table_id(deleted_table_id);
+  req.set_table_id(table_id);
 
   const Status s =
       SyncLeaderMasterRpc<IsDeleteTableDoneRequestPB, IsDeleteTableDoneResponsePB>(
@@ -581,6 +623,10 @@ Status YBClient::Data::IsDeleteTableInProgress(YBClient* client,
   // compiler complains.
   RETURN_NOT_OK(s);
   if (resp.has_error()) {
+    if (resp.error().code() == MasterErrorPB::OBJECT_NOT_FOUND) {
+      *delete_in_progress = false;
+      return Status::OK();
+    }
     return StatusFromPB(resp.error().status());
   }
 
@@ -589,21 +635,23 @@ Status YBClient::Data::IsDeleteTableInProgress(YBClient* client,
 }
 
 Status YBClient::Data::WaitForDeleteTableToFinish(YBClient* client,
-                                                  const std::string& deleted_table_id,
-                                                  const MonoTime& deadline) {
+                                                  const std::string& table_id,
+                                                  CoarseTimePoint deadline) {
   return RetryFunc(
       deadline, "Waiting on Delete Table to be completed", "Timed out waiting for Table Deletion",
-      std::bind(&YBClient::Data::IsDeleteTableInProgress, this, client, deleted_table_id, _1, _2));
+      std::bind(&YBClient::Data::IsDeleteTableInProgress, this, client, table_id, _1, _2));
 }
 
-Status YBClient::Data::TruncateTable(YBClient* client,
-                                     const string& table_id,
-                                     const MonoTime& deadline,
+Status YBClient::Data::TruncateTables(YBClient* client,
+                                     const vector<string>& table_ids,
+                                     CoarseTimePoint deadline,
                                      bool wait) {
   TruncateTableRequestPB req;
   TruncateTableResponsePB resp;
 
-  req.set_table_id(table_id);
+  for (const auto& table_id : table_ids) {
+    req.add_table_ids(table_id);
+  }
   RETURN_NOT_OK((SyncLeaderMasterRpc<TruncateTableRequestPB, TruncateTableResponsePB>(
       deadline, client, req, &resp, nullptr /* num_attempts */, "TruncateTable",
       &MasterServiceProxy::TruncateTable)));
@@ -613,16 +661,18 @@ Status YBClient::Data::TruncateTable(YBClient* client,
 
   // Spin until the table is fully truncated, if requested.
   if (wait) {
-    RETURN_NOT_OK(WaitForTruncateTableToFinish(client, table_id, deadline));
+    for (const auto& table_id : table_ids) {
+      RETURN_NOT_OK(WaitForTruncateTableToFinish(client, table_id, deadline));
+    }
   }
 
-  LOG(INFO) << "Truncated table " << table_id;
+  LOG(INFO) << "Truncated table(s) " << JoinStrings(table_ids, ",");
   return Status::OK();
 }
 
 Status YBClient::Data::IsTruncateTableInProgress(YBClient* client,
                                                  const std::string& table_id,
-                                                 const MonoTime& deadline,
+                                                 CoarseTimePoint deadline,
                                                  bool* truncate_in_progress) {
   DCHECK_ONLY_NOTNULL(truncate_in_progress);
   IsTruncateTableDoneRequestPB req;
@@ -642,16 +692,36 @@ Status YBClient::Data::IsTruncateTableInProgress(YBClient* client,
 
 Status YBClient::Data::WaitForTruncateTableToFinish(YBClient* client,
                                                     const std::string& table_id,
-                                                    const MonoTime& deadline) {
+                                                    CoarseTimePoint deadline) {
   return RetryFunc(
       deadline, "Waiting on Truncate Table to be completed",
       "Timed out waiting for Table Truncation",
       std::bind(&YBClient::Data::IsTruncateTableInProgress, this, client, table_id, _1, _2));
 }
 
+Status YBClient::Data::AlterNamespace(YBClient* client,
+                                      const AlterNamespaceRequestPB& req,
+                                      CoarseTimePoint deadline) {
+  AlterNamespaceResponsePB resp;
+  Status s =
+      SyncLeaderMasterRpc<AlterNamespaceRequestPB, AlterNamespaceResponsePB>(
+          deadline,
+          client,
+          req,
+          &resp,
+          nullptr /* num_attempts */,
+          "AlterNamespace",
+          &MasterServiceProxy::AlterNamespace);
+  RETURN_NOT_OK(s);
+  if (resp.has_error()) {
+    return StatusFromPB(resp.error().status());
+  }
+  return Status::OK();
+}
+
 Status YBClient::Data::AlterTable(YBClient* client,
                                   const AlterTableRequestPB& req,
-                                  const MonoTime& deadline) {
+                                  CoarseTimePoint deadline) {
   AlterTableResponsePB resp;
   Status s =
       SyncLeaderMasterRpc<AlterTableRequestPB, AlterTableResponsePB>(
@@ -676,12 +746,20 @@ Status YBClient::Data::AlterTable(YBClient* client,
 
 Status YBClient::Data::IsAlterTableInProgress(YBClient* client,
                                               const YBTableName& table_name,
-                                              const MonoTime& deadline,
+                                              string table_id,
+                                              CoarseTimePoint deadline,
                                               bool *alter_in_progress) {
   IsAlterTableDoneRequestPB req;
   IsAlterTableDoneResponsePB resp;
 
-  table_name.SetIntoTableIdentifierPB(req.mutable_table());
+  if (table_name.has_table()) {
+    table_name.SetIntoTableIdentifierPB(req.mutable_table());
+  }
+
+  if (!table_id.empty()) {
+    (req.mutable_table())->set_table_id(table_id);
+  }
+
   Status s =
       SyncLeaderMasterRpc<IsAlterTableDoneRequestPB, IsAlterTableDoneResponsePB>(
           deadline,
@@ -702,10 +780,12 @@ Status YBClient::Data::IsAlterTableInProgress(YBClient* client,
 
 Status YBClient::Data::WaitForAlterTableToFinish(YBClient* client,
                                                  const YBTableName& alter_name,
-                                                 const MonoTime& deadline) {
+                                                 const string table_id,
+                                                 CoarseTimePoint deadline) {
   return RetryFunc(
       deadline, "Waiting on Alter Table to be completed", "Timed out waiting for AlterTable",
-      std::bind(&YBClient::Data::IsAlterTableInProgress, this, client, alter_name, _1, _2));
+      std::bind(&YBClient::Data::IsAlterTableInProgress, this, client,
+              alter_name, table_id, _1, _2));
 }
 
 Status YBClient::Data::InitLocalHostNames() {
@@ -774,6 +854,30 @@ bool YBClient::Data::IsTabletServerLocal(const RemoteTabletServer& rts) const {
 
 namespace internal {
 
+// Gets data from the leader master. If the leader master
+// is down, waits for a new master to become the leader, and then gets
+// the data from the new leader master.
+class ClientMasterRpc : public Rpc {
+ public:
+  ClientMasterRpc(YBClient* client,
+                  CoarseTimePoint deadline,
+                  rpc::Messenger* messenger,
+                  rpc::ProxyCache* proxy_cache);
+
+  virtual ~ClientMasterRpc();
+
+  void ResetLeaderMasterAndRetry();
+
+  void NewLeaderMasterDeterminedCb(const Status& status);
+
+  template<class Response>
+  Status HandleFinished(const Status& status, const Response& resp, bool* finished);
+
+ private:
+  YBClient* const client_;
+
+};
+
 // Gets a table's schema from the leader master. If the leader master
 // is down, waits for a new master to become the leader, and then gets
 // the table schema from the new leader master.
@@ -781,21 +885,21 @@ namespace internal {
 // TODO: When we implement the next fault tolerant client-master RPC
 // call (e.g., CreateTable/AlterTable), we should generalize this
 // method as to enable code sharing.
-class GetTableSchemaRpc : public Rpc {
+class GetTableSchemaRpc : public ClientMasterRpc {
  public:
   GetTableSchemaRpc(YBClient* client,
                     StatusCallback user_cb,
                     const YBTableName& table_name,
-                    YBTable::Info* info,
-                    const MonoTime& deadline,
-                    const shared_ptr<rpc::Messenger>& messenger,
+                    YBTableInfo* info,
+                    CoarseTimePoint deadline,
+                    rpc::Messenger* messenger,
                     rpc::ProxyCache* proxy_cache);
   GetTableSchemaRpc(YBClient* client,
                     StatusCallback user_cb,
                     const TableId& table_id,
-                    YBTable::Info* info,
-                    const MonoTime& deadline,
-                    const shared_ptr<rpc::Messenger>& messenger,
+                    YBTableInfo* info,
+                    CoarseTimePoint deadline,
+                    rpc::Messenger* messenger,
                     rpc::ProxyCache* proxy_cache);
 
   void SendRpc() override;
@@ -807,15 +911,13 @@ class GetTableSchemaRpc : public Rpc {
  private:
   void Finished(const Status& status) override;
 
-  void ResetLeaderMasterAndRetry();
-
-  void NewLeaderMasterDeterminedCb(const Status& status);
-
-  YBClient* client_;
+  YBClient* const client_;
   StatusCallback user_cb_;
   master::TableIdentifierPB table_identifier_;
-  YBTable::Info* info_;
+  YBTableInfo* info_;
+  GetTableSchemaRequestPB req_;
   GetTableSchemaResponsePB resp_;
+  rpc::Rpcs::Handle retained_self_;
 };
 
 namespace {
@@ -834,54 +936,143 @@ master::TableIdentifierPB ToTableIdentifierPB(const TableId& table_id) {
 
 } // namespace
 
+ClientMasterRpc::ClientMasterRpc(YBClient* client,
+                                 CoarseTimePoint deadline,
+                                 rpc::Messenger* messenger,
+                                 rpc::ProxyCache* proxy_cache)
+    : Rpc(deadline, messenger, proxy_cache),
+      client_(DCHECK_NOTNULL(client)) {
+}
+
+ClientMasterRpc::~ClientMasterRpc() {
+}
+
+void ClientMasterRpc::ResetLeaderMasterAndRetry() {
+  client_->data_->SetMasterServerProxyAsync(
+      client_,
+      retrier().deadline(),
+      false /* skip_resolution */,
+      Bind(&ClientMasterRpc::NewLeaderMasterDeterminedCb,
+           Unretained(this)));
+}
+
+void ClientMasterRpc::NewLeaderMasterDeterminedCb(const Status& status) {
+  if (status.ok()) {
+    mutable_retrier()->mutable_controller()->Reset();
+    SendRpc();
+  } else {
+    LOG(WARNING) << "Failed to determine new Master: " << status.ToString();
+    ScheduleRetry(status);
+  }
+}
+
+template<class Response>
+Status ClientMasterRpc::HandleFinished(const Status& status, const Response& resp,
+                                       bool* finished) {
+  *finished = false;
+  Status new_status = status;
+  if (new_status.ok() && mutable_retrier()->HandleResponse(this, &new_status)) {
+    return new_status;
+  }
+
+  if (new_status.ok() && resp.has_error()) {
+    if (resp.error().code() == MasterErrorPB::NOT_THE_LEADER ||
+        resp.error().code() == MasterErrorPB::CATALOG_MANAGER_NOT_INITIALIZED) {
+      LOG(WARNING) << "Leader Master has changed ("
+                   << client_->data_->leader_master_hostport().ToString()
+                   << " is no longer the leader), re-trying...";
+      ResetLeaderMasterAndRetry();
+      return new_status;
+    }
+
+    if (resp.error().status().code() == AppStatusPB::LEADER_NOT_READY_TO_SERVE ||
+        resp.error().status().code() == AppStatusPB::LEADER_HAS_NO_LEASE) {
+      LOG(WARNING) << "Leader Master " << client_->data_->leader_master_hostport().ToString()
+                   << " does not have a valid exclusive lease: "
+                   << resp.error().status().ShortDebugString() << ", re-trying...";
+      ResetLeaderMasterAndRetry();
+      return new_status;
+    }
+    VLOG(2) << "resp.error().status()=" << resp.error().status().DebugString();
+    new_status = StatusFromPB(resp.error().status());
+  }
+
+  if (new_status.IsTimedOut()) {
+    if (CoarseMonoClock::Now() < retrier().deadline()) {
+      LOG(WARNING) << "Leader Master ("
+          << client_->data_->leader_master_hostport().ToString()
+          << ") timed out, re-trying...";
+      ResetLeaderMasterAndRetry();
+      return new_status;
+    } else {
+      // Operation deadline expired during this latest RPC.
+      new_status = new_status.CloneAndPrepend(
+          "RPC timed out after deadline expired");
+    }
+  }
+
+  if (new_status.IsNetworkError()) {
+    LOG(WARNING) << "Encountered a network error from the Master("
+                 << client_->data_->leader_master_hostport().ToString() << "): "
+                 << new_status.ToString() << ", retrying...";
+    ResetLeaderMasterAndRetry();
+    return new_status;
+  }
+
+  *finished = true;
+  return new_status;
+}
+
 GetTableSchemaRpc::GetTableSchemaRpc(YBClient* client,
                                      StatusCallback user_cb,
                                      const YBTableName& table_name,
-                                     YBTable::Info* info,
-                                     const MonoTime& deadline,
-                                     const shared_ptr<rpc::Messenger>& messenger,
+                                     YBTableInfo* info,
+                                     CoarseTimePoint deadline,
+                                     rpc::Messenger* messenger,
                                      rpc::ProxyCache* proxy_cache)
-    : Rpc(deadline, messenger, proxy_cache),
+    : ClientMasterRpc(client, deadline, messenger, proxy_cache),
       client_(DCHECK_NOTNULL(client)),
       user_cb_(std::move(user_cb)),
       table_identifier_(ToTableIdentifierPB(table_name)),
-      info_(DCHECK_NOTNULL(info)) {
+      info_(DCHECK_NOTNULL(info)),
+      retained_self_(client->data_->rpcs_.InvalidHandle()) {
 }
 
 GetTableSchemaRpc::GetTableSchemaRpc(YBClient* client,
                                      StatusCallback user_cb,
                                      const TableId& table_id,
-                                     YBTable::Info* info,
-                                     const MonoTime& deadline,
-                                     const shared_ptr<rpc::Messenger>& messenger,
+                                     YBTableInfo* info,
+                                     CoarseTimePoint deadline,
+                                     rpc::Messenger* messenger,
                                      rpc::ProxyCache* proxy_cache)
-    : Rpc(deadline, messenger, proxy_cache),
+    : ClientMasterRpc(client, deadline, messenger, proxy_cache),
       client_(DCHECK_NOTNULL(client)),
       user_cb_(std::move(user_cb)),
       table_identifier_(ToTableIdentifierPB(table_id)),
-      info_(DCHECK_NOTNULL(info)) {
+      info_(DCHECK_NOTNULL(info)),
+      retained_self_(client->data_->rpcs_.InvalidHandle()) {
 }
 
 GetTableSchemaRpc::~GetTableSchemaRpc() {
 }
 
 void GetTableSchemaRpc::SendRpc() {
-  MonoTime now = MonoTime::Now();
-  if (retrier().deadline().ComesBefore(now)) {
+  client_->data_->rpcs_.Register(shared_from_this(), &retained_self_);
+
+  auto now = CoarseMonoClock::Now();
+  if (retrier().deadline() < now) {
     Finished(STATUS(TimedOut, "GetTableSchema timed out after deadline expired"));
     return;
   }
 
   // See YBClient::Data::SyncLeaderMasterRpc().
-  MonoTime rpc_deadline = now;
-  rpc_deadline.AddDelta(client_->default_rpc_timeout());
+  auto rpc_deadline = now + client_->default_rpc_timeout();
   mutable_retrier()->mutable_controller()->set_deadline(
-      MonoTime::Earliest(rpc_deadline, retrier().deadline()));
+      std::min(rpc_deadline, retrier().deadline()));
 
-  GetTableSchemaRequestPB req;
-  req.mutable_table()->CopyFrom(table_identifier_);
+  req_.mutable_table()->CopyFrom(table_identifier_);
   client_->data_->master_proxy()->GetTableSchemaAsync(
-      req, &resp_, mutable_retrier()->mutable_controller(),
+      req_, &resp_, mutable_retrier()->mutable_controller(),
       std::bind(&GetTableSchemaRpc::Finished, this, Status::OK()));
 }
 
@@ -890,80 +1081,14 @@ string GetTableSchemaRpc::ToString() const {
                     table_identifier_.ShortDebugString(), num_attempts());
 }
 
-void GetTableSchemaRpc::ResetLeaderMasterAndRetry() {
-  client_->data_->SetMasterServerProxyAsync(
-      client_,
-      retrier().deadline(),
-      false /* skip_resolution */,
-      Bind(&GetTableSchemaRpc::NewLeaderMasterDeterminedCb,
-           Unretained(this)));
-}
-
-void GetTableSchemaRpc::NewLeaderMasterDeterminedCb(const Status& status) {
-  if (status.ok()) {
-    mutable_retrier()->mutable_controller()->Reset();
-    SendRpc();
-  } else {
-    LOG(WARNING) << "Failed to determine new Master: " << status.ToString();
-    auto retry_status = mutable_retrier()->DelayedRetry(this, status);
-    LOG_IF(DFATAL, !retry_status.ok()) << "Retry failed: " << retry_status;
-  }
-}
-
 void GetTableSchemaRpc::Finished(const Status& status) {
-  Status new_status = status;
-  if (new_status.ok() && mutable_retrier()->HandleResponse(this, &new_status)) {
+  bool finished;
+  Status new_status = HandleFinished(status, resp_, &finished);
+  if (!finished) {
     return;
   }
 
-  if (new_status.ok() && resp_.has_error()) {
-    if (resp_.error().code() == MasterErrorPB::NOT_THE_LEADER ||
-        resp_.error().code() == MasterErrorPB::CATALOG_MANAGER_NOT_INITIALIZED) {
-      if (client_->IsMultiMaster()) {
-        LOG(WARNING) << "Leader Master has changed ("
-                     << client_->data_->leader_master_hostport().ToString()
-                     << " is no longer the leader), re-trying...";
-        ResetLeaderMasterAndRetry();
-        return;
-      }
-    }
-    if (resp_.error().status().code() == AppStatusPB::LEADER_NOT_READY_TO_SERVE ||
-        resp_.error().status().code() == AppStatusPB::LEADER_HAS_NO_LEASE) {
-      LOG(WARNING) << "Leader Master " << client_->data_->leader_master_hostport().ToString()
-                   << " does not have a valid exclusive lease: "
-                   << resp_.error().status().ShortDebugString() << ", re-trying...";
-      ResetLeaderMasterAndRetry();
-      return;
-    }
-    VLOG(2) << "resp_.error().status()=" << resp_.error().status().DebugString();
-    new_status = StatusFromPB(resp_.error().status());
-  }
-
-  if (new_status.IsTimedOut()) {
-    if (MonoTime::Now().ComesBefore(retrier().deadline())) {
-      if (client_->IsMultiMaster()) {
-        LOG(WARNING) << "Leader Master ("
-            << client_->data_->leader_master_hostport().ToString()
-            << ") timed out, re-trying...";
-        ResetLeaderMasterAndRetry();
-        return;
-      }
-    } else {
-      // Operation deadline expired during this latest RPC.
-      new_status = new_status.CloneAndPrepend(
-          "GetTableSchema timed out after deadline expired");
-    }
-  }
-
-  if (new_status.IsNetworkError()) {
-    if (client_->IsMultiMaster()) {
-      LOG(WARNING) << "Encountered a network error from the Master("
-                   << client_->data_->leader_master_hostport().ToString() << "): "
-                   << new_status.ToString() << ", retrying...";
-      ResetLeaderMasterAndRetry();
-      return;
-    }
-  }
+  auto retained_self = client_->data_->rpcs_.Unregister(&retained_self_);
 
   if (new_status.ok()) {
     std::unique_ptr<Schema> schema(new Schema());
@@ -977,13 +1102,191 @@ void GetTableSchemaRpc::Finished(const Status& status) {
 
       info_->table_name.GetFromTableIdentifierPB(resp_.identifier());
       info_->table_id = resp_.identifier().table_id();
-      if (resp_.has_indexed_table_id()) {
-        info_->indexed_table_id = resp_.indexed_table_id();
-      }
+      YBTable::PBToClientTableType(resp_.table_type(), &info_->table_type);
       info_->index_map.FromPB(resp_.indexes());
+      if (resp_.has_index_info()) {
+        info_->index_info.emplace(resp_.index_info());
+      }
       CHECK_GT(info_->table_id.size(), 0) << "Running against a too-old master";
     }
   }
+  if (!new_status.ok()) {
+    LOG(WARNING) << ToString() << " failed: " << new_status.ToString();
+  }
+  user_cb_.Run(new_status);
+}
+
+class CreateCDCStreamRpc : public ClientMasterRpc {
+ public:
+  CreateCDCStreamRpc(YBClient* client,
+                     CreateCDCStreamCallback user_cb,
+                     const TableId& table_id,
+                     const std::unordered_map<std::string, std::string>& options,
+                     CoarseTimePoint deadline,
+                     rpc::Messenger* messenger,
+                     rpc::ProxyCache* proxy_cache);
+
+  void SendRpc() override;
+
+  string ToString() const override;
+
+  virtual ~CreateCDCStreamRpc();
+
+ private:
+  void Finished(const Status& status) override;
+
+  YBClient* const client_;
+  CreateCDCStreamCallback user_cb_;
+  std::string table_id_;
+  std::unordered_map<std::string, std::string> options_;
+  CreateCDCStreamRequestPB req_;
+  CreateCDCStreamResponsePB resp_;
+  rpc::Rpcs::Handle retained_self_;
+};
+
+CreateCDCStreamRpc::CreateCDCStreamRpc(YBClient* client,
+                                       CreateCDCStreamCallback user_cb,
+                                       const TableId& table_id,
+                                       const std::unordered_map<std::string, std::string>& options,
+                                       CoarseTimePoint deadline,
+                                       rpc::Messenger* messenger,
+                                       rpc::ProxyCache* proxy_cache)
+    : ClientMasterRpc(client, deadline, messenger, proxy_cache),
+      client_(DCHECK_NOTNULL(client)),
+      user_cb_(std::move(user_cb)),
+      table_id_(table_id),
+      options_(options),
+      retained_self_(client->data_->rpcs_.InvalidHandle()) {
+}
+
+CreateCDCStreamRpc::~CreateCDCStreamRpc() {
+}
+
+void CreateCDCStreamRpc::SendRpc() {
+  client_->data_->rpcs_.Register(shared_from_this(), &retained_self_);
+
+  auto now = CoarseMonoClock::Now();
+  if (retrier().deadline() < now) {
+    Finished(STATUS(TimedOut, "CreateCDCStream timed out after deadline expired"));
+    return;
+  }
+
+  // See YBClient::Data::SyncLeaderMasterRpc().
+  auto rpc_deadline = now + client_->default_rpc_timeout();
+  mutable_retrier()->mutable_controller()->set_deadline(
+      std::min(rpc_deadline, retrier().deadline()));
+
+  req_.set_table_id(table_id_);
+  req_.mutable_options()->Reserve(options_.size());
+  for (const auto& option : options_) {
+    auto* op = req_.add_options();
+    op->set_key(option.first);
+    op->set_value(option.second);
+  }
+
+  client_->data_->master_proxy()->CreateCDCStreamAsync(
+      req_, &resp_, mutable_retrier()->mutable_controller(),
+      std::bind(&CreateCDCStreamRpc::Finished, this, Status::OK()));
+}
+
+string CreateCDCStreamRpc::ToString() const {
+  return Substitute("CreateCDCStream(table_id: $0, num_attempts: $1)",
+                    table_id_, num_attempts());
+}
+
+void CreateCDCStreamRpc::Finished(const Status& status) {
+  bool finished;
+  Status new_status = HandleFinished(status, resp_, &finished);
+  if (!finished) {
+    return;
+  }
+
+  auto retained_self = client_->data_->rpcs_.Unregister(&retained_self_);
+
+  if (new_status.ok()) {
+    user_cb_(resp_.stream_id());
+  } else {
+    LOG(WARNING) << ToString() << " failed: " << new_status.ToString();
+    user_cb_(new_status);
+  }
+}
+
+class DeleteCDCStreamRpc : public ClientMasterRpc {
+ public:
+  DeleteCDCStreamRpc(YBClient* client,
+                     StatusCallback user_cb,
+                     const CDCStreamId& stream_id,
+                     CoarseTimePoint deadline,
+                     rpc::Messenger* messenger,
+                     rpc::ProxyCache* proxy_cache);
+
+  void SendRpc() override;
+
+  string ToString() const override;
+
+  virtual ~DeleteCDCStreamRpc();
+
+ private:
+  void Finished(const Status& status) override;
+
+  YBClient* const client_;
+  StatusCallback user_cb_;
+  std::string stream_id_;
+  DeleteCDCStreamRequestPB req_;
+  DeleteCDCStreamResponsePB resp_;
+  rpc::Rpcs::Handle retained_self_;
+};
+
+DeleteCDCStreamRpc::DeleteCDCStreamRpc(YBClient* client,
+                                       StatusCallback user_cb,
+                                       const CDCStreamId& stream_id,
+                                       CoarseTimePoint deadline,
+                                       rpc::Messenger* messenger,
+                                       rpc::ProxyCache* proxy_cache)
+    : ClientMasterRpc(client, deadline, messenger, proxy_cache),
+      client_(DCHECK_NOTNULL(client)),
+      user_cb_(std::move(user_cb)),
+      stream_id_(stream_id),
+      retained_self_(client->data_->rpcs_.InvalidHandle()) {
+}
+
+DeleteCDCStreamRpc::~DeleteCDCStreamRpc() {
+}
+
+void DeleteCDCStreamRpc::SendRpc() {
+  client_->data_->rpcs_.Register(shared_from_this(), &retained_self_);
+
+  auto now = CoarseMonoClock::Now();
+  if (retrier().deadline() < now) {
+    Finished(STATUS(TimedOut, "DeleteCDCStream timed out after deadline expired"));
+    return;
+  }
+
+  // See YBClient::Data::SyncLeaderMasterRpc().
+  auto rpc_deadline = now + client_->default_rpc_timeout();
+  mutable_retrier()->mutable_controller()->set_deadline(
+      std::min(rpc_deadline, retrier().deadline()));
+
+  req_.add_stream_id(stream_id_);
+  client_->data_->master_proxy()->DeleteCDCStreamAsync(
+      req_, &resp_, mutable_retrier()->mutable_controller(),
+      std::bind(&DeleteCDCStreamRpc::Finished, this, Status::OK()));
+}
+
+string DeleteCDCStreamRpc::ToString() const {
+  return Substitute("DeleteCDCStream(stream_id: $0, num_attempts: $1)",
+                    stream_id_, num_attempts());
+}
+
+void DeleteCDCStreamRpc::Finished(const Status& status) {
+  bool finished;
+  Status new_status = HandleFinished(status, resp_, &finished);
+  if (!finished) {
+    return;
+  }
+
+  auto retained_self = client_->data_->rpcs_.Unregister(&retained_self_);
+
   if (!new_status.ok()) {
     LOG(WARNING) << ToString() << " failed: " << new_status.ToString();
   }
@@ -994,8 +1297,8 @@ void GetTableSchemaRpc::Finished(const Status& status) {
 
 Status YBClient::Data::GetTableSchema(YBClient* client,
                                       const YBTableName& table_name,
-                                      const MonoTime& deadline,
-                                      YBTable::Info* info) {
+                                      CoarseTimePoint deadline,
+                                      YBTableInfo* info) {
   Synchronizer sync;
   auto rpc = rpc::StartRpc<GetTableSchemaRpc>(
       client,
@@ -1010,8 +1313,8 @@ Status YBClient::Data::GetTableSchema(YBClient* client,
 
 Status YBClient::Data::GetTableSchema(YBClient* client,
                                       const TableId& table_id,
-                                      const MonoTime& deadline,
-                                      YBTable::Info* info) {
+                                      CoarseTimePoint deadline,
+                                      YBTableInfo* info) {
   Synchronizer sync;
   auto rpc = rpc::StartRpc<GetTableSchemaRpc>(
       client,
@@ -1022,6 +1325,50 @@ Status YBClient::Data::GetTableSchema(YBClient* client,
       messenger_,
       proxy_cache_.get());
   return sync.Wait();
+}
+
+Status YBClient::Data::GetTableSchemaById(YBClient* client,
+                                          const TableId& table_id,
+                                          CoarseTimePoint deadline,
+                                          std::shared_ptr<YBTableInfo> info,
+                                          StatusCallback callback) {
+  auto rpc = rpc::StartRpc<GetTableSchemaRpc>(
+      client,
+      callback,
+      table_id,
+      info.get(),
+      deadline,
+      messenger_,
+      proxy_cache_.get());
+  return Status::OK();
+}
+
+void YBClient::Data::CreateCDCStream(YBClient* client,
+                                     const TableId& table_id,
+                                     const std::unordered_map<std::string, std::string>& options,
+                                     CoarseTimePoint deadline,
+                                     CreateCDCStreamCallback callback) {
+  auto rpc = rpc::StartRpc<internal::CreateCDCStreamRpc>(
+      client,
+      callback,
+      table_id,
+      options,
+      deadline,
+      messenger_,
+      proxy_cache_.get());
+}
+
+void YBClient::Data::DeleteCDCStream(YBClient* client,
+                                     const CDCStreamId& stream_id,
+                                     CoarseTimePoint deadline,
+                                     StatusCallback callback) {
+  auto rpc = rpc::StartRpc<internal::DeleteCDCStreamRpc>(
+      client,
+      callback,
+      stream_id,
+      deadline,
+      messenger_,
+      proxy_cache_.get());
 }
 
 void YBClient::Data::LeaderMasterDetermined(const Status& status,
@@ -1047,7 +1394,7 @@ void YBClient::Data::LeaderMasterDetermined(const Status& status,
 }
 
 Status YBClient::Data::SetMasterServerProxy(YBClient* client,
-                                            const MonoTime& deadline,
+                                            CoarseTimePoint deadline,
                                             bool skip_resolution) {
   Synchronizer sync;
   SetMasterServerProxyAsync(client, deadline, skip_resolution, sync.AsStatusCallback());
@@ -1055,12 +1402,12 @@ Status YBClient::Data::SetMasterServerProxy(YBClient* client,
 }
 
 void YBClient::Data::SetMasterServerProxyAsync(YBClient* client,
-                                               const MonoTime& deadline,
+                                               CoarseTimePoint deadline,
                                                bool skip_resolution,
                                                const StatusCallback& cb) {
-  DCHECK(deadline.Initialized());
+  DCHECK(deadline != CoarseTimePoint::max());
 
-  std::vector<HostPort> master_addrs;
+  server::MasterAddresses master_addrs;
   // Refresh the value of 'master_server_addrs_' if needed.
   Status s = ReinitializeMasterAddresses();
   {
@@ -1085,16 +1432,15 @@ void YBClient::Data::SetMasterServerProxyAsync(YBClient* client,
         return;
       }
 
-      master_addrs.insert(master_addrs.end(), addrs.begin(), addrs.end());
+      master_addrs.push_back(std::move(addrs));
     }
   }
 
   // Finding a new master involves a fan-out RPC to each master. A single
   // RPC timeout's worth of time should be sufficient, though we'll use
   // the provided deadline if it's sooner.
-  MonoTime leader_master_deadline = MonoTime::Now();
-  leader_master_deadline.AddDelta(client->default_rpc_timeout());
-  MonoTime actual_deadline = MonoTime::Earliest(deadline, leader_master_deadline);
+  auto leader_master_deadline = CoarseMonoClock::Now() + client->default_rpc_timeout();
+  auto actual_deadline = std::min(deadline, leader_master_deadline);
 
   // This ensures that no more than one GetLeaderMasterRpc is in
   // flight at a time -- there isn't much sense in requesting this information
@@ -1103,9 +1449,9 @@ void YBClient::Data::SetMasterServerProxyAsync(YBClient* client,
   // callback to leader_master_callbacks_.
   std::unique_lock<simple_spinlock> l(leader_master_lock_);
   leader_master_callbacks_.push_back(cb);
-  if (skip_resolution && !master_addrs.empty()) {
+  if (skip_resolution && !master_addrs.empty() && !master_addrs.front().empty()) {
     l.unlock();
-    LeaderMasterDetermined(Status::OK(), master_addrs.front());
+    LeaderMasterDetermined(Status::OK(), master_addrs.front().front());
     return;
   }
   if (leader_master_rpc_ == rpcs_.InvalidHandle()) {
@@ -1151,6 +1497,34 @@ Status YBClient::Data::AddMasterAddress(const HostPort& addr) {
   return Status::OK();
 }
 
+namespace {
+
+Result<std::string> ReadMasterAddressesFromFlagFile(const std::string& flag_file_path) {
+  std::ifstream input_file(flag_file_path);
+  if (!input_file) {
+    return STATUS_FORMAT(IOError, "Unable to open flag file '$0': $1",
+        flag_file_path, strerror(errno));
+  }
+  std::string line;
+
+  std::string master_addrs;
+  while (input_file.good() && std::getline(input_file, line)) {
+    static const std::string kTServerMasterAddrsFlagPrefix = "--tserver_master_addrs=";
+    if (boost::starts_with(line, kTServerMasterAddrsFlagPrefix)) {
+      master_addrs = line.c_str() + kTServerMasterAddrsFlagPrefix.size();
+    }
+  }
+
+  if (input_file.bad()) {
+    // Do not check input_file.fail() here, reaching EOF may set that.
+    return STATUS_FORMAT(IOError, "Failed reading flag file '$0': $1",
+        flag_file_path, strerror(errno));
+  }
+  return master_addrs;
+}
+
+} // anonymous namespace
+
 // Read the master addresses (from a remote endpoint or a file depending on which is specified), and
 // re-initialize the 'master_server_addrs_' variable.
 Status YBClient::Data::ReinitializeMasterAddresses() {
@@ -1171,19 +1545,17 @@ Status YBClient::Data::ReinitializeMasterAddresses() {
     master_server_addrs_.push_back(master_addrs);
     LOG(INFO) << "Got master addresses = " << master_addrs
               << " from REST endpoint: " << master_server_endpoint_;
-  } else if (!FLAGS_flagfile.empty()) {
+  } else if (!FLAGS_flagfile.empty() && !skip_master_flagfile_) {
     LOG(INFO) << "Reinitialize master addresses from file: " << FLAGS_flagfile;
-    if (!RefreshFlagsFile(FLAGS_flagfile)) {
-      return STATUS_SUBSTITUTE(RuntimeError, "Couldn't load flags from file: $0", FLAGS_flagfile);
-    }
+    string master_addrs = VERIFY_RESULT(ReadMasterAddressesFromFlagFile(FLAGS_flagfile));
 
-    if (FLAGS_tserver_master_addrs.empty()) {
+    if (master_addrs.empty()) {
       return STATUS_SUBSTITUTE(IllegalState, "Couldn't find flag $0 in flagfile $1",
                                FLAGS_tserver_master_addrs, FLAGS_flagfile);
     }
     master_server_addrs_.clear();
-    master_server_addrs_.push_back(FLAGS_tserver_master_addrs);
-    LOG(INFO) << "New master addresses: " << FLAGS_tserver_master_addrs;
+    master_server_addrs_.push_back(master_addrs);
+    LOG(INFO) << "New master addresses: " << master_addrs;
   } else {
     VLOG(1) << "Skipping reinitialize of master addresses, no REST endpoint or file specified";
   }
@@ -1192,7 +1564,6 @@ Status YBClient::Data::ReinitializeMasterAddresses() {
 
 // Remove a given master from the list of master_server_addrs_.
 Status YBClient::Data::RemoveMasterAddress(const HostPort& addr) {
-  vector<HostPort> new_list;
 
   {
     auto str = addr.ToString();
@@ -1203,13 +1574,11 @@ Status YBClient::Data::RemoveMasterAddress(const HostPort& addr) {
     }
   }
 
-  RETURN_NOT_OK(SetMasterAddresses(HostPort::ToCommaSeparatedString(new_list)));
-
   return Status::OK();
 }
 
 Status YBClient::Data::SetReplicationInfo(
-    YBClient* client, const master::ReplicationInfoPB& replication_info, const MonoTime& deadline,
+    YBClient* client, const master::ReplicationInfoPB& replication_info, CoarseTimePoint deadline,
     bool* retry) {
   // If retry was not set, we'll wrap around in a retryable function.
   if (!retry) {

@@ -22,15 +22,24 @@
 
 #include <glog/logging.h>
 
+#include "yb/util/format.h"
+#include "yb/util/thread.h"
+
+using namespace std::literals;
+
 namespace yb {
 namespace rpc {
 
 class IoThreadPool::Impl {
  public:
-  explicit Impl(size_t num_threads) {
+  Impl(const std::string& name, size_t num_threads) : name_(name) {
     threads_.reserve(num_threads);
+    size_t index = 0;
     while (threads_.size() != num_threads) {
-      threads_.emplace_back([this] { Execute(); });
+      threads_.push_back(CHECK_RESULT(Thread::Make(
+          Format("iotp_$0", name_), Format("iotp_$0_$1", name_, index),
+          std::bind(&Impl::Execute, this))));
+      ++index;
     }
   }
 
@@ -48,10 +57,17 @@ class IoThreadPool::Impl {
   }
 
   void Join() {
-    for (auto& thread : threads_) {
-      if (thread.joinable()) {
-        thread.join();
+    auto deadline = std::chrono::steady_clock::now() + 15s;
+    while (!io_service_.stopped()) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        LOG(ERROR) << "Io service failed to stop";
+        io_service_.stop();
+        break;
       }
+      std::this_thread::sleep_for(10ms);
+    }
+    for (auto& thread : threads_) {
+      thread->Join();
     }
   }
 
@@ -62,12 +78,15 @@ class IoThreadPool::Impl {
     LOG_IF(ERROR, ec) << "Failed to run io service: " << ec;
   }
 
-  std::vector<std::thread> threads_;
+  std::string name_;
+  std::vector<ThreadPtr> threads_;
   IoService io_service_;
   boost::optional<IoService::work> work_{io_service_};
 };
 
-IoThreadPool::IoThreadPool(size_t num_threads) : impl_(new Impl(num_threads)) {}
+IoThreadPool::IoThreadPool(const std::string& name, size_t num_threads)
+    : impl_(new Impl(name, num_threads)) {}
+
 IoThreadPool::~IoThreadPool() {}
 
 IoService& IoThreadPool::io_service() {

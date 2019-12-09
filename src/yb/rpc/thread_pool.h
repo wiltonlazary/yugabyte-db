@@ -19,9 +19,12 @@
 #include <memory>
 #include <string>
 
+#include "yb/gutil/port.h"
+
 namespace yb {
 
 class Status;
+class Thread;
 
 namespace rpc {
 
@@ -32,6 +35,7 @@ class ThreadPoolTask {
 
   // When thread pool done with task, i.e. it completed or failed, it invokes Done
   virtual void Done(const Status& status) = 0;
+
  protected:
   ~ThreadPoolTask() {}
 };
@@ -63,6 +67,9 @@ class ThreadPool {
   void Shutdown();
 
   static bool IsCurrentThreadRpcWorker();
+
+  bool Owns(Thread* thread);
+  bool OwnsThisThread();
 
  private:
   class Impl;

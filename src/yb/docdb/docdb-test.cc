@@ -29,7 +29,10 @@
 #include "yb/docdb/intent.h"
 #include "yb/gutil/stringprintf.h"
 #include "yb/rocksutil/yb_rocksdb.h"
+#include "yb/tablet/tablet_options.h"
 #include "yb/server/hybrid_clock.h"
+#include "yb/docdb/consensus_frontier.h"
+#include "yb/docdb/docdb_rocksdb_util.h"
 
 #include "yb/util/minmax.h"
 #include "yb/util/path_util.h"
@@ -57,11 +60,12 @@ using namespace std::chrono_literals;
 
 DECLARE_bool(use_docdb_aware_bloom_filter);
 DECLARE_int32(max_nexts_to_avoid_seek);
+DECLARE_bool(docdb_sort_weak_intents_in_tests);
+
+#define ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(str) ASSERT_NO_FATALS(AssertDocDbDebugDumpStrEq(str))
 
 namespace yb {
 namespace docdb {
-
-using PV = PrimitiveValue;
 
 CHECKED_STATUS GetPrimitiveValue(const rocksdb::UserBoundaryValues &values,
     size_t index,
@@ -220,7 +224,7 @@ SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey_b", "subkey_d"; HT{ physica
     GetSubDocumentData data = { encoded_subdoc_key, &doc_from_rocksdb, &subdoc_found_in_rocksdb };
     EXPECT_OK(GetSubDocument(
         doc_db(), data, rocksdb::kDefaultQueryId,
-        kNonTransactionalOperationContext, MonoTime::Max() /* deadline */,
+        kNonTransactionalOperationContext, CoarseTimePoint::max() /* deadline */,
         ReadHybridTime::SingleTime(ht)));
     if (subdoc_string.empty()) {
       EXPECT_FALSE(subdoc_found_in_rocksdb);
@@ -238,7 +242,7 @@ SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey_b", "subkey_d"; HT{ physica
   void CheckExpectedLatestDBState();
 
   // Checks bloom filter useful counter increment to be in range [1;expected_max_increment] and
-  // table iterators number incr  ement to be expected_num_iterators_increment.
+  // table iterators number increment to be expected_num_iterators_increment.
   // Updates total_useful, total_iterators
   void CheckBloom(const int expected_max_increment, int *total_useful,
       const int expected_num_iterators_increment, int *total_iterators) {
@@ -302,7 +306,7 @@ SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey_b", "subkey_d"; HT{ physica
     }
     ASSERT_OK(InsertSubDocument(DocPath(collection_key.Encode()), subdoc, 1000_usec_ht, 10s));
 
-    AssertDocDbDebugDumpStrEq(Format(R"#(
+    ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(Format(R"#(
         SubDocKey($0, [HT{ physical: 1000 }]) -> {}; ttl: 10.000s
         SubDocKey($0, ["k0"; HT{ physical: 1000 w: 1 }]) -> "v0"; ttl: 10.000s
         SubDocKey($0, ["k1"; HT{ physical: 1000 w: 2 }]) -> "v1"; ttl: 10.000s
@@ -370,6 +374,36 @@ SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey_b", "subkey_d"; HT{ physica
     return Format(result_template, collection_key.ToString());
   }
 
+  void InitializeCollection(const std::string& key_string,
+                            std::string* val_string,
+                            vector<HybridTime>::iterator* time_iter,
+                            std::set<std::pair<string, string>>* docdb_dump) {
+    SubDocument subdoc;
+    DocKey collection_key(PrimitiveValues(key_string));
+
+    for (int i = 0; i < kNumSubKeysForCollectionsWithTTL; i++) {
+      string key = "sk" + std::to_string(i);
+      subdoc.SetChildPrimitive(PrimitiveValue(key), PrimitiveValue(*val_string));
+      (*val_string)[1]++;
+    }
+
+    ASSERT_OK(InsertSubDocument(DocPath(collection_key.Encode()), subdoc, **time_iter));
+    ++*time_iter;
+
+    SubDocument new_subdoc;
+    // Add new keys as well.
+    for (int i = kNumSubKeysForCollectionsWithTTL / 2;
+         i < 3 * kNumSubKeysForCollectionsWithTTL / 2; i++) {
+      string key = "sk" + std::to_string(i);
+      new_subdoc.SetChildPrimitive(PrimitiveValue(key), PrimitiveValue(*val_string));
+      (*val_string)[1]++;
+    }
+    ASSERT_OK(ExtendSubDocument(
+      DocPath(collection_key.Encode()), new_subdoc, **time_iter));
+    ++*time_iter;
+
+  }
+
 };
 
 class DocDBTestWithoutBlockCache: public DocDBTest {
@@ -423,7 +457,7 @@ void DocDBTest::CheckExpectedLatestDBState() {
   GetSubDocumentData data = { encoded_subdoc_key, &subdoc, &doc_found };
   ASSERT_OK(GetSubDocument(
       doc_db(), data, rocksdb::kDefaultQueryId,
-      kNonTransactionalOperationContext, MonoTime::Max() /* deadline */));
+      kNonTransactionalOperationContext, CoarseTimePoint::max() /* deadline */));
   ASSERT_TRUE(doc_found);
   ASSERT_STR_EQ_VERBOSE_TRIMMED(
       R"#(
@@ -468,7 +502,7 @@ TEST_F(DocDBTest, HistoryCompactionFirstRowHandlingRegression) {
       3000_usec_ht));
   ASSERT_OK(SetPrimitive(
       DocPath(encoded_doc_key), PrimitiveValue::kObject, 4000_usec_ht));
-  AssertDocDbDebugDumpStrEq(R"#(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
       SubDocKey(DocKey([], ["mydockey", 123456]), [HT{ physical: 4000 }]) -> {}
       SubDocKey(DocKey([], ["mydockey", 123456]), [HT{ physical: 1000 }]) -> {}
       SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey1"; HT{ physical: 3000 }]) -> "value3"
@@ -476,7 +510,7 @@ TEST_F(DocDBTest, HistoryCompactionFirstRowHandlingRegression) {
       SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey1"; HT{ physical: 1000 }]) -> "value1"
       )#");
   FullyCompactHistoryBefore(3500_usec_ht);
-  AssertDocDbDebugDumpStrEq(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
       R"#(
 SubDocKey(DocKey([], ["mydockey", 123456]), [HT{ physical: 4000 }]) -> {}
 SubDocKey(DocKey([], ["mydockey", 123456]), [HT{ physical: 1000 }]) -> {}
@@ -487,7 +521,7 @@ SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey1"; HT{ physical: 3000 }]) -
 TEST_F(DocDBTest, SetPrimitiveQL) {
   const DocKey doc_key(PrimitiveValues("mydockey", 123456));
   SetupRocksDBState(doc_key.Encode());
-  AssertDocDbDebugDumpStrEq(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
       R"#(
 SubDocKey(DocKey([], ["mydockey", 123456]), [HT{ physical: 1000 }]) -> {}
 SubDocKey(DocKey([], ["mydockey", 123456]), ["a", "1"; HT{ physical: 4000 }]) -> "3"
@@ -706,7 +740,7 @@ TEST_F(DocDBTest, ListInsertAndGetTest) {
   }
         )#");
 
-  AssertDocDbDebugDumpStrEq(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
       R"#(
 SubDocKey(DocKey([], ["list_test", 231]), [HT{ physical: 0 logical: 100 }]) -> {}
 SubDocKey(DocKey([], ["list_test", 231]), ["list1", ArrayIndex(3); \
@@ -724,15 +758,14 @@ SubDocKey(DocKey([], ["list_test", 231]), ["list2", ArrayIndex(2); \
 SubDocKey(DocKey([], ["list_test", 231]), ["other"; \
     HT{ physical: 0 logical: 100 w: 3 }]) -> "other_value"
         )#");
-
   ASSERT_OK(ExtendList(DocPath(encoded_doc_key, PrimitiveValue("list2")),
-      SubDocument({PrimitiveValue(5), PrimitiveValue(2)}), ListExtendOrder::PREPEND,
+      SubDocument({PrimitiveValue(5), PrimitiveValue(2)}, ListExtendOrder::PREPEND_BLOCK),
       HybridTime(300)));
   ASSERT_OK(ExtendList(DocPath(encoded_doc_key, PrimitiveValue("list2")),
-      SubDocument({PrimitiveValue(7), PrimitiveValue(4)}), ListExtendOrder::APPEND,
+      SubDocument({PrimitiveValue(7), PrimitiveValue(4)}, ListExtendOrder::APPEND),
       HybridTime(400)));
 
-  AssertDocDbDebugDumpStrEq(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
       R"#(
 SubDocKey(DocKey([], ["list_test", 231]), [HT{ physical: 0 logical: 100 }]) -> {}
 SubDocKey(DocKey([], ["list_test", 231]), ["list1", ArrayIndex(3); \
@@ -792,12 +825,14 @@ SubDocKey(DocKey([], ["list_test", 231]), ["other"; \
         )#");
 
   vector<int> indexes = {2, 4};
+  ReadHybridTime read_ht;
+  read_ht.read = HybridTime(460);
   vector<SubDocument> values = {
       SubDocument(PrimitiveValue::kTombstone), SubDocument(PrimitiveValue(17))};
   ASSERT_OK(ReplaceInList(DocPath(encoded_doc_key, PrimitiveValue("list2")),
-      indexes, values, HybridTime(460), HybridTime(500), rocksdb::kDefaultQueryId));
+    indexes, values, read_ht, HybridTime(500), rocksdb::kDefaultQueryId));
 
-  AssertDocDbDebugDumpStrEq(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
       R"#(
 SubDocKey(DocKey([], ["list_test", 231]), [HT{ physical: 0 logical: 100 }]) -> {}
 SubDocKey(DocKey([], ["list_test", 231]), ["list1", ArrayIndex(3); \
@@ -854,7 +889,7 @@ SubDocKey(DocKey([], ["list_test", 231]), ["other"; \
 
   ASSERT_OK(InsertSubDocument(DocPath(encoded_sub_doc_key), list3, HybridTime(100)));
 
-  AssertDocDbDebugDumpStrEq(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
       R"#(
 SubDocKey(DocKey([], ["list_test", 231]), [HT{ physical: 0 logical: 100 }]) -> {}
 SubDocKey(DocKey([], ["list_test", 231]), ["list1", ArrayIndex(3); \
@@ -933,18 +968,811 @@ TEST_F(DocDBTest, ExpiredValueCompactionTest) {
       PrimitiveValue("v24"), t2));
 
   // Note: HT{ physical: 1000 } + 4ms = HT{ physical: 5000 }
-  AssertDocDbDebugDumpStrEq(R"#(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
       SubDocKey(DocKey([], ["k1"]), ["s1"; HT{ physical: 5000 }]) -> "v14"
       SubDocKey(DocKey([], ["k1"]), ["s1"; HT{ physical: 1000 }]) -> "v11"; ttl: 0.001s
       SubDocKey(DocKey([], ["k1"]), ["s2"; HT{ physical: 5000 }]) -> "v24"
       SubDocKey(DocKey([], ["k1"]), ["s2"; HT{ physical: 1000 }]) -> "v21"; ttl: 0.003s
       )#");
   FullyCompactHistoryBefore(t1);
-  AssertDocDbDebugDumpStrEq(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
       R"#(
 SubDocKey(DocKey([], ["k1"]), ["s1"; HT{ physical: 5000 }]) -> "v14"
 SubDocKey(DocKey([], ["k1"]), ["s2"; HT{ physical: 5000 }]) -> "v24"
 SubDocKey(DocKey([], ["k1"]), ["s2"; HT{ physical: 1000 }]) -> "v21"; ttl: 0.003s
+      )#");
+}
+
+// Compaction testing with TTL merge records for generic Redis collections.
+// Observe that because only collection-level merge records are supported,
+// all tests begin with initializing a vanilla collection and adding TTL over it.
+TEST_F(DocDBTest, RedisCollectionTTLCompactionTest) {
+  const MonoDelta one_ms = 1ms;
+  string key_string = "k0";
+  string val_string = "v0";
+  int n_times = 35;
+  vector<HybridTime> t(n_times);
+  t[0] = 1000_usec_ht;
+  for (int i = 1; i < n_times; ++i) {
+    t[i] = server::HybridClock::AddPhysicalTimeToHybridTime(t[i-1], one_ms);
+  }
+
+  std::set<std::pair<string, string>> docdb_dump;
+  auto time_iter = t.begin();
+
+  // Stack 1
+  InitializeCollection(key_string, &val_string, &time_iter, &docdb_dump);
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(),
+    Value(PrimitiveValue(ValueType::kTombstone)), *time_iter));
+  ++time_iter;
+  InitializeCollection(key_string, &val_string, &time_iter, &docdb_dump);
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(),
+    Value(PrimitiveValue(ValueType::kObject), 21ms, Value::kInvalidUserTimestamp, Value::kTtlFlag),
+                         *time_iter));
+  ++time_iter;
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(),
+    Value(PrimitiveValue(ValueType::kObject), 9ms, Value::kInvalidUserTimestamp, Value::kTtlFlag),
+                         *time_iter));
+  time_iter = t.begin();
+  ++key_string[1];
+
+  // Stack 2
+  InitializeCollection(key_string, &val_string, &time_iter, &docdb_dump);
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(),
+    Value(PrimitiveValue(ValueType::kObject), 18ms, Value::kInvalidUserTimestamp, Value::kTtlFlag),
+                         *time_iter));
+  ++time_iter;
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(),
+    Value(PrimitiveValue(ValueType::kObject), 15ms, Value::kInvalidUserTimestamp, Value::kTtlFlag),
+                         *time_iter));
+  ++time_iter;
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(),
+    Value(PrimitiveValue(ValueType::kTombstone)), *time_iter));
+  time_iter = t.begin();
+  ++key_string[1];
+
+  // Stack 3
+  InitializeCollection(key_string, &val_string, &time_iter, &docdb_dump);
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(),
+    Value(PrimitiveValue(ValueType::kObject), 15ms, Value::kInvalidUserTimestamp, Value::kTtlFlag),
+                         *time_iter));
+  ++time_iter;
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(),
+    Value(PrimitiveValue(ValueType::kObject), 18ms, Value::kInvalidUserTimestamp, Value::kTtlFlag),
+                         *time_iter));
+  ++time_iter;
+  InitializeCollection(key_string, &val_string, &time_iter, &docdb_dump);
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(),
+    Value(PrimitiveValue(ValueType::kObject), 21ms, Value::kInvalidUserTimestamp, Value::kTtlFlag),
+                         *time_iter));
+  ++time_iter;
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(),
+    Value(PrimitiveValue(ValueType::kObject), 9ms, Value::kInvalidUserTimestamp, Value::kTtlFlag),
+                         *time_iter));
+  ++time_iter;
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(),
+    Value(PrimitiveValue(ValueType::kObject), 12ms, Value::kInvalidUserTimestamp, Value::kTtlFlag),
+                         *time_iter));
+  time_iter = t.begin();
+  ++key_string[1];
+
+  // Stack 4
+  InitializeCollection(key_string, &val_string, &time_iter, &docdb_dump);
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(),
+    Value(PrimitiveValue(ValueType::kObject), 15ms, Value::kInvalidUserTimestamp, Value::kTtlFlag),
+                         *time_iter));
+  ++time_iter;
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(),
+    Value(PrimitiveValue(ValueType::kObject), 6ms, Value::kInvalidUserTimestamp, Value::kTtlFlag),
+                         *time_iter));
+  ++time_iter;
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(),
+    Value(PrimitiveValue(ValueType::kObject), 18ms, Value::kInvalidUserTimestamp, Value::kTtlFlag),
+                         *time_iter));
+  ++time_iter;
+  InitializeCollection(key_string, &val_string, &time_iter, &docdb_dump);
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(),
+    Value(PrimitiveValue(ValueType::kObject), 18ms, Value::kInvalidUserTimestamp, Value::kTtlFlag),
+                         *time_iter));
+  ++time_iter;
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(),
+    Value(PrimitiveValue(ValueType::kObject), 9ms, Value::kInvalidUserTimestamp, Value::kTtlFlag),
+                         *time_iter));
+  ++time_iter;
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(),
+    Value(PrimitiveValue(ValueType::kObject), Value::kMaxTtl,
+          Value::kInvalidUserTimestamp, Value::kTtlFlag), *time_iter));
+
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
+      R"#(
+  SubDocKey(DocKey([], ["k0"]), [HT{ physical: 7000 }]) -> {}; merge flags: 1; ttl: 0.009s
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 6000 }]) -> {}; merge flags: 1; ttl: 0.021s
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 4000 }]) -> {}
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 3000 }]) -> DEL
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 1000 }]) -> {}
+SubDocKey(DocKey([], ["k0"]), ["sk0"; HT{ physical: 4000 w: 1 }]) -> "v6"
+SubDocKey(DocKey([], ["k0"]), ["sk0"; HT{ physical: 1000 w: 1 }]) -> "v0"
+SubDocKey(DocKey([], ["k0"]), ["sk1"; HT{ physical: 5000 }]) -> "v9"
+SubDocKey(DocKey([], ["k0"]), ["sk1"; HT{ physical: 4000 w: 2 }]) -> "v7"
+SubDocKey(DocKey([], ["k0"]), ["sk1"; HT{ physical: 2000 }]) -> "v3"
+SubDocKey(DocKey([], ["k0"]), ["sk1"; HT{ physical: 1000 w: 2 }]) -> "v1"
+SubDocKey(DocKey([], ["k0"]), ["sk2"; HT{ physical: 5000 w: 1 }]) -> "v:"
+SubDocKey(DocKey([], ["k0"]), ["sk2"; HT{ physical: 4000 w: 3 }]) -> "v8"
+SubDocKey(DocKey([], ["k0"]), ["sk2"; HT{ physical: 2000 w: 1 }]) -> "v4"
+SubDocKey(DocKey([], ["k0"]), ["sk2"; HT{ physical: 1000 w: 3 }]) -> "v2"
+SubDocKey(DocKey([], ["k0"]), ["sk3"; HT{ physical: 5000 w: 2 }]) -> "v;"
+SubDocKey(DocKey([], ["k0"]), ["sk3"; HT{ physical: 2000 w: 2 }]) -> "v5"
+SubDocKey(DocKey([], ["k1"]), [HT{ physical: 5000 }]) -> DEL
+SubDocKey(DocKey([], ["k1"]), [HT{ physical: 4000 }]) -> {}; merge flags: 1; ttl: 0.015s
+SubDocKey(DocKey([], ["k1"]), [HT{ physical: 3000 }]) -> {}; merge flags: 1; ttl: 0.018s
+SubDocKey(DocKey([], ["k1"]), [HT{ physical: 1000 }]) -> {}
+SubDocKey(DocKey([], ["k1"]), ["sk0"; HT{ physical: 1000 w: 1 }]) -> "v<"
+SubDocKey(DocKey([], ["k1"]), ["sk1"; HT{ physical: 2000 }]) -> "v?"
+SubDocKey(DocKey([], ["k1"]), ["sk1"; HT{ physical: 1000 w: 2 }]) -> "v="
+SubDocKey(DocKey([], ["k1"]), ["sk2"; HT{ physical: 2000 w: 1 }]) -> "v@"
+SubDocKey(DocKey([], ["k1"]), ["sk2"; HT{ physical: 1000 w: 3 }]) -> "v>"
+SubDocKey(DocKey([], ["k1"]), ["sk3"; HT{ physical: 2000 w: 2 }]) -> "vA"
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 9000 }]) -> {}; merge flags: 1; ttl: 0.012s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 8000 }]) -> {}; merge flags: 1; ttl: 0.009s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 7000 }]) -> {}; merge flags: 1; ttl: 0.021s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 5000 }]) -> {}
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 4000 }]) -> {}; merge flags: 1; ttl: 0.018s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 3000 }]) -> {}; merge flags: 1; ttl: 0.015s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 1000 }]) -> {}
+SubDocKey(DocKey([], ["k2"]), ["sk0"; HT{ physical: 5000 w: 1 }]) -> "vH"
+SubDocKey(DocKey([], ["k2"]), ["sk0"; HT{ physical: 1000 w: 1 }]) -> "vB"
+SubDocKey(DocKey([], ["k2"]), ["sk1"; HT{ physical: 6000 }]) -> "vK"
+SubDocKey(DocKey([], ["k2"]), ["sk1"; HT{ physical: 5000 w: 2 }]) -> "vI"
+SubDocKey(DocKey([], ["k2"]), ["sk1"; HT{ physical: 2000 }]) -> "vE"
+SubDocKey(DocKey([], ["k2"]), ["sk1"; HT{ physical: 1000 w: 2 }]) -> "vC"
+SubDocKey(DocKey([], ["k2"]), ["sk2"; HT{ physical: 6000 w: 1 }]) -> "vL"
+SubDocKey(DocKey([], ["k2"]), ["sk2"; HT{ physical: 5000 w: 3 }]) -> "vJ"
+SubDocKey(DocKey([], ["k2"]), ["sk2"; HT{ physical: 2000 w: 1 }]) -> "vF"
+SubDocKey(DocKey([], ["k2"]), ["sk2"; HT{ physical: 1000 w: 3 }]) -> "vD"
+SubDocKey(DocKey([], ["k2"]), ["sk3"; HT{ physical: 6000 w: 2 }]) -> "vM"
+SubDocKey(DocKey([], ["k2"]), ["sk3"; HT{ physical: 2000 w: 2 }]) -> "vG"
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 10000 }]) -> {}; merge flags: 1
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 9000 }]) -> {}; merge flags: 1; ttl: 0.009s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 8000 }]) -> {}; merge flags: 1; ttl: 0.018s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 6000 }]) -> {}
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 5000 }]) -> {}; merge flags: 1; ttl: 0.018s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 4000 }]) -> {}; merge flags: 1; ttl: 0.006s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 3000 }]) -> {}; merge flags: 1; ttl: 0.015s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 1000 }]) -> {}
+SubDocKey(DocKey([], ["k3"]), ["sk0"; HT{ physical: 6000 w: 1 }]) -> "vT"
+SubDocKey(DocKey([], ["k3"]), ["sk0"; HT{ physical: 1000 w: 1 }]) -> "vN"
+SubDocKey(DocKey([], ["k3"]), ["sk1"; HT{ physical: 7000 }]) -> "vW"
+SubDocKey(DocKey([], ["k3"]), ["sk1"; HT{ physical: 6000 w: 2 }]) -> "vU"
+SubDocKey(DocKey([], ["k3"]), ["sk1"; HT{ physical: 2000 }]) -> "vQ"
+SubDocKey(DocKey([], ["k3"]), ["sk1"; HT{ physical: 1000 w: 2 }]) -> "vO"
+SubDocKey(DocKey([], ["k3"]), ["sk2"; HT{ physical: 7000 w: 1 }]) -> "vX"
+SubDocKey(DocKey([], ["k3"]), ["sk2"; HT{ physical: 6000 w: 3 }]) -> "vV"
+SubDocKey(DocKey([], ["k3"]), ["sk2"; HT{ physical: 2000 w: 1 }]) -> "vR"
+SubDocKey(DocKey([], ["k3"]), ["sk2"; HT{ physical: 1000 w: 3 }]) -> "vP"
+SubDocKey(DocKey([], ["k3"]), ["sk3"; HT{ physical: 7000 w: 2 }]) -> "vY"
+SubDocKey(DocKey([], ["k3"]), ["sk3"; HT{ physical: 2000 w: 2 }]) -> "vS"
+      )#");
+  FullyCompactHistoryBefore(t[0]);
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
+      R"#(
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 7000 }]) -> {}; merge flags: 1; ttl: 0.009s
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 6000 }]) -> {}; merge flags: 1; ttl: 0.021s
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 4000 }]) -> {}
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 3000 }]) -> DEL
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 1000 }]) -> {}
+SubDocKey(DocKey([], ["k0"]), ["sk0"; HT{ physical: 4000 w: 1 }]) -> "v6"
+SubDocKey(DocKey([], ["k0"]), ["sk0"; HT{ physical: 1000 w: 1 }]) -> "v0"
+SubDocKey(DocKey([], ["k0"]), ["sk1"; HT{ physical: 5000 }]) -> "v9"
+SubDocKey(DocKey([], ["k0"]), ["sk1"; HT{ physical: 4000 w: 2 }]) -> "v7"
+SubDocKey(DocKey([], ["k0"]), ["sk1"; HT{ physical: 2000 }]) -> "v3"
+SubDocKey(DocKey([], ["k0"]), ["sk1"; HT{ physical: 1000 w: 2 }]) -> "v1"
+SubDocKey(DocKey([], ["k0"]), ["sk2"; HT{ physical: 5000 w: 1 }]) -> "v:"
+SubDocKey(DocKey([], ["k0"]), ["sk2"; HT{ physical: 4000 w: 3 }]) -> "v8"
+SubDocKey(DocKey([], ["k0"]), ["sk2"; HT{ physical: 2000 w: 1 }]) -> "v4"
+SubDocKey(DocKey([], ["k0"]), ["sk2"; HT{ physical: 1000 w: 3 }]) -> "v2"
+SubDocKey(DocKey([], ["k0"]), ["sk3"; HT{ physical: 5000 w: 2 }]) -> "v;"
+SubDocKey(DocKey([], ["k0"]), ["sk3"; HT{ physical: 2000 w: 2 }]) -> "v5"
+SubDocKey(DocKey([], ["k1"]), [HT{ physical: 5000 }]) -> DEL
+SubDocKey(DocKey([], ["k1"]), [HT{ physical: 4000 }]) -> {}; merge flags: 1; ttl: 0.015s
+SubDocKey(DocKey([], ["k1"]), [HT{ physical: 3000 }]) -> {}; merge flags: 1; ttl: 0.018s
+SubDocKey(DocKey([], ["k1"]), [HT{ physical: 1000 }]) -> {}
+SubDocKey(DocKey([], ["k1"]), ["sk0"; HT{ physical: 1000 w: 1 }]) -> "v<"
+SubDocKey(DocKey([], ["k1"]), ["sk1"; HT{ physical: 2000 }]) -> "v?"
+SubDocKey(DocKey([], ["k1"]), ["sk1"; HT{ physical: 1000 w: 2 }]) -> "v="
+SubDocKey(DocKey([], ["k1"]), ["sk2"; HT{ physical: 2000 w: 1 }]) -> "v@"
+SubDocKey(DocKey([], ["k1"]), ["sk2"; HT{ physical: 1000 w: 3 }]) -> "v>"
+SubDocKey(DocKey([], ["k1"]), ["sk3"; HT{ physical: 2000 w: 2 }]) -> "vA"
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 9000 }]) -> {}; merge flags: 1; ttl: 0.012s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 8000 }]) -> {}; merge flags: 1; ttl: 0.009s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 7000 }]) -> {}; merge flags: 1; ttl: 0.021s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 5000 }]) -> {}
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 4000 }]) -> {}; merge flags: 1; ttl: 0.018s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 3000 }]) -> {}; merge flags: 1; ttl: 0.015s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 1000 }]) -> {}
+SubDocKey(DocKey([], ["k2"]), ["sk0"; HT{ physical: 5000 w: 1 }]) -> "vH"
+SubDocKey(DocKey([], ["k2"]), ["sk0"; HT{ physical: 1000 w: 1 }]) -> "vB"
+SubDocKey(DocKey([], ["k2"]), ["sk1"; HT{ physical: 6000 }]) -> "vK"
+SubDocKey(DocKey([], ["k2"]), ["sk1"; HT{ physical: 5000 w: 2 }]) -> "vI"
+SubDocKey(DocKey([], ["k2"]), ["sk1"; HT{ physical: 2000 }]) -> "vE"
+SubDocKey(DocKey([], ["k2"]), ["sk1"; HT{ physical: 1000 w: 2 }]) -> "vC"
+SubDocKey(DocKey([], ["k2"]), ["sk2"; HT{ physical: 6000 w: 1 }]) -> "vL"
+SubDocKey(DocKey([], ["k2"]), ["sk2"; HT{ physical: 5000 w: 3 }]) -> "vJ"
+SubDocKey(DocKey([], ["k2"]), ["sk2"; HT{ physical: 2000 w: 1 }]) -> "vF"
+SubDocKey(DocKey([], ["k2"]), ["sk2"; HT{ physical: 1000 w: 3 }]) -> "vD"
+SubDocKey(DocKey([], ["k2"]), ["sk3"; HT{ physical: 6000 w: 2 }]) -> "vM"
+SubDocKey(DocKey([], ["k2"]), ["sk3"; HT{ physical: 2000 w: 2 }]) -> "vG"
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 10000 }]) -> {}; merge flags: 1
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 9000 }]) -> {}; merge flags: 1; ttl: 0.009s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 8000 }]) -> {}; merge flags: 1; ttl: 0.018s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 6000 }]) -> {}
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 5000 }]) -> {}; merge flags: 1; ttl: 0.018s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 4000 }]) -> {}; merge flags: 1; ttl: 0.006s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 3000 }]) -> {}; merge flags: 1; ttl: 0.015s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 1000 }]) -> {}
+SubDocKey(DocKey([], ["k3"]), ["sk0"; HT{ physical: 6000 w: 1 }]) -> "vT"
+SubDocKey(DocKey([], ["k3"]), ["sk0"; HT{ physical: 1000 w: 1 }]) -> "vN"
+SubDocKey(DocKey([], ["k3"]), ["sk1"; HT{ physical: 7000 }]) -> "vW"
+SubDocKey(DocKey([], ["k3"]), ["sk1"; HT{ physical: 6000 w: 2 }]) -> "vU"
+SubDocKey(DocKey([], ["k3"]), ["sk1"; HT{ physical: 2000 }]) -> "vQ"
+SubDocKey(DocKey([], ["k3"]), ["sk1"; HT{ physical: 1000 w: 2 }]) -> "vO"
+SubDocKey(DocKey([], ["k3"]), ["sk2"; HT{ physical: 7000 w: 1 }]) -> "vX"
+SubDocKey(DocKey([], ["k3"]), ["sk2"; HT{ physical: 6000 w: 3 }]) -> "vV"
+SubDocKey(DocKey([], ["k3"]), ["sk2"; HT{ physical: 2000 w: 1 }]) -> "vR"
+SubDocKey(DocKey([], ["k3"]), ["sk2"; HT{ physical: 1000 w: 3 }]) -> "vP"
+SubDocKey(DocKey([], ["k3"]), ["sk3"; HT{ physical: 7000 w: 2 }]) -> "vY"
+SubDocKey(DocKey([], ["k3"]), ["sk3"; HT{ physical: 2000 w: 2 }]) -> "vS"
+      )#");
+  FullyCompactHistoryBefore(t[1]);
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
+      R"#(
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 7000 }]) -> {}; merge flags: 1; ttl: 0.009s
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 6000 }]) -> {}; merge flags: 1; ttl: 0.021s
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 4000 }]) -> {}
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 3000 }]) -> DEL
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 1000 }]) -> {}
+SubDocKey(DocKey([], ["k0"]), ["sk0"; HT{ physical: 4000 w: 1 }]) -> "v6"
+SubDocKey(DocKey([], ["k0"]), ["sk0"; HT{ physical: 1000 w: 1 }]) -> "v0"
+SubDocKey(DocKey([], ["k0"]), ["sk1"; HT{ physical: 5000 }]) -> "v9"
+SubDocKey(DocKey([], ["k0"]), ["sk1"; HT{ physical: 4000 w: 2 }]) -> "v7"
+SubDocKey(DocKey([], ["k0"]), ["sk1"; HT{ physical: 2000 }]) -> "v3"
+SubDocKey(DocKey([], ["k0"]), ["sk2"; HT{ physical: 5000 w: 1 }]) -> "v:"
+SubDocKey(DocKey([], ["k0"]), ["sk2"; HT{ physical: 4000 w: 3 }]) -> "v8"
+SubDocKey(DocKey([], ["k0"]), ["sk2"; HT{ physical: 2000 w: 1 }]) -> "v4"
+SubDocKey(DocKey([], ["k0"]), ["sk3"; HT{ physical: 5000 w: 2 }]) -> "v;"
+SubDocKey(DocKey([], ["k0"]), ["sk3"; HT{ physical: 2000 w: 2 }]) -> "v5"
+SubDocKey(DocKey([], ["k1"]), [HT{ physical: 5000 }]) -> DEL
+SubDocKey(DocKey([], ["k1"]), [HT{ physical: 4000 }]) -> {}; merge flags: 1; ttl: 0.015s
+SubDocKey(DocKey([], ["k1"]), [HT{ physical: 3000 }]) -> {}; merge flags: 1; ttl: 0.018s
+SubDocKey(DocKey([], ["k1"]), [HT{ physical: 1000 }]) -> {}
+SubDocKey(DocKey([], ["k1"]), ["sk0"; HT{ physical: 1000 w: 1 }]) -> "v<"
+SubDocKey(DocKey([], ["k1"]), ["sk1"; HT{ physical: 2000 }]) -> "v?"
+SubDocKey(DocKey([], ["k1"]), ["sk2"; HT{ physical: 2000 w: 1 }]) -> "v@"
+SubDocKey(DocKey([], ["k1"]), ["sk3"; HT{ physical: 2000 w: 2 }]) -> "vA"
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 9000 }]) -> {}; merge flags: 1; ttl: 0.012s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 8000 }]) -> {}; merge flags: 1; ttl: 0.009s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 7000 }]) -> {}; merge flags: 1; ttl: 0.021s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 5000 }]) -> {}
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 4000 }]) -> {}; merge flags: 1; ttl: 0.018s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 3000 }]) -> {}; merge flags: 1; ttl: 0.015s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 1000 }]) -> {}
+SubDocKey(DocKey([], ["k2"]), ["sk0"; HT{ physical: 5000 w: 1 }]) -> "vH"
+SubDocKey(DocKey([], ["k2"]), ["sk0"; HT{ physical: 1000 w: 1 }]) -> "vB"
+SubDocKey(DocKey([], ["k2"]), ["sk1"; HT{ physical: 6000 }]) -> "vK"
+SubDocKey(DocKey([], ["k2"]), ["sk1"; HT{ physical: 5000 w: 2 }]) -> "vI"
+SubDocKey(DocKey([], ["k2"]), ["sk1"; HT{ physical: 2000 }]) -> "vE"
+SubDocKey(DocKey([], ["k2"]), ["sk2"; HT{ physical: 6000 w: 1 }]) -> "vL"
+SubDocKey(DocKey([], ["k2"]), ["sk2"; HT{ physical: 5000 w: 3 }]) -> "vJ"
+SubDocKey(DocKey([], ["k2"]), ["sk2"; HT{ physical: 2000 w: 1 }]) -> "vF"
+SubDocKey(DocKey([], ["k2"]), ["sk3"; HT{ physical: 6000 w: 2 }]) -> "vM"
+SubDocKey(DocKey([], ["k2"]), ["sk3"; HT{ physical: 2000 w: 2 }]) -> "vG"
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 10000 }]) -> {}; merge flags: 1
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 9000 }]) -> {}; merge flags: 1; ttl: 0.009s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 8000 }]) -> {}; merge flags: 1; ttl: 0.018s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 6000 }]) -> {}
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 5000 }]) -> {}; merge flags: 1; ttl: 0.018s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 4000 }]) -> {}; merge flags: 1; ttl: 0.006s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 3000 }]) -> {}; merge flags: 1; ttl: 0.015s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 1000 }]) -> {}
+SubDocKey(DocKey([], ["k3"]), ["sk0"; HT{ physical: 6000 w: 1 }]) -> "vT"
+SubDocKey(DocKey([], ["k3"]), ["sk0"; HT{ physical: 1000 w: 1 }]) -> "vN"
+SubDocKey(DocKey([], ["k3"]), ["sk1"; HT{ physical: 7000 }]) -> "vW"
+SubDocKey(DocKey([], ["k3"]), ["sk1"; HT{ physical: 6000 w: 2 }]) -> "vU"
+SubDocKey(DocKey([], ["k3"]), ["sk1"; HT{ physical: 2000 }]) -> "vQ"
+SubDocKey(DocKey([], ["k3"]), ["sk2"; HT{ physical: 7000 w: 1 }]) -> "vX"
+SubDocKey(DocKey([], ["k3"]), ["sk2"; HT{ physical: 6000 w: 3 }]) -> "vV"
+SubDocKey(DocKey([], ["k3"]), ["sk2"; HT{ physical: 2000 w: 1 }]) -> "vR"
+SubDocKey(DocKey([], ["k3"]), ["sk3"; HT{ physical: 7000 w: 2 }]) -> "vY"
+SubDocKey(DocKey([], ["k3"]), ["sk3"; HT{ physical: 2000 w: 2 }]) -> "vS"
+      )#");
+  FullyCompactHistoryBefore(t[2]);
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
+      R"#(
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 7000 }]) -> {}; merge flags: 1; ttl: 0.009s
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 6000 }]) -> {}; merge flags: 1; ttl: 0.021s
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 4000 }]) -> {}
+SubDocKey(DocKey([], ["k0"]), ["sk0"; HT{ physical: 4000 w: 1 }]) -> "v6"
+SubDocKey(DocKey([], ["k0"]), ["sk1"; HT{ physical: 5000 }]) -> "v9"
+SubDocKey(DocKey([], ["k0"]), ["sk1"; HT{ physical: 4000 w: 2 }]) -> "v7"
+SubDocKey(DocKey([], ["k0"]), ["sk2"; HT{ physical: 5000 w: 1 }]) -> "v:"
+SubDocKey(DocKey([], ["k0"]), ["sk2"; HT{ physical: 4000 w: 3 }]) -> "v8"
+SubDocKey(DocKey([], ["k0"]), ["sk3"; HT{ physical: 5000 w: 2 }]) -> "v;"
+SubDocKey(DocKey([], ["k1"]), [HT{ physical: 5000 }]) -> DEL
+SubDocKey(DocKey([], ["k1"]), [HT{ physical: 4000 }]) -> {}; merge flags: 1; ttl: 0.015s
+SubDocKey(DocKey([], ["k1"]), [HT{ physical: 1000 }]) -> {}; ttl: 0.020s
+SubDocKey(DocKey([], ["k1"]), ["sk0"; HT{ physical: 1000 w: 1 }]) -> "v<"
+SubDocKey(DocKey([], ["k1"]), ["sk1"; HT{ physical: 2000 }]) -> "v?"
+SubDocKey(DocKey([], ["k1"]), ["sk2"; HT{ physical: 2000 w: 1 }]) -> "v@"
+SubDocKey(DocKey([], ["k1"]), ["sk3"; HT{ physical: 2000 w: 2 }]) -> "vA"
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 9000 }]) -> {}; merge flags: 1; ttl: 0.012s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 8000 }]) -> {}; merge flags: 1; ttl: 0.009s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 7000 }]) -> {}; merge flags: 1; ttl: 0.021s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 5000 }]) -> {}
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 4000 }]) -> {}; merge flags: 1; ttl: 0.018s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 1000 }]) -> {}; ttl: 0.017s
+SubDocKey(DocKey([], ["k2"]), ["sk0"; HT{ physical: 5000 w: 1 }]) -> "vH"
+SubDocKey(DocKey([], ["k2"]), ["sk0"; HT{ physical: 1000 w: 1 }]) -> "vB"
+SubDocKey(DocKey([], ["k2"]), ["sk1"; HT{ physical: 6000 }]) -> "vK"
+SubDocKey(DocKey([], ["k2"]), ["sk1"; HT{ physical: 5000 w: 2 }]) -> "vI"
+SubDocKey(DocKey([], ["k2"]), ["sk1"; HT{ physical: 2000 }]) -> "vE"
+SubDocKey(DocKey([], ["k2"]), ["sk2"; HT{ physical: 6000 w: 1 }]) -> "vL"
+SubDocKey(DocKey([], ["k2"]), ["sk2"; HT{ physical: 5000 w: 3 }]) -> "vJ"
+SubDocKey(DocKey([], ["k2"]), ["sk2"; HT{ physical: 2000 w: 1 }]) -> "vF"
+SubDocKey(DocKey([], ["k2"]), ["sk3"; HT{ physical: 6000 w: 2 }]) -> "vM"
+SubDocKey(DocKey([], ["k2"]), ["sk3"; HT{ physical: 2000 w: 2 }]) -> "vG"
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 10000 }]) -> {}; merge flags: 1
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 9000 }]) -> {}; merge flags: 1; ttl: 0.009s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 8000 }]) -> {}; merge flags: 1; ttl: 0.018s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 6000 }]) -> {}
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 5000 }]) -> {}; merge flags: 1; ttl: 0.018s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 4000 }]) -> {}; merge flags: 1; ttl: 0.006s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 1000 }]) -> {}; ttl: 0.017s
+SubDocKey(DocKey([], ["k3"]), ["sk0"; HT{ physical: 6000 w: 1 }]) -> "vT"
+SubDocKey(DocKey([], ["k3"]), ["sk0"; HT{ physical: 1000 w: 1 }]) -> "vN"
+SubDocKey(DocKey([], ["k3"]), ["sk1"; HT{ physical: 7000 }]) -> "vW"
+SubDocKey(DocKey([], ["k3"]), ["sk1"; HT{ physical: 6000 w: 2 }]) -> "vU"
+SubDocKey(DocKey([], ["k3"]), ["sk1"; HT{ physical: 2000 }]) -> "vQ"
+SubDocKey(DocKey([], ["k3"]), ["sk2"; HT{ physical: 7000 w: 1 }]) -> "vX"
+SubDocKey(DocKey([], ["k3"]), ["sk2"; HT{ physical: 6000 w: 3 }]) -> "vV"
+SubDocKey(DocKey([], ["k3"]), ["sk2"; HT{ physical: 2000 w: 1 }]) -> "vR"
+SubDocKey(DocKey([], ["k3"]), ["sk3"; HT{ physical: 7000 w: 2 }]) -> "vY"
+SubDocKey(DocKey([], ["k3"]), ["sk3"; HT{ physical: 2000 w: 2 }]) -> "vS"
+      )#");
+  FullyCompactHistoryBefore(t[3]);
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
+      R"#(
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 7000 }]) -> {}; merge flags: 1; ttl: 0.009s
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 6000 }]) -> {}; merge flags: 1; ttl: 0.021s
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 4000 }]) -> {}
+SubDocKey(DocKey([], ["k0"]), ["sk0"; HT{ physical: 4000 w: 1 }]) -> "v6"
+SubDocKey(DocKey([], ["k0"]), ["sk1"; HT{ physical: 5000 }]) -> "v9"
+SubDocKey(DocKey([], ["k0"]), ["sk1"; HT{ physical: 4000 w: 2 }]) -> "v7"
+SubDocKey(DocKey([], ["k0"]), ["sk2"; HT{ physical: 5000 w: 1 }]) -> "v:"
+SubDocKey(DocKey([], ["k0"]), ["sk2"; HT{ physical: 4000 w: 3 }]) -> "v8"
+SubDocKey(DocKey([], ["k0"]), ["sk3"; HT{ physical: 5000 w: 2 }]) -> "v;"
+SubDocKey(DocKey([], ["k1"]), [HT{ physical: 5000 }]) -> DEL
+SubDocKey(DocKey([], ["k1"]), [HT{ physical: 1000 }]) -> {}; ttl: 0.018s
+SubDocKey(DocKey([], ["k1"]), ["sk0"; HT{ physical: 1000 w: 1 }]) -> "v<"
+SubDocKey(DocKey([], ["k1"]), ["sk1"; HT{ physical: 2000 }]) -> "v?"
+SubDocKey(DocKey([], ["k1"]), ["sk2"; HT{ physical: 2000 w: 1 }]) -> "v@"
+SubDocKey(DocKey([], ["k1"]), ["sk3"; HT{ physical: 2000 w: 2 }]) -> "vA"
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 9000 }]) -> {}; merge flags: 1; ttl: 0.012s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 8000 }]) -> {}; merge flags: 1; ttl: 0.009s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 7000 }]) -> {}; merge flags: 1; ttl: 0.021s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 5000 }]) -> {}
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 1000 }]) -> {}; ttl: 0.021s
+SubDocKey(DocKey([], ["k2"]), ["sk0"; HT{ physical: 5000 w: 1 }]) -> "vH"
+SubDocKey(DocKey([], ["k2"]), ["sk0"; HT{ physical: 1000 w: 1 }]) -> "vB"
+SubDocKey(DocKey([], ["k2"]), ["sk1"; HT{ physical: 6000 }]) -> "vK"
+SubDocKey(DocKey([], ["k2"]), ["sk1"; HT{ physical: 5000 w: 2 }]) -> "vI"
+SubDocKey(DocKey([], ["k2"]), ["sk1"; HT{ physical: 2000 }]) -> "vE"
+SubDocKey(DocKey([], ["k2"]), ["sk2"; HT{ physical: 6000 w: 1 }]) -> "vL"
+SubDocKey(DocKey([], ["k2"]), ["sk2"; HT{ physical: 5000 w: 3 }]) -> "vJ"
+SubDocKey(DocKey([], ["k2"]), ["sk2"; HT{ physical: 2000 w: 1 }]) -> "vF"
+SubDocKey(DocKey([], ["k2"]), ["sk3"; HT{ physical: 6000 w: 2 }]) -> "vM"
+SubDocKey(DocKey([], ["k2"]), ["sk3"; HT{ physical: 2000 w: 2 }]) -> "vG"
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 10000 }]) -> {}; merge flags: 1
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 9000 }]) -> {}; merge flags: 1; ttl: 0.009s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 8000 }]) -> {}; merge flags: 1; ttl: 0.018s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 6000 }]) -> {}
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 5000 }]) -> {}; merge flags: 1; ttl: 0.018s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 1000 }]) -> {}; ttl: 0.009s
+SubDocKey(DocKey([], ["k3"]), ["sk0"; HT{ physical: 6000 w: 1 }]) -> "vT"
+SubDocKey(DocKey([], ["k3"]), ["sk0"; HT{ physical: 1000 w: 1 }]) -> "vN"
+SubDocKey(DocKey([], ["k3"]), ["sk1"; HT{ physical: 7000 }]) -> "vW"
+SubDocKey(DocKey([], ["k3"]), ["sk1"; HT{ physical: 6000 w: 2 }]) -> "vU"
+SubDocKey(DocKey([], ["k3"]), ["sk1"; HT{ physical: 2000 }]) -> "vQ"
+SubDocKey(DocKey([], ["k3"]), ["sk2"; HT{ physical: 7000 w: 1 }]) -> "vX"
+SubDocKey(DocKey([], ["k3"]), ["sk2"; HT{ physical: 6000 w: 3 }]) -> "vV"
+SubDocKey(DocKey([], ["k3"]), ["sk2"; HT{ physical: 2000 w: 1 }]) -> "vR"
+SubDocKey(DocKey([], ["k3"]), ["sk3"; HT{ physical: 7000 w: 2 }]) -> "vY"
+SubDocKey(DocKey([], ["k3"]), ["sk3"; HT{ physical: 2000 w: 2 }]) -> "vS"
+      )#");
+  FullyCompactHistoryBefore(t[4]);
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
+      R"#(
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 7000 }]) -> {}; merge flags: 1; ttl: 0.009s
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 6000 }]) -> {}; merge flags: 1; ttl: 0.021s
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 4000 }]) -> {}
+SubDocKey(DocKey([], ["k0"]), ["sk0"; HT{ physical: 4000 w: 1 }]) -> "v6"
+SubDocKey(DocKey([], ["k0"]), ["sk1"; HT{ physical: 5000 }]) -> "v9"
+SubDocKey(DocKey([], ["k0"]), ["sk2"; HT{ physical: 5000 w: 1 }]) -> "v:"
+SubDocKey(DocKey([], ["k0"]), ["sk3"; HT{ physical: 5000 w: 2 }]) -> "v;"
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 9000 }]) -> {}; merge flags: 1; ttl: 0.012s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 8000 }]) -> {}; merge flags: 1; ttl: 0.009s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 7000 }]) -> {}; merge flags: 1; ttl: 0.021s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 5000 }]) -> {}
+SubDocKey(DocKey([], ["k2"]), ["sk0"; HT{ physical: 5000 w: 1 }]) -> "vH"
+SubDocKey(DocKey([], ["k2"]), ["sk1"; HT{ physical: 6000 }]) -> "vK"
+SubDocKey(DocKey([], ["k2"]), ["sk1"; HT{ physical: 5000 w: 2 }]) -> "vI"
+SubDocKey(DocKey([], ["k2"]), ["sk2"; HT{ physical: 6000 w: 1 }]) -> "vL"
+SubDocKey(DocKey([], ["k2"]), ["sk2"; HT{ physical: 5000 w: 3 }]) -> "vJ"
+SubDocKey(DocKey([], ["k2"]), ["sk3"; HT{ physical: 6000 w: 2 }]) -> "vM"
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 10000 }]) -> {}; merge flags: 1
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 9000 }]) -> {}; merge flags: 1; ttl: 0.009s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 8000 }]) -> {}; merge flags: 1; ttl: 0.018s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 6000 }]) -> {}
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 1000 }]) -> {}; ttl: 0.022s
+SubDocKey(DocKey([], ["k3"]), ["sk0"; HT{ physical: 6000 w: 1 }]) -> "vT"
+SubDocKey(DocKey([], ["k3"]), ["sk0"; HT{ physical: 1000 w: 1 }]) -> "vN"
+SubDocKey(DocKey([], ["k3"]), ["sk1"; HT{ physical: 7000 }]) -> "vW"
+SubDocKey(DocKey([], ["k3"]), ["sk1"; HT{ physical: 6000 w: 2 }]) -> "vU"
+SubDocKey(DocKey([], ["k3"]), ["sk1"; HT{ physical: 2000 }]) -> "vQ"
+SubDocKey(DocKey([], ["k3"]), ["sk2"; HT{ physical: 7000 w: 1 }]) -> "vX"
+SubDocKey(DocKey([], ["k3"]), ["sk2"; HT{ physical: 6000 w: 3 }]) -> "vV"
+SubDocKey(DocKey([], ["k3"]), ["sk2"; HT{ physical: 2000 w: 1 }]) -> "vR"
+SubDocKey(DocKey([], ["k3"]), ["sk3"; HT{ physical: 7000 w: 2 }]) -> "vY"
+SubDocKey(DocKey([], ["k3"]), ["sk3"; HT{ physical: 2000 w: 2 }]) -> "vS"
+      )#");
+  FullyCompactHistoryBefore(t[5]);
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
+      R"#(
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 7000 }]) -> {}; merge flags: 1; ttl: 0.009s
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 4000 }]) -> {}; ttl: 0.023s
+SubDocKey(DocKey([], ["k0"]), ["sk0"; HT{ physical: 4000 w: 1 }]) -> "v6"
+SubDocKey(DocKey([], ["k0"]), ["sk1"; HT{ physical: 5000 }]) -> "v9"
+SubDocKey(DocKey([], ["k0"]), ["sk2"; HT{ physical: 5000 w: 1 }]) -> "v:"
+SubDocKey(DocKey([], ["k0"]), ["sk3"; HT{ physical: 5000 w: 2 }]) -> "v;"
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 9000 }]) -> {}; merge flags: 1; ttl: 0.012s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 8000 }]) -> {}; merge flags: 1; ttl: 0.009s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 7000 }]) -> {}; merge flags: 1; ttl: 0.021s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 5000 }]) -> {}
+SubDocKey(DocKey([], ["k2"]), ["sk0"; HT{ physical: 5000 w: 1 }]) -> "vH"
+SubDocKey(DocKey([], ["k2"]), ["sk1"; HT{ physical: 6000 }]) -> "vK"
+SubDocKey(DocKey([], ["k2"]), ["sk2"; HT{ physical: 6000 w: 1 }]) -> "vL"
+SubDocKey(DocKey([], ["k2"]), ["sk3"; HT{ physical: 6000 w: 2 }]) -> "vM"
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 10000 }]) -> {}; merge flags: 1
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 9000 }]) -> {}; merge flags: 1; ttl: 0.009s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 8000 }]) -> {}; merge flags: 1; ttl: 0.018s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 6000 }]) -> {}
+SubDocKey(DocKey([], ["k3"]), ["sk0"; HT{ physical: 6000 w: 1 }]) -> "vT"
+SubDocKey(DocKey([], ["k3"]), ["sk1"; HT{ physical: 7000 }]) -> "vW"
+SubDocKey(DocKey([], ["k3"]), ["sk1"; HT{ physical: 6000 w: 2 }]) -> "vU"
+SubDocKey(DocKey([], ["k3"]), ["sk2"; HT{ physical: 7000 w: 1 }]) -> "vX"
+SubDocKey(DocKey([], ["k3"]), ["sk2"; HT{ physical: 6000 w: 3 }]) -> "vV"
+SubDocKey(DocKey([], ["k3"]), ["sk3"; HT{ physical: 7000 w: 2 }]) -> "vY"
+      )#");
+  FullyCompactHistoryBefore(t[6]);
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
+      R"#(
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 4000 }]) -> {}; ttl: 0.012s
+SubDocKey(DocKey([], ["k0"]), ["sk0"; HT{ physical: 4000 w: 1 }]) -> "v6"
+SubDocKey(DocKey([], ["k0"]), ["sk1"; HT{ physical: 5000 }]) -> "v9"
+SubDocKey(DocKey([], ["k0"]), ["sk2"; HT{ physical: 5000 w: 1 }]) -> "v:"
+SubDocKey(DocKey([], ["k0"]), ["sk3"; HT{ physical: 5000 w: 2 }]) -> "v;"
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 9000 }]) -> {}; merge flags: 1; ttl: 0.012s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 8000 }]) -> {}; merge flags: 1; ttl: 0.009s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 5000 }]) -> {}; ttl: 0.023s
+SubDocKey(DocKey([], ["k2"]), ["sk0"; HT{ physical: 5000 w: 1 }]) -> "vH"
+SubDocKey(DocKey([], ["k2"]), ["sk1"; HT{ physical: 6000 }]) -> "vK"
+SubDocKey(DocKey([], ["k2"]), ["sk2"; HT{ physical: 6000 w: 1 }]) -> "vL"
+SubDocKey(DocKey([], ["k2"]), ["sk3"; HT{ physical: 6000 w: 2 }]) -> "vM"
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 10000 }]) -> {}; merge flags: 1
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 9000 }]) -> {}; merge flags: 1; ttl: 0.009s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 8000 }]) -> {}; merge flags: 1; ttl: 0.018s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 6000 }]) -> {}
+SubDocKey(DocKey([], ["k3"]), ["sk0"; HT{ physical: 6000 w: 1 }]) -> "vT"
+SubDocKey(DocKey([], ["k3"]), ["sk1"; HT{ physical: 7000 }]) -> "vW"
+SubDocKey(DocKey([], ["k3"]), ["sk2"; HT{ physical: 7000 w: 1 }]) -> "vX"
+SubDocKey(DocKey([], ["k3"]), ["sk3"; HT{ physical: 7000 w: 2 }]) -> "vY"
+      )#");
+  FullyCompactHistoryBefore(t[7]);
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
+      R"#(
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 4000 }]) -> {}; ttl: 0.012s
+SubDocKey(DocKey([], ["k0"]), ["sk0"; HT{ physical: 4000 w: 1 }]) -> "v6"
+SubDocKey(DocKey([], ["k0"]), ["sk1"; HT{ physical: 5000 }]) -> "v9"
+SubDocKey(DocKey([], ["k0"]), ["sk2"; HT{ physical: 5000 w: 1 }]) -> "v:"
+SubDocKey(DocKey([], ["k0"]), ["sk3"; HT{ physical: 5000 w: 2 }]) -> "v;"
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 9000 }]) -> {}; merge flags: 1; ttl: 0.012s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 5000 }]) -> {}; ttl: 0.012s
+SubDocKey(DocKey([], ["k2"]), ["sk0"; HT{ physical: 5000 w: 1 }]) -> "vH"
+SubDocKey(DocKey([], ["k2"]), ["sk1"; HT{ physical: 6000 }]) -> "vK"
+SubDocKey(DocKey([], ["k2"]), ["sk2"; HT{ physical: 6000 w: 1 }]) -> "vL"
+SubDocKey(DocKey([], ["k2"]), ["sk3"; HT{ physical: 6000 w: 2 }]) -> "vM"
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 10000 }]) -> {}; merge flags: 1
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 9000 }]) -> {}; merge flags: 1; ttl: 0.009s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 6000 }]) -> {}; ttl: 0.020s
+SubDocKey(DocKey([], ["k3"]), ["sk0"; HT{ physical: 6000 w: 1 }]) -> "vT"
+SubDocKey(DocKey([], ["k3"]), ["sk1"; HT{ physical: 7000 }]) -> "vW"
+SubDocKey(DocKey([], ["k3"]), ["sk2"; HT{ physical: 7000 w: 1 }]) -> "vX"
+SubDocKey(DocKey([], ["k3"]), ["sk3"; HT{ physical: 7000 w: 2 }]) -> "vY"
+      )#");
+  FullyCompactHistoryBefore(t[8]);
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
+      R"#(
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 4000 }]) -> {}; ttl: 0.012s
+SubDocKey(DocKey([], ["k0"]), ["sk0"; HT{ physical: 4000 w: 1 }]) -> "v6"
+SubDocKey(DocKey([], ["k0"]), ["sk1"; HT{ physical: 5000 }]) -> "v9"
+SubDocKey(DocKey([], ["k0"]), ["sk2"; HT{ physical: 5000 w: 1 }]) -> "v:"
+SubDocKey(DocKey([], ["k0"]), ["sk3"; HT{ physical: 5000 w: 2 }]) -> "v;"
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 5000 }]) -> {}; ttl: 0.016s
+SubDocKey(DocKey([], ["k2"]), ["sk0"; HT{ physical: 5000 w: 1 }]) -> "vH"
+SubDocKey(DocKey([], ["k2"]), ["sk1"; HT{ physical: 6000 }]) -> "vK"
+SubDocKey(DocKey([], ["k2"]), ["sk2"; HT{ physical: 6000 w: 1 }]) -> "vL"
+SubDocKey(DocKey([], ["k2"]), ["sk3"; HT{ physical: 6000 w: 2 }]) -> "vM"
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 10000 }]) -> {}; merge flags: 1
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 6000 }]) -> {}; ttl: 0.012s
+SubDocKey(DocKey([], ["k3"]), ["sk0"; HT{ physical: 6000 w: 1 }]) -> "vT"
+SubDocKey(DocKey([], ["k3"]), ["sk1"; HT{ physical: 7000 }]) -> "vW"
+SubDocKey(DocKey([], ["k3"]), ["sk2"; HT{ physical: 7000 w: 1 }]) -> "vX"
+SubDocKey(DocKey([], ["k3"]), ["sk3"; HT{ physical: 7000 w: 2 }]) -> "vY"
+      )#");
+  FullyCompactHistoryBefore(t[9]);
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
+      R"#(
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 4000 }]) -> {}; ttl: 0.012s
+SubDocKey(DocKey([], ["k0"]), ["sk0"; HT{ physical: 4000 w: 1 }]) -> "v6"
+SubDocKey(DocKey([], ["k0"]), ["sk1"; HT{ physical: 5000 }]) -> "v9"
+SubDocKey(DocKey([], ["k0"]), ["sk2"; HT{ physical: 5000 w: 1 }]) -> "v:"
+SubDocKey(DocKey([], ["k0"]), ["sk3"; HT{ physical: 5000 w: 2 }]) -> "v;"
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 5000 }]) -> {}; ttl: 0.016s
+SubDocKey(DocKey([], ["k2"]), ["sk0"; HT{ physical: 5000 w: 1 }]) -> "vH"
+SubDocKey(DocKey([], ["k2"]), ["sk1"; HT{ physical: 6000 }]) -> "vK"
+SubDocKey(DocKey([], ["k2"]), ["sk2"; HT{ physical: 6000 w: 1 }]) -> "vL"
+SubDocKey(DocKey([], ["k2"]), ["sk3"; HT{ physical: 6000 w: 2 }]) -> "vM"
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 6000 }]) -> {}
+SubDocKey(DocKey([], ["k3"]), ["sk0"; HT{ physical: 6000 w: 1 }]) -> "vT"
+SubDocKey(DocKey([], ["k3"]), ["sk1"; HT{ physical: 7000 }]) -> "vW"
+SubDocKey(DocKey([], ["k3"]), ["sk2"; HT{ physical: 7000 w: 1 }]) -> "vX"
+SubDocKey(DocKey([], ["k3"]), ["sk3"; HT{ physical: 7000 w: 2 }]) -> "vY"
+      )#");
+  FullyCompactHistoryBefore(t[16]);
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
+      R"#(
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 5000 }]) -> {}; ttl: 0.016s
+SubDocKey(DocKey([], ["k2"]), ["sk0"; HT{ physical: 5000 w: 1 }]) -> "vH"
+SubDocKey(DocKey([], ["k2"]), ["sk1"; HT{ physical: 6000 }]) -> "vK"
+SubDocKey(DocKey([], ["k2"]), ["sk2"; HT{ physical: 6000 w: 1 }]) -> "vL"
+SubDocKey(DocKey([], ["k2"]), ["sk3"; HT{ physical: 6000 w: 2 }]) -> "vM"
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 6000 }]) -> {}
+SubDocKey(DocKey([], ["k3"]), ["sk0"; HT{ physical: 6000 w: 1 }]) -> "vT"
+SubDocKey(DocKey([], ["k3"]), ["sk1"; HT{ physical: 7000 }]) -> "vW"
+SubDocKey(DocKey([], ["k3"]), ["sk2"; HT{ physical: 7000 w: 1 }]) -> "vX"
+SubDocKey(DocKey([], ["k3"]), ["sk3"; HT{ physical: 7000 w: 2 }]) -> "vY"
+      )#");
+  FullyCompactHistoryBefore(t[21]);
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
+      R"#(
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 6000 }]) -> {}
+SubDocKey(DocKey([], ["k3"]), ["sk0"; HT{ physical: 6000 w: 1 }]) -> "vT"
+SubDocKey(DocKey([], ["k3"]), ["sk1"; HT{ physical: 7000 }]) -> "vW"
+SubDocKey(DocKey([], ["k3"]), ["sk2"; HT{ physical: 7000 w: 1 }]) -> "vX"
+SubDocKey(DocKey([], ["k3"]), ["sk3"; HT{ physical: 7000 w: 2 }]) -> "vY"
+      )#");
+  FullyCompactHistoryBefore(t[34]);
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
+      R"#(
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 6000 }]) -> {}
+SubDocKey(DocKey([], ["k3"]), ["sk0"; HT{ physical: 6000 w: 1 }]) -> "vT"
+SubDocKey(DocKey([], ["k3"]), ["sk1"; HT{ physical: 7000 }]) -> "vW"
+SubDocKey(DocKey([], ["k3"]), ["sk2"; HT{ physical: 7000 w: 1 }]) -> "vX"
+SubDocKey(DocKey([], ["k3"]), ["sk3"; HT{ physical: 7000 w: 2 }]) -> "vY"
+      )#");
+}
+
+// Basic compaction testing for TTL in Redis.
+TEST_F(DocDBTest, RedisTTLCompactionTest) {
+  const MonoDelta one_ms = 1ms;
+  string key_string = "k0";
+  string val_string = "v0";
+  int n_times = 20;
+  vector<HybridTime> t(n_times);
+  t[0] = 1000_usec_ht;
+  for (int i = 1; i < n_times; ++i) {
+    t[i] = server::HybridClock::AddPhysicalTimeToHybridTime(t[i-1], one_ms);
+  }
+  // Compact at t10
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(), // k0
+                         Value(PrimitiveValue(val_string), 4ms), t[2]));
+  val_string[1]++;
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(),
+                         Value(PrimitiveValue(val_string), 3ms), t[0]));
+  val_string[1]++;
+  key_string[1]++;
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(), // k1
+                         Value(PrimitiveValue(val_string), 8ms), t[3]));
+  val_string[1]++;
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(),
+                         Value(PrimitiveValue(val_string), 1ms), t[5]));
+  val_string[1]++;
+  key_string[1]++;
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(), // k2
+                         Value(PrimitiveValue(val_string), 3ms), t[5]));
+  val_string[1]++;
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(),
+                         Value(PrimitiveValue(val_string), 5ms), t[7]));
+  val_string[1]++;
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(),
+                         Value(PrimitiveValue(val_string), Value::kMaxTtl), t[11]));
+  key_string[1]++;
+  val_string[1]++;
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(), // k3
+                         Value(PrimitiveValue(val_string), 4ms), t[1]));
+  val_string[1]++;
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(),
+                         Value(PrimitiveValue(val_string), Value::kMaxTtl), t[4]));
+  val_string[1]++;
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(),
+                         Value(PrimitiveValue(val_string), 1ms), t[13]));
+  val_string[1]++;
+  key_string[1]++;
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(), // k4
+                         Value(PrimitiveValue::kTombstone), t[12]));
+  key_string[1]++;
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(), // k5
+                         Value(PrimitiveValue(val_string), 9ms), t[8]));
+  val_string[1]++;
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(),
+                         Value(PrimitiveValue::kTombstone), t[9]));
+  key_string[1]++;
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(), // k6
+                         Value(PrimitiveValue(val_string), 9ms), t[8]));
+  val_string[1]++;
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(),
+                         Value(PrimitiveValue::kTombstone), t[6]));
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
+      R"#(
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 3000 }]) -> "v0"; ttl: 0.004s
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 1000 }]) -> "v1"; ttl: 0.003s
+SubDocKey(DocKey([], ["k1"]), [HT{ physical: 6000 }]) -> "v3"; ttl: 0.001s
+SubDocKey(DocKey([], ["k1"]), [HT{ physical: 4000 }]) -> "v2"; ttl: 0.008s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 12000 }]) -> "v6"
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 8000 }]) -> "v5"; ttl: 0.005s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 6000 }]) -> "v4"; ttl: 0.003s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 14000 }]) -> "v9"; ttl: 0.001s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 5000 }]) -> "v8"
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 2000 }]) -> "v7"; ttl: 0.004s
+SubDocKey(DocKey([], ["k4"]), [HT{ physical: 13000 }]) -> DEL
+SubDocKey(DocKey([], ["k5"]), [HT{ physical: 10000 }]) -> DEL
+SubDocKey(DocKey([], ["k5"]), [HT{ physical: 9000 }]) -> "v:"; ttl: 0.009s
+SubDocKey(DocKey([], ["k6"]), [HT{ physical: 9000 }]) -> "v;"; ttl: 0.009s
+SubDocKey(DocKey([], ["k6"]), [HT{ physical: 7000 }]) -> DEL
+      )#");
+  FullyCompactHistoryBefore(t[10]);
+
+  // Major compaction
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
+      R"#(
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 12000 }]) -> "v6"
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 8000 }]) -> "v5"; ttl: 0.005s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 14000 }]) -> "v9"; ttl: 0.001s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 5000 }]) -> "v8"
+SubDocKey(DocKey([], ["k4"]), [HT{ physical: 13000 }]) -> DEL
+SubDocKey(DocKey([], ["k6"]), [HT{ physical: 9000 }]) -> "v;"; ttl: 0.009s
+      )#");
+
+  FullyCompactHistoryBefore(t[14]);
+
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
+      R"#(
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 12000 }]) -> "v6"
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 14000 }]) -> "v9"; ttl: 0.001s
+SubDocKey(DocKey([], ["k6"]), [HT{ physical: 9000 }]) -> "v;"; ttl: 0.009s
+      )#");
+
+  FullyCompactHistoryBefore(t[19]);
+
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
+      R"#(
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 12000 }]) -> "v6"
+      )#");
+
+  key_string = "k0";
+  val_string = "v0";
+  // Checking TTL rows now
+  ASSERT_OK(SetPrimitive(
+      DocKey(PrimitiveValues(key_string)).Encode(), // k0
+      Value(PrimitiveValue(ValueType::kString), 6ms, Value::kInvalidUserTimestamp, Value::kTtlFlag),
+      t[5]));
+  ASSERT_OK(SetPrimitive(
+      DocKey(PrimitiveValues(key_string)).Encode(),
+      Value(PrimitiveValue(ValueType::kString), 4ms, Value::kInvalidUserTimestamp, Value::kTtlFlag),
+      t[2]));
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(),
+                         Value(PrimitiveValue(val_string), 3ms), t[0]));
+  val_string[1]++;
+  key_string[1]++;
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(), // k1
+                         Value(PrimitiveValue(val_string), 8ms), t[3]));
+  val_string[1]++;
+  ASSERT_OK(SetPrimitive(
+      DocKey(PrimitiveValues(key_string)).Encode(),
+      Value(PrimitiveValue(ValueType::kString), 3ms, Value::kInvalidUserTimestamp, Value::kTtlFlag),
+      t[5]));
+  key_string[1]++;
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(), // k2
+                         Value(PrimitiveValue(val_string), 3ms), t[5]));
+  val_string[1]++;
+  ASSERT_OK(SetPrimitive(
+      DocKey(PrimitiveValues(key_string)).Encode(),
+      Value(PrimitiveValue(ValueType::kString), 5ms, Value::kInvalidUserTimestamp, Value::kTtlFlag),
+      t[7]));
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(),
+      Value(PrimitiveValue(ValueType::kString), Value::kMaxTtl, Value::kInvalidUserTimestamp,
+      Value::kTtlFlag), t[11]));
+  key_string[1]++;
+  ASSERT_OK(SetPrimitive( // k3
+  DocKey(PrimitiveValues(key_string)).Encode(),
+                         Value(PrimitiveValue(val_string), 4ms), t[1]));
+  val_string[1]++;
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(),
+      Value(PrimitiveValue(ValueType::kString), Value::kMaxTtl, Value::kInvalidUserTimestamp,
+      Value::kTtlFlag), t[4]));
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(),
+                         Value(PrimitiveValue(val_string), 1ms), t[13]));
+  val_string[1]++;
+  key_string[1]++;
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(), // k4
+                         Value(PrimitiveValue::kTombstone), t[12]));
+  key_string[1]++;
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(), // k5
+                         Value(PrimitiveValue(val_string), 9ms), t[8]));
+  val_string[1]++;
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(),
+                         Value(PrimitiveValue::kTombstone), t[9]));
+  key_string[1]++;
+  ASSERT_OK(SetPrimitive( // k6
+      DocKey(PrimitiveValues(key_string)).Encode(),
+      Value(PrimitiveValue(ValueType::kString), 4ms, Value::kInvalidUserTimestamp, Value::kTtlFlag),
+      t[10]));
+
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(),
+                         Value(PrimitiveValue(val_string), 9ms), t[8]));
+  val_string[1]++;
+  ASSERT_OK(SetPrimitive(DocKey(PrimitiveValues(key_string)).Encode(),
+                         Value(PrimitiveValue::kTombstone), t[6]));
+
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
+      R"#(
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 6000 }]) -> ""; merge flags: 1; ttl: 0.006s
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 3000 }]) -> ""; merge flags: 1; ttl: 0.004s
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 1000 }]) -> "v0"; ttl: 0.003s
+SubDocKey(DocKey([], ["k1"]), [HT{ physical: 6000 }]) -> ""; merge flags: 1; ttl: 0.003s
+SubDocKey(DocKey([], ["k1"]), [HT{ physical: 4000 }]) -> "v1"; ttl: 0.008s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 12000 }]) -> ""; merge flags: 1
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 8000 }]) -> ""; merge flags: 1; ttl: 0.005s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 6000 }]) -> "v2"; ttl: 0.003s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 14000 }]) -> "v4"; ttl: 0.001s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 5000 }]) -> ""; merge flags: 1
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 2000 }]) -> "v3"; ttl: 0.004s
+SubDocKey(DocKey([], ["k4"]), [HT{ physical: 13000 }]) -> DEL
+SubDocKey(DocKey([], ["k5"]), [HT{ physical: 10000 }]) -> DEL
+SubDocKey(DocKey([], ["k5"]), [HT{ physical: 9000 }]) -> "v5"; ttl: 0.009s
+SubDocKey(DocKey([], ["k6"]), [HT{ physical: 11000 }]) -> ""; merge flags: 1; ttl: 0.004s
+SubDocKey(DocKey([], ["k6"]), [HT{ physical: 9000 }]) -> "v6"; ttl: 0.009s
+SubDocKey(DocKey([], ["k6"]), [HT{ physical: 7000 }]) -> DEL
+      )#");
+  FullyCompactHistoryBefore(t[9]);
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
+      R"#(
+SubDocKey(DocKey([], ["k0"]), [HT{ physical: 1000 }]) -> "v0"; ttl: 0.011s
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 12000 }]) -> ""; merge flags: 1
+SubDocKey(DocKey([], ["k2"]), [HT{ physical: 6000 }]) -> "v2"; ttl: 0.007s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 14000 }]) -> "v4"; ttl: 0.001s
+SubDocKey(DocKey([], ["k3"]), [HT{ physical: 2000 }]) -> "v3"
+SubDocKey(DocKey([], ["k4"]), [HT{ physical: 13000 }]) -> DEL
+SubDocKey(DocKey([], ["k6"]), [HT{ physical: 11000 }]) -> ""; merge flags: 1; ttl: 0.004s
+SubDocKey(DocKey([], ["k6"]), [HT{ physical: 9000 }]) -> "v6"; ttl: 0.009s
       )#");
 }
 
@@ -979,7 +1807,7 @@ TEST_F(DocDBTest, TTLCompactionTest) {
       Value(PrimitiveValue("v1"), 2ms), t0));
   ASSERT_OK(SetPrimitive(DocPath(encoded_doc_key_row2, PrimitiveValue(ColumnId(1))),
       Value(PrimitiveValue("v2"), 1ms), t0));
-  AssertDocDbDebugDumpStrEq(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
       R"#(
 SubDocKey(DocKey([], ["k1"]), [SystemColumnId(0); HT{ physical: 1000 }]) -> null; ttl: 0.001s
 SubDocKey(DocKey([], ["k1"]), [ColumnId(0); HT{ physical: 1000 }]) -> "v1"; ttl: 0.002s
@@ -994,7 +1822,7 @@ SubDocKey(DocKey([], ["k2"]), [ColumnId(1); HT{ physical: 1000 }]) -> "v2"; ttl:
   FullyCompactHistoryBefore(t2);
 
   // Liveness column is gone for row1, v2 gone for row2.
-  AssertDocDbDebugDumpStrEq(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
       R"#(
 SubDocKey(DocKey([], ["k1"]), [ColumnId(0); HT{ physical: 1000 }]) -> "v1"; ttl: 0.002s
 SubDocKey(DocKey([], ["k1"]), [ColumnId(1); HT{ physical: 1000 }]) -> "v2"; ttl: 0.003s
@@ -1007,7 +1835,7 @@ SubDocKey(DocKey([], ["k2"]), [ColumnId(0); HT{ physical: 1000 }]) -> "v1"; ttl:
   FullyCompactHistoryBefore(t3);
 
   // v1 is gone.
-  AssertDocDbDebugDumpStrEq(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
       R"#(
 SubDocKey(DocKey([], ["k1"]), [ColumnId(1); HT{ physical: 1000 }]) -> "v2"; ttl: 0.003s
 SubDocKey(DocKey([], ["k1"]), [ColumnId(2); HT{ physical: 1000 }]) -> "v3"
@@ -1017,7 +1845,7 @@ SubDocKey(DocKey([], ["k2"]), [SystemColumnId(0); HT{ physical: 1000 }]) -> null
 
   FullyCompactHistoryBefore(t4);
   // v2 is gone for row 1, liveness column gone for row 2.
-  AssertDocDbDebugDumpStrEq(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
       R"#(
 SubDocKey(DocKey([], ["k1"]), [ColumnId(2); HT{ physical: 1000 }]) -> "v3"
 SubDocKey(DocKey([], ["k1"]), [ColumnId(3); HT{ physical: 1000 }]) -> "v4"
@@ -1030,7 +1858,7 @@ SubDocKey(DocKey([], ["k1"]), [ColumnId(3); HT{ physical: 1000 }]) -> "v4"
       Value(PrimitiveValue::kTombstone, Value::kMaxTtl), t1));
 
   // Values are now marked with tombstones.
-  AssertDocDbDebugDumpStrEq(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
       R"#(
 SubDocKey(DocKey([], ["k1"]), [ColumnId(2); HT{ physical: 2000 }]) -> DEL
 SubDocKey(DocKey([], ["k1"]), [ColumnId(2); HT{ physical: 1000 }]) -> "v3"
@@ -1040,7 +1868,7 @@ SubDocKey(DocKey([], ["k1"]), [ColumnId(3); HT{ physical: 1000 }]) -> "v4"
 
   FullyCompactHistoryBefore(t0);
   // Nothing is removed.
-  AssertDocDbDebugDumpStrEq(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
       R"#(
 SubDocKey(DocKey([], ["k1"]), [ColumnId(2); HT{ physical: 2000 }]) -> DEL
 SubDocKey(DocKey([], ["k1"]), [ColumnId(2); HT{ physical: 1000 }]) -> "v3"
@@ -1050,7 +1878,7 @@ SubDocKey(DocKey([], ["k1"]), [ColumnId(3); HT{ physical: 1000 }]) -> "v4"
 
   FullyCompactHistoryBefore(t1);
   // Next compactions removes everything.
-  AssertDocDbDebugDumpStrEq(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
       R"#(
       )#");
 }
@@ -1072,7 +1900,7 @@ TEST_F(DocDBTest, TableTTLCompactionTest) {
   ASSERT_OK(SetPrimitive(DocPath(encoded_doc_key, PrimitiveValue("s4")),
       Value(PrimitiveValue("v4"), 3ms), t1));
   // Note: HT{ physical: 1000 } + 1ms = HT{ physical: 4097000 }
-  AssertDocDbDebugDumpStrEq(R"#(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
       SubDocKey(DocKey([], ["k1"]), ["s1"; HT{ physical: 1000 }]) -> "v1"; ttl: 0.001s
       SubDocKey(DocKey([], ["k1"]), ["s2"; HT{ physical: 1000 }]) -> "v2"
       SubDocKey(DocKey([], ["k1"]), ["s3"; HT{ physical: 2000 }]) -> "v3"; ttl: 0.000s
@@ -1082,7 +1910,7 @@ TEST_F(DocDBTest, TableTTLCompactionTest) {
   FullyCompactHistoryBefore(t3);
 
   // v1 compacted due to column level ttl.
-  AssertDocDbDebugDumpStrEq(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
       R"#(
 SubDocKey(DocKey([], ["k1"]), ["s2"; HT{ physical: 1000 }]) -> "v2"
 SubDocKey(DocKey([], ["k1"]), ["s3"; HT{ physical: 2000 }]) -> "v3"; ttl: 0.000s
@@ -1092,7 +1920,7 @@ SubDocKey(DocKey([], ["k1"]), ["s4"; HT{ physical: 1000 }]) -> "v4"; ttl: 0.003s
   FullyCompactHistoryBefore(t4);
   // v2 compacted due to table level ttl.
   // init marker compacted due to table level ttl.
-  AssertDocDbDebugDumpStrEq(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
       R"#(
 SubDocKey(DocKey([], ["k1"]), ["s3"; HT{ physical: 2000 }]) -> "v3"; ttl: 0.000s
 SubDocKey(DocKey([], ["k1"]), ["s4"; HT{ physical: 1000 }]) -> "v4"; ttl: 0.003s
@@ -1101,7 +1929,7 @@ SubDocKey(DocKey([], ["k1"]), ["s4"; HT{ physical: 1000 }]) -> "v4"; ttl: 0.003s
   FullyCompactHistoryBefore(t5);
   // v4 compacted due to column level ttl.
   // v3 stays forever due to ttl being set to 0.
-  AssertDocDbDebugDumpStrEq(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
       R"#(
 SubDocKey(DocKey([], ["k1"]), ["s3"; HT{ physical: 2000 }]) -> "v3"; ttl: 0.000s
       )#");
@@ -1113,7 +1941,7 @@ TEST_F(DocDBTest, MinorCompactionNoDeletions) {
   KeyBytes encoded_doc_key(doc_key.Encode());
   for (int i = 1; i <= 6; ++i) {
     auto value_str = Format("v$0", i);
-    PV pv = PV(value_str);
+    PrimitiveValue pv(value_str);
     ASSERT_OK(SetPrimitive(
         DocPath(encoded_doc_key), Value(pv), HybridTime::FromMicros(i * 1000)));
     ASSERT_OK(FlushRocksDbAndWait());
@@ -1129,19 +1957,19 @@ SubDocKey(DocKey([], ["k"]), [HT{ physical: 2000 }]) -> "v2"  // file 2
 SubDocKey(DocKey([], ["k"]), [HT{ physical: 1000 }]) -> "v1"  // file 1
       )#";
 
-  AssertDocDbDebugDumpStrEq(kInitialDocDbStateStr);
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(kInitialDocDbStateStr);
   MinorCompaction(5000_usec_ht, /* num_files_to_compact */ 2);
 
   ASSERT_EQ(5, NumSSTableFiles());
   // No changes in DocDB rows as we still need the entry at 5000_ms_ht.
   // Let's call the output file resulting from the last compaction "file 7".
-  AssertDocDbDebugDumpStrEq(kInitialDocDbStateStr);
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(kInitialDocDbStateStr);
 
   MinorCompaction(5000_usec_ht, /* num_files_to_compact */ 2);
   ASSERT_EQ(4, NumSSTableFiles());
   // Removed the entry at 4000_ms_ht as it was overwritten at time 5000. Earlier entries are in
   // other files that haven't been compacted yet.
-  AssertDocDbDebugDumpStrEq(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
       R"#(
 SubDocKey(DocKey([], ["k"]), [HT{ physical: 6000 }]) -> "v6"  // file 8
 SubDocKey(DocKey([], ["k"]), [HT{ physical: 5000 }]) -> "v5"  // file 8
@@ -1153,7 +1981,7 @@ SubDocKey(DocKey([], ["k"]), [HT{ physical: 1000 }]) -> "v1"  // file 1
   MinorCompaction(5000_usec_ht, /* num_files_to_compact */ 2);
   ASSERT_EQ(3, NumSSTableFiles());
   // Removed the entry at 3000_ms_ht.
-  AssertDocDbDebugDumpStrEq(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
       R"#(
 SubDocKey(DocKey([], ["k"]), [HT{ physical: 6000 }]) -> "v6"  // file 9
 SubDocKey(DocKey([], ["k"]), [HT{ physical: 5000 }]) -> "v5"  // file 9
@@ -1164,7 +1992,7 @@ SubDocKey(DocKey([], ["k"]), [HT{ physical: 1000 }]) -> "v1"  // file 1
   MinorCompaction(5000_usec_ht, /* num_files_to_compact */ 2);
   ASSERT_EQ(2, NumSSTableFiles());
   // Removed the entry at 2000_ms_ht.
-  AssertDocDbDebugDumpStrEq(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
       R"#(
 SubDocKey(DocKey([], ["k"]), [HT{ physical: 6000 }]) -> "v6"  // file 10
 SubDocKey(DocKey([], ["k"]), [HT{ physical: 5000 }]) -> "v5"  // file 10
@@ -1174,7 +2002,7 @@ SubDocKey(DocKey([], ["k"]), [HT{ physical: 1000 }]) -> "v1"  // file 1
   MinorCompaction(5000_usec_ht, /* num_files_to_compact */ 2);
   ASSERT_EQ(1, NumSSTableFiles());
   // Removed the entry at 2000_ms_ht.
-  AssertDocDbDebugDumpStrEq(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
       R"#(
 SubDocKey(DocKey([], ["k"]), [HT{ physical: 6000 }]) -> "v6"  // file 11
 SubDocKey(DocKey([], ["k"]), [HT{ physical: 5000 }]) -> "v5"  // file 11
@@ -1187,14 +2015,14 @@ TEST_F(DocDBTest, MinorCompactionWithDeletions) {
   KeyBytes encoded_doc_key(doc_key.Encode());
   for (int i = 1; i <= 6; ++i) {
     auto value_str = Format("v$0", i);
-    PV pv = i == 5 ? PV::kTombstone : PV(value_str);
+    PrimitiveValue pv = i == 5 ? PrimitiveValue::kTombstone : PrimitiveValue(value_str);
     ASSERT_OK(SetPrimitive(
         DocPath(encoded_doc_key), Value(pv), HybridTime::FromMicros(i * 1000)));
     ASSERT_OK(FlushRocksDbAndWait());
   }
 
   ASSERT_EQ(6, NumSSTableFiles());
-  AssertDocDbDebugDumpStrEq(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
       R"#(
 SubDocKey(DocKey([], ["k"]), [HT{ physical: 6000 }]) -> "v6"  // file 6
 SubDocKey(DocKey([], ["k"]), [HT{ physical: 5000 }]) -> DEL   // file 5
@@ -1206,7 +2034,7 @@ SubDocKey(DocKey([], ["k"]), [HT{ physical: 1000 }]) -> "v1"  // file 1
   MinorCompaction(5000_usec_ht, /* num_files_to_compact */ 2);
 
   ASSERT_EQ(5, NumSSTableFiles());
-  AssertDocDbDebugDumpStrEq(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
       R"#(
 SubDocKey(DocKey([], ["k"]), [HT{ physical: 6000 }]) -> "v6"  // file 7
 SubDocKey(DocKey([], ["k"]), [HT{ physical: 5000 }]) -> DEL   // file 7 as well
@@ -1218,7 +2046,7 @@ SubDocKey(DocKey([], ["k"]), [HT{ physical: 1000 }]) -> "v1"  // file 1
 
   MinorCompaction(5000_usec_ht, /* num_files_to_compact */ 2);
   ASSERT_EQ(4, NumSSTableFiles());
-  AssertDocDbDebugDumpStrEq(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
       R"#(
 SubDocKey(DocKey([], ["k"]), [HT{ physical: 6000 }]) -> "v6"  // file 8
 SubDocKey(DocKey([], ["k"]), [HT{ physical: 5000 }]) -> DEL   // file 8
@@ -1229,7 +2057,7 @@ SubDocKey(DocKey([], ["k"]), [HT{ physical: 1000 }]) -> "v1"  // file 1
 
   MinorCompaction(5000_usec_ht, /* num_files_to_compact */ 2);
   ASSERT_EQ(3, NumSSTableFiles());
-  AssertDocDbDebugDumpStrEq(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
       R"#(
 SubDocKey(DocKey([], ["k"]), [HT{ physical: 6000 }]) -> "v6"  // file 9
 SubDocKey(DocKey([], ["k"]), [HT{ physical: 5000 }]) -> DEL   // file 9
@@ -1239,7 +2067,7 @@ SubDocKey(DocKey([], ["k"]), [HT{ physical: 1000 }]) -> "v1"  // file 1
 
   MinorCompaction(5000_usec_ht, /* num_files_to_compact */ 2);
   ASSERT_EQ(2, NumSSTableFiles());
-  AssertDocDbDebugDumpStrEq(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
       R"#(
 SubDocKey(DocKey([], ["k"]), [HT{ physical: 6000 }]) -> "v6"  // file 10
 SubDocKey(DocKey([], ["k"]), [HT{ physical: 5000 }]) -> DEL   // file 10
@@ -1250,7 +2078,7 @@ SubDocKey(DocKey([], ["k"]), [HT{ physical: 1000 }]) -> "v1"  // file 1
   // The tombstone is now gone as well.
   MinorCompaction(5000_usec_ht, /* num_files_to_compact */ 2);
   ASSERT_EQ(1, NumSSTableFiles());
-  AssertDocDbDebugDumpStrEq(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
       R"#(
 SubDocKey(DocKey([], ["k"]), [HT{ physical: 6000 }]) -> "v6"  // file 11
       )#");
@@ -1379,7 +2207,7 @@ TEST_F(DocDBTest, BasicTest) {
       )#");
 
   // Check the final state of the database.
-  AssertDocDbDebugDumpStrEq(kPredefinedDBStateDebugDumpStr);
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(kPredefinedDBStateDebugDumpStr);
   CheckExpectedLatestDBState();
 
   // Compaction cleanup testing.
@@ -1394,7 +2222,7 @@ TEST_F(DocDBTest, BasicTest) {
   // This entry is deleted because we can always remove deletes at or below the cutoff hybrid_time:
   // SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey_b", "subkey_c"; HT{ physical: 5000 }])
   //     -> DEL
-  AssertDocDbDebugDumpStrEq(R"#(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
 SubDocKey(DocKey([], ["my_key_where_value_is_a_string"]), [HT{ physical: 1000 }]) -> "value1"
 SubDocKey(DocKey([], ["mydockey", 123456]), [HT{ physical: 2000 }]) -> {}
 SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey_a"; HT{ physical: 2000 w: 1 }]) -> "value_a"
@@ -1407,7 +2235,6 @@ SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey_b", "subkey_d"; HT{ physica
     "value_bd"
       )#");
   CheckExpectedLatestDBState();
-
   CaptureLogicalSnapshot();
   // Perform the next history compaction starting both from the initial state as well as from the
   // state with the first history compaction (at hybrid_time 5000) already performed.
@@ -1426,7 +2253,7 @@ SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey_b", "subkey_d"; HT{ physica
     //
     // And the deletion itself is removed because it is at the history cutoff hybrid_time:
     // SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey_b"; HT{ physical: 6000 }]) -> DEL
-    AssertDocDbDebugDumpStrEq(R"#(
+    ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
 SubDocKey(DocKey([], ["my_key_where_value_is_a_string"]), [HT{ physical: 1000 }]) -> "value1"
 SubDocKey(DocKey([], ["mydockey", 123456]), [HT{ physical: 2000 }]) -> {}
 SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey_a"; HT{ physical: 2000 w: 1 }]) -> "value_a"
@@ -1437,7 +2264,6 @@ SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey_b", "subkey_c"; HT{ physica
     CheckExpectedLatestDBState();
   }
   CaptureLogicalSnapshot();
-
   // Also test the next compaction starting with all previously captured states, (1) initial,
   // (2) after a compaction at hybrid_time 5000, and (3) after a compaction at hybrid_time 6000.
   // We are going through snapshots in reverse order so that we end with the initial snapshot that
@@ -1455,7 +2281,6 @@ SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey_b", "subkey_c"; HT{ physica
           I\x80\x00\x00\x00\x00\x01\xe2@\
           !', '{')
         )#");
-
     VerifySubDocument(SubDocKey(doc_key), 8000_usec_ht, "{}");
   }
 
@@ -1465,7 +2290,7 @@ SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey_b", "subkey_c"; HT{ physica
   CaptureLogicalSnapshot();
   // This is similar to the kPredefinedDBStateDebugDumpStr, but has an additional overwrite of the
   // document with an empty object at hybrid_time 8000.
-  AssertDocDbDebugDumpStrEq(R"#(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
 SubDocKey(DocKey([], ["my_key_where_value_is_a_string"]), [HT{ physical: 1000 }]) -> "value1"
 SubDocKey(DocKey([], ["mydockey", 123456]), [HT{ physical: 8000 }]) -> {}
 SubDocKey(DocKey([], ["mydockey", 123456]), [HT{ physical: 2000 }]) -> {}
@@ -1481,9 +2306,8 @@ SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey_b", "subkey_c"; HT{ physica
 SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey_b", "subkey_d"; HT{ physical: 3500 }]) -> \
     "value_bd"
       )#");
-
   FullyCompactHistoryBefore(7999_usec_ht);
-  AssertDocDbDebugDumpStrEq(R"#(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
 SubDocKey(DocKey([], ["my_key_where_value_is_a_string"]), [HT{ physical: 1000 }]) -> "value1"
 SubDocKey(DocKey([], ["mydockey", 123456]), [HT{ physical: 8000 }]) -> {}
 SubDocKey(DocKey([], ["mydockey", 123456]), [HT{ physical: 2000 }]) -> {}
@@ -1493,13 +2317,12 @@ SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey_b", "subkey_c"; HT{ physica
     -> "value_bc_prime"
       )#");
   CaptureLogicalSnapshot();
-
   // Starting with each snapshot, perform the final history compaction and verify we always get the
   // same result.
   for (int i = 0; i < logical_snapshots().size(); ++i) {
     RestoreToRocksDBLogicalSnapshot(i);
     FullyCompactHistoryBefore(8000_usec_ht);
-    AssertDocDbDebugDumpStrEq(R"#(
+    ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
 SubDocKey(DocKey([], ["my_key_where_value_is_a_string"]), [HT{ physical: 1000 }]) -> "value1"
 SubDocKey(DocKey([], ["mydockey", 123456]), [HT{ physical: 8000 }]) -> {}
         )#");
@@ -1515,7 +2338,7 @@ TEST_F(DocDBTest, MultiOperationDocWriteBatch) {
 
   ASSERT_OK(WriteToRocksDB(dwb, 1000_usec_ht));
 
-  AssertDocDbDebugDumpStrEq(R"#(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
       SubDocKey(DocKey([], ["a"]), ["b"; HT{ physical: 1000 }]) -> "v1"
       SubDocKey(DocKey([], ["a"]), ["c", "d"; HT{ physical: 1000 w: 1 }]) -> "v2"
       SubDocKey(DocKey([], ["a"]), ["c", "e"; HT{ physical: 1000 w: 2 }]) -> "v3"
@@ -1674,7 +2497,7 @@ TEST_F(DocDBTest, BloomFilterTest) {
     GetSubDocumentData data = { encoded_subdoc_key, &doc_from_rocksdb, &subdoc_found_in_rocksdb };
     ASSERT_OK(GetSubDocument(
         doc_db(), data, rocksdb::kDefaultQueryId,
-        boost::none /* txn_op_context */, MonoTime::Max() /* deadline */));
+        boost::none /* txn_op_context */, CoarseTimePoint::max() /* deadline */));
   };
 
   ASSERT_NO_FATALS(CheckBloom(0, &total_bloom_useful, 0, &total_table_iterators));
@@ -1692,7 +2515,6 @@ TEST_F(DocDBTest, BloomFilterTest) {
   ASSERT_NO_FATALS(get_doc(key3));
   ASSERT_TRUE(subdoc_found_in_rocksdb);
   ASSERT_NO_FATALS(CheckBloom(0, &total_bloom_useful, 1, &total_table_iterators));
-
   dwb.Clear();
   ASSERT_OK(ht.FromUint64(2000));
   ASSERT_OK(dwb.SetPrimitive(DocPath(key1.Encode()), PrimitiveValue("value")));
@@ -1700,6 +2522,7 @@ TEST_F(DocDBTest, BloomFilterTest) {
   ASSERT_OK(WriteToRocksDB(dwb, ht));
   flush_rocksdb();
   ASSERT_NO_FATALS(get_doc(key1));
+
   ASSERT_NO_FATALS(CheckBloom(0, &total_bloom_useful, 2, &total_table_iterators));
   ASSERT_NO_FATALS(get_doc(key2));
   ASSERT_NO_FATALS(CheckBloom(2, &total_bloom_useful, 1, &total_table_iterators));
@@ -1766,7 +2589,7 @@ TEST_F(DocDBTest, TestInetSortOrder) {
   InsertInet("255.255.255.255");
   InsertInet("ffff:ffff::");
   InsertInet("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff");
-  AssertDocDbDebugDumpStrEq(R"#(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
 SubDocKey(DocKey([], ["mydockey"]), [::1; HT{ physical: 1000 }]) -> null
 SubDocKey(DocKey([], ["mydockey"]), [::255.255.255.255; HT{ physical: 1000 }]) -> null
 SubDocKey(DocKey([], ["mydockey"]), [::ff:ffff:ffff; HT{ physical: 1000 }]) -> null
@@ -1798,7 +2621,7 @@ TEST_F(DocDBTest, TestDisambiguationOnWriteId) {
   auto encoded_subdoc_key = subdoc_key.EncodeWithoutHt();
   GetSubDocumentData data = { encoded_subdoc_key, &subdoc, &doc_found };
   GetSubDocument(doc_db(), data, rocksdb::kDefaultQueryId,
-                 kNonTransactionalOperationContext, MonoTime::Max() /* deadline */);
+                 kNonTransactionalOperationContext, CoarseTimePoint::max() /* deadline */);
   ASSERT_FALSE(doc_found);
 
   CaptureLogicalSnapshot();
@@ -1809,9 +2632,9 @@ TEST_F(DocDBTest, TestDisambiguationOnWriteId) {
     // TODO(dtxn) - check both transaction and non-transaction path?
     FullyCompactHistoryBefore(HybridTime::FromMicros(cutoff_time_ms));
     GetSubDocument(doc_db(), data, rocksdb::kDefaultQueryId,
-                   kNonTransactionalOperationContext, MonoTime::Max() /* deadline */);
+                   kNonTransactionalOperationContext, CoarseTimePoint::max() /* deadline */);
     ASSERT_FALSE(doc_found);
-    AssertDocDbDebugDumpStrEq("");
+    ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ("");
   }
 
   // Delete the row first, and then set a column. This row will exist.
@@ -1826,7 +2649,7 @@ TEST_F(DocDBTest, TestDisambiguationOnWriteId) {
   auto encoded_subdoc_key2 = subdoc_key2.EncodeWithoutHt();
   data.subdocument_key = encoded_subdoc_key2;
   GetSubDocument(doc_db(), data, rocksdb::kDefaultQueryId,
-                 kNonTransactionalOperationContext, MonoTime::Max() /* deadline */);
+                 kNonTransactionalOperationContext, CoarseTimePoint::max() /* deadline */);
   ASSERT_TRUE(doc_found);
 
   // The row should still exist after a compaction. The deletion marker should be compacted away.
@@ -1836,9 +2659,9 @@ TEST_F(DocDBTest, TestDisambiguationOnWriteId) {
     FullyCompactHistoryBefore(HybridTime::FromMicros(cutoff_time_ms));
     // TODO(dtxn) - check both transaction and non-transaction path?
     GetSubDocument(doc_db(), data, rocksdb::kDefaultQueryId,
-                   kNonTransactionalOperationContext, MonoTime::Max() /* deadline */);
+                   kNonTransactionalOperationContext, CoarseTimePoint::max() /* deadline */);
     ASSERT_TRUE(doc_found);
-    AssertDocDbDebugDumpStrEq(R"#(
+    ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
 SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(10); HT{ physical: 2000 w: 1 }]) -> "value2"
         )#");
   }
@@ -1903,7 +2726,7 @@ TEST_F(DocDBTest, StaticColumnCompaction) {
       Value(PrimitiveValue::kTombstone), t2));
 
   // Verify before compaction.
-  AssertDocDbDebugDumpStrEq(R"#(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
 SubDocKey(DocKey(0x0000, ["h1"], []), ["s1"; HT{ physical: 1000 }]) -> "v1"; ttl: 0.001s
 SubDocKey(DocKey(0x0000, ["h1"], []), ["s2"; HT{ physical: 1000 }]) -> "v2"; ttl: 0.002s
 SubDocKey(DocKey(0x0000, ["h1"], []), ["s3"; HT{ physical: 3000 }]) -> "v3new"
@@ -1932,7 +2755,7 @@ SubDocKey(DocKey(0x0000, ["h1"], ["r2"]), ["c8"; HT{ physical: 1000 }]) -> "v82"
   //   pk1.c5 -> expired
   //   pk1.c7 = v71old -> compacted
   //   pk2.c5 -> expired
-  AssertDocDbDebugDumpStrEq(R"#(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
 SubDocKey(DocKey(0x0000, ["h1"], []), ["s2"; HT{ physical: 1000 }]) -> "v2"; ttl: 0.002s
 SubDocKey(DocKey(0x0000, ["h1"], []), ["s3"; HT{ physical: 3000 }]) -> "v3new"
 SubDocKey(DocKey(0x0000, ["h1"], ["r1"]), ["c6"; HT{ physical: 1000 }]) -> "v61"; ttl: 0.002s
@@ -1968,9 +2791,9 @@ TEST_F(DocDBTest, TestUserTimestamp) {
       Value(PrimitiveValue::kObject, Value::kMaxTtl, 500)));
   ASSERT_OK(WriteToRocksDB(doc_write_batch, ht));
 
-  AssertDocDbDebugDumpStrEq(R"#(
-SubDocKey(DocKey([], ["k1"]), ["s1"; HT{ physical: 10000 w: 1 }]) -> {}; user_timestamp: 500
-SubDocKey(DocKey([], ["k1"]), ["s1", "s2"; HT{ physical: 10000 }]) -> "v1"; user_timestamp: 1000
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
+SubDocKey(DocKey([], ["k1"]), ["s1"; HT{ physical: 10000 w: 1 }]) -> {}; user timestamp: 500
+SubDocKey(DocKey([], ["k1"]), ["s1", "s2"; HT{ physical: 10000 }]) -> "v1"; user timestamp: 1000
       )#");
 
   doc_write_batch.Clear();
@@ -1983,10 +2806,10 @@ SubDocKey(DocKey([], ["k1"]), ["s1", "s2"; HT{ physical: 10000 }]) -> "v1"; user
       Value(PrimitiveValue("v1"), Value::kMaxTtl, 500)));
   ASSERT_OK(WriteToRocksDB(doc_write_batch, ht));
 
-  AssertDocDbDebugDumpStrEq(R"#(
-SubDocKey(DocKey([], ["k1"]), ["s1"; HT{ physical: 10000 w: 1 }]) -> {}; user_timestamp: 500
-SubDocKey(DocKey([], ["k1"]), ["s1", "s2"; HT{ physical: 10000 }]) -> "v1"; user_timestamp: 1000
-SubDocKey(DocKey([], ["k1"]), ["s3"; HT{ physical: 10000 }]) -> {}; user_timestamp: 1000
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
+SubDocKey(DocKey([], ["k1"]), ["s1"; HT{ physical: 10000 w: 1 }]) -> {}; user timestamp: 500
+SubDocKey(DocKey([], ["k1"]), ["s1", "s2"; HT{ physical: 10000 }]) -> "v1"; user timestamp: 1000
+SubDocKey(DocKey([], ["k1"]), ["s3"; HT{ physical: 10000 }]) -> {}; user timestamp: 1000
       )#");
 
   doc_write_batch.Clear();
@@ -1999,13 +2822,13 @@ SubDocKey(DocKey([], ["k1"]), ["s3"; HT{ physical: 10000 }]) -> {}; user_timesta
       Value(PrimitiveValue("v1"), Value::kMaxTtl, 2000)));
   ASSERT_OK(WriteToRocksDB(doc_write_batch, ht));
 
-  AssertDocDbDebugDumpStrEq(R"#(
-SubDocKey(DocKey([], ["k1"]), ["s1"; HT{ physical: 10000 w: 1 }]) -> {}; user_timestamp: 500
-SubDocKey(DocKey([], ["k1"]), ["s1", "s2"; HT{ physical: 10000 }]) -> "v1"; user_timestamp: 1000
-SubDocKey(DocKey([], ["k1"]), ["s3"; HT{ physical: 10000 }]) -> {}; user_timestamp: 1000
-SubDocKey(DocKey([], ["k1"]), ["s3", "s4"; HT{ physical: 10000 }]) -> "v1"; user_timestamp: 2000
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
+SubDocKey(DocKey([], ["k1"]), ["s1"; HT{ physical: 10000 w: 1 }]) -> {}; user timestamp: 500
+SubDocKey(DocKey([], ["k1"]), ["s1", "s2"; HT{ physical: 10000 }]) -> "v1"; user timestamp: 1000
+SubDocKey(DocKey([], ["k1"]), ["s3"; HT{ physical: 10000 }]) -> {}; user timestamp: 1000
+SubDocKey(DocKey([], ["k1"]), ["s3", "s4"; HT{ physical: 10000 }]) -> "v1"; user timestamp: 2000
 SubDocKey(DocKey([], ["k1"]), ["s3", "s5"; HT{ physical: 10000 w: 1 }]) -> "v1"; \
-    user_timestamp: 2000
+    user timestamp: 2000
       )#");
 }
 
@@ -2017,13 +2840,13 @@ TEST_F(DocDBTest, TestCompactionWithUserTimestamp) {
   ASSERT_OK(SetPrimitive(DocPath(encoded_doc_key, PrimitiveValue("s1")),
                          Value(PrimitiveValue("v11")), t3000));
 
-  AssertDocDbDebugDumpStrEq(R"#(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
       SubDocKey(DocKey([], ["k1"]), ["s1"; HT{ physical: 3000 }]) -> "v11"
       )#");
 
   // Delete the row.
   ASSERT_OK(DeleteSubDoc(DocPath(encoded_doc_key, PrimitiveValue("s1")), t5000));
-  AssertDocDbDebugDumpStrEq(R"#(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
       SubDocKey(DocKey([], ["k1"]), ["s1"; HT{ physical: 5000 }]) -> DEL
       SubDocKey(DocKey([], ["k1"]), ["s1"; HT{ physical: 3000 }]) -> "v11"
       )#");
@@ -2033,21 +2856,21 @@ TEST_F(DocDBTest, TestCompactionWithUserTimestamp) {
                          Value(PrimitiveValue("v13"), Value::kMaxTtl, 4000), t3000));
 
   // No effect on DB.
-  AssertDocDbDebugDumpStrEq(R"#(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
       SubDocKey(DocKey([], ["k1"]), ["s1"; HT{ physical: 5000 }]) -> DEL
       SubDocKey(DocKey([], ["k1"]), ["s1"; HT{ physical: 3000 }]) -> "v11"
       )#");
 
   // Compaction takes away everything.
   FullyCompactHistoryBefore(t5000);
-  AssertDocDbDebugDumpStrEq(R"#(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
       )#");
 
   // Same insert with lower timestamp now works!
   ASSERT_OK(SetPrimitive(DocPath(encoded_doc_key, PrimitiveValue("s1")),
                          Value(PrimitiveValue("v13"), Value::kMaxTtl, 4000), t3000));
-  AssertDocDbDebugDumpStrEq(R"#(
-      SubDocKey(DocKey([], ["k1"]), ["s1"; HT{ physical: 3000 }]) -> "v13"; user_timestamp: 4000
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
+      SubDocKey(DocKey([], ["k1"]), ["s1"; HT{ physical: 3000 }]) -> "v13"; user timestamp: 4000
       )#");
 
   // Now try the same with TTL.
@@ -2055,32 +2878,34 @@ TEST_F(DocDBTest, TestCompactionWithUserTimestamp) {
                          Value(PrimitiveValue("v11"), MonoDelta::FromMicroseconds(1000)), t3000));
 
   // Insert with TTL.
-  AssertDocDbDebugDumpStrEq(R"#(
-      SubDocKey(DocKey([], ["k1"]), ["s1"; HT{ physical: 3000 }]) -> "v13"; user_timestamp: 4000
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
+      SubDocKey(DocKey([], ["k1"]), ["s1"; HT{ physical: 3000 }]) -> "v13"; user timestamp: 4000
       SubDocKey(DocKey([], ["k1"]), ["s2"; HT{ physical: 3000 }]) -> "v11"; ttl: 0.001s
       )#");
 
   // Try insert with lower timestamp.
   ASSERT_OK(SetPrimitive(DocPath(encoded_doc_key, PrimitiveValue("s2")),
-                         Value(PrimitiveValue("v13"), Value::kMaxTtl, 2000), t3000));
+                         Value(PrimitiveValue("v13"), Value::kMaxTtl, 2000),
+                         t3000,
+                         ReadHybridTime::SingleTime(t3000)));
 
-  AssertDocDbDebugDumpStrEq(R"#(
-      SubDocKey(DocKey([], ["k1"]), ["s1"; HT{ physical: 3000 }]) -> "v13"; user_timestamp: 4000
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
+      SubDocKey(DocKey([], ["k1"]), ["s1"; HT{ physical: 3000 }]) -> "v13"; user timestamp: 4000
       SubDocKey(DocKey([], ["k1"]), ["s2"; HT{ physical: 3000 }]) -> "v11"; ttl: 0.001s
       )#");
 
   FullyCompactHistoryBefore(t5000);
 
-  AssertDocDbDebugDumpStrEq(R"#(
-      SubDocKey(DocKey([], ["k1"]), ["s1"; HT{ physical: 3000 }]) -> "v13"; user_timestamp: 4000
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
+      SubDocKey(DocKey([], ["k1"]), ["s1"; HT{ physical: 3000 }]) -> "v13"; user timestamp: 4000
       )#");
 
   // Insert with lower timestamp after compaction works!
   ASSERT_OK(SetPrimitive(DocPath(encoded_doc_key, PrimitiveValue("s2")),
                          Value(PrimitiveValue("v13"), Value::kMaxTtl, 2000), t3000));
-  AssertDocDbDebugDumpStrEq(R"#(
-      SubDocKey(DocKey([], ["k1"]), ["s1"; HT{ physical: 3000 }]) -> "v13"; user_timestamp: 4000
-      SubDocKey(DocKey([], ["k1"]), ["s2"; HT{ physical: 3000 }]) -> "v13"; user_timestamp: 2000
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
+      SubDocKey(DocKey([], ["k1"]), ["s1"; HT{ physical: 3000 }]) -> "v13"; user timestamp: 4000
+      SubDocKey(DocKey([], ["k1"]), ["s2"; HT{ physical: 3000 }]) -> "v13"; user timestamp: 2000
       )#");
 }
 
@@ -2100,7 +2925,7 @@ void QueryBounds(const DocKey& doc_key, int lower, int upper, int base, const Do
   data.high_subkey = &upper_bound;
   EXPECT_OK(GetSubDocument(
       doc_db, data, rocksdb::kDefaultQueryId,
-      kNonTransactionalOperationContext, MonoTime::Max() /* deadline */,
+      kNonTransactionalOperationContext, CoarseTimePoint::max() /* deadline */,
       ReadHybridTime::SingleTime(ht)));
 }
 
@@ -2133,7 +2958,7 @@ TEST_F(DocDBTest, TestBuildSubDocumentBounds) {
   string expected_docdb_str;
   AddSubKeys(encoded_doc_key, nsubkeys, base, &expected_docdb_str);
 
-  AssertDocDbDebugDumpStrEq(expected_docdb_str);
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(expected_docdb_str);
 
   const SubDocKey subdoc_to_search(doc_key);
 
@@ -2188,11 +3013,11 @@ TEST_F(DocDBTest, TestCompactionForCollectionsWithTTL) {
   DocKey collection_key(PrimitiveValues("collection"));
   SetUpCollectionWithTTL(collection_key, UseIntermediateFlushes::kFalse);
 
-  AssertDocDbDebugDumpStrEq(ExpectedDebugDumpForCollectionWithTTL(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(ExpectedDebugDumpForCollectionWithTTL(
       collection_key, InitMarkerExpired::kFalse));
 
   FullyCompactHistoryBefore(HybridTime::FromMicros(1050 + 10 * 1000000));
-  AssertDocDbDebugDumpStrEq(ExpectedDebugDumpForCollectionWithTTL(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(ExpectedDebugDumpForCollectionWithTTL(
       collection_key, InitMarkerExpired::kTrue));
 
   const auto subdoc_key = SubDocKey(collection_key).EncodeWithoutHt();
@@ -2201,7 +3026,7 @@ TEST_F(DocDBTest, TestCompactionForCollectionsWithTTL) {
   GetSubDocumentData data = { subdoc_key, &doc_from_rocksdb, &subdoc_found_in_rocksdb };
   EXPECT_OK(GetSubDocument(
       doc_db(), data, rocksdb::kDefaultQueryId,
-      kNonTransactionalOperationContext, MonoTime::Max() /* deadline */,
+      kNonTransactionalOperationContext, CoarseTimePoint::max() /* deadline */,
       ReadHybridTime::FromMicros(1200)));
   ASSERT_TRUE(subdoc_found_in_rocksdb);
 
@@ -2217,13 +3042,13 @@ TEST_F(DocDBTest, MinorCompactionsForCollectionsWithTTL) {
   ASSERT_OK(DisableCompactions());
   DocKey collection_key(PrimitiveValues("c"));
   SetUpCollectionWithTTL(collection_key, UseIntermediateFlushes::kTrue);
-  AssertDocDbDebugDumpStrEq(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
       ExpectedDebugDumpForCollectionWithTTL(collection_key, InitMarkerExpired::kFalse));
   MinorCompaction(
       HybridTime::FromMicros(1100 + 20 * 1000000 + 1), /* num_files_to_compact */ 2,
       /* start_index */ 1);
 
-  AssertDocDbDebugDumpStrEq(R"#(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
 SubDocKey(DocKey([], ["c"]), [HT{ physical: 1000 }]) -> {}; ttl: 10.000s               // file 1
 SubDocKey(DocKey([], ["c"]), ["k0"; HT{ physical: 1100 }]) -> DEL                      // file 8
 SubDocKey(DocKey([], ["c"]), ["k0"; HT{ physical: 1000 w: 1 }]) -> "v0"; ttl: 10.000s  // file 1
@@ -2242,7 +3067,7 @@ SubDocKey(DocKey([], ["c"]), ["k5"; HT{ physical: 1100 }]) -> "vv5"; ttl: 25.000
       HybridTime::FromMicros(1100 + 24 * 1000000 + 1), /* num_files_to_compact */ 5,
       /* start_index */ 1);
 
-  AssertDocDbDebugDumpStrEq(R"#(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
 SubDocKey(DocKey([], ["c"]), [HT{ physical: 1000 }]) -> {}; ttl: 10.000s               // file 1
 SubDocKey(DocKey([], ["c"]), ["k0"; HT{ physical: 1100 }]) -> DEL                      // file 9
 SubDocKey(DocKey([], ["c"]), ["k0"; HT{ physical: 1000 w: 1 }]) -> "v0"; ttl: 10.000s  // file 1
@@ -2258,6 +3083,7 @@ SubDocKey(DocKey([], ["c"]), ["k5"; HT{ physical: 1100 }]) -> "vv5"; ttl: 25.000
 }
 
 TEST_F(DocDBTest, CompactionWithTransactions) {
+  FLAGS_docdb_sort_weak_intents_in_tests = true;
 
   const DocKey doc_key(PrimitiveValues("mydockey", 123456));
   KeyBytes encoded_doc_key(doc_key.Encode());
@@ -2275,73 +3101,196 @@ TEST_F(DocDBTest, CompactionWithTransactions) {
   SetTransactionIsolationLevel(IsolationLevel::SNAPSHOT_ISOLATION);
 
   Result<TransactionId> txn1 = FullyDecodeTransactionId("0000000000000001");
+  const auto kTxn1HT = 5000_usec_ht;
   ASSERT_OK(txn1);
   SetCurrentTransactionId(*txn1);
   ASSERT_OK(SetPrimitive(
-      DocPath(encoded_doc_key), PrimitiveValue::kObject, 5000_usec_ht));
+      DocPath(encoded_doc_key), PrimitiveValue::kObject, kTxn1HT));
   ASSERT_OK(SetPrimitive(
-      DocPath(encoded_doc_key, "subkey1"), PrimitiveValue("value4"), 5000_usec_ht));
+      DocPath(encoded_doc_key, "subkey1"), PrimitiveValue("value4"), kTxn1HT));
 
   Result<TransactionId> txn2 = FullyDecodeTransactionId("0000000000000002");
+  const auto kTxn2HT = 6000_usec_ht;
   ASSERT_OK(txn2);
   SetCurrentTransactionId(*txn2);
   ASSERT_OK(SetPrimitive(
-      DocPath(encoded_doc_key), PrimitiveValue::kObject, 5000_usec_ht));
+      DocPath(encoded_doc_key), PrimitiveValue::kObject, kTxn2HT));
   ASSERT_OK(SetPrimitive(
-      DocPath(encoded_doc_key, "subkey2"), PrimitiveValue("value5"), 5000_usec_ht));
+      DocPath(encoded_doc_key, "subkey2"), PrimitiveValue("value5"), kTxn2HT));
 
-  AssertDocDbDebugDumpStrEq(R"#(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
 SubDocKey(DocKey([], ["mydockey", 123456]), [HT{ physical: 4000 }]) -> {}
 SubDocKey(DocKey([], ["mydockey", 123456]), [HT{ physical: 1000 }]) -> {}
 SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey1"; HT{ physical: 3000 }]) -> "value3"
 SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey1"; HT{ physical: 2000 }]) -> "value2"
 SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey1"; HT{ physical: 1000 }]) -> "value1"
-SubDocKey(DocKey([], ["mydockey", 123456]), []) kWeakSnapshotWrite HT{ physical: 5000 w: 1 } \
+SubDocKey(DocKey([], []), []) [kWeakRead, kWeakWrite] HT{ physical: 6000 w: 1 } -> \
+    TransactionId(30303030-3030-3030-3030-303030303032) none
+SubDocKey(DocKey([], []), []) [kWeakRead, kWeakWrite] HT{ physical: 5000 w: 1 } -> \
+    TransactionId(30303030-3030-3030-3030-303030303031) none
+SubDocKey(DocKey([], ["mydockey"]), []) [kWeakRead, kWeakWrite] HT{ physical: 6000 w: 2 } -> \
+    TransactionId(30303030-3030-3030-3030-303030303032) none
+SubDocKey(DocKey([], ["mydockey"]), []) [kWeakRead, kWeakWrite] HT{ physical: 5000 w: 2 } -> \
+    TransactionId(30303030-3030-3030-3030-303030303031) none
+SubDocKey(DocKey([], ["mydockey", 123456]), []) [kWeakRead, kWeakWrite] HT{ physical: 6000 w: 3 } \
     -> TransactionId(30303030-3030-3030-3030-303030303032) none
-SubDocKey(DocKey([], ["mydockey", 123456]), []) kStrongSnapshotWrite HT{ physical: 5000 } \
+SubDocKey(DocKey([], ["mydockey", 123456]), []) [kWeakRead, kWeakWrite] HT{ physical: 5000 w: 3 } \
+    -> TransactionId(30303030-3030-3030-3030-303030303031) none
+SubDocKey(DocKey([], ["mydockey", 123456]), []) [kStrongRead, kStrongWrite] HT{ physical: 6000 } \
     -> TransactionId(30303030-3030-3030-3030-303030303032) WriteId(2) {}
-SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey1"]) kStrongSnapshotWrite HT{ physical: 5000 } \
-    -> TransactionId(30303030-3030-3030-3030-303030303031) WriteId(1) "value4"
-SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey2"]) kStrongSnapshotWrite HT{ physical: 5000 } \
-    -> TransactionId(30303030-3030-3030-3030-303030303032) WriteId(3) "value5"
+SubDocKey(DocKey([], ["mydockey", 123456]), []) [kStrongRead, kStrongWrite] HT{ physical: 5000 } \
+    -> TransactionId(30303030-3030-3030-3030-303030303031) WriteId(0) {}
+SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey1"]) [kStrongRead, kStrongWrite] \
+    HT{ physical: 5000 } -> TransactionId(30303030-3030-3030-3030-303030303031) WriteId(1) "value4"
+SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey2"]) [kStrongRead, kStrongWrite] \
+    HT{ physical: 6000 } -> TransactionId(30303030-3030-3030-3030-303030303032) WriteId(3) "value5"
 TXN REV 30303030-3030-3030-3030-303030303031 HT{ physical: 5000 } -> \
-    SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey1"]) \
-    kStrongSnapshotWrite HT{ physical: 5000 }
+    SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey1"]) [kStrongRead, kStrongWrite] \
+    HT{ physical: 5000 }
 TXN REV 30303030-3030-3030-3030-303030303031 HT{ physical: 5000 w: 1 } -> \
-    SubDocKey(DocKey([], ["mydockey", 123456]), []) kWeakSnapshotWrite HT{ physical: 5000 w: 1 }
-TXN REV 30303030-3030-3030-3030-303030303032 HT{ physical: 5000 } -> \
-    SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey2"]) \
-    kStrongSnapshotWrite HT{ physical: 5000 }
-TXN REV 30303030-3030-3030-3030-303030303032 HT{ physical: 5000 w: 1 } -> \
-    SubDocKey(DocKey([], ["mydockey", 123456]), []) kWeakSnapshotWrite HT{ physical: 5000 w: 1 }
-      )#");
+    SubDocKey(DocKey([], []), []) [kWeakRead, kWeakWrite] HT{ physical: 5000 w: 1 }
+TXN REV 30303030-3030-3030-3030-303030303031 HT{ physical: 5000 w: 2 } -> \
+    SubDocKey(DocKey([], ["mydockey"]), []) [kWeakRead, kWeakWrite] HT{ physical: 5000 w: 2 }
+TXN REV 30303030-3030-3030-3030-303030303031 HT{ physical: 5000 w: 3 } -> \
+    SubDocKey(DocKey([], ["mydockey", 123456]), []) [kWeakRead, kWeakWrite] \
+    HT{ physical: 5000 w: 3 }
+TXN REV 30303030-3030-3030-3030-303030303032 HT{ physical: 6000 } -> \
+    SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey2"]) [kStrongRead, kStrongWrite] \
+    HT{ physical: 6000 }
+TXN REV 30303030-3030-3030-3030-303030303032 HT{ physical: 6000 w: 1 } -> \
+    SubDocKey(DocKey([], []), []) [kWeakRead, kWeakWrite] HT{ physical: 6000 w: 1 }
+TXN REV 30303030-3030-3030-3030-303030303032 HT{ physical: 6000 w: 2 } -> \
+    SubDocKey(DocKey([], ["mydockey"]), []) [kWeakRead, kWeakWrite] HT{ physical: 6000 w: 2 }
+TXN REV 30303030-3030-3030-3030-303030303032 HT{ physical: 6000 w: 3 } -> \
+    SubDocKey(DocKey([], ["mydockey", 123456]), []) [kWeakRead, kWeakWrite] \
+    HT{ physical: 6000 w: 3 }
+    )#");
   FullyCompactHistoryBefore(3500_usec_ht);
-  AssertDocDbDebugDumpStrEq(
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
       R"#(
 SubDocKey(DocKey([], ["mydockey", 123456]), [HT{ physical: 4000 }]) -> {}
 SubDocKey(DocKey([], ["mydockey", 123456]), [HT{ physical: 1000 }]) -> {}
 SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey1"; HT{ physical: 3000 }]) -> "value3"
-SubDocKey(DocKey([], ["mydockey", 123456]), []) kWeakSnapshotWrite HT{ physical: 5000 w: 1 } \
+SubDocKey(DocKey([], []), []) [kWeakRead, kWeakWrite] HT{ physical: 6000 w: 1 } -> \
+    TransactionId(30303030-3030-3030-3030-303030303032) none
+SubDocKey(DocKey([], []), []) [kWeakRead, kWeakWrite] HT{ physical: 5000 w: 1 } -> \
+    TransactionId(30303030-3030-3030-3030-303030303031) none
+SubDocKey(DocKey([], ["mydockey"]), []) [kWeakRead, kWeakWrite] HT{ physical: 6000 w: 2 } -> \
+    TransactionId(30303030-3030-3030-3030-303030303032) none
+SubDocKey(DocKey([], ["mydockey"]), []) [kWeakRead, kWeakWrite] HT{ physical: 5000 w: 2 } -> \
+    TransactionId(30303030-3030-3030-3030-303030303031) none
+SubDocKey(DocKey([], ["mydockey", 123456]), []) [kWeakRead, kWeakWrite] HT{ physical: 6000 w: 3 } \
     -> TransactionId(30303030-3030-3030-3030-303030303032) none
-SubDocKey(DocKey([], ["mydockey", 123456]), []) kStrongSnapshotWrite HT{ physical: 5000 } \
+SubDocKey(DocKey([], ["mydockey", 123456]), []) [kWeakRead, kWeakWrite] HT{ physical: 5000 w: 3 } \
+    -> TransactionId(30303030-3030-3030-3030-303030303031) none
+SubDocKey(DocKey([], ["mydockey", 123456]), []) [kStrongRead, kStrongWrite] HT{ physical: 6000 } \
     -> TransactionId(30303030-3030-3030-3030-303030303032) WriteId(2) {}
-SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey1"]) kStrongSnapshotWrite HT{ physical: 5000 } \
-    -> TransactionId(30303030-3030-3030-3030-303030303031) WriteId(1) "value4"
-SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey2"]) kStrongSnapshotWrite HT{ physical: 5000 } \
-    -> TransactionId(30303030-3030-3030-3030-303030303032) WriteId(3) "value5"
+SubDocKey(DocKey([], ["mydockey", 123456]), []) [kStrongRead, kStrongWrite] HT{ physical: 5000 } \
+    -> TransactionId(30303030-3030-3030-3030-303030303031) WriteId(0) {}
+SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey1"]) [kStrongRead, kStrongWrite] \
+    HT{ physical: 5000 } -> TransactionId(30303030-3030-3030-3030-303030303031) WriteId(1) "value4"
+SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey2"]) [kStrongRead, kStrongWrite] \
+    HT{ physical: 6000 } -> TransactionId(30303030-3030-3030-3030-303030303032) WriteId(3) "value5"
 TXN REV 30303030-3030-3030-3030-303030303031 HT{ physical: 5000 } -> \
-    SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey1"]) \
-    kStrongSnapshotWrite HT{ physical: 5000 }
+    SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey1"]) [kStrongRead, kStrongWrite] \
+    HT{ physical: 5000 }
 TXN REV 30303030-3030-3030-3030-303030303031 HT{ physical: 5000 w: 1 } -> \
-    SubDocKey(DocKey([], ["mydockey", 123456]), []) kWeakSnapshotWrite HT{ physical: 5000 w: 1 }
-TXN REV 30303030-3030-3030-3030-303030303032 HT{ physical: 5000 } -> \
-    SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey2"]) \
-    kStrongSnapshotWrite HT{ physical: 5000 }
-TXN REV 30303030-3030-3030-3030-303030303032 HT{ physical: 5000 w: 1 } -> \
-    SubDocKey(DocKey([], ["mydockey", 123456]), []) kWeakSnapshotWrite HT{ physical: 5000 w: 1 }
-      )#");
+    SubDocKey(DocKey([], []), []) [kWeakRead, kWeakWrite] HT{ physical: 5000 w: 1 }
+TXN REV 30303030-3030-3030-3030-303030303031 HT{ physical: 5000 w: 2 } -> \
+    SubDocKey(DocKey([], ["mydockey"]), []) [kWeakRead, kWeakWrite] HT{ physical: 5000 w: 2 }
+TXN REV 30303030-3030-3030-3030-303030303031 HT{ physical: 5000 w: 3 } -> \
+    SubDocKey(DocKey([], ["mydockey", 123456]), []) [kWeakRead, kWeakWrite] \
+    HT{ physical: 5000 w: 3 }
+TXN REV 30303030-3030-3030-3030-303030303032 HT{ physical: 6000 } -> \
+    SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey2"]) [kStrongRead, kStrongWrite] \
+    HT{ physical: 6000 }
+TXN REV 30303030-3030-3030-3030-303030303032 HT{ physical: 6000 w: 1 } -> \
+    SubDocKey(DocKey([], []), []) [kWeakRead, kWeakWrite] HT{ physical: 6000 w: 1 }
+TXN REV 30303030-3030-3030-3030-303030303032 HT{ physical: 6000 w: 2 } -> \
+    SubDocKey(DocKey([], ["mydockey"]), []) [kWeakRead, kWeakWrite] HT{ physical: 6000 w: 2 }
+TXN REV 30303030-3030-3030-3030-303030303032 HT{ physical: 6000 w: 3 } -> \
+    SubDocKey(DocKey([], ["mydockey", 123456]), []) [kWeakRead, kWeakWrite] \
+    HT{ physical: 6000 w: 3 }
+    )#");
 }
 
+TEST_F(DocDBTest, ForceFlushedFrontier) {
+  // We run with compactions disabled, because they may interefere with force-setting the OpId.
+  ASSERT_OK(DisableCompactions());
+  op_id_ = {1, 1};
+  rocksdb::UserFrontierPtr flushed_frontier;
+  for (int i = 1; i < 20; ++i) {
+    const DocKey doc_key(PrimitiveValues(i));
+    const KeyBytes encoded_doc_key = doc_key.Encode();
+    SetupRocksDBState(encoded_doc_key);
+    ASSERT_OK(FlushRocksDbAndWait());
+    flushed_frontier = rocksdb()->GetFlushedFrontier();
+    LOG(INFO) << "Flushed frontier after i=" << i << ": "
+              << (flushed_frontier ? flushed_frontier->ToString() : "N/A");
+  }
+  ASSERT_TRUE(flushed_frontier.get() != nullptr);
+  ConsensusFrontier consensus_frontier =
+      down_cast<ConsensusFrontier&>(*flushed_frontier);
+  ConsensusFrontier new_consensus_frontier = consensus_frontier;
+  new_consensus_frontier.set_op_id({
+      consensus_frontier.op_id().term,
+      consensus_frontier.op_id().index / 2
+  });
+  ASSERT_EQ(new_consensus_frontier.op_id().term, consensus_frontier.op_id().term);
+  ASSERT_LT(new_consensus_frontier.op_id().index, consensus_frontier.op_id().index);
+  ASSERT_EQ(new_consensus_frontier.hybrid_time(), consensus_frontier.hybrid_time());
+  ASSERT_EQ(new_consensus_frontier.history_cutoff(), consensus_frontier.history_cutoff());
+  rocksdb::UserFrontierPtr new_user_frontier_ptr(new ConsensusFrontier(new_consensus_frontier));
+
+  LOG(INFO) << "Attempting to change flushed frontier from " << consensus_frontier
+            << " to " << new_consensus_frontier;
+  ASSERT_OK(rocksdb_->ModifyFlushedFrontier(
+      new_user_frontier_ptr, rocksdb::FrontierModificationMode::kForce));
+  LOG(INFO) << "Checking that flushed froniter was set to " << new_consensus_frontier;
+  ASSERT_EQ(*new_user_frontier_ptr, *rocksdb_->GetFlushedFrontier());
+
+  LOG(INFO) << "Reopening RocksDB";
+  ASSERT_OK(ReopenRocksDB());
+  LOG(INFO) << "Checking that flushed frontier is still set to "
+            << rocksdb_->GetFlushedFrontier()->ToString();
+  ASSERT_EQ(*new_user_frontier_ptr, *rocksdb_->GetFlushedFrontier());
+}
+
+// Handy code to analyze some DB.
+TEST_F(DocDBTest, DISABLED_DumpDB) {
+  tablet::TabletOptions tablet_options;
+  rocksdb::Options options;
+  docdb::InitRocksDBOptions(
+      &options, "" /* log_prefix */, rocksdb::CreateDBStatistics(), tablet_options);
+
+  rocksdb::DB* rocksdb = nullptr;
+  std::string db_path = "";
+  ASSERT_OK(rocksdb::DB::Open(options, db_path, &rocksdb));
+
+  rocksdb::ReadOptions read_opts;
+  read_opts.query_id = rocksdb::kDefaultQueryId;
+  unique_ptr<rocksdb::Iterator> iter(rocksdb->NewIterator(read_opts));
+  iter->SeekToFirst();
+
+  int txn_meta = 0;
+  int rev_key = 0;
+  int intent = 0;
+  while (iter->Valid()) {
+    auto key_type = GetKeyType(iter->key(), StorageDbType::kIntents);
+    if (key_type == KeyType::kTransactionMetadata) {
+      ++txn_meta;
+    } else if (key_type == KeyType::kReverseTxnKey) {
+      ++rev_key;
+    } else if (key_type == KeyType::kIntentKey) {
+      ++intent;
+    } else {
+      ASSERT_TRUE(false);
+    }
+    iter->Next();
+  }
+
+  LOG(INFO) << "TXN meta: " << txn_meta << ", rev key: " << rev_key << ", intents: " << intent;
+}
 
 }  // namespace docdb
 }  // namespace yb

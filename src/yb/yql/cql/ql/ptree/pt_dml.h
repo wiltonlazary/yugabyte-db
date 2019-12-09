@@ -26,17 +26,50 @@
 #include "yb/yql/cql/ql/ptree/pt_dml_using_clause.h"
 #include "yb/yql/cql/ql/ptree/column_arg.h"
 #include "yb/common/table_properties_constants.h"
+#include "yb/common/common.pb.h"
+#include "yb/client/client.h"
 
 namespace yb {
 namespace ql {
+
+inline ostream& operator<< (ostream& out, const QLOperator& ql_op) {
+  switch (ql_op) {
+    case QL_OP_AND:
+      out << "AND";
+      break;
+    case QL_OP_EQUAL:
+      out << "=";
+      break;
+    case QL_OP_LESS_THAN:
+      out << "<";
+      break;
+    case QL_OP_LESS_THAN_EQUAL:
+      out << "<=";
+      break;
+    case QL_OP_GREATER_THAN:
+      out << ">";
+      break;
+    case QL_OP_GREATER_THAN_EQUAL:
+      out << ">=";
+      break;
+    case QL_OP_IN:
+      out << "IN";
+      break;
+    case QL_OP_NOT_IN:
+      out << "NOT IN";
+      break;
+    default:
+      out << "";
+      break;
+  }
+  return out;
+}
 
 //--------------------------------------------------------------------------------------------------
 // Counter of operators on each column. "gt" includes ">" and ">=". "lt" includes "<" and "<=".
 class ColumnOpCounter {
  public:
-  ColumnOpCounter() : gt_count_(0), lt_count_(0), eq_count_(0), in_count_(0),
-                      partial_col_gt_count_(0), partial_col_lt_count_(0), partial_col_eq_count_(0),
-                      partial_col_in_count_(0) {}
+  ColumnOpCounter() {}
   int gt_count() const { return gt_count_; }
   int lt_count() const { return lt_count_; }
   int eq_count() const { return eq_count_; }
@@ -70,21 +103,20 @@ class ColumnOpCounter {
 
  private:
   // These are counts for regular columns.
-  int gt_count_;
-  int lt_count_;
-  int eq_count_;
-  int in_count_;
+  int gt_count_ = 0;
+  int lt_count_ = 0;
+  int eq_count_ = 0;
+  int in_count_ = 0;
   // These are counts for partial columns like json(c1->'a') and collection(c1[0]) operators.
-  int partial_col_gt_count_;
-  int partial_col_lt_count_;
-  int partial_col_eq_count_;
-  int partial_col_in_count_;
+  int partial_col_gt_count_ = 0;
+  int partial_col_lt_count_ = 0;
+  int partial_col_eq_count_ = 0;
+  int partial_col_in_count_ = 0;
 };
 
 // State variables for where clause.
 class WhereExprState {
  public:
-
   WhereExprState(MCList<ColumnOp> *ops,
                  MCVector<ColumnOp> *key_ops,
                  MCList<SubscriptedColumnOp> *subscripted_col_ops,
@@ -93,7 +125,8 @@ class WhereExprState {
                  MCVector<ColumnOpCounter> *op_counters,
                  ColumnOpCounter *partition_key_counter,
                  TreeNodeOpcode statement_type,
-                 MCList<FuncOp> *func_ops)
+                 MCList<FuncOp> *func_ops,
+                 MCVector<const PTExpr*> *filtering_exprs)
     : ops_(ops),
       key_ops_(key_ops),
       subscripted_col_ops_(subscripted_col_ops),
@@ -102,7 +135,8 @@ class WhereExprState {
       op_counters_(op_counters),
       partition_key_counter_(partition_key_counter),
       statement_type_(statement_type),
-      func_ops_(func_ops) {
+      func_ops_(func_ops),
+      filtering_exprs_(filtering_exprs) {
   }
 
   CHECKED_STATUS AnalyzeColumnOp(SemContext *sem_context,
@@ -149,6 +183,25 @@ class WhereExprState {
 
   MCList<FuncOp> *func_ops_;
 
+  // Collecting all expressions that a chosen index must cover to process the statement.
+  MCVector<const PTExpr*> *filtering_exprs_;
+};
+
+// State variables for if clause.
+class IfExprState {
+ public:
+  explicit IfExprState(MCVector<const PTExpr*> *filtering_exprs)
+      : filtering_exprs_(filtering_exprs) {
+  }
+
+  void AddFilteringExpr(SemContext *sem_context, const PTRelationExpr *expr) {
+    // Collecting all filtering expressions to help choosing INDEX when processing a DML.
+    filtering_exprs_->push_back(expr);
+  }
+
+ private:
+  // Collecting all expressions that a chosen index must cover to process the statement.
+  MCVector<const PTExpr*> *filtering_exprs_;
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -166,6 +219,11 @@ class PTCollection : public TreeNode {
   typedef MCSharedPtr<PTCollection> SharedPtr;
   typedef MCSharedPtr<const PTCollection> SharedPtrConst;
 
+  // Node type.
+  virtual TreeNodeOpcode opcode() const override {
+    return TreeNodeOpcode::kPTCollection;
+  }
+
  protected:
   //------------------------------------------------------------------------------------------------
   // Constructor and destructor. Define them in protected section to prevent application from
@@ -181,15 +239,20 @@ class PTCollection : public TreeNode {
 
 class PTDmlStmt : public PTCollection {
  public:
+  // Table column name to description map.
+  using MCColumnMap = MCMap<MCString, ColumnDesc>;
+
   //------------------------------------------------------------------------------------------------
   // Constructor and destructor.
-  explicit PTDmlStmt(MemoryContext *memctx,
-                     YBLocation::SharedPtr loc,
-                     PTExpr::SharedPtr where_clause = nullptr,
-                     PTExpr::SharedPtr if_clause = nullptr,
-                     bool else_error = false,
-                     PTDmlUsingClause::SharedPtr using_clause = nullptr,
-                     bool returns_status = false);
+  PTDmlStmt(MemoryContext *memctx,
+            YBLocation::SharedPtr loc,
+            PTExpr::SharedPtr where_clause = nullptr,
+            PTExpr::SharedPtr if_clause = nullptr,
+            bool else_error = false,
+            PTDmlUsingClause::SharedPtr using_clause = nullptr,
+            bool returns_status = false);
+  // Clone a DML tnode for re-analysis.
+  PTDmlStmt(MemoryContext *memctx, const PTDmlStmt& other, bool copy_if_clause);
   virtual ~PTDmlStmt();
 
   template<typename... TypeArgs>
@@ -197,11 +260,14 @@ class PTDmlStmt : public PTCollection {
     return MCMakeShared<PTDmlStmt>(memctx, std::forward<TypeArgs>(args)...);
   }
 
-  // Lookup table from the metadata database.
-  CHECKED_STATUS LookupTable(SemContext *sem_context);
-
   // Node semantics analysis.
   virtual CHECKED_STATUS Analyze(SemContext *sem_context) override;
+
+  virtual ExplainPlanPB AnalysisResultToPB() = 0;
+
+  // Find column descriptor. From the context, the column value will be marked to be read if
+  // necessary when executing the QL statement.
+  const ColumnDesc *GetColumnDesc(const SemContext *sem_context, const MCString& col_name);
 
   virtual bool IsDml() const override {
     return true;
@@ -222,21 +288,17 @@ class PTDmlStmt : public PTCollection {
     return is_system_;
   }
 
-  const MCVector<ColumnDesc>& table_columns() const {
-    return table_columns_;
+  const MCColumnMap& column_map() const {
+    return column_map_;
   }
 
-  int num_columns() const {
-    return table_columns_.size();
-  }
+  int num_columns() const;
 
-  int num_key_columns() const {
-    return num_key_columns_;
-  }
+  int num_key_columns() const;
 
-  int num_hash_key_columns() const {
-    return num_hash_key_columns_;
-  }
+  int num_hash_key_columns() const;
+
+  string hash_key_columns() const;
 
   const MCVector<ColumnOp>& key_where_ops() const {
     return key_where_ops_;
@@ -278,22 +340,26 @@ class PTDmlStmt : public PTCollection {
     return if_clause_;
   }
 
-  const PTExpr::SharedPtr& ttl_seconds() const {
-    return using_clause_ != nullptr ? using_clause_->ttl_seconds() : kNullPointerRef;
+  PTExpr::SharedPtr ttl_seconds() const {
+    return using_clause_ ? using_clause_->ttl_seconds() : nullptr;
   }
 
-  const PTExpr::SharedPtr& user_timestamp_usec() const {
-    return using_clause_ != nullptr ? using_clause_->user_timestamp_usec() : kNullPointerRef;
+  PTExpr::SharedPtr user_timestamp_usec() const {
+    return using_clause_ ? using_clause_->user_timestamp_usec() : nullptr;
   }
 
-  const MCVector<PTBindVar*> &bind_variables() const {
+  virtual const std::shared_ptr<client::YBTable>& bind_table() const {
+    return table_;
+  }
+
+  virtual const MCVector<PTBindVar*> &bind_variables() const {
     return bind_variables_;
   }
-  MCVector<PTBindVar*> &bind_variables() {
+  virtual MCVector<PTBindVar*> &bind_variables() {
     return bind_variables_;
   }
 
-  std::vector<int64_t> hash_col_indices() const {
+  virtual std::vector<int64_t> hash_col_indices() const {
     std::vector<int64_t> indices;
     indices.reserve(hash_col_bindvars_.size());
     for (const PTBindVar* bindvar : hash_col_bindvars_) {
@@ -304,8 +370,12 @@ class PTDmlStmt : public PTCollection {
 
   // Access for column_args.
   const MCVector<ColumnArg>& column_args() const {
-    CHECK(column_args_ != nullptr) << "column arguments not set up";
-    return *column_args_;
+    return *CHECK_NOTNULL(column_args_.get());
+  }
+
+  // Mutable acccess to column_args, used in PreExec phase
+  MCVector<ColumnArg>& column_args() {
+    return *CHECK_NOTNULL(column_args_.get());
   }
 
   // Add column ref to be read by DocDB.
@@ -324,8 +394,8 @@ class PTDmlStmt : public PTCollection {
 
   // Add all column refs to be read by DocDB.
   void AddRefForAllColumns() {
-    for (const auto col_desc : table_columns_) {
-      AddColumnRef(col_desc);
+    for (const auto pair : column_map_) {
+      AddColumnRef(pair.second);
     }
   }
 
@@ -388,11 +458,61 @@ class PTDmlStmt : public PTCollection {
   }
 
  protected:
+
+  template <typename T>
+  string conditionsToString(T conds) {
+    string str;
+    for (auto col_op = conds.begin(); col_op != conds.end(); ++col_op) {
+      std::stringstream s;
+      if (col_op != conds.begin()) {
+        s << " AND ";
+      }
+      s << "(" << col_op->desc()->name() << " " << col_op->yb_op();
+
+      if (col_op->expr()->expr_op() != ExprOperator::kBindVar &&
+          col_op->expr()->ql_type_id() == DataType::STRING) {
+        s << " '" << col_op->expr()->QLName() << "')";
+      } else {
+        s << " " << col_op->expr()->QLName() << ")";
+      }
+      str += s.str();
+    }
+    return str;
+  }
+
+  string partitionkeyToString(MCList<PartitionKeyOp> conds) {
+    string str;
+    for (auto col_op = conds.begin(); col_op != conds.end(); ++col_op) {
+      std::stringstream s;
+      if (col_op != conds.begin()) {
+        s << " AND ";
+      }
+      // Partition_hash is stored as INT32, token is stored as INT64, unless you specify the
+      // rhs expression e.g partition_hash(h1, h2) >= 3 in which case it's stored as an VARINT.
+      // So setting the default to the yql partition_hash in that case seems reasonable.
+      string label = (col_op->expr()->expected_internal_type() == InternalType::kInt64Value) ?
+          "token" : "partition_hash";
+      s << "(" << label << "(" << hash_key_columns() <<  ") " << col_op->yb_op()
+        << " " << col_op->expr()->QLName() << ")";
+      str += s.str();
+    }
+    return str;
+  }
+
+  // Lookup table from the metadata database.
+  CHECKED_STATUS LookupTable(SemContext *sem_context);
+
+  // Load table schema into symbol table.
+  static void LoadSchema(SemContext *sem_context,
+                         const client::YBTablePtr& table,
+                         MCColumnMap* column_map,
+                         bool is_index);
+
   // Semantic-analyzing the where clause.
-  CHECKED_STATUS AnalyzeWhereClause(SemContext *sem_context, const PTExpr::SharedPtr& where_clause);
+  CHECKED_STATUS AnalyzeWhereClause(SemContext *sem_context);
 
   // Semantic-analyzing the if clause.
-  CHECKED_STATUS AnalyzeIfClause(SemContext *sem_context, const PTExpr::SharedPtr& if_clause);
+  CHECKED_STATUS AnalyzeIfClause(SemContext *sem_context);
 
   // Semantic-analyzing the USING TTL clause.
   CHECKED_STATUS AnalyzeUsingClause(SemContext *sem_context);
@@ -423,11 +543,12 @@ class PTDmlStmt : public PTCollection {
 
   // -- The semantic analyzer will decorate this node with the following information --
 
-  std::shared_ptr<client::YBTable> table_;
-  bool is_system_ = false; // Is the table a system table?
-  MCVector<ColumnDesc> table_columns_; // Table columns.
-  int num_key_columns_ = 0;
-  int num_hash_key_columns_ = 0;
+  // Is the target table a system table?
+  bool is_system_ = false;
+
+  // Target table and column name->description map.
+  client::YBTablePtr table_;
+  MCColumnMap column_map_;
 
   // Where operator list.
   // - When reading (SELECT), key_where_ops_ has only HASH (partition) columns.
@@ -467,8 +588,11 @@ class PTDmlStmt : public PTCollection {
 
   // The set of indexes that index primary key columns of the indexed table only and the set of
   // indexes that do not.
-  MCUnorderedSet<std::shared_ptr<client::YBTable>> pk_only_indexes_;
+  MCUnorderedSet<client::YBTablePtr> pk_only_indexes_;
   MCUnorderedSet<TableId> non_pk_only_indexes_;
+
+  // Collecting all expressions that a chosen index must cover to process the statement.
+  MCVector<const PTExpr*> filtering_exprs_;
 
   // For inter-dependency analysis of DMLs in a batch/transaction
   bool modifies_primary_row_ = false;
@@ -478,8 +602,7 @@ class PTDmlStmt : public PTCollection {
   // For optimizing SELECT queries with IN condition on hash key: does this SELECT have all primary
   // key columns set with '=' or 'IN' conditions.
   bool select_has_primary_keys_set_ = false;
-
-  static const PTExpr::SharedPtr kNullPointerRef;
+  bool has_incomplete_hash_ = false;
 };
 
 }  // namespace ql

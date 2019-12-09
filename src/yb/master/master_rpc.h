@@ -39,6 +39,9 @@
 #include "yb/gutil/ref_counted.h"
 #include "yb/master/master.pb.h"
 #include "yb/rpc/rpc.h"
+
+#include "yb/server/server_base_options.h"
+
 #include "yb/util/locks.h"
 #include "yb/util/net/net_util.h"
 #include "yb/util/net/sockaddr.h"
@@ -79,9 +82,9 @@ class GetLeaderMasterRpc : public rpc::Rpc {
   // Calls 'user_cb' when the leader is found, or if no leader can be
   // found until 'deadline' passes.
   GetLeaderMasterRpc(LeaderCallback user_cb,
-                     std::vector<HostPort> addrs,
-                     MonoTime deadline,
-                     const std::shared_ptr<rpc::Messenger>& messenger,
+                     const server::MasterAddresses& addrs,
+                     CoarseTimePoint deadline,
+                     rpc::Messenger* messenger,
                      rpc::ProxyCache* proxy_cache,
                      rpc::Rpcs* rpcs,
                      bool should_timeout_to_follower_ = false);

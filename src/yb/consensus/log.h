@@ -39,27 +39,34 @@
 #include <string>
 #include <vector>
 
+#include <boost/atomic.hpp>
 #include <boost/thread/shared_mutex.hpp>
 
 #include "yb/common/schema.h"
+#include "yb/consensus/consensus_fwd.h"
 #include "yb/consensus/log_util.h"
 #include "yb/consensus/opid_util.h"
-#include "yb/consensus/ref_counted_replicate.h"
 #include "yb/gutil/ref_counted.h"
 #include "yb/gutil/spinlock.h"
 #include "yb/util/async_util.h"
 #include "yb/util/blocking_queue.h"
 #include "yb/util/locks.h"
+#include "yb/util/monotime.h"
 #include "yb/util/opid.h"
 #include "yb/util/promise.h"
 #include "yb/util/status.h"
 #include "yb/util/threadpool.h"
+#include "yb/util/shared_lock.h"
 
 namespace yb {
 
-class FsManager;
 class MetricEntity;
 class ThreadPool;
+
+namespace cdc {
+class CDCServiceTest_TestLogRetentionByOpId_MaxRentionTime_Test;
+class CDCServiceTest_TestLogRetentionByOpId_MinSpace_Test;
+}
 
 namespace log {
 
@@ -92,16 +99,14 @@ class LogReader;
 // might hold references to these classes to execute the callbacks after each write.
 class Log : public RefCountedThreadSafe<Log> {
  public:
-  class LogFaultHooks;
-
   static const Status kLogShutdownStatus;
 
   // Opens or continues a log and sets 'log' to the newly built Log.
   // After a successful Open() the Log is ready to receive entries.
   static CHECKED_STATUS Open(const LogOptions &options,
-                             FsManager *fs_manager,
                              const std::string& tablet_id,
                              const std::string& tablet_wal_path,
+                             const std::string& peer_uuid,
                              const Schema& schema,
                              uint32_t schema_version,
                              const scoped_refptr<MetricEntity>& metric_entity,
@@ -128,13 +133,17 @@ class Log : public RefCountedThreadSafe<Log> {
                              const StatusCallback& callback);
 
   // Synchronously append a new entry to the log.  Log does not take ownership of the passed
-  // 'entry'.
+  // 'entry'. If skip_wal_write is true, only update consensus metadata and LogIndex, skip write
+  // to wal.
   // TODO get rid of this method, transition to the asynchronous API.
-  CHECKED_STATUS Append(LogEntryPB* entry);
+  CHECKED_STATUS Append(LogEntryPB* entry,
+                        LogEntryMetadata entry_metadata,
+                        bool skip_wal_write = false);
 
   // Append the given set of replicate messages, asynchronously.  This requires that the replicates
   // have already been assigned OpIds.
-  CHECKED_STATUS AsyncAppendReplicates(const ReplicateMsgs& replicates,
+  CHECKED_STATUS AsyncAppendReplicates(const ReplicateMsgs& replicates, const OpId& committed_op_id,
+                                       RestartSafeCoarseTimePoint batch_mono_time,
                                        const StatusCallback& callback);
 
   // Blocks the current thread until all the entries in the log queue are flushed and fsynced (if
@@ -143,7 +152,7 @@ class Log : public RefCountedThreadSafe<Log> {
 
   // Kick off an asynchronous task that pre-allocates a new log-segment, setting
   // 'allocation_status_'. To wait for the result of the task, use allocation_status_.Get().
-  CHECKED_STATUS AsyncAllocateSegment();
+  CHECKED_STATUS AsyncAllocateSegment() EXCLUDES(allocation_mutex_);
 
   // The closure submitted to allocation_pool_ to allocate a new segment.
   void SegmentAllocationTask();
@@ -153,13 +162,16 @@ class Log : public RefCountedThreadSafe<Log> {
 
   // Delete all WAL data from the log associated with this tablet.
   // REQUIRES: The Log must be closed.
-  static CHECKED_STATUS DeleteOnDiskData(FsManager* fs_manager,
+  static CHECKED_STATUS DeleteOnDiskData(Env* env,
                                          const std::string& tablet_id,
-                                         const std::string& tablet_wal_path);
+                                         const std::string& tablet_wal_path,
+                                         const std::string& peer_uuid);
 
   // Returns a reader that is able to read through the previous segments. The reader pointer is
   // guaranteed to be live as long as the log itself is initialized and live.
   LogReader* GetLogReader() const;
+
+  CHECKED_STATUS GetSegmentsSnapshot(SegmentSequence* segments) const;
 
   void SetMaxSegmentSizeForTests(uint64_t max_segment_size) {
     max_segment_size_ = max_segment_size;
@@ -195,7 +207,7 @@ class Log : public RefCountedThreadSafe<Log> {
   CHECKED_STATUS GC(int64_t min_op_idx, int* num_gced);
 
   // Computes the amount of bytes that would have been GC'd if Log::GC had been called.
-  void GetGCableDataSize(int64_t min_op_idx, int64_t* total_size) const;
+  CHECKED_STATUS GetGCableDataSize(int64_t min_op_idx, int64_t* total_size) const;
 
   // Returns a map of log index -> segment size, of all the segments that currently cannot be GCed
   // because in-memory structures have anchors in them.
@@ -206,8 +218,8 @@ class Log : public RefCountedThreadSafe<Log> {
                                      std::map<int64_t, int64_t>* max_idx_to_segment_size) const;
 
   // Returns the file system location of the currently active WAL segment.
-  const std::string& ActiveSegmentPathForTests() const {
-    return active_segment_->path();
+  const WritableLogSegment* ActiveSegmentForTests() const {
+    return active_segment_.get();
   }
 
   // Forces the Log to allocate a new segment and roll over.  This can be used to make sure all
@@ -218,11 +230,8 @@ class Log : public RefCountedThreadSafe<Log> {
   // Returns 0 if the log is shut down.
   uint64_t OnDiskSize();
 
-  // Returns this Log's FsManager.
-  FsManager* GetFsManager();
-
-  void SetLogFaultHooksForTests(const std::shared_ptr<LogFaultHooks> &hooks) {
-    log_hooks_ = hooks;
+  void ListenPostAppend(std::function<void()> listener) {
+    post_append_listener_ = std::move(listener);
   }
 
   // Set the schema for the _next_ log segment.
@@ -230,10 +239,19 @@ class Log : public RefCountedThreadSafe<Log> {
   // This method is thread-safe.
   void SetSchemaForNextLogSegment(const Schema& schema, uint32_t version);
 
+  void set_wal_retention_secs(uint32_t wal_retention_secs);
+
+  uint32_t wal_retention_secs() const;
+
   // Waits until specified op id is added to log.
   // Returns current op id after waiting, which could be greater than or equal to specified op id.
-  // `op_id` should be already committed.
-  yb::OpId WaitForSafeOpIdToApply(const yb::OpId& op_id);
+  //
+  // On timeout returns default constructed OpId.
+  yb::OpId WaitForSafeOpIdToApply(const yb::OpId& op_id, MonoDelta duration = MonoDelta());
+
+  // Return a readable segment with the given sequence number, or NULL if it
+  // cannot be found (e.g. if it has already been GCed).
+  scoped_refptr<ReadableLogSegment> GetSegmentBySequenceNumber(int64_t seq) const;
 
   void TEST_SetSleepDuration(const std::chrono::nanoseconds& duration) {
     sleep_duration_.store(duration, std::memory_order_release);
@@ -243,12 +261,35 @@ class Log : public RefCountedThreadSafe<Log> {
     all_op_ids_safe_ = value;
   }
 
+  uint64_t active_segment_sequence_number() const;
+
+  CHECKED_STATUS TEST_SubmitFuncToAppendToken(const std::function<void()>& func);
+
+  // Returns the number of segments.
+  const int num_segments() const;
+
+  const std::string& LogPrefix() const {
+    return log_prefix_;
+  }
+
+  void set_cdc_min_replicated_index(int64_t cdc_min_replicated_index) {
+    // TODO: check that the passed index is greater than the current index.
+    cdc_min_replicated_index_.store(cdc_min_replicated_index, std::memory_order_release);
+  }
+
+  int64_t cdc_min_replicated_index() {
+    return cdc_min_replicated_index_.load(std::memory_order_acquire);
+  }
+
  private:
   friend class LogTest;
   friend class LogTestBase;
+
   FRIEND_TEST(LogTest, TestMultipleEntriesInABatch);
   FRIEND_TEST(LogTest, TestReadLogWithReplacedReplicates);
   FRIEND_TEST(LogTest, TestWriteAndReadToAndFromInProgressSegment);
+  FRIEND_TEST(cdc::CDCServiceTest, TestLogRetentionByOpId_MaxRentionTime);
+  FRIEND_TEST(cdc::CDCServiceTest, TestLogRetentionByOpId_MinSpace);
 
   class Appender;
 
@@ -266,10 +307,14 @@ class Log : public RefCountedThreadSafe<Log> {
     kAllocationFinished // Next segment ready
   };
 
-  Log(LogOptions options, FsManager* fs_manager, std::string log_path,
-      std::string tablet_id, std::string tablet_wal_path, const Schema& schema,
-      uint32_t schema_version, const scoped_refptr<MetricEntity>& metric_entity,
-      ThreadPool* append_thread_pool);
+  Log(LogOptions options, std::string log_path,
+      std::string tablet_id, std::string tablet_wal_path, std::string peer_uuid,
+      const Schema& schema, uint32_t schema_version,
+      const scoped_refptr<MetricEntity>& metric_entity, ThreadPool* append_thread_pool);
+
+  Env* get_env() {
+    return options_.env;
+  }
 
   // Initializes a new one or continues an existing log.
   CHECKED_STATUS Init();
@@ -289,7 +334,7 @@ class Log : public RefCountedThreadSafe<Log> {
 
   // Creates a new WAL segment on disk, writes the next_segment_header_ to disk as the header, and
   // sets active_segment_ to point to this new segment.
-  CHECKED_STATUS SwitchToAllocatedSegment();
+  CHECKED_STATUS SwitchToAllocatedSegment() EXCLUDES(allocation_mutex_);
 
   // Preallocates the space for a new segment.
   CHECKED_STATUS PreAllocateNewSegment();
@@ -299,18 +344,20 @@ class Log : public RefCountedThreadSafe<Log> {
 
   // Writes serialized contents of 'entry' to the log. Called inside AppenderThread. If
   // 'caller_owns_operation' is true, then the 'operation' field of the entry will be released after
-  // the entry is appended.
+  // the entry is appended. If skip_wal_write is true, only update consensus metadata and LogIndex,
+  // skip WAL write.
   //
   // TODO once Append() is removed, 'caller_owns_operation' and associated logic will no longer be
   // needed.
-  CHECKED_STATUS DoAppend(LogEntryBatch* entry, bool caller_owns_operation = true);
+  CHECKED_STATUS DoAppend(
+      LogEntryBatch* entry, bool caller_owns_operation = true, bool skip_wal_write = false);
 
   // Update footer_builder_ to reflect the log indexes seen in 'batch'.
   void UpdateFooterForBatch(LogEntryBatch* batch);
 
   // Update the LogIndex to include entries for the replicate messages found in 'batch'. The index
   // entry points to the offset 'start_offset' in the current log segment.
-  CHECKED_STATUS UpdateIndexForBatch(const LogEntryBatch& batch, int64_t start_offset);
+  CHECKED_STATUS UpdateIndexForBatch(const LogEntryBatch& batch);
 
   // Replaces the last "empty" segment in 'log_reader_', i.e. the one currently being written to, by
   // the same segment once properly closed.
@@ -321,17 +368,19 @@ class Log : public RefCountedThreadSafe<Log> {
   // Helper method to get the segment sequence to GC based on the provided min_op_idx.
   CHECKED_STATUS GetSegmentsToGCUnlocked(int64_t min_op_idx, SegmentSequence* segments_to_gc) const;
 
-  const SegmentAllocationState allocation_state() {
-    boost::shared_lock<boost::shared_mutex> shared_lock(allocation_lock_);
+  const SegmentAllocationState allocation_state() EXCLUDES(allocation_mutex_) {
+    SharedLock<decltype(allocation_mutex_)> shared_lock(allocation_mutex_);
     return allocation_state_;
   }
 
   LogOptions options_;
-  FsManager *fs_manager_;
   std::string log_dir_;
 
   // The ID of the tablet this log is dedicated to.
   std::string tablet_id_;
+
+  // Peer this log is dedicated to.
+  std::string peer_uuid_;
 
   // The path where the write-ahead log for this tablet is stored.
   std::string tablet_wal_path_;
@@ -349,7 +398,7 @@ class Log : public RefCountedThreadSafe<Log> {
   gscoped_ptr<WritableLogSegment> active_segment_;
 
   // The current (active) segment sequence number.
-  uint64_t active_segment_sequence_number_;
+  std::atomic<uint64_t> active_segment_sequence_number_ = {0};
 
   // The writable file for the next allocated segment
   std::shared_ptr<WritableFile> next_segment_file_;
@@ -368,13 +417,17 @@ class Log : public RefCountedThreadSafe<Log> {
   // Index which translates between operation indexes and the position of the operation in the log.
   scoped_refptr<LogIndex> log_index_;
 
-  // Lock for notification of last_entry_op_id_ changes.
-  mutable std::mutex last_entry_op_id_mutex_;
-  mutable std::condition_variable last_entry_op_id_cond_;
+  // Lock for notification of last_synced_entry_op_id_ changes.
+  mutable std::mutex last_synced_entry_op_id_mutex_;
+  mutable std::condition_variable last_synced_entry_op_id_cond_;
 
-  // The last known OpId for a REPLICATE message appended to this log (any segment).
-  // NOTE: this op is not necessarily durable.
-  std::atomic<yb::OpId> last_entry_op_id_{yb::OpId()};
+  // The last known OpId for a REPLICATE message appended and synced to this log (any segment).
+  // NOTE: this op is not necessarily durable unless gflag durable_wal_write is true.
+  boost::atomic<yb::OpId> last_synced_entry_op_id_{yb::OpId()};
+
+  // The last know OpId for a REPLICATE message appended to this log (any segment).
+  // This variable is not accessed concurrently.
+  yb::OpId last_appended_entry_op_id_;
 
   // A footer being prepared for the current segment.  When the segment is closed, it will be
   // written.
@@ -420,8 +473,8 @@ class Log : public RefCountedThreadSafe<Log> {
   Promise<Status> allocation_status_;
 
   // Read-write lock to protect 'allocation_state_'.
-  mutable boost::shared_mutex allocation_lock_;
-  SegmentAllocationState allocation_state_;
+  mutable boost::shared_mutex allocation_mutex_;
+  SegmentAllocationState allocation_state_ GUARDED_BY(allocation_mutex_);
 
   scoped_refptr<MetricEntity> metric_entity_;
   gscoped_ptr<LogMetrics> metrics_;
@@ -429,13 +482,20 @@ class Log : public RefCountedThreadSafe<Log> {
   // The cached on-disk size of the log, used to track its size even if it has been closed.
   std::atomic<uint64_t> on_disk_size_;
 
-  std::shared_ptr<LogFaultHooks> log_hooks_;
+  // Listener that will be invoked after new entry was appended to the log.
+  std::function<void()> post_append_listener_;
 
   // Used in tests delay writing log entries.
   std::atomic<std::chrono::nanoseconds> sleep_duration_{std::chrono::nanoseconds(0)};
 
   // Used in tests to declare all operations as safe.
   bool all_op_ids_safe_ = false;
+
+  const std::string log_prefix_;
+
+  std::atomic<uint32_t> wal_retention_secs_{0};
+
+  std::atomic<int64_t> cdc_min_replicated_index_{std::numeric_limits<int64_t>::max()};
 
   DISALLOW_COPY_AND_ASSIGN(Log);
 };
@@ -444,13 +504,12 @@ class Log : public RefCountedThreadSafe<Log> {
 // the user and is managed by the Log class.
 class LogEntryBatch {
  public:
+  LogEntryBatch(LogEntryTypePB type, LogEntryBatchPB&& entry_batch_pb);
   ~LogEntryBatch();
 
  private:
   friend class Log;
   friend class MultiThreadedLogTest;
-
-  LogEntryBatch(LogEntryTypePB type, LogEntryBatchPB* entry_batch_pb, size_t count);
 
   // Serializes contents of the entry to an internal buffer.
   CHECKED_STATUS Serialize();
@@ -486,6 +545,8 @@ class LogEntryBatch {
     DCHECK_EQ(state_, kEntrySerialized);
     return Slice(buffer_);
   }
+
+  bool flush_marker() const;
 
   size_t count() const { return count_; }
 
@@ -528,6 +589,12 @@ class LogEntryBatch {
   // Buffer to which 'phys_entries_' are serialized by call to 'Serialize()'
   faststring buffer_;
 
+  // Offset into the log file for this entry batch.
+  int64_t offset_;
+
+  // Segment sequence number for this entry batch.
+  uint64_t active_segment_sequence_number_;
+
   enum LogEntryState {
     kEntryInitialized,
     kEntryReserved,
@@ -538,24 +605,6 @@ class LogEntryBatch {
   LogEntryState state_ = kEntryInitialized;
 
   DISALLOW_COPY_AND_ASSIGN(LogEntryBatch);
-};
-
-class Log::LogFaultHooks {
- public:
-
-  // Executed immediately before returning from Log::Sync() at *ALL* times.
-  virtual CHECKED_STATUS PostSync() { return Status::OK(); }
-
-  // Iff fsync is enabled, executed immediately after call to fsync.
-  virtual CHECKED_STATUS PostSyncIfFsyncEnabled() { return Status::OK(); }
-
-  // Emulate a slow disk where the filesystem has decided to synchronously flush a full buffer.
-  virtual CHECKED_STATUS PostAppend() { return Status::OK(); }
-
-  virtual CHECKED_STATUS PreClose() { return Status::OK(); }
-  virtual CHECKED_STATUS PostClose() { return Status::OK(); }
-
-  virtual ~LogFaultHooks() {}
 };
 
 }  // namespace log

@@ -35,10 +35,14 @@
 
 #include <string>
 
-#include "yb/consensus/consensus.h"
+#include <boost/atomic.hpp>
+
+#include "yb/consensus/consensus_types.h"
 #include "yb/gutil/ref_counted.h"
 #include "yb/gutil/walltime.h"
 #include "yb/tablet/operations/operation.h"
+#include "yb/util/lockfree.h"
+#include "yb/util/opid.h"
 #include "yb/util/status.h"
 #include "yb/util/trace.h"
 
@@ -58,59 +62,53 @@ class Preparer;
 
 // Base class for operation drivers.
 //
-// OperationDriver classes encapsulate the logic of coordinating the execution of
-// an operation. The exact triggering of the methods differs based on whether the
-// operation is being executed on a leader or replica, but the general flow is:
+// OperationDriver classes encapsulate the logic of coordinating the execution of an operation. The
+// exact triggering of the methods differs based on whether the operation is being executed on a
+// leader or replica, but the general flow is:
 //
-//  1 - Init() is called on a newly created driver object.
-//      If the driver is instantiated from a REPLICA, then we know that
-//      the operation is already "REPLICATING" (and thus we don't need to
-//      trigger replication ourself later on).
+//  1 - Init() is called on a newly created driver object.  If the driver is instantiated from a
+//  REPLICA, then we know that the operation is already "REPLICATING" (and thus we don't need to
+//  trigger replication ourself later on).
 //
-//  2 - ExecuteAsync() is called. This submits the operation driver to the Preparer
-//      and returns immediately.
+//  2 - ExecuteAsync() is called. This submits the operation driver to the Preparer and returns
+//      immediately.
 //
 //  3 - PrepareAndStartTask() calls Prepare() and Start() on the operation.
 //
-//      Once successfully prepared, if we have not yet replicated (i.e we are leader),
-//      also triggers consensus->Replicate() and changes the replication state to
-//      REPLICATING.
+//      Once successfully prepared, if we have not yet replicated (i.e we are leader), also triggers
+//      consensus->Replicate() and changes the replication state to REPLICATING.
 //
 //      What happens in reality is more complicated, as Preparer tries to batch leader-side
 //      operations before submitting them to consensus.
-
-//      On the other hand, if we have already successfully replicated (e.g. we are the
-//      follower and ConsensusCommitted() has already been called, then we can move
-//      on to ApplyAsync().
+//
+//      On the other hand, if we have already successfully replicated (e.g. we are the follower and
+//      ConsensusCommitted() has already been called, then we can move on to ApplyOperation().
 //
 //  4 - The Consensus implementation calls ConsensusCommitted()
 //
-//      This is triggered by consensus when the commit index moves past our own
-//      OpId. On followers, this can happen before Prepare() finishes, and thus
-//      we have to check whether we have already done step 3. On leaders, we
-//      don't start the consensus round until after Prepare, so this check always
-//      passes.
+//      This is triggered by consensus when the commit index moves past our own OpId. On followers,
+//      this can happen before Prepare() finishes, and thus we have to check whether we have already
+//      done step 3. On leaders, we don't start the consensus round until after Prepare, so this
+//      check always passes.
 //
 //      If Prepare() has already completed, then we trigger ApplyAsync().
 //
-//  5 - ApplyAsync() submits ApplyTask() to the apply_pool_.
-//      ApplyTask() calls operation_->Apply().
+//  5 - ApplyOperation() calls ApplyTask(), which then calls operation_->Apply().
 //
-//      When Apply() is called, changes are made to the in-memory data structures. These
+//      When operation_->Apply() is called, changes are made to the in-memory data structures. These
 //      changes are not visible to clients yet.
 //
-//      After the commit message has been enqueued in the Log, the driver executes Finalize()
-//      which, in turn, makes operations make their changes visible to other operations.
-//      After this step the driver replies to the client if needed and the operation
-//      is completed.
-//      In-mem data structures that contain the changes made by the operation can now
-//      be made durable.
+//  6 - The driver executes Finalize() which, in turn, makes operations make their changes visible
+//      to other operations.  After this step the driver replies to the client if needed and the
+//      operation is completed.  In-mem data structures that contain the changes made by the
+//      operation can now be made durable.
 //
 // [1] - see 'Implementation Techniques for Main Memory Database Systems', DeWitt et. al.
 //
 // This class is thread safe.
 class OperationDriver : public RefCountedThreadSafe<OperationDriver>,
-                        public consensus::ConsensusAppendCallback {
+                        public consensus::ConsensusAppendCallback,
+                        public MPSCQueueEntry<OperationDriver> {
 
  public:
   // Construct OperationDriver. OperationDriver does not take ownership
@@ -119,18 +117,19 @@ class OperationDriver : public RefCountedThreadSafe<OperationDriver>,
                   consensus::Consensus* consensus,
                   log::Log* log,
                   Preparer* preparer,
-                  ThreadPool* apply_pool,
                   OperationOrderVerifier* order_verifier,
                   TableType table_type_);
 
   // Perform any non-constructor initialization. Sets the operation
   // that will be executed.
-  CHECKED_STATUS Init(std::unique_ptr<Operation>* operation, consensus::DriverType driver);
+  // if term == kUnknownTerm then we launch this operation as replica, otherwise
+  // we are leader and operation should be bound to this term.
+  CHECKED_STATUS Init(std::unique_ptr<Operation>* operation, int64_t term);
 
   // Returns the OpId of the operation being executed or an uninitialized
   // OpId if none has been assigned. Returns a copy and thus should not
   // be used in tight loops.
-  consensus::OpId GetOpId();
+  yb::OpId GetOpId();
 
   // Submits the operation for execution.
   // The returned status acknowledges any error on the submission process.
@@ -149,7 +148,8 @@ class OperationDriver : public RefCountedThreadSafe<OperationDriver>,
   // If status is anything different from OK() we don't proceed with the apply.
   //
   // see comment in the interface for an important TODO.
-  void ReplicationFinished(const Status& status);
+  void ReplicationFinished(
+      const Status& status, int64_t leader_term, OpIds* applied_op_ids);
 
   std::string ToString() const;
 
@@ -187,12 +187,12 @@ class OperationDriver : public RefCountedThreadSafe<OperationDriver>,
   void PrepareAndStartTask();
 
   // This should be called in case of a failure to submit the operation for replication.
-  void SetReplicationFailed(const Status& replication_status);
+  void ReplicationFailed(const Status& replication_status);
 
   // Handle a failure in any of the stages of the operation.
   // In some cases, this will end the operation and call its callback.
   // In others, where we can't recover, this will FATAL.
-  void HandleFailure(const Status& s);
+  void HandleFailure(Status status = Status::OK());
 
   consensus::Consensus* consensus() { return consensus_; }
 
@@ -205,9 +205,7 @@ class OperationDriver : public RefCountedThreadSafe<OperationDriver>,
     mvcc_ = mvcc;
   }
 
-  int64_t SpaceUsed() {
-    return operation_ ? state()->request()->SpaceUsed() : 0;
-  }
+  int64_t SpaceUsed();
 
  private:
   friend class RefCountedThreadSafe<OperationDriver>;
@@ -238,16 +236,12 @@ class OperationDriver : public RefCountedThreadSafe<OperationDriver>,
   // Starts operation, returns false is we should NOT continue processing the operation.
   bool StartOperation();
 
-  // Submits ApplyTask to the apply pool.
-  CHECKED_STATUS ApplyAsync();
+  // Performs status checks and calls ApplyTask.
+  CHECKED_STATUS ApplyOperation(int64_t leader_term, OpIds* applied_op_ids);
 
   // Calls Operation::Apply() followed by Consensus::Commit() with the
   // results from the Apply().
-  void ApplyTask();
-
-  // Called on Operation::Apply() after the CommitMsg has been successfully
-  // appended to the WAL.
-  void Finalize();
+  void ApplyTask(int64_t leader_term, OpIds* applied_op_ids);
 
   // Returns the mutable state of the operation being executed by
   // this driver.
@@ -262,7 +256,6 @@ class OperationDriver : public RefCountedThreadSafe<OperationDriver>,
   consensus::Consensus* const consensus_;
   log::Log* const log_;
   Preparer* const preparer_;
-  ThreadPool* const apply_pool_;
   OperationOrderVerifier* const order_verifier_;
 
   Status operation_status_;
@@ -274,13 +267,7 @@ class OperationDriver : public RefCountedThreadSafe<OperationDriver>,
   // receives one from Consensus and uninitialized until then.
   // TODO(todd): we have three separate copies of this now -- in OperationState,
   // CommitMsg, and here... we should be able to consolidate!
-  consensus::OpId op_id_copy_;
-
-  // Lock that protects access to the driver's copy of the op_id, specifically.
-  // GetOpId() is the only method expected to be called by threads outside
-  // of the control of the driver, so we use a special lock to control access
-  // otherwise callers would block for a long time for long running operations.
-  mutable simple_spinlock opid_lock_;
+  boost::atomic<yb::OpId> op_id_copy_{yb::OpId::Invalid()};
 
   // The operation to be executed by this driver.
   std::unique_ptr<Operation> operation_;

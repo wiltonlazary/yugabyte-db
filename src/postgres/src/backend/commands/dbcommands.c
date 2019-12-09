@@ -8,13 +8,29 @@
  * stepping on each others' toes.  Formerly we used table-level locks
  * on pg_database, but that's too coarse-grained.
  *
- * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
  *	  src/backend/commands/dbcommands.c
  *
+ * The following only applies to changes made to this file as part of
+ * YugaByte development.
+ *
+ * Portions Copyright (c) YugaByte, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you
+ * may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+ * implied.  See the License for the specific language governing
+ * permissions and limitations under the License.
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -63,6 +79,9 @@
 #include "utils/syscache.h"
 #include "utils/tqual.h"
 
+/*  YB includes. */
+#include "commands/ybccmds.h"
+#include "pg_yb_utils.h"
 
 typedef struct
 {
@@ -90,7 +109,6 @@ static bool have_createdb_privilege(void);
 static void remove_dbtablespaces(Oid db_id);
 static bool check_db_file_conflict(Oid db_id);
 static int	errdetail_busy_db(int notherbackends, int npreparedxacts);
-
 
 /*
  * CREATE DATABASE
@@ -128,6 +146,7 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	DefElem    *distemplate = NULL;
 	DefElem    *dallowconnections = NULL;
 	DefElem    *dconnlimit = NULL;
+	DefElem    **default_options[] = {&dctype, &dcollate, &dencoding, &dtablespacename};
 	char	   *dbname = stmt->dbname;
 	char	   *dbowner = NULL;
 	const char *dbtemplate = NULL;
@@ -141,6 +160,10 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	int			notherbackends;
 	int			npreparedxacts;
 	createdb_failure_params fparms;
+
+	if (dbname != NULL && (strcmp(dbname, "template0") == 0 || strcmp(dbname, "template1") == 0)) {
+		YBSetPreparingTemplates();
+	}
 
 	/* Extract options from the statement node tree */
 	foreach(option, stmt->options)
@@ -324,6 +347,40 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	if (!dbtemplate)
 		dbtemplate = "template1";	/* Default template database name */
 
+	/* Check YB options support */
+	if (YBIsUsingYBParser()) {
+		for (int i = lengthof(default_options); i > 0; --i) {
+			DefElem *option = *default_options[i - 1];
+			if (option != NULL && option->arg != NULL) {
+        ereport(YBUnsupportedFeatureSignalLevel(),
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+             errmsg("Value other than default for %s option is not yet supported", option->defname),
+             errhint("Please report the issue on "
+                     "https://github.com/YugaByte/yugabyte-db/issues"),
+             parser_errposition(pstate, option->location)));
+			}
+		}
+
+		if (strcmp(dbtemplate, "template0") != 0 && strcmp(dbtemplate, "template1") != 0) {
+      ereport(YBUnsupportedFeatureSignalLevel(),
+          (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+           errmsg("Value other than default, template0 or template1 "
+                  "for template option is not yet supported"),
+           errhint("Please report the issue on "
+                   "https://github.com/YugaByte/yugabyte-db/issues"),
+           parser_errposition(pstate, dtemplate->location)));
+		}
+
+		if (dbistemplate) {
+      ereport(YBUnsupportedFeatureSignalLevel(),
+          (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+           errmsg("Value other than default or false for is_template option is not yet supported"),
+           errhint("Please report the issue on "
+                   "https://github.com/YugaByte/yugabyte-db/issues"),
+           parser_errposition(pstate, distemplate->location)));
+		}
+	}
+
 	if (!get_db_info(dbtemplate, ShareLock,
 					 &src_dboid, &src_owner, &src_encoding,
 					 &src_istemplate, &src_allowconn, &src_lastsysoid,
@@ -422,7 +479,7 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 		aclresult = pg_tablespace_aclcheck(dst_deftablespace, GetUserId(),
 										   ACL_CREATE);
 		if (aclresult != ACLCHECK_OK)
-			aclcheck_error(aclresult, ACL_KIND_TABLESPACE,
+			aclcheck_error(aclresult, OBJECT_TABLESPACE,
 						   tablespacename);
 
 		/* pg_global must never be the default tablespace */
@@ -533,6 +590,9 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	new_record[Anum_pg_database_datminmxid - 1] = TransactionIdGetDatum(src_minmxid);
 	new_record[Anum_pg_database_dattablespace - 1] = ObjectIdGetDatum(dst_deftablespace);
 
+	if (IsYugaByteEnabled())
+		YBCCreateDatabase(dboid, dbname, src_dboid, InvalidOid);
+
 	/*
 	 * We deliberately set datacl to default (NULL), rather than copying it
 	 * from the template database.  Copying it would be a bad idea when the
@@ -583,68 +643,72 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	fparms.src_dboid = src_dboid;
 	fparms.dest_dboid = dboid;
 	PG_ENSURE_ERROR_CLEANUP(createdb_failure_callback,
-							PointerGetDatum(&fparms));
+	                        PointerGetDatum(&fparms));
 	{
-		/*
-		 * Iterate through all tablespaces of the template database, and copy
-		 * each one to the new database.
-		 */
-		rel = heap_open(TableSpaceRelationId, AccessShareLock);
-		scan = heap_beginscan_catalog(rel, 0, NULL);
-		while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
+		if (!IsYugaByteEnabled())
 		{
-			Oid			srctablespace = HeapTupleGetOid(tuple);
-			Oid			dsttablespace;
-			char	   *srcpath;
-			char	   *dstpath;
-			struct stat st;
-
-			/* No need to copy global tablespace */
-			if (srctablespace == GLOBALTABLESPACE_OID)
-				continue;
-
-			srcpath = GetDatabasePath(src_dboid, srctablespace);
-
-			if (stat(srcpath, &st) < 0 || !S_ISDIR(st.st_mode) ||
-				directory_is_empty(srcpath))
-			{
-				/* Assume we can ignore it */
-				pfree(srcpath);
-				continue;
-			}
-
-			if (srctablespace == src_deftablespace)
-				dsttablespace = dst_deftablespace;
-			else
-				dsttablespace = srctablespace;
-
-			dstpath = GetDatabasePath(dboid, dsttablespace);
-
 			/*
-			 * Copy this subdirectory to the new location
-			 *
-			 * We don't need to copy subdirectories
+			 * Iterate through all tablespaces of the template database, and copy
+			 * each one to the new database.
 			 */
-			copydir(srcpath, dstpath, false);
-
-			/* Record the filesystem change in XLOG */
+			rel = heap_open(TableSpaceRelationId, AccessShareLock);
+			scan = heap_beginscan_catalog(rel, 0, NULL);
+			while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
 			{
-				xl_dbase_create_rec xlrec;
 
-				xlrec.db_id = dboid;
-				xlrec.tablespace_id = dsttablespace;
-				xlrec.src_db_id = src_dboid;
-				xlrec.src_tablespace_id = srctablespace;
+				Oid			srctablespace = HeapTupleGetOid(tuple);
+				Oid			dsttablespace;
+				char	   *srcpath;
+				char	   *dstpath;
+				struct stat st;
 
-				XLogBeginInsert();
-				XLogRegisterData((char *) &xlrec, sizeof(xl_dbase_create_rec));
+				/* No need to copy global tablespace */
+				if (srctablespace == GLOBALTABLESPACE_OID)
+					continue;
 
-				(void) XLogInsert(RM_DBASE_ID,
-								  XLOG_DBASE_CREATE | XLR_SPECIAL_REL_UPDATE);
+				srcpath = GetDatabasePath(src_dboid, srctablespace);
+
+				if (stat(srcpath, &st) < 0 || !S_ISDIR(st.st_mode) ||
+				    directory_is_empty(srcpath))
+				{
+					/* Assume we can ignore it */
+					pfree(srcpath);
+					continue;
+				}
+
+				if (srctablespace == src_deftablespace)
+					dsttablespace = dst_deftablespace;
+				else
+					dsttablespace = srctablespace;
+
+				dstpath = GetDatabasePath(dboid, dsttablespace);
+
+				/*
+				 * Copy this subdirectory to the new location
+				 *
+				 * We don't need to copy subdirectories
+				 */
+				copydir(srcpath, dstpath, false);
+
+				/* Record the filesystem change in XLOG */
+				{
+					xl_dbase_create_rec xlrec;
+
+					xlrec.db_id = dboid;
+					xlrec.tablespace_id = dsttablespace;
+					xlrec.src_db_id = src_dboid;
+					xlrec.src_tablespace_id = srctablespace;
+
+					XLogBeginInsert();
+					XLogRegisterData((char *) &xlrec, sizeof(xl_dbase_create_rec));
+
+					(void) XLogInsert(RM_DBASE_ID,
+					                  XLOG_DBASE_CREATE | XLR_SPECIAL_REL_UPDATE);
+				}
 			}
+			heap_endscan(scan);
+			heap_close(rel, AccessShareLock);
 		}
-		heap_endscan(scan);
-		heap_close(rel, AccessShareLock);
 
 		/*
 		 * We force a checkpoint before committing.  This effectively means
@@ -690,9 +754,9 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 		 */
 		ForceSyncCommit();
 	}
-	PG_END_ENSURE_ERROR_CLEANUP(createdb_failure_callback,
-								PointerGetDatum(&fparms));
 
+	PG_END_ENSURE_ERROR_CLEANUP(createdb_failure_callback,
+	                            PointerGetDatum(&fparms));
 	return dboid;
 }
 
@@ -822,7 +886,7 @@ dropdb(const char *dbname, bool missing_ok)
 	 * Permission checks
 	 */
 	if (!pg_database_ownercheck(db_id, GetUserId()))
-		aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_DATABASE,
+		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_DATABASE,
 					   dbname);
 
 	/* DROP hook for the database being removed */
@@ -845,6 +909,13 @@ dropdb(const char *dbname, bool missing_ok)
 				 errmsg("cannot drop the currently open database")));
 
 	/*
+	 * YugaByte allows dropping a database even when multiple sessions are dependent on that database.
+	 * Skip the following checks.
+	 */
+	if (IsYugaByteEnabled())
+		goto removing_database_from_system;
+
+	/*
 	 * Check whether there are active logical slots that refer to the
 	 * to-be-dropped database. The database lock we are holding prevents the
 	 * creation of new slots using the database or existing slots becoming
@@ -857,8 +928,8 @@ dropdb(const char *dbname, bool missing_ok)
 				(errcode(ERRCODE_OBJECT_IN_USE),
 				 errmsg("database \"%s\" is used by an active logical replication slot",
 						dbname),
-				 errdetail_plural("There is %d active slot",
-								  "There are %d active slots",
+				 errdetail_plural("There is %d active slot.",
+								  "There are %d active slots.",
 								  nslots_active, nslots_active)));
 	}
 
@@ -890,6 +961,7 @@ dropdb(const char *dbname, bool missing_ok)
 								  "There are %d subscriptions.",
 								  nsubscriptions, nsubscriptions)));
 
+removing_database_from_system:
 	/*
 	 * Remove the database's tuple from pg_database.
 	 */
@@ -897,7 +969,7 @@ dropdb(const char *dbname, bool missing_ok)
 	if (!HeapTupleIsValid(tup))
 		elog(ERROR, "cache lookup failed for database %u", db_id);
 
-	CatalogTupleDelete(pgdbrel, &tup->t_self);
+	CatalogTupleDelete(pgdbrel, tup);
 
 	ReleaseSysCache(tup);
 
@@ -967,6 +1039,14 @@ dropdb(const char *dbname, bool missing_ok)
 	 * according to pg_database, which is not good.
 	 */
 	ForceSyncCommit();
+
+	/*
+	 * Call YugaByte to delete the entries ourselves.
+	 */
+	if (IsYugaByteEnabled())
+	{
+		YBCDropDatabase(db_id, dbname);
+	}
 }
 
 
@@ -997,7 +1077,7 @@ RenameDatabase(const char *oldname, const char *newname)
 
 	/* must be owner */
 	if (!pg_database_ownercheck(db_id, GetUserId()))
-		aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_DATABASE,
+		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_DATABASE,
 					   oldname);
 
 	/* must have createdb rights */
@@ -1045,6 +1125,14 @@ RenameDatabase(const char *oldname, const char *newname)
 		elog(ERROR, "cache lookup failed for database %u", db_id);
 	namestrcpy(&(((Form_pg_database) GETSTRUCT(newtup))->datname), newname);
 	CatalogTupleUpdate(rel, &newtup->t_self, newtup);
+
+	if (IsYugaByteEnabled()) {
+		YBCPgStatement handle = NULL;
+		HandleYBStatus(YBCPgNewAlterDatabase(ybc_pg_session, oldname, db_id, &handle));
+		HandleYBStmtStatus(YBCPgAlterDatabaseRenameDatabase(handle, newname), handle);
+		HandleYBStmtStatus(YBCPgExecAlterDatabase(handle), handle);
+		HandleYBStatus(YBCPgDeleteStatement(handle));
+	}
 
 	InvokeObjectPostAlterHook(DatabaseRelationId, db_id, 0);
 
@@ -1112,7 +1200,7 @@ movedb(const char *dbname, const char *tblspcname)
 	 * Permission checks
 	 */
 	if (!pg_database_ownercheck(db_id, GetUserId()))
-		aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_DATABASE,
+		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_DATABASE,
 					   dbname);
 
 	/*
@@ -1134,7 +1222,7 @@ movedb(const char *dbname, const char *tblspcname)
 	aclresult = pg_tablespace_aclcheck(dst_tblspcoid, GetUserId(),
 									   ACL_CREATE);
 	if (aclresult != ACLCHECK_OK)
-		aclcheck_error(aclresult, ACL_KIND_TABLESPACE,
+		aclcheck_error(aclresult, OBJECT_TABLESPACE,
 					   tblspcname);
 
 	/*
@@ -1410,6 +1498,7 @@ AlterDatabase(ParseState *pstate, AlterDatabaseStmt *stmt, bool isTopLevel)
 	DefElem    *dallowconnections = NULL;
 	DefElem    *dconnlimit = NULL;
 	DefElem    *dtablespace = NULL;
+	DefElem   **unsupported_options[] = {&distemplate, &dtablespace};
 	Datum		new_record[Natts_pg_database];
 	bool		new_record_nulls[Natts_pg_database];
 	bool		new_record_repl[Natts_pg_database];
@@ -1462,6 +1551,21 @@ AlterDatabase(ParseState *pstate, AlterDatabaseStmt *stmt, bool isTopLevel)
 					 parser_errposition(pstate, defel->location)));
 	}
 
+	/* Check YB options support */
+	if (YBIsUsingYBParser()) {
+		for (int i = lengthof(unsupported_options); i > 0; --i) {
+			DefElem *option = *unsupported_options[i - 1];
+			if (option != NULL && option->arg != NULL) {
+				ereport(YBUnsupportedFeatureSignalLevel(),
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+										errmsg("Altering %s option is not yet supported", option->defname),
+                    errhint("Please report the issue on "
+                            "https://github.com/YugaByte/yugabyte-db/issues"),
+										parser_errposition(pstate, option->location)));
+			}
+		}
+	}
+
 	if (dtablespace)
 	{
 		/*
@@ -1476,7 +1580,7 @@ AlterDatabase(ParseState *pstate, AlterDatabaseStmt *stmt, bool isTopLevel)
 							dtablespace->defname),
 					 parser_errposition(pstate, dtablespace->location)));
 		/* this case isn't allowed within a transaction block */
-		PreventTransactionChain(isTopLevel, "ALTER DATABASE SET TABLESPACE");
+		PreventInTransactionBlock(isTopLevel, "ALTER DATABASE SET TABLESPACE");
 		movedb(stmt->dbname, defGetString(dtablespace));
 		return InvalidOid;
 	}
@@ -1515,7 +1619,7 @@ AlterDatabase(ParseState *pstate, AlterDatabaseStmt *stmt, bool isTopLevel)
 	dboid = HeapTupleGetOid(tuple);
 
 	if (!pg_database_ownercheck(HeapTupleGetOid(tuple), GetUserId()))
-		aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_DATABASE,
+		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_DATABASE,
 					   stmt->dbname);
 
 	/*
@@ -1583,7 +1687,7 @@ AlterDatabaseSet(AlterDatabaseSetStmt *stmt)
 	shdepLockAndCheckObject(DatabaseRelationId, datid);
 
 	if (!pg_database_ownercheck(datid, GetUserId()))
-		aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_DATABASE,
+		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_DATABASE,
 					   stmt->dbname);
 
 	AlterSetting(datid, InvalidOid, stmt->setstmt);
@@ -1646,7 +1750,7 @@ AlterDatabaseOwner(const char *dbname, Oid newOwnerId)
 
 		/* Otherwise, must be owner of the existing object */
 		if (!pg_database_ownercheck(HeapTupleGetOid(tuple), GetUserId()))
-			aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_DATABASE,
+			aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_DATABASE,
 						   dbname);
 
 		/* Must be able to become new owner */
@@ -1718,8 +1822,8 @@ AlterDatabaseOwner(const char *dbname, Oid newOwnerId)
 /*
  * Look up info about the database named "name".  If the database exists,
  * obtain the specified lock type on it, fill in any of the remaining
- * parameters that aren't NULL, and return TRUE.  If no such database,
- * return FALSE.
+ * parameters that aren't NULL, and return true.  If no such database,
+ * return false.
  */
 static bool
 get_db_info(const char *name, LOCKMODE lockmode,
@@ -1923,7 +2027,7 @@ remove_dbtablespaces(Oid db_id)
 
 /*
  * Check for existing files that conflict with a proposed new DB OID;
- * return TRUE if there are any
+ * return true if there are any
  *
  * If there were a subdirectory in any tablespace matching the proposed new
  * OID, we'd get a create failure due to the duplicate name ... and then we'd

@@ -24,11 +24,17 @@ namespace master {
 // An iterator over a YQLVirtualTable.
 class YQLVTableIterator : public common::YQLRowwiseIteratorIf {
  public:
-  explicit YQLVTableIterator(const std::unique_ptr<QLRowBlock> vtable);
+  // hashed_column_values - is used to filter rows, i.e. if hashed_column_values is not empty
+  // only rows starting with specified hashed columns will be iterated.
+  YQLVTableIterator(
+      std::shared_ptr<QLRowBlock> vtable,
+      const google::protobuf::RepeatedPtrField<QLExpressionPB>& hashed_column_values);
+
+  virtual ~YQLVTableIterator();
 
   void SkipRow() override;
 
-  bool HasNext() const override;
+  Result<bool> HasNext() const override;
 
   std::string ToString() const override;
 
@@ -36,13 +42,14 @@ class YQLVTableIterator : public common::YQLRowwiseIteratorIf {
 
   HybridTime RestartReadHt() override { return HybridTime::kInvalid; }
 
-  virtual ~YQLVTableIterator();
-
  private:
   CHECKED_STATUS DoNextRow(const Schema& projection, QLTableRow* table_row) override;
 
-  std::unique_ptr<QLRowBlock> vtable_;
-  size_t vtable_index_;
+  void Advance(bool increment);
+
+  std::shared_ptr<QLRowBlock> vtable_;
+  size_t vtable_index_ = 0;
+  const google::protobuf::RepeatedPtrField<QLExpressionPB>& hashed_column_values_;
 };
 
 }  // namespace master

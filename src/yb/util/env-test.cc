@@ -43,11 +43,13 @@
 #include "yb/gutil/strings/substitute.h"
 #include "yb/gutil/strings/util.h"
 #include "yb/util/alignment.h"
+#include "yb/util/stol_utils.h"
 #include "yb/util/crc.h"
 #include "yb/util/env.h"
 #include "yb/util/env_util.h"
 #include "yb/util/malloc.h"
 #include "yb/util/memenv/memenv.h"
+#include "yb/util/os-util.h"
 #include "yb/util/random.h"
 #include "yb/util/random_util.h"
 #include "yb/util/path_util.h"
@@ -56,6 +58,7 @@
 #include "yb/util/test_util.h"
 
 DECLARE_int32(o_direct_block_size_bytes);
+DECLARE_bool(TEST_simulate_fs_without_fallocate);
 
 #if !defined(__APPLE__)
 #include <linux/falloc.h>
@@ -92,6 +95,11 @@ class TestEnv : public YBTest, public ::testing::WithParamInterface<bool> {
   void CheckFallocateSupport() {
     static bool checked = false;
     if (checked) return;
+
+    if (FLAGS_TEST_simulate_fs_without_fallocate) {
+      checked = true;
+      return;
+    }
 
 #if defined(__linux__)
     int fd = creat(GetTestPath("check-fallocate").c_str(), S_IWUSR);
@@ -131,7 +139,7 @@ class TestEnv : public YBTest, public ::testing::WithParamInterface<bool> {
     shared_ptr<RandomAccessFile> raf;
     ASSERT_OK(env_util::OpenFileForRandom(env_.get(), file_path, &raf));
     Slice slice;
-    gscoped_ptr<uint8_t[]> scratch(new uint8_t[file_size]);
+    std::unique_ptr<uint8_t[]> scratch(new uint8_t[file_size]);
     ASSERT_OK(env_util::ReadFully(raf.get(), 0, file_size, &slice, scratch.get()));
     ASSERT_EQ(file_size, slice.size());
     uint64_t file_checksum = 0;
@@ -140,7 +148,7 @@ class TestEnv : public YBTest, public ::testing::WithParamInterface<bool> {
   }
 
   void MakeVectors(int num_slices, int slice_size, int num_iterations,
-                   gscoped_ptr<faststring[]>* data, vector<vector<Slice > >* vec) {
+                   std::unique_ptr<faststring[]>* data, vector<vector<Slice > >* vec) {
     data->reset(new faststring[num_iterations * num_slices]);
     vec->resize(num_iterations);
 
@@ -162,7 +170,7 @@ class TestEnv : public YBTest, public ::testing::WithParamInterface<bool> {
   }
 
   void ReadAndVerifyTestData(RandomAccessFile* raf, size_t offset, size_t n) {
-    gscoped_ptr<uint8_t[]> scratch(new uint8_t[n]);
+    std::unique_ptr<uint8_t[]> scratch(new uint8_t[n]);
     Slice s;
     ASSERT_OK(env_util::ReadFully(raf, offset, n, &s,
                                          scratch.get()));
@@ -181,7 +189,7 @@ class TestEnv : public YBTest, public ::testing::WithParamInterface<bool> {
       ASSERT_OK(file->Sync());
     }
 
-    gscoped_ptr<faststring[]> data;
+    std::unique_ptr<faststring[]> data;
     vector<vector<Slice> > input;
 
     MakeVectors(num_slices, slice_size, iterations, &data, &input);
@@ -407,7 +415,7 @@ TEST_F(TestEnv, TestHolePunch) {
     return;
   }
   string test_path = GetTestPath("test_env_wf");
-  gscoped_ptr<RWFile> file;
+  std::unique_ptr<RWFile> file;
   ASSERT_OK(env_->NewRWFile(test_path, &file));
 
   // Write 1 MB. The size and size-on-disk both agree.
@@ -490,7 +498,7 @@ TEST_F(TestEnv, TestReadFully) {
   SeedRandom();
   const string kTestPath = "test";
   const int kFileSize = 64 * 1024;
-  gscoped_ptr<Env> mem(NewMemEnv(Env::Default()));
+  std::unique_ptr<Env> mem(NewMemEnv(Env::Default()));
 
   WriteTestFile(mem.get(), kTestPath, kFileSize);
   ASSERT_NO_FATALS();
@@ -503,7 +511,7 @@ TEST_F(TestEnv, TestReadFully) {
 
   const int kReadLength = 10000;
   Slice s;
-  gscoped_ptr<uint8_t[]> scratch(new uint8_t[kReadLength]);
+  std::unique_ptr<uint8_t[]> scratch(new uint8_t[kReadLength]);
 
   // Verify that ReadFully reads the whole requested data.
   ASSERT_OK(env_util::ReadFully(&sr_raf, 0, kReadLength, &s, scratch.get()));
@@ -553,7 +561,7 @@ TEST_F(TestEnv, TestOpenEmptyRandomAccessFile) {
   Env* env = Env::Default();
   string test_file = JoinPathSegments(GetTestDataDirectory(), "test_file");
   ASSERT_NO_FATALS(WriteTestFile(env, test_file, 0));
-  gscoped_ptr<RandomAccessFile> readable_file;
+  std::unique_ptr<RandomAccessFile> readable_file;
   ASSERT_OK(env->NewRandomAccessFile(test_file, &readable_file));
   uint64_t size = ASSERT_RESULT(readable_file->Size());
   ASSERT_EQ(0, size);
@@ -620,7 +628,7 @@ TEST_F(TestEnv, TestIsDirectory) {
   ASSERT_TRUE(is_dir);
 
   string not_dir = GetTestPath("not_a_directory");
-  gscoped_ptr<WritableFile> writer;
+  std::unique_ptr<WritableFile> writer;
   ASSERT_OK(env_->NewWritableFile(not_dir, &writer));
   ASSERT_OK(env_->IsDirectory(not_dir, &is_dir));
   ASSERT_FALSE(is_dir);
@@ -641,7 +649,7 @@ static Status CreateDir(Env* env, const string& name, vector<string>* created) {
 }
 
 static Status CreateFile(Env* env, const string& name, vector<string>* created) {
-  gscoped_ptr<WritableFile> writer;
+  std::unique_ptr<WritableFile> writer;
   RETURN_NOT_OK(env->NewWritableFile(name, &writer));
   created->push_back(writer->filename());
   return Status::OK();
@@ -701,7 +709,7 @@ TEST_F(TestEnv, TestWalkCbReturnsError) {
   string new_dir = GetTestPath("foo");
   string new_file = "myfile";
   ASSERT_OK(env_->CreateDir(new_dir));
-  gscoped_ptr<WritableFile> writer;
+  std::unique_ptr<WritableFile> writer;
   ASSERT_OK(env_->NewWritableFile(JoinPathSegments(new_dir, new_file), &writer));
   int num_calls = 0;
   ASSERT_TRUE(env_->Walk(new_dir, Env::PRE_ORDER,
@@ -722,7 +730,7 @@ TEST_F(TestEnv, TestGetBlockSize) {
 
   // Try with a file.
   string path = GetTestPath("foo");
-  gscoped_ptr<WritableFile> writer;
+  std::unique_ptr<WritableFile> writer;
   ASSERT_OK(env_->NewWritableFile(path, &writer));
   block_size = ASSERT_RESULT(env_->GetBlockSize(path));
   ASSERT_GT(block_size, 0);
@@ -730,7 +738,7 @@ TEST_F(TestEnv, TestGetBlockSize) {
 
 TEST_F(TestEnv, TestRWFile) {
   // Create the file.
-  gscoped_ptr<RWFile> file;
+  std::unique_ptr<RWFile> file;
   ASSERT_OK(env_->NewRWFile(GetTestPath("foo"), &file));
 
   // Append to it.
@@ -739,7 +747,7 @@ TEST_F(TestEnv, TestRWFile) {
 
   // Read from it.
   Slice result;
-  gscoped_ptr<uint8_t[]> scratch(new uint8_t[kTestData.length()]);
+  std::unique_ptr<uint8_t[]> scratch(new uint8_t[kTestData.length()]);
   ASSERT_OK(file->Read(0, kTestData.length(), &result, scratch.get()));
   ASSERT_EQ(result, kTestData);
   uint64_t sz;
@@ -751,7 +759,7 @@ TEST_F(TestEnv, TestRWFile) {
   ASSERT_OK(file->Write(kTestData.length(), kTestData));
   ASSERT_OK(file->Write(1, kTestData));
   string kNewTestData = "aabcdebcdeabcde";
-  gscoped_ptr<uint8_t[]> scratch2(new uint8_t[kNewTestData.length()]);
+  std::unique_ptr<uint8_t[]> scratch2(new uint8_t[kNewTestData.length()]);
   ASSERT_OK(file->Read(0, kNewTestData.length(), &result, scratch2.get()));
 
   // Retest.
@@ -796,6 +804,21 @@ TEST_F(TestEnv, TestGetTotalRAMBytes) {
   ASSERT_GT(ram, 0);
 }
 
+TEST_F(TestEnv, TestGetFreeSpace) {
+  char cwd[1024];
+  char* ret = getcwd(cwd, sizeof(cwd));
+  ASSERT_NE(ret, nullptr);
+
+  auto free_space = ASSERT_RESULT(env_->GetFreeSpaceBytes(cwd));
+
+  string cmd = strings::Substitute("df $0 -B1 | tail -1 | awk '{print $$4}' | tr -d '\\n'", cwd);
+  string df_free_space_str;
+  ASSERT_TRUE(RunShellProcess(cmd, &df_free_space_str));
+  auto df_free_space = ASSERT_RESULT(CheckedStoll(df_free_space_str));
+
+  ASSERT_EQ(df_free_space, free_space);
+}
+
 // Test that CopyFile() copies all the bytes properly.
 TEST_F(TestEnv, TestCopyFile) {
   string orig_path = GetTestPath("test");
@@ -805,7 +828,7 @@ TEST_F(TestEnv, TestCopyFile) {
   Env* env = Env::Default();
   ASSERT_NO_FATALS(WriteTestFile(env, orig_path, kFileSize));
   ASSERT_OK(env_util::CopyFile(env, orig_path, copy_path, WritableFileOptions()));
-  gscoped_ptr<RandomAccessFile> copy;
+  std::unique_ptr<RandomAccessFile> copy;
   ASSERT_OK(env->NewRandomAccessFile(copy_path, &copy));
   ASSERT_NO_FATALS(ReadAndVerifyTestData(copy.get(), 0, kFileSize));
 }

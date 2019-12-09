@@ -116,12 +116,24 @@ class CQLMessage {
 
   // Message body compression schemes.
   enum class CompressionScheme {
-    NONE = 0,
-    LZ4,
-    SNAPPY
+    kNone = 0,
+    kLz4,
+    kSnappy
   };
   static constexpr char kLZ4Compression[] = "lz4";
   static constexpr char kSnappyCompression[] = "snappy";
+
+  // Supported events.
+  static constexpr char kTopologyChangeEvent[] = "TOPOLOGY_CHANGE";
+  static constexpr char kStatusChangeEvent[] = "STATUS_CHANGE";
+  static constexpr char kSchemaChangeEvent[] = "SCHEMA_CHANGE";
+
+  using Events = uint8_t;
+  static constexpr Events kNoEvents       = 0x00;
+  static constexpr Events kTopologyChange = 0x01;
+  static constexpr Events kStatusChange   = 0x02;
+  static constexpr Events kSchemaChange   = 0x04;
+  static constexpr Events kAllEvents      = kTopologyChange | kStatusChange | kSchemaChange;
 
   // Basic datatype mapping for CQL message body:
   //   Int        -> int32_t
@@ -452,11 +464,13 @@ class RegisterRequest : public CQLRequest {
   RegisterRequest(const Header& header, const Slice& body);
   virtual ~RegisterRequest() override;
 
+  Events events() const { return events_; }
+
  protected:
   virtual CHECKED_STATUS ParseBody() override;
 
  private:
-  std::vector<std::string> event_types_;
+  Events events_;
 };
 
 // ------------------------------------ CQL response -----------------------------------
@@ -465,6 +479,9 @@ class CQLResponse : public CQLMessage {
   virtual ~CQLResponse();
   virtual void Serialize(CompressionScheme compression_scheme, faststring* mesg) const;
 
+  Events registered_events() const { return registered_events_; }
+  void set_registered_events(Events events) { registered_events_ = events; }
+
  protected:
   CQLResponse(const CQLRequest& request, Opcode opcode);
   CQLResponse(StreamId stream_id, Opcode opcode);
@@ -472,6 +489,9 @@ class CQLResponse : public CQLMessage {
 
   // Function to serialize a response body that all CQLResponse subclasses need to implement
   virtual void SerializeBody(faststring* mesg) const = 0;
+
+ private:
+  Events registered_events_ = kNoEvents;
 };
 
 // ------------------------------ Individual CQL responses -----------------------------------
@@ -622,12 +642,12 @@ class ResultResponse : public CQLResponse {
         TIME      = 0x0012, // Since V4
         SMALLINT  = 0x0013, // Since V4
         TINYINT   = 0x0014, // Since V4
-        JSONB     = 0x0019,
         LIST      = 0x0020,
         MAP       = 0x0021,
         SET       = 0x0022,
         UDT       = 0x0030,
-        TUPLE     = 0x0031
+        TUPLE     = 0x0031,
+        JSONB     = 0x0080  // Yugabyte specific types start here
       };
 
       Id id = Id::CUSTOM;
@@ -903,7 +923,7 @@ class AuthSuccessResponse : public CQLResponse {
 class CQLServerEvent : public rpc::ServerEvent {
  public:
   explicit CQLServerEvent(std::unique_ptr<EventResponse> event_response);
-  void Serialize(std::deque<RefCntBuffer>* output) const override;
+  void Serialize(boost::container::small_vector_base<RefCntBuffer>* output) const override;
   std::string ToString() const override;
  private:
 
@@ -918,7 +938,7 @@ class CQLServerEventList : public rpc::ServerEventList {
  public:
   CQLServerEventList();
   void AddEvent(std::unique_ptr<CQLServerEvent> event);
-  void Serialize(std::deque<RefCntBuffer>* output) const override;
+  void Serialize(boost::container::small_vector_base<RefCntBuffer>* output) override;
   std::string ToString() const override;
  private:
   void Transferred(const Status& status, rpc::Connection*) override;

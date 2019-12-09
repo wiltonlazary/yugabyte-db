@@ -32,16 +32,15 @@
 
 #include <vector>
 
-#include <boost/scope_exit.hpp>
-
 #include <gtest/gtest.h>
 #include <glog/logging.h>
 
 #include "yb/server/logical_clock.h"
 #include "yb/tablet/mvcc.h"
-#include "yb/util/random_util.h"
-#include "yb/util/test_util.h"
 #include "yb/util/enums.h"
+#include "yb/util/random_util.h"
+#include "yb/util/scope_exit.h"
+#include "yb/util/test_util.h"
 
 using namespace std::literals;
 using std::vector;
@@ -96,14 +95,14 @@ TEST_F(MvccTest, SafeHybridTimeToReadAt) {
 
   HybridTime ht1 = clock_->Now();
   manager_.AddPending(&ht1);
-  ASSERT_EQ(ht1.Decremented(), manager_.SafeTime());
+  ASSERT_EQ(ht1.Decremented(), manager_.SafeTime(HybridTime::kMax));
 
   HybridTime ht2;
   manager_.AddPending(&ht2);
-  ASSERT_EQ(ht1.Decremented(), manager_.SafeTime());
+  ASSERT_EQ(ht1.Decremented(), manager_.SafeTime(HybridTime::kMax));
 
   manager_.Replicated(ht1);
-  ASSERT_EQ(ht2.Decremented(), manager_.SafeTime());
+  ASSERT_EQ(ht2.Decremented(), manager_.SafeTime(HybridTime::kMax));
 
   manager_.Replicated(ht2);
   auto now = clock_->Now();
@@ -121,7 +120,7 @@ TEST_F(MvccTest, Abort) {
     manager_.Aborted(hts[i]);
   }
   for (size_t i = 0; i < hts.size(); i += 2) {
-    ASSERT_EQ(hts[i].Decremented(), manager_.SafeTime());
+    ASSERT_EQ(hts[i].Decremented(), manager_.SafeTime(HybridTime::kMax));
     manager_.Replicated(hts[i]);
   }
   auto now = clock_->Now();
@@ -160,18 +159,18 @@ void MvccTest::RunRandomizedTest(bool use_ht_lease) {
   std::thread safetime_query_thread([this, &stopped, &ht_lease_provider, &is_leader]() {
     while (!stopped.load(std::memory_order_acquire)) {
       if (is_leader.load(std::memory_order_acquire)) {
-        manager_.SafeTime(HybridTime::kMin, MonoTime::kMax, ht_lease_provider());
+        manager_.SafeTime(HybridTime::kMin, CoarseTimePoint::max(), ht_lease_provider());
       } else {
-        manager_.SafeTimeForFollower(HybridTime::kMin, MonoTime::kMax);
+        manager_.SafeTimeForFollower(HybridTime::kMin, CoarseTimePoint::max());
       }
       std::this_thread::yield();
     }
   });
 
-  BOOST_SCOPE_EXIT(&stopped, &safetime_query_thread) {
+  auto se = ScopeExit([&stopped, &safetime_query_thread] {
     stopped = true;
     safetime_query_thread.join();
-  } BOOST_SCOPE_EXIT_END;
+  });
 
   vector<std::pair<Op, HybridTime>> ops;
   ops.reserve(kTotalOperations);
@@ -290,12 +289,12 @@ TEST_F(MvccTest, WaitForSafeTime) {
   manager_.AddPending(&ht2);
   std::atomic<bool> t1_done(false);
   std::thread t1([this, ht2, &t1_done] {
-    manager_.SafeTime(ht2.Decremented(), MonoTime::kMax, HybridTime::kMax);
+    manager_.SafeTime(ht2.Decremented(), CoarseTimePoint::max(), HybridTime::kMax);
     t1_done = true;
   });
   std::atomic<bool> t2_done(false);
   std::thread t2([this, ht2, &t2_done] {
-    manager_.SafeTime(AddLogical(ht2, 1), MonoTime::kMax, HybridTime::kMax);
+    manager_.SafeTime(AddLogical(ht2, 1), CoarseTimePoint::max(), HybridTime::kMax);
     t2_done = true;
   });
   std::this_thread::sleep_for(100ms);
@@ -317,7 +316,7 @@ TEST_F(MvccTest, WaitForSafeTime) {
 
   HybridTime ht3;
   manager_.AddPending(&ht3);
-  ASSERT_FALSE(manager_.SafeTime(ht3, MonoTime::Now() + 100ms, HybridTime::kMax));
+  ASSERT_FALSE(manager_.SafeTime(ht3, CoarseMonoClock::now() + 100ms, HybridTime::kMax));
 }
 
 } // namespace tablet

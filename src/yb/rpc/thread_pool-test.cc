@@ -20,8 +20,9 @@
 
 #include "yb/rpc/thread_pool.h"
 
-#include "yb/util/test_util.h"
 #include "yb/util/countdown_latch.h"
+#include "yb/util/test_util.h"
+#include "yb/util/thread.h"
 
 namespace yb {
 namespace rpc {
@@ -125,6 +126,7 @@ TEST_F(ThreadPoolTest, TestMultiProducers) {
   for (size_t i = 0; i != kProducers; ++i) {
     size_t end = kTotalTasks * (i + 1) / kProducers;
     threads.emplace_back([&pool, &latch, &tasks, begin, end] {
+      CDSAttacher attacher;
       for (size_t i = begin; i != end; ++i) {
         tasks[i].SetLatch(&latch);
         ASSERT_TRUE(pool.Enqueue(&tasks[i]));
@@ -155,6 +157,7 @@ TEST_F(ThreadPoolTest, TestQueueOverflow) {
   for (size_t i = 0; i != kProducers; ++i) {
     size_t end = kTotalTasks * (i + 1) / kProducers;
     threads.emplace_back([&pool, &latch, &tasks, &enqueue_failed, begin, end] {
+      CDSAttacher attacher;
       for (size_t i = begin; i != end; ++i) {
         tasks[i].SetLatch(&latch);
         if(!pool.Enqueue(&tasks[i])) {
@@ -191,6 +194,7 @@ TEST_F(ThreadPoolTest, TestShutdown) {
   for (size_t i = 0; i != kProducers; ++i) {
     size_t end = kTotalTasks * (i + 1) / kProducers;
     threads.emplace_back([&pool, &latch, &tasks, begin, end] {
+      CDSAttacher attacher;
       for (size_t i = begin; i != end; ++i) {
         tasks[i].SetLatch(&latch);
         pool.Enqueue(&tasks[i]);
@@ -206,6 +210,47 @@ TEST_F(ThreadPoolTest, TestShutdown) {
   for (auto& thread : threads) {
     thread.join();
   }
+}
+
+TEST_F(ThreadPoolTest, TestOwns) {
+  class TestTask : public ThreadPoolTask {
+   public:
+    explicit TestTask(ThreadPool* thread_pool) : thread_pool_(thread_pool) {}
+
+    void Run() {
+      thread_ = Thread::current_thread();
+      ASSERT_TRUE(thread_pool_->OwnsThisThread());
+    }
+
+    void Done(const Status& status) {
+      latch_.CountDown();
+    }
+
+    Thread* thread() {
+      return thread_;
+    }
+
+    void Wait() {
+      return latch_.Wait();
+    }
+
+    virtual ~TestTask() {}
+
+   private:
+    ThreadPool* const thread_pool_;
+    Thread* thread_ = nullptr;
+    CountDownLatch latch_{1};
+  };
+
+  constexpr size_t kTotalTasks = 1;
+  constexpr size_t kTotalWorkers = 1;
+
+  ThreadPool pool("test", kTotalTasks, kTotalWorkers);
+  ASSERT_FALSE(pool.OwnsThisThread());
+  TestTask task(&pool);
+  pool.Enqueue(&task);
+  task.Wait();
+  ASSERT_TRUE(pool.Owns(task.thread()));
 }
 
 } // namespace rpc

@@ -37,24 +37,23 @@ class YQLStorageIf {
 
   //------------------------------------------------------------------------------------------------
   // CQL Support.
-  virtual CHECKED_STATUS GetIterator(
-      const QLReadRequestPB& request,
-      const Schema& projection,
-      const Schema& schema,
-      const TransactionOperationContextOpt& txn_op_context,
-      MonoTime deadline,
-      const ReadHybridTime& read_time,
-      const QLScanSpec& spec,
-      std::unique_ptr<YQLRowwiseIteratorIf>* iter) const = 0;
+  virtual CHECKED_STATUS GetIterator(const QLReadRequestPB& request,
+                                     const Schema& projection,
+                                     const Schema& schema,
+                                     const TransactionOperationContextOpt& txn_op_context,
+                                     CoarseTimePoint deadline,
+                                     const ReadHybridTime& read_time,
+                                     const QLScanSpec& spec,
+                                     std::unique_ptr<YQLRowwiseIteratorIf>* iter) const = 0;
 
-  virtual CHECKED_STATUS BuildYQLScanSpec(const QLReadRequestPB& request,
-                                          const ReadHybridTime& read_time,
-                                          const Schema& schema,
-                                          bool include_static_columns,
-                                          const Schema& static_projection,
-                                          std::unique_ptr<common::QLScanSpec>* spec,
-                                          std::unique_ptr<common::QLScanSpec>* static_row_spec,
-                                          ReadHybridTime* req_read_time) const = 0;
+  virtual CHECKED_STATUS BuildYQLScanSpec(
+      const QLReadRequestPB& request,
+      const ReadHybridTime& read_time,
+      const Schema& schema,
+      bool include_static_columns,
+      const Schema& static_projection,
+      std::unique_ptr<common::QLScanSpec>* spec,
+      std::unique_ptr<common::QLScanSpec>* static_row_spec) const = 0;
 
   //------------------------------------------------------------------------------------------------
   // PGSQL Support.
@@ -62,17 +61,9 @@ class YQLStorageIf {
                                      const Schema& projection,
                                      const Schema& schema,
                                      const TransactionOperationContextOpt& txn_op_context,
-                                     MonoTime deadline,
+                                     CoarseTimePoint deadline,
                                      const ReadHybridTime& read_time,
-                                     const PgsqlScanSpec& spec,
                                      YQLRowwiseIteratorIf::UniPtr* iter) const = 0;
-
-  // PostgreSQL allow expression as scan-value, so we must pass an executor to the expressions.
-  virtual CHECKED_STATUS BuildYQLScanSpec(const PgsqlReadRequestPB& request,
-                                          const ReadHybridTime& read_time,
-                                          const Schema& schema,
-                                          std::unique_ptr<PgsqlScanSpec>* spec,
-                                          ReadHybridTime* req_read_time) const = 0;
 };
 
 }  // namespace common

@@ -22,27 +22,21 @@
 #define YB_YQL_CQL_QL_UTIL_QL_ENV_H_
 
 #include "yb/client/callbacks.h"
+#include "yb/client/client.h"
 #include "yb/client/transaction.h"
 #include "yb/client/transaction_manager.h"
-
-#include "yb/gutil/callback.h"
-
-#include "yb/rpc/rpc_fwd.h"
-
-#include "yb/yql/cql/cqlserver/cql_rpc.h"
-#include "yb/yql/cql/cqlserver/cql_rpcserver_env.h"
-#include "yb/yql/cql/ql/ql_session.h"
-
-#include "yb/util/enums.h"
 #include "yb/common/common.pb.h"
+#include "yb/gutil/callback.h"
+#include "yb/rpc/rpc_fwd.h"
 #include "yb/server/hybrid_clock.h"
+#include "yb/util/enums.h"
+#include "yb/yql/cql/ql/ptree/pt_option.h"
+#include "yb/yql/cql/ql/ql_session.h"
 
 namespace yb {
 namespace ql {
 
-YB_STRONGLY_TYPED_BOOL(ReExecute);
-
-typedef std::function<client::TransactionManager*()> TransactionManagerProvider;
+typedef std::function<client::TransactionPool*()> TransactionPoolProvider;
 
 class QLEnv {
  public:
@@ -53,16 +47,18 @@ class QLEnv {
 
   //------------------------------------------------------------------------------------------------
   // Constructor & destructor.
-  QLEnv(std::weak_ptr<rpc::Messenger> messenger, std::shared_ptr<client::YBClient> client,
+  QLEnv(client::YBClient* client,
         std::shared_ptr<client::YBMetaDataCache> cache,
         const server::ClockPtr& clock,
-        TransactionManagerProvider transaction_manager_provider,
-        cqlserver::CQLRpcServerEnv* cql_rpcserver_env = nullptr);
+        TransactionPoolProvider transaction_pool_provider);
   virtual ~QLEnv();
 
-  virtual client::YBTableCreator *NewTableCreator();
+  //------------------------------------------------------------------------------------------------
+  // Table related methods.
 
-  virtual client::YBTableAlterer *NewTableAlterer(const client::YBTableName& table_name);
+  virtual client::YBTableCreator* NewTableCreator();
+
+  virtual client::YBTableAlterer* NewTableAlterer(const client::YBTableName& table_name);
 
   virtual CHECKED_STATUS TruncateTable(const std::string& table_id);
 
@@ -71,58 +67,37 @@ class QLEnv {
   virtual CHECKED_STATUS DeleteIndexTable(const client::YBTableName& name,
                                           client::YBTableName* indexed_table_name);
 
-  //------------------------------------------------------------------------------------------------
-  // Read/write related methods.
-
-  // Set the consistent read point for the read/write operations.
-  virtual void SetReadPoint(ReExecute reexecute = ReExecute::kFalse);
-
-  // Apply a read/write operation. The operation is buffered and needs to be flushed with
-  // FlushAsync. Mix of read/write operations in a batch is not supported currently.
-  virtual CHECKED_STATUS Apply(std::shared_ptr<client::YBqlOp> op);
-
-  // Returns if there are buffered operations to be flushed.
-  virtual bool HasBufferedOperations() const;
-
-  // Flush buffered operations. Returns false when there is no buffered operation.
-  virtual bool FlushAsync(Callback<void(const Status &, bool)>* cb);
-
-  // Get the status of an individual read/write op after it has been flushed and completed.
-  virtual Status GetOpError(const client::YBqlOp* op) const;
-
-  // Start a distributed transaction.
-  void StartTransaction(IsolationLevel isolation_level);
-
-  // Prepare a child distributed transaction.
-  CHECKED_STATUS PrepareChildTransaction(ChildTransactionDataPB* data);
-
-  // Apply the result of a child distributed transaction.
-  CHECKED_STATUS ApplyChildTransactionResult(const ChildTransactionResultPB& result);
-
-  // Commit the current distributed transaction.
-  void CommitTransaction(client::CommitCallback callback);
-
-  // Is a transaction currently in progress.
-  bool HasTransaction() const {
-    return transaction_ != nullptr;
-  }
+  virtual CHECKED_STATUS GetUpToDateTableSchemaVersion(const client::YBTableName& table_name,
+                                                       uint32_t* ver);
 
   virtual std::shared_ptr<client::YBTable> GetTableDesc(const client::YBTableName& table_name,
-                                                        bool *cache_used);
-  virtual std::shared_ptr<client::YBTable> GetTableDesc(const TableId& table_id, bool *cache_used);
+                                                        bool* cache_used);
+  virtual std::shared_ptr<client::YBTable> GetTableDesc(const TableId& table_id, bool* cache_used);
 
   virtual void RemoveCachedTableDesc(const client::YBTableName& table_name);
   virtual void RemoveCachedTableDesc(const TableId& table_id);
 
   //------------------------------------------------------------------------------------------------
+  // Read/write related methods.
+
+  // Create a read/write session.
+  client::YBSessionPtr NewSession();
+
+  // Create a new transaction.
+  Result<client::YBTransactionPtr> NewTransaction(const client::YBTransactionPtr& transaction,
+                                                  IsolationLevel isolation_level);
+
+  //------------------------------------------------------------------------------------------------
   // Permission related methods.
 
-  // Grant Permission with the given arguments.
-  virtual CHECKED_STATUS GrantPermission(const PermissionType& permission,
-                                         const ResourceType& resource_type,
-                                         const std::string& canonical_resource,
-                                         const char* resource_name, const char* namespace_name,
-                                         const std::string& role_name);
+  // Grant/Revoke a permission with the given arguments.
+  virtual CHECKED_STATUS GrantRevokePermission(GrantRevokeStatementType statement_type,
+                                               const PermissionType& permission,
+                                               const ResourceType& resource_type,
+                                               const std::string& canonical_resource,
+                                               const char* resource_name,
+                                               const char* namespace_name,
+                                               const std::string& role_name);
 
   //------------------------------------------------------------------------------------------------
   // Keyspace related methods.
@@ -136,120 +111,121 @@ class QLEnv {
   // Use keyspace with the given name.
   virtual CHECKED_STATUS UseKeyspace(const std::string& keyspace_name);
 
+  // Alter keyspace with the given name.
+  virtual CHECKED_STATUS AlterKeyspace(const std::string& keyspace_name);
+
   virtual std::string CurrentKeyspace() const {
-    return (current_call_ != nullptr) ?
-           current_cql_call()->ql_session()->current_keyspace() :
-           current_keyspace_ != nullptr ? *current_keyspace_ : kUndefinedKeyspace;
+    return ql_session()->current_keyspace();
   }
 
   //------------------------------------------------------------------------------------------------
   // Role related methods.
 
   // Create role with the given arguments.
-  CHECKED_STATUS CreateRole(const std::string& role_name,
-                            const std::string& salted_hash,
-                            const bool login, const bool superuser);
+  virtual CHECKED_STATUS CreateRole(const std::string& role_name,
+                                    const std::string& salted_hash,
+                                    const bool login, const bool superuser);
 
   // Alter an existing role with the given arguments.
-  CHECKED_STATUS AlterRole(const std::string& role_name,
-                           const boost::optional<std::string>& salted_hash,
-                           const boost::optional<bool> login,
-                           const boost::optional<bool> superuser);
+  virtual CHECKED_STATUS AlterRole(const std::string& role_name,
+                                   const boost::optional<std::string>& salted_hash,
+                                   const boost::optional<bool> login,
+                                   const boost::optional<bool> superuser);
 
   // Delete role by name.
   virtual CHECKED_STATUS DeleteRole(const std::string& role_name);
 
-  CHECKED_STATUS GrantRole(const std::string& granted_role_name,
-                           const std::string& recipient_role_name);
+  virtual CHECKED_STATUS GrantRevokeRole(GrantRevokeStatementType statement_type,
+                                         const std::string& granted_role_name,
+                                         const std::string& recipient_role_name);
 
   virtual std::string CurrentRoleName() const {
-    return (current_call_ != nullptr) ?
-        current_cql_call()->ql_session()->current_role_name() : kUndefinedRoleName;
+    return ql_session()->current_role_name();
   }
+
+  // Check the cache to determine whether the current role has been given permissions on a specific
+  // canonical resource.
+  // keyspace and table are only used to generate the error message.
+  // If the permission is not found, the client will refresh the cache from the master once.
+  virtual CHECKED_STATUS HasResourcePermission(const string& canonical_name,
+                                               const ql::ObjectType& object_type,
+                                               const PermissionType permission,
+                                               const NamespaceName& keyspace = "",
+                                               const TableName& table = "");
+
+  // Convenience methods to check whether the current role has the specified permission on the
+  // given table.
+  // These method call YBMetaDataCache::HasTablePermissionWithRetry which first checks if the
+  // keyspace has the permission. Otherwise, it checks whether the table has the permission.
+  virtual CHECKED_STATUS HasTablePermission(const NamespaceName& keyspace_name,
+                                            const TableName& table_name,
+                                            const PermissionType permission);
+
+  virtual CHECKED_STATUS HasTablePermission(const client::YBTableName table_name,
+                                            const PermissionType permission);
+
+  // Convenience method to check whether the current role has the specified permission on the given
+  // role.
+  virtual CHECKED_STATUS HasRolePermission(const RoleName& role_name,
+                                           const PermissionType permission);
 
   //------------------------------------------------------------------------------------------------
   // (User-defined) Type related methods.
 
   // Create (user-defined) type with the given arguments.
-  CHECKED_STATUS CreateUDType(const std::string &keyspace_name,
-                              const std::string &type_name,
-                              const std::vector<std::string> &field_names,
-                              const std::vector<std::shared_ptr<QLType>> &field_types);
+  CHECKED_STATUS CreateUDType(const std::string& keyspace_name,
+                              const std::string& type_name,
+                              const std::vector<std::string>& field_names,
+                              const std::vector<std::shared_ptr<QLType>>& field_types);
 
   // Delete (user-defined) type by name.
-  virtual CHECKED_STATUS DeleteUDType(const std::string &keyspace_name,
-                                      const std::string &type_name);
+  virtual CHECKED_STATUS DeleteUDType(const std::string& keyspace_name,
+                                      const std::string& type_name);
 
   // Retrieve (user-defined) type by name.
-  std::shared_ptr<QLType> GetUDType(const std::string &keyspace_name,
-                                    const std::string &type_name,
-                                    bool *cache_used);
+  std::shared_ptr<QLType> GetUDType(const std::string& keyspace_name,
+                                    const std::string& type_name,
+                                    bool* cache_used);
 
   virtual void RemoveCachedUDType(const std::string& keyspace_name, const std::string& type_name);
 
   //------------------------------------------------------------------------------------------------
+  // QLSession related methods.
 
-  // Reset all env states or variables before executing the next statement or re-executing the
-  // current one.
-  void Reset(ReExecute reexecute = ReExecute::kFalse);
-
-  void SetCurrentCall(rpc::InboundCallPtr call);
-
-  // Reschedule the current call to be resumed at the given callback.
-  void RescheduleCurrentCall(Callback<void(void)>* callback);
-
-  cqlserver::CQLRpcServerEnv* cql_rpcserver_env() { return cql_rpcserver_env_; }
-
- private:
-  // Helpers to process the asynchronously received response from ybclient.
-  void FlushAsyncDone(const Status &s);
-  void ResumeCQLCall();
-
-  cqlserver::CQLInboundCall* current_cql_call() const {
-    return static_cast<cqlserver::CQLInboundCall*>(current_call_.get());
+  void set_ql_session(const QLSession::SharedPtr& ql_session) {
+    ql_session_ = ql_session;
+  }
+  const QLSession::SharedPtr& ql_session() const {
+    if (!ql_session_) {
+      ql_session_.reset(new QLSession());
+    }
+    return ql_session_;
   }
 
+ private:
+  //------------------------------------------------------------------------------------------------
   // Persistent attributes.
 
   // YBClient, an API that SQL engine uses to communicate with all servers.
-  std::shared_ptr<client::YBClient> client_;
+  client::YBClient* const client_;
 
   // YBMetaDataCache, a cache to avoid creating a new table or type for each call.
+  // Also used to hold the permissions cache when authentication is enabled.
   std::shared_ptr<client::YBMetaDataCache> metadata_cache_;
 
-  // YBSession to apply operations.
-  std::shared_ptr<client::YBSession> session_;
-
-  TransactionManagerProvider transaction_manager_provider_;
+  // Server clock.
+  const server::ClockPtr clock_;
 
   // Transaction manager to create distributed transactions.
-  client::TransactionManager* transaction_manager_ = nullptr;
+  TransactionPoolProvider transaction_pool_provider_;
+  client::TransactionPool* transaction_pool_ = nullptr;
 
-  // Current distributed transaction if present.
-  std::shared_ptr<client::YBTransaction> transaction_;
-
-  // Messenger used to requeue the CQL call upon callback.
-  std::weak_ptr<rpc::Messenger> messenger_;
-
+  //------------------------------------------------------------------------------------------------
   // Transient attributes.
   // The following attributes are reset implicitly for every execution.
 
-  // The "current" call whose response we might be waiting for.
-  rpc::InboundCallPtr current_call_ = nullptr;
-
-  // Last flush error if any.
-  Status flush_status_;
-
-  // Errors of read/write operations that failed.
-  std::unordered_map<const client::YBqlOp*, Status> op_errors_;
-
-  Callback<void(const Status&, bool)>* requested_callback_ = nullptr;
-  Callback<void(void)> resume_execution_;
-
-  // The current keyspace. Used only in test environment when there is no current call.
-  std::unique_ptr<std::string> current_keyspace_;
-
-  cqlserver::CQLRpcServerEnv* cql_rpcserver_env_;
+  // The QL session processing the statement.
+  mutable QLSession::SharedPtr ql_session_;
 };
 
 }  // namespace ql

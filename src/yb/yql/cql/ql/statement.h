@@ -22,8 +22,6 @@
 #include "yb/yql/cql/ql/util/statement_params.h"
 #include "yb/yql/cql/ql/util/statement_result.h"
 
-#include "yb/common/ql_value.h"
-
 #include "yb/util/monotime.h"
 
 namespace yb {
@@ -47,7 +45,7 @@ class Statement {
 
   // Prepare the statement for execution. Optionally return prepared result if requested.
   CHECKED_STATUS Prepare(QLProcessor *processor, const MemTrackerPtr& mem_tracker = nullptr,
-                         PreparedResult::UniPtr *result = nullptr);
+                         const bool internal = false, PreparedResult::UniPtr *result = nullptr);
 
   // Execute the prepared statement.
   CHECKED_STATUS ExecuteAsync(QLProcessor* processor, const StatementParameters& params,

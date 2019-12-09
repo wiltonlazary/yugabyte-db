@@ -19,16 +19,21 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
-#include "yb/rocksdb/db.h"
-#include "yb/rocksdb/options.h"
 #include "yb/client/client.h"
+#include "yb/client/table.h"
 #include "yb/common/entity_ids.h"
 #include "yb/common/hybrid_time.h"
+#include "yb/common/jsonb.h"
+#include "yb/common/ql_protocol.pb.h"
+#include "yb/common/ql_value.h"
 #include "yb/common/schema.h"
 #include "yb/common/wire_protocol.h"
-#include "yb/common/ql_protocol.pb.h"
-#include "yb/docdb/docdb.h"
+#include "yb/docdb/cql_operation.h"
 #include "yb/docdb/doc_operation.h"
+#include "yb/docdb/docdb.h"
+#include "yb/master/master_util.h"
+#include "yb/rocksdb/db.h"
+#include "yb/rocksdb/options.h"
 #include "yb/rpc/messenger.h"
 #include "yb/rpc/rpc_controller.h"
 #include "yb/tools/bulk_load_docdb_util.h"
@@ -83,6 +88,8 @@ DEFINE_uint64(bulk_load_num_files_per_tablet, 5,
               "Determines how to compact the data of a tablet to ensure we have only a certain "
               "number of sst files per tablet");
 
+DECLARE_string(skipped_cols);
+
 namespace yb {
 namespace tools {
 
@@ -104,6 +111,7 @@ class BulkLoadTask : public Runnable {
                            docdb::DocWriteBatch *const doc_write_batch,
                            YBPartitionGenerator *const partition_generator);
   vector<pair<TabletId, string>> rows_;
+  const std::set<int> skipped_cols_;
   BulkLoadDocDBUtil *const db_fixture_;
   const YBTable *const table_;
   YBPartitionGenerator *const partition_generator_;
@@ -130,7 +138,7 @@ class BulkLoad {
   CHECKED_STATUS RetryableSubmit(vector<pair<TabletId, string>> rows);
   CHECKED_STATUS CompactFiles();
 
-  shared_ptr<YBClient> client_;
+  std::unique_ptr<YBClient> client_;
   shared_ptr<YBTable> table_;
   unique_ptr<YBPartitionGenerator> partition_generator_;
   gscoped_ptr<ThreadPool> thread_pool_;
@@ -158,13 +166,14 @@ BulkLoadTask::BulkLoadTask(vector<pair<TabletId, string>> rows,
                            BulkLoadDocDBUtil *db_fixture, const YBTable *table,
                            YBPartitionGenerator *partition_generator)
     : rows_(std::move(rows)),
+      skipped_cols_(tools::SkippedColumns()),
       db_fixture_(db_fixture),
       table_(table),
       partition_generator_(partition_generator) {
 }
 
 void BulkLoadTask::Run() {
-  DocWriteBatch doc_write_batch(docdb::DocDB::FromRegular(db_fixture_->rocksdb()),
+  DocWriteBatch doc_write_batch(docdb::DocDB::FromRegularUnbounded(db_fixture_->rocksdb()),
                                 InitMarkerBehavior::kOptional);
 
   for (const auto &entry : rows_) {
@@ -195,19 +204,25 @@ Status BulkLoadTask::PopulateColumnValue(const string &column,
     YB_SET_INT_VALUE(ql_valuepb, column, 32);
     YB_SET_INT_VALUE(ql_valuepb, column, 64);
     case DataType::FLOAT: {
-      auto value = util::CheckedStold(column);
+      auto value = CheckedStold(column);
       RETURN_NOT_OK(value);
       ql_valuepb->set_float_value(*value);
       break;
     }
     case DataType::DOUBLE: {
-      auto value = util::CheckedStold(column);
+      auto value = CheckedStold(column);
       RETURN_NOT_OK(value);
       ql_valuepb->set_double_value(*value);
       break;
     }
     case DataType::STRING: {
       ql_valuepb->set_string_value(column);
+      break;
+    }
+    case DataType::JSONB: {
+      common::Jsonb jsonb;
+      RETURN_NOT_OK(jsonb.FromString(column));
+      ql_valuepb->set_jsonb_value(jsonb.MoveSerializedJsonb());
       break;
     }
     case DataType::TIMESTAMP: {
@@ -245,9 +260,13 @@ Status BulkLoadTask::InsertRow(const string &row,
   req.set_type(QLWriteRequestPB_QLStmtType_QL_STMT_INSERT);
   req.set_client(YQL_CLIENT_CQL);
 
+  int col_id = 0;
   auto it = tokenizer.begin();
   // Process the hash keys first.
-  for (int i = 0; i < schema.num_key_columns(); i++, it++) {
+  for (int i = 0; i < schema.num_key_columns(); it++, col_id++) {
+    if (skipped_cols_.find(col_id) != skipped_cols_.end()) {
+      continue;
+    }
     if (IsNull(*it)) {
       return STATUS_SUBSTITUTE(IllegalState, "Primary key cannot be null: $0", *it);
     }
@@ -260,10 +279,14 @@ Status BulkLoadTask::InsertRow(const string &row,
     }
 
     RETURN_NOT_OK(PopulateColumnValue(*it, schema.column(i).type_info()->type(), column_value));
+    i++;  // Avoid this if we are skipping the column.
   }
 
   // Finally process the regular columns.
-  for (int i = schema.num_key_columns(); i < schema.num_columns(); i++, it++) {
+  for (int i = schema.num_key_columns(); i < schema.num_columns(); it++, col_id++) {
+    if (skipped_cols_.find(col_id) != skipped_cols_.end()) {
+      continue;
+    }
     QLColumnValuePB *column_value = req.add_column_values();
     column_value->set_column_id(kFirstColumnId + i);
     if (IsNull(*it)) {
@@ -273,13 +296,14 @@ Status BulkLoadTask::InsertRow(const string &row,
       RETURN_NOT_OK(PopulateColumnValue(*it, schema.column(i).type_info()->type(),
                                         column_value->mutable_expr()));
     }
+    i++;  // Avoid this if we are skipping the column.
   }
 
   // Add the hash code to the operation.
   string tablet_id;
   string partition_key;
-  RETURN_NOT_OK(partition_generator->LookupTabletIdWithTokenizer(tokenizer, &tablet_id,
-                                                                     &partition_key));
+  RETURN_NOT_OK(partition_generator->LookupTabletIdWithTokenizer(
+      tokenizer, skipped_cols_, &tablet_id, &partition_key));
   req.set_hash_code(PartitionSchema::DecodeMultiColumnHashValue(partition_key));
 
   // Finally apply the operation to the doc_write_batch.
@@ -291,7 +315,7 @@ Status BulkLoadTask::InsertRow(const string &row,
   RETURN_NOT_OK(op.Init(&req, &resp));
   RETURN_NOT_OK(op.Apply({
       doc_write_batch,
-      MonoTime::Max() /* deadline */,
+      CoarseTimePoint::max() /* deadline */,
       ReadHybridTime::SingleTime(HybridTime::FromMicros(kYugaByteMicrosecondEpoch))}));
   return Status::OK();
 }
@@ -409,8 +433,8 @@ Status BulkLoad::FinishTabletProcessing(const TabletId &tablet_id,
 
   // Finalize the import.
   rpc::MessengerBuilder bld("Client");
-  auto client_messenger = VERIFY_RESULT(bld.Build());
-  rpc::ProxyCache proxy_cache(client_messenger);
+  std::unique_ptr<rpc::Messenger> client_messenger = VERIFY_RESULT(bld.Build());
+  rpc::ProxyCache proxy_cache(client_messenger.get());
   vector<string> lines;
   boost::split(lines, bulk_load_helper_stdout, boost::is_any_of("\n"));
   for (const string &line : lines) {
@@ -461,12 +485,13 @@ CHECKED_STATUS BulkLoad::InitDBUtil(const TabletId &tablet_id) {
 Status BulkLoad::InitYBBulkLoad() {
   // Convert table_name to lowercase since we store table names in lowercase.
   string table_name_lower = boost::to_lower_copy(FLAGS_table_name);
-  YBTableName table_name(FLAGS_namespace_name, table_name_lower);
+  YBTableName table_name(
+      master::GetDefaultDatabaseType(FLAGS_namespace_name), FLAGS_namespace_name, table_name_lower);
 
   YBClientBuilder builder;
   builder.add_master_server_addr(FLAGS_master_addresses);
 
-  RETURN_NOT_OK(builder.Build(&client_));
+  client_ = VERIFY_RESULT(builder.Build());
   RETURN_NOT_OK(client_->OpenTable(table_name, &table_));
   partition_generator_.reset(new YBPartitionGenerator(table_name, {FLAGS_master_addresses}));
   RETURN_NOT_OK(partition_generator_->Init());

@@ -19,7 +19,7 @@ import os
 import re
 import time
 
-from yb.common_util import get_build_type_from_build_root  # nopep8
+from yb.common_util import get_build_type_from_build_root, is_macos  # nopep8
 
 
 # This is used to separate relative binary path from gtest_filter for C++ tests in what we call
@@ -43,10 +43,17 @@ MAX_TIME_TO_WAIT_FOR_CLOCK_SYNC_SEC = 60
 
 class TestDescriptor:
     """
-    test_descriptor is either a C++ test program name relative to the build root, optionally
-    followed by the separator and the gtest filter identifying a test within that test program,
-    or a Java test class source path (including .java/.scala extension) relative to the "java"
-    directory.
+    A "test descriptor" identifies a particular test we could run on a distributed test worker.
+    A string representation of a "test descriptor" is one of the following:
+    - A C++ test program name relative to the build root. This implies running all tests within
+      the test program. This has the disadvantage that a failure of one of those tests will cause
+      the rest of tests to not be run.
+    - A C++ test program name relative to the build root followed by the ':::' separator and the
+      gtest filter identifying a test within that test program,
+    - A string like 'com.yugabyte.jedis.TestYBJedis#testPool[1]' describing a Java test. This is
+      something that could be passed directly to the -Dtest=... Maven option.
+    - A Java test class source path (including .java/.scala extension) relative to the "java"
+      directory in the YugaByte DB source tree.
     """
     def __init__(self, descriptor_str):
         self.descriptor_str = descriptor_str
@@ -60,22 +67,34 @@ class TestDescriptor:
             self.descriptor_str_without_attempt_index = descriptor_str
 
         self.is_jvm_based = False
-        if self.descriptor_str.endswith('.java'):
+        is_mvn_compatible_descriptor = False
+        if len(self.descriptor_str.split('#')) == 2:
+            self.is_jvm_based = True
+            # Could be Scala, but as of 08/2018 we only have Java tests in the repository.
+            self.language = 'Java'
+            is_mvn_compatible_descriptor = True
+        elif self.descriptor_str.endswith('.java'):
             self.is_jvm_based = True
             self.language = 'Java'
-        if self.descriptor_str.endswith('.scala'):
+        elif self.descriptor_str.endswith('.scala'):
             self.is_jvm_based = True
             self.language = 'Scala'
 
         if self.is_jvm_based:
-            # This is a Java/Scala test. The "test descriptors string " is the Java source file path
-            # relative to the "java" directory.
-            mvn_module, package_and_class_with_slashes = JAVA_TEST_DESCRIPTOR_RE.match(
-                self.descriptor_str_without_attempt_index).groups()
+            # This is a Java/Scala test.
+            if is_mvn_compatible_descriptor:
+                # This is a string of the form "com.yugabyte.jedis.TestYBJedis#testPool[1]".
+                self.args_for_run_test = self.descriptor_str
+                output_file_name = self.descriptor_str
+            else:
+                # The "test descriptors string " is the Java source file path relative to the "java"
+                # directory.
+                mvn_module, package_and_class_with_slashes = JAVA_TEST_DESCRIPTOR_RE.match(
+                    self.descriptor_str_without_attempt_index).groups()
 
-            package_and_class = package_and_class_with_slashes.replace('/', '.')
-            self.args_for_run_test = "{} {}".format(mvn_module, package_and_class)
-            output_file_name = package_and_class
+                package_and_class = package_and_class_with_slashes.replace('/', '.')
+                self.args_for_run_test = "{} {}".format(mvn_module, package_and_class)
+                output_file_name = package_and_class
         else:
             self.language = 'C++'
             # This is a C++ test.
@@ -97,7 +116,7 @@ class TestDescriptor:
             if test_name:
                 output_file_name += '__' + test_name
 
-        output_file_name = output_file_name.replace('/', '__')
+        output_file_name = re.sub(r'[\[\]/#]', '_', output_file_name)
         self.error_output_path = os.path.join(
                 global_conf.build_root, 'yb-test-logs', output_file_name + '__error.log')
 
@@ -121,11 +140,10 @@ class TestDescriptor:
 
 
 class GlobalTestConfig:
-    def __init__(self, build_root, build_type, yb_src_root, mvn_local_repo):
+    def __init__(self, build_root, build_type, yb_src_root):
         self.build_root = build_root
         self.build_type = build_type
         self.yb_src_root = yb_src_root
-        self.mvn_local_repo = mvn_local_repo
 
     def get_run_test_script_path(self):
         return os.path.join(self.yb_src_root, 'build-support', 'run-test.sh')
@@ -136,8 +154,6 @@ class GlobalTestConfig:
         necessary environment.
         """
         os.environ['BUILD_ROOT'] = self.build_root
-        if global_conf.mvn_local_repo:
-            os.environ['YB_MVN_LOCAL_REPO'] = global_conf.mvn_local_repo
         # This is how we tell run-test.sh what set of C++ binaries to use for mini-clusters in Java
         # tests.
         for env_var_name, env_var_value in propagated_env_vars.iteritems():
@@ -175,10 +191,7 @@ def set_global_conf_from_args(args):
     global_conf = GlobalTestConfig(
             build_root=build_root,
             build_type=build_type,
-            yb_src_root=yb_src_root,
-            mvn_local_repo=os.environ.get(
-                'YB_MVN_LOCAL_REPO',
-                os.path.join(os.path.expanduser('~'), '.m2', 'repository')))
+            yb_src_root=yb_src_root)
     return global_conf
 
 
@@ -188,11 +201,17 @@ def set_global_conf_from_dict(global_conf_dict):
     the main program to distributed workers.
     """
     global global_conf
-    global_conf = GlobalTestConfig(**global_conf_dict)
+    try:
+        global_conf = GlobalTestConfig(**global_conf_dict)
+    except TypeError as ex:
+        raise TypeError("Cannot set global configuration from dictionary %s: %s" % (
+            repr(global_conf_dict), ex.message))
+
     return global_conf
 
 
 def is_clock_synchronized():
+    assert not is_macos()
     result = command_util.run_program('ntpstat', error_ok=True)
     return ClockSyncCheckResult(
         is_synchronized=result.stdout.startswith('synchron'),
@@ -200,6 +219,9 @@ def is_clock_synchronized():
 
 
 def wait_for_clock_sync():
+    if is_macos():
+        return
+
     start_time = time.time()
     last_log_time = start_time
     waited_for_clock_sync = False

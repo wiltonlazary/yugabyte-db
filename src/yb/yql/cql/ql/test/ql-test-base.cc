@@ -20,6 +20,8 @@
 #include "yb/tserver/mini_tablet_server.h"
 #include "yb/tserver/tablet_server.h"
 
+DECLARE_bool(use_cassandra_authentication);
+
 namespace yb {
 namespace ql {
 
@@ -51,8 +53,9 @@ void QLTestBase::CreateSimulatedCluster(int num_tablet_servers) {
   builder.add_master_server_addr(cluster_->mini_master()->bound_rpc_addr_str());
   builder.default_rpc_timeout(MonoDelta::FromSeconds(30));
   builder.set_tserver_uuid(cluster_->mini_tablet_server(0)->server()->permanent_uuid());
-  ASSERT_OK(builder.Build(&client_));
-  metadata_cache_ = std::make_shared<client::YBMetaDataCache>(client_);
+  client_ = ASSERT_RESULT(builder.Build());
+  metadata_cache_ = std::make_shared<client::YBMetaDataCache>(client_.get(),
+      false /* Update roles' permissions cache */);
   ASSERT_OK(client_->CreateNamespaceIfNotExists(kDefaultKeyspaceName));
 }
 
@@ -63,13 +66,15 @@ static void CallUseKeyspace(const TestQLProcessor::UniPtr& processor, const stri
   ASSERT_OK(processor->UseKeyspace(keyspace_name));
 }
 
-TestQLProcessor *QLTestBase::GetQLProcessor() {
-  if (client_ == nullptr) {
+TestQLProcessor* QLTestBase::GetQLProcessor(const RoleName& role_name) {
+  if (!role_name.empty()) {
+    CHECK(FLAGS_use_cassandra_authentication);
+  }
+  if (!client_) {
     CreateSimulatedCluster();
   }
 
-  std::weak_ptr<rpc::Messenger> messenger;
-  ql_processors_.emplace_back(new TestQLProcessor(messenger, client_, metadata_cache_));
+  ql_processors_.emplace_back(new TestQLProcessor(client_.get(), metadata_cache_, role_name));
   CallUseKeyspace(ql_processors_.back(), kDefaultKeyspaceName);
   return ql_processors_.back().get();
 }

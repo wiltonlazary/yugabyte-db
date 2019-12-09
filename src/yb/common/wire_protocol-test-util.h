@@ -42,6 +42,7 @@
 #include "yb/common/ql_protocol.pb.h"
 #include "yb/docdb/docdb.pb.h"
 #include "yb/docdb/doc_key.h"
+#include "yb/util/yb_partition.h"
 
 namespace yb {
 
@@ -137,7 +138,7 @@ inline void AddKVToPB(int32_t key_val,
 
   auto add_kv_pair =
     [&](const SubDocKey &subdoc_key, const PrimitiveValue &primitive_value) {
-        KeyValuePairPB *const kv = write_batch->add_kv_pairs();
+        KeyValuePairPB *const kv = write_batch->add_write_pairs();
         kv->set_key(subdoc_key.Encode().AsStringRef());
         kv->set_value(primitive_value.ToValue());
     };

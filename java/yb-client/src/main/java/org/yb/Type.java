@@ -65,6 +65,9 @@ public enum Type {
   UUID (DataType.UUID, "uuid"),
   TIMEUUID (DataType.TIMEUUID, "timeuuid"),
   FROZEN (DataType.FROZEN, "frozen"),
+  DATE (DataType.DATE, "date"),
+  TIME (DataType.TIME, "time"),
+  JSONB (DataType.JSONB, "jsonb"),
   USER_DEFINED_TYPE (DataType.USER_DEFINED_TYPE, "user_defined_type");
 
   private final DataType dataType;
@@ -128,6 +131,7 @@ public enum Type {
       case TIMEUUID:
       case FROZEN:
       case USER_DEFINED_TYPE:
+      case JSONB:
       // TODO(mihnea) handle the cases above properly after cleaning up inherited code
       case STRING:
       case BINARY: return 8 + 8; // offset then string length
@@ -135,10 +139,12 @@ public enum Type {
       case INT8: return 1;
       case INT16: return Shorts.BYTES;
       case INT32:
-      case FLOAT: return Ints.BYTES;
+      case FLOAT:
+      case DATE: return Ints.BYTES;
       case INT64:
       case DOUBLE:
-      case TIMESTAMP: return Longs.BYTES;
+      case TIMESTAMP:
+      case TIME: return Longs.BYTES;
       default: throw new IllegalArgumentException("The provided data type doesn't map" +
           " to know any known one.");
     }
@@ -171,6 +177,9 @@ public enum Type {
       case TIMEUUID: return TIMEUUID;
       case FROZEN: return FROZEN;
       case USER_DEFINED_TYPE: return USER_DEFINED_TYPE;
+      case DATE: return DATE;
+      case TIME: return TIME;
+      case JSONB: return JSONB;
 
       default:
         throw new IllegalArgumentException("The provided data type doesn't map" +

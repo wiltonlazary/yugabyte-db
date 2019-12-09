@@ -47,6 +47,9 @@ class CQLMetrics : public ql::QLMetrics {
   scoped_refptr<yb::Counter> num_errors_parsing_cql_;
   // Rpc level metrics
   yb::rpc::RpcMethodMetrics rpc_method_metrics_;
+
+  scoped_refptr<AtomicGauge<int64_t>> cql_processors_alive_;
+  scoped_refptr<Counter> cql_processors_created_;
 };
 
 
@@ -63,6 +66,10 @@ class CQLProcessor : public ql::QLProcessor {
 
   // Processing an inbound call.
   void ProcessCall(rpc::InboundCallPtr call);
+
+ protected:
+  bool NeedReschedule() override;
+  void Reschedule(rpc::ThreadPoolTask* task) override;
 
  private:
   // Process a CQL request.
@@ -90,6 +97,7 @@ class CQLProcessor : public ql::QLProcessor {
                             boost::optional<CQLMessage::QueryId> query_id = boost::none);
 
   // Send response back to client.
+  void PrepareAndSendResponse(const std::unique_ptr<CQLResponse>& response);
   void SendResponse(const CQLResponse& response);
 
   // Pointer to the containing CQL service implementation.
@@ -120,6 +128,34 @@ class CQLProcessor : public ql::QLProcessor {
   ql::StatementExecutedCallback statement_executed_cb_;
 
   //----------------------------------------------------------------------------------------------
+
+  class ProcessRequestTask : public rpc::ThreadPoolTask {
+   public:
+    ProcessRequestTask& Bind(CQLProcessor* processor) {
+      processor_ = processor;
+      return *this;
+    }
+
+    virtual ~ProcessRequestTask() {}
+
+   private:
+    void Run() override {
+      auto processor = processor_;
+      processor_ = nullptr;
+      std::unique_ptr<CQLResponse> response(processor->ProcessRequest(*processor->request_));
+      if (response != nullptr) {
+        processor->SendResponse(*response);
+      }
+    }
+
+    void Done(const Status& status) override {}
+
+    CQLProcessor* processor_ = nullptr;
+  };
+
+  friend class ProcessRequestTask;
+
+  ProcessRequestTask process_request_task_;
 };
 
 }  // namespace cqlserver

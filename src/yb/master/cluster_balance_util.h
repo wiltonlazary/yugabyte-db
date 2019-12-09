@@ -74,6 +74,10 @@ struct CBTabletMetadata {
     return !wrong_placement_tablet_servers.empty() || !blacklisted_tablet_servers.empty();
   }
 
+  bool has_blacklisted_leader() {
+    return !leader_blacklisted_tablet_servers.empty();
+  }
+
   // Number of running replicas for this tablet.
   int running = 0;
 
@@ -109,6 +113,7 @@ struct CBTabletMetadata {
   // Set of tablet server ids that have been blacklisted and as such, should not get any more load
   // assigned to them and should be prioritized for removing load.
   std::set<TabletServerId> blacklisted_tablet_servers;
+  std::set<TabletServerId> leader_blacklisted_tablet_servers;
 
   // The tablet server id of the leader in this tablet's peer group.
   TabletServerId leader_uuid;
@@ -116,6 +121,17 @@ struct CBTabletMetadata {
   // Leader stepdown failures. We use this to prevent retrying the same leader stepdown too soon.
   LeaderStepDownFailureTimes leader_stepdown_failures;
 
+  std::string ToString() const {
+    return Format("{ running: $0 starting: $1 is_under_replicated: $2 "
+                      "under_replicated_placements: $3 is_over_replicated: $4 "
+                      "over_replicated_tablet_servers: $5 wrong_placement_tablet_servers: $6 "
+                      "blacklisted_tablet_servers: $7 leader_uuid: $8 "
+                      "leader_stepdown_failures: $9 leader_blacklisted_tablet_servers: $10}",
+                  running, starting, is_under_replicated, under_replicated_placements,
+                  is_over_replicated, over_replicated_tablet_servers,
+                  wrong_placement_tablet_servers, blacklisted_tablet_servers,
+                  leader_uuid, leader_stepdown_failures, leader_blacklisted_tablet_servers);
+  }
 };
 
 struct CBTabletServerMetadata {
@@ -208,6 +224,16 @@ class ClusterLoadState {
   struct LeaderLoadComparator {
     explicit LeaderLoadComparator(ClusterLoadState* state) : state_(state) {}
     bool operator()(const TabletServerId& a, const TabletServerId& b) {
+      // Primary criteria: whether tserver is leader blacklisted.
+      auto a_leader_blacklisted =
+        state_->leader_blacklisted_servers_.find(a) != state_->leader_blacklisted_servers_.end();
+      auto b_leader_blacklisted =
+        state_->leader_blacklisted_servers_.find(b) != state_->leader_blacklisted_servers_.end();
+      if (a_leader_blacklisted != b_leader_blacklisted) {
+        return !a_leader_blacklisted;
+      }
+
+      // Secondary criteria: tserver leader load.
       return state_->GetLeaderLoad(a) < state_->GetLeaderLoad(b);
     }
     ClusterLoadState* state_;
@@ -225,9 +251,12 @@ class ClusterLoadState {
   }
 
   void SetBlacklist(const BlacklistPB& blacklist) { blacklist_ = blacklist; }
+  void SetLeaderBlacklist(const BlacklistPB& leader_blacklist) {
+    leader_blacklist_ = leader_blacklist;
+  }
 
   // Update the per-tablet information for this tablet.
-  bool UpdateTablet(TabletInfo* tablet) {
+  Status UpdateTablet(TabletInfo* tablet) {
     const auto& tablet_id = tablet->id();
     // Set the per-tablet entry to empty default and get the reference for filling up information.
     auto& tablet_meta = per_tablet_meta_[tablet_id];
@@ -252,7 +281,9 @@ class ClusterLoadState {
       // becomes a problem!
       auto ts_meta_it = per_ts_meta_.find(ts_uuid);
       if (ts_meta_it == per_ts_meta_.end()) {
-        return false;
+        return STATUS_SUBSTITUTE(LeaderNotReadyToServe, "Master leader has not yet received "
+            "heartbeat from ts $0, either master just became leader or a network partition.",
+                                 ts_uuid);
       }
 
       // Fill leader info.
@@ -261,12 +292,14 @@ class ClusterLoadState {
         ts_meta_it->second.leaders.insert(tablet_id);
       }
 
-      const tablet::TabletStatePB& tablet_state = replica.second.state;
+      const tablet::RaftGroupStatePB& tablet_state = replica.second.state;
+      const bool replica_is_stale = replica.second.IsStale();
       if (tablet_state == tablet::RUNNING) {
         ts_meta_it->second.running_tablets.insert(tablet_id);
         ++tablet_meta.running;
         ++total_running_;
-      } else if (tablet_state == tablet::BOOTSTRAPPING || tablet_state == tablet::NOT_STARTED) {
+      } else if (!replica_is_stale &&
+                 (tablet_state == tablet::BOOTSTRAPPING || tablet_state == tablet::NOT_STARTED)) {
         // Keep track of transitioning state (not running, but not in a stopped or failed state).
         ts_meta_it->second.starting_tablets.insert(tablet_id);
         ++tablet_meta.starting;
@@ -277,6 +310,12 @@ class ClusterLoadState {
       // prioritize accordingly.
       if (blacklisted_servers_.count(ts_uuid)) {
         tablet_meta.blacklisted_tablet_servers.insert(ts_uuid);
+      }
+
+      // If this replica has blacklisted leader, we want to keep track of these specially, so we can
+      // prioritize accordingly.
+      if (leader_blacklisted_servers_.count(ts_uuid)) {
+        tablet_meta.leader_blacklisted_tablet_servers.insert(ts_uuid);
       }
     }
 
@@ -311,7 +350,7 @@ class ClusterLoadState {
       }
       // Now actually fill the structures with matching TSs.
       for (auto& replica_entry : replica_map) {
-        if (HasValidPlacement(replica_entry.first, &placement)) {
+        if (VERIFY_RESULT(HasValidPlacement(replica_entry.first, &placement))) {
           const auto& placement_id = per_ts_meta_[replica_entry.first].descriptor->placement_id();
           placement_to_replicas[placement_id].push_back(std::move(replica_entry.second));
         } else {
@@ -354,7 +393,7 @@ class ClusterLoadState {
       tablets_wrong_placement_.insert(tablet_id);
     }
 
-    return true;
+    return Status::OK();
   }
 
   virtual void UpdateTabletServer(std::shared_ptr<TSDescriptor> ts_desc) {
@@ -376,6 +415,14 @@ class ClusterLoadState {
       }
     }
 
+    // Mark as blacklisted leader if it matches.
+    for (const auto& hp : leader_blacklist_.hosts()) {
+      if (ts_meta.descriptor->IsRunningOn(hp)) {
+        leader_blacklisted_servers_.insert(ts_uuid);
+        break;
+      }
+    }
+
     // Add this tablet server for leader load-balancing only if it is not blacklisted and it has
     // heartbeated recently enough to be considered responsive for leader balancing.
     if (!is_blacklisted &&
@@ -385,12 +432,11 @@ class ClusterLoadState {
     }
 
     if (ts_desc->HasTabletDeletePending()) {
-      LOG(INFO) << "tablet server " << ts_uuid << " has a pending delete";
       servers_with_pending_deletes_.insert(ts_uuid);
     }
   }
 
-  bool CanAddTabletToTabletServer(
+  Result<bool> CanAddTabletToTabletServer(
     const TabletId& tablet_id, const TabletServerId& to_ts,
     const PlacementInfoPB* placement_info = nullptr) {
     const auto& ts_meta = per_ts_meta_[to_ts];
@@ -407,7 +453,7 @@ class ClusterLoadState {
       return false;
     }
     // If we ask to use placement information, check against it.
-    if (placement_info && !HasValidPlacement(to_ts, placement_info)) {
+    if (placement_info && !VERIFY_RESULT(HasValidPlacement(to_ts, placement_info))) {
       LOG(INFO) << "tablet server " << to_ts << " has invalid placement info. "
                 << "Not allowing it to take more tablets.";
       return false;
@@ -422,7 +468,8 @@ class ClusterLoadState {
     return true;
   }
 
-  bool HasValidPlacement(const TabletServerId& ts_uuid, const PlacementInfoPB* placement_info) {
+  Result<bool> HasValidPlacement(const TabletServerId& ts_uuid,
+                                 const PlacementInfoPB* placement_info) {
     if (!placement_info->placement_blocks().empty()) {
       for (const auto& pb : placement_info->placement_blocks()) {
         if (per_ts_meta_[ts_uuid].descriptor->MatchesCloudInfo(pb.cloud_info())) {
@@ -434,7 +481,7 @@ class ClusterLoadState {
     return true;
   }
 
-  bool SelectWrongReplicaToMove(
+  Result<bool> CanSelectWrongReplicaToMove(
     const TabletId& tablet_id, const PlacementInfoPB& placement_info, TabletServerId* out_from_ts,
     TabletServerId* out_to_ts) {
     // We consider both invalid placements (potentially due to config or schema changes), as well
@@ -454,10 +501,11 @@ class ClusterLoadState {
         // If this is a blacklisted server, we should aim to still respect placement and for now,
         // just try to move the load to the same placement. However, if the from_uuid was
         // previously invalidly placed, then we should ignore its placement.
-        if (invalid_placement && CanAddTabletToTabletServer(tablet_id, to_uuid, &placement_info)) {
+        if (invalid_placement &&
+            VERIFY_RESULT(CanAddTabletToTabletServer(tablet_id, to_uuid, &placement_info))) {
           found_match = true;
         } else {
-          if (CanAddTabletToTabletServer(tablet_id, to_uuid)) {
+          if (VERIFY_RESULT(CanAddTabletToTabletServer(tablet_id, to_uuid))) {
             const auto& from_placement_id = per_ts_meta_[from_uuid].descriptor->placement_id();
             const auto& to_placement_id = per_ts_meta_[to_uuid].descriptor->placement_id();
             if (from_placement_id == to_placement_id) {
@@ -490,7 +538,7 @@ class ClusterLoadState {
     // placement tablet servers. We can pick any of them as the source for now.
     if (!tablet_meta.wrong_placement_tablet_servers.empty()) {
       for (const auto& to_uuid : sorted_load_) {
-        if (CanAddTabletToTabletServer(tablet_id, to_uuid, &placement_info)) {
+        if (VERIFY_RESULT(CanAddTabletToTabletServer(tablet_id, to_uuid, &placement_info))) {
           *out_from_ts = *tablet_meta.wrong_placement_tablet_servers.begin();
           *out_to_ts = to_uuid;
           return true;
@@ -501,15 +549,16 @@ class ClusterLoadState {
     return false;
   }
 
-  void AddReplica(const TabletId& tablet_id, const TabletServerId& to_ts) {
+  Status AddReplica(const TabletId& tablet_id, const TabletServerId& to_ts) {
     per_ts_meta_[to_ts].starting_tablets.insert(tablet_id);
     ++per_tablet_meta_[tablet_id].starting;
     ++total_starting_;
     tablets_added_.insert(tablet_id);
     SortLoad();
+    return Status::OK();
   }
 
-  void RemoveReplica(const TabletId& tablet_id, const TabletServerId& from_ts) {
+  Status RemoveReplica(const TabletId& tablet_id, const TabletServerId& from_ts) {
     if (per_ts_meta_[from_ts].running_tablets.count(tablet_id)) {
       per_ts_meta_[from_ts].running_tablets.erase(tablet_id);
       --per_tablet_meta_[tablet_id].running;
@@ -521,7 +570,7 @@ class ClusterLoadState {
       --total_starting_;
     }
     if (per_tablet_meta_[tablet_id].leader_uuid == from_ts) {
-      MoveLeader(tablet_id, from_ts);
+      RETURN_NOT_OK(MoveLeader(tablet_id, from_ts));
     }
     // This artificially constrains the removes to only handle one over_replication/wrong_placement
     // per run.
@@ -532,6 +581,7 @@ class ClusterLoadState {
     tablets_over_replicated_.erase(tablet_id_key);
     tablets_wrong_placement_.erase(tablet_id_key);
     SortLoad();
+    return Status::OK();
   }
 
   void SortLoad() {
@@ -539,20 +589,47 @@ class ClusterLoadState {
     sort(sorted_load_.begin(), sorted_load_.end(), comparator);
   }
 
-  void MoveLeader(
+  Status MoveLeader(
     const TabletId& tablet_id, const TabletServerId& from_ts, const TabletServerId& to_ts = "") {
-    DCHECK_EQ(per_tablet_meta_[tablet_id].leader_uuid, from_ts);
+    if (per_tablet_meta_[tablet_id].leader_uuid != from_ts) {
+      return STATUS_SUBSTITUTE(IllegalState, "Tablet $0 has leader $1, but $2 expected.",
+                               tablet_id, per_tablet_meta_[tablet_id].leader_uuid, from_ts);
+    }
     per_tablet_meta_[tablet_id].leader_uuid = to_ts;
     per_ts_meta_[from_ts].leaders.erase(tablet_id);
     if (!to_ts.empty()) {
       per_ts_meta_[to_ts].leaders.insert(tablet_id);
     }
     SortLeaderLoad();
+    return Status::OK();
   }
 
   virtual void SortLeaderLoad() {
     auto leader_count_comparator = LeaderLoadComparator(this);
     sort(sorted_leader_load_.begin(), sorted_leader_load_.end(), leader_count_comparator);
+  }
+
+  void LogSortedLeaderLoad() {
+    // Sample output:
+    // ts1_uuid[ts1_load] ts2_uuid[ts2_load] ts4_uuid[ts4_load] -- ts3_uuid[ts3_load]
+    // Note: entries following "--" are leader blacklisted tservers
+
+    bool blacklisted_leader = false;
+    std::string s;
+    for (const auto& ts_uuid : sorted_leader_load_) {
+      if (!blacklisted_leader) {
+        blacklisted_leader = (leader_blacklisted_servers_.find(ts_uuid) !=
+            leader_blacklisted_servers_.end());
+        if (blacklisted_leader) {
+          s += " --";
+        }
+      }
+
+      s +=  " " + ts_uuid + "[" + strings::Substitute("$0", GetLeaderLoad(ts_uuid)) + "]";
+    }
+    if (s.size() > 0) {
+      LOG(INFO) << "tservers sorted by whether leader blacklisted and load: " << s;
+    }
   }
 
   inline bool IsLeaderLoadBelowThreshold(const TabletServerId& ts_uuid) {
@@ -619,9 +696,11 @@ class ClusterLoadState {
   // The cached blacklist setting of the cluster. We store this upfront, as we add to the list of
   // tablet servers one by one, so we compare against it once per tablet server.
   BlacklistPB blacklist_;
+  BlacklistPB leader_blacklist_;
 
   // The list of tablet server ids that match the cached blacklist.
   std::set<TabletServerId> blacklisted_servers_;
+  std::set<TabletServerId> leader_blacklisted_servers_;
 
   // List of tablet server ids that have pending deletes.
   std::set<TabletServerId> servers_with_pending_deletes_;
@@ -632,7 +711,7 @@ class ClusterLoadState {
   // Number of leaders per each tablet server to balance below.
   int leader_balance_threshold_ = 0;
 
-  // List of table server ids sorted by their leader load.
+  // List of table server ids sorted by whether leader blacklisted and their leader load.
   // If affinitized leaders is enabled, stores leader load for affinitized nodes.
   vector<TabletServerId> sorted_leader_load_;
 

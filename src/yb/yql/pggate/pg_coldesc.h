@@ -18,8 +18,7 @@
 #ifndef YB_YQL_PGGATE_PG_COLDESC_H_
 #define YB_YQL_PGGATE_PG_COLDESC_H_
 
-#include "yb/common/types.h"
-#include "yb/util/memory/mc_types.h"
+#include "yb/client/client.h"
 
 namespace yb {
 namespace pggate {
@@ -36,13 +35,7 @@ class ColumnDesc {
   typedef std::shared_ptr<ColumnDesc> SharedPtr;
   typedef std::shared_ptr<const ColumnDesc> SharedPtrConst;
 
-  ColumnDesc()
-      : index_(-1),
-        id_(-1),
-        is_partition_(false),
-        is_primary_(false),
-        ql_type_(QLType::Create(DataType::UNKNOWN_DATA)),
-        internal_type_(InternalType::VALUE_NOT_SET) {
+  ColumnDesc() : ql_type_(QLType::Create(DataType::UNKNOWN_DATA)) {
   }
 
   void Init(int index,
@@ -52,7 +45,8 @@ class ColumnDesc {
             bool is_primary,
             int32_t attr_num,
             const std::shared_ptr<QLType>& ql_type,
-            InternalType internal_type) {
+            InternalType internal_type,
+            ColumnSchema::SortingType sorting_type) {
     index_ = index,
     id_ = id;
     name_ = name;
@@ -61,6 +55,7 @@ class ColumnDesc {
     attr_num_ = attr_num;
     ql_type_ = ql_type;
     internal_type_ = internal_type;
+    sorting_type_ = sorting_type;
   }
 
   bool IsInitialized() const {
@@ -99,15 +94,20 @@ class ColumnDesc {
     return internal_type_;
   }
 
+  ColumnSchema::SortingType sorting_type() const {
+    return sorting_type_;
+  }
+
  private:
-  int index_;
-  int id_;
+  int index_ = -1;
+  int id_ = -1;
   string name_;
-  bool is_partition_;
-  bool is_primary_;
-  int32_t attr_num_;
+  bool is_partition_ = false;
+  bool is_primary_ = false;
+  int32_t attr_num_ = -1;
   std::shared_ptr<QLType> ql_type_;
-  InternalType internal_type_;
+  InternalType internal_type_ = InternalType::VALUE_NOT_SET;
+  ColumnSchema::SortingType sorting_type_ = ColumnSchema::SortingType::kNotSpecified;
 };
 
 }  // namespace pggate

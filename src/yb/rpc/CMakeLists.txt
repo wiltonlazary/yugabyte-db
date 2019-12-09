@@ -30,8 +30,6 @@
 # under the License.
 #
 
-YB_INCLUDE_EXTENSIONS()
-
 #### Global header protobufs
 PROTOBUF_GENERATE_CPP(
   RPC_HEADER_PROTO_SRCS RPC_HEADER_PROTO_HDRS RPC_HEADER_PROTO_TGTS
@@ -60,6 +58,7 @@ ADD_YB_LIBRARY(rpc_introspection_proto
 set(YRPC_SRCS
     acceptor.cc
     binary_call_parser.cc
+    circular_read_buffer.cc
     connection.cc
     connection_context.cc
     growable_buffer.cc
@@ -76,9 +75,11 @@ set(YRPC_SRCS
     rpc.cc
     rpc_context.cc
     rpc_controller.cc
+    rpc_metrics.cc
     rpc_with_call_id.cc
     rpc_with_queue.cc
     scheduler.cc
+    secure_stream.cc
     serialization.cc
     service_if.cc
     service_pool.cc
@@ -94,7 +95,8 @@ set(YRPC_LIBS
   yb_util
   gutil
   libev
-  ${RPC_LIBS_EXTENSIONS})
+  ${OPENSSL_CRYPTO_LIBRARY}
+  ${OPENSSL_SSL_LIBRARY})
 
 ADD_YB_LIBRARY(yrpc
   SRCS ${YRPC_SRCS}
@@ -108,6 +110,9 @@ target_link_libraries(protoc-gen-yrpc
     protobuf
     gutil
     yb_util)
+
+add_library(rpc_test_util rpc_test_util.cc)
+target_link_libraries(rpc_test_util yrpc)
 
 #### RPC test
 PROTOBUF_GENERATE_CPP(
@@ -128,10 +133,11 @@ target_link_libraries(rtest_yrpc
   yb_test_util
   yrpc
   rpc_header_proto
+  rpc_test_util
   rtest_diff_package_proto)
 
 # Tests
-set(YB_TEST_LINK_LIBS rtest_yrpc yrpc ${YB_MIN_TEST_LIBS})
+set(YB_TEST_LINK_LIBS rtest_yrpc yrpc rpc_test_util ${YB_MIN_TEST_LIBS})
 ADD_YB_TEST(growable_buffer-test)
 ADD_YB_TEST(mt-rpc-test RUN_SERIAL true)
 ADD_YB_TEST(periodic-test)

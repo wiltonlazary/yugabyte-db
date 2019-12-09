@@ -34,6 +34,7 @@
 #include "yb/common/row.h"
 #include "yb/common/schema.h"
 #include "yb/common/wire_protocol.h"
+#include "yb/util/errno.h"
 #include "yb/util/status.h"
 #include "yb/util/stopwatch.h"
 #include "yb/util/test_macros.h"
@@ -81,7 +82,7 @@ TEST_F(WireProtocolTest, TestBadStatus) {
 }
 
 TEST_F(WireProtocolTest, TestBadStatusWithPosixCode) {
-  Status s = STATUS(NotFound, "foo", "bar", 1234);
+  Status s = STATUS(NotFound, "foo", "bar", Errno(1234));
   AppStatusPB pb;
   StatusToPB(s, &pb);
   EXPECT_EQ(AppStatusPB::NOT_FOUND, pb.code());
@@ -92,14 +93,14 @@ TEST_F(WireProtocolTest, TestBadStatusWithPosixCode) {
 
   Status s2 = StatusFromPB(pb);
   EXPECT_TRUE(s2.IsNotFound());
-  EXPECT_EQ(1234, s2.error_code());
+  EXPECT_EQ(1234, Errno(s2));
   EXPECT_EQ(s.ToString(/* no file/line */ false), s2.ToString(/* no file/line */ false));
 }
 
 TEST_F(WireProtocolTest, TestSchemaRoundTrip) {
   google::protobuf::RepeatedPtrField<ColumnSchemaPB> pbs;
 
-  ASSERT_OK(SchemaToColumnPBs(schema_, &pbs));
+  SchemaToColumnPBs(schema_, &pbs);
   ASSERT_EQ(3, pbs.size());
 
   // Column 0.

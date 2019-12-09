@@ -17,8 +17,8 @@ import com.datastax.driver.core.Row;
 
 import java.util.*;
 
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.assertEquals;
+import static org.yb.AssertionWrappers.assertTrue;
+import static org.yb.AssertionWrappers.assertEquals;
 import org.junit.Test;
 import org.yb.client.TestUtils;
 
@@ -26,6 +26,11 @@ import org.yb.client.TestUtils;
  * This an extensive test suite ensures that we appropriately test the tricky cassandra TTL
  * semantics, with various edge cases.
  */
+import org.yb.YBTestRunner;
+
+import org.junit.runner.RunWith;
+
+@RunWith(value=YBTestRunner.class)
 public class TestTTLSemantics extends BaseCQLTest {
 
   private void createTtlTable(String tableName) {

@@ -13,8 +13,12 @@
 
 #include "yb/master/master_util.h"
 
+#include <boost/container/stable_vector.hpp>
+
+#include "yb/common/redis_constants_common.h"
 #include "yb/common/wire_protocol.h"
 #include "yb/consensus/metadata.pb.h"
+#include "yb/master/master_defaults.h"
 #include "yb/master/master.proxy.h"
 #include "yb/master/master.service.h"
 #include "yb/util/flag_tags.h"
@@ -27,23 +31,60 @@ using master::GetMasterRegistrationRequestPB;
 using master::GetMasterRegistrationResponsePB;
 using master::MasterServiceProxy;
 
-Status GetMasterEntryForHost(rpc::ProxyCache* proxy_cache,
-                             const HostPort& hostport,
-                             int timeout,
-                             ServerEntryPB* e) {
-  MasterServiceProxy proxy(proxy_cache, hostport);
+namespace {
+
+struct GetMasterRegistrationData {
   GetMasterRegistrationRequestPB req;
   GetMasterRegistrationResponsePB resp;
   rpc::RpcController controller;
-  controller.set_timeout(MonoDelta::FromMilliseconds(timeout));
-  RETURN_NOT_OK(proxy.GetMasterRegistration(req, &resp, &controller));
-  e->mutable_instance_id()->CopyFrom(resp.instance_id());
-  if (resp.has_error()) {
-    return StatusFromPB(resp.error().status());
+  MasterServiceProxy proxy;
+
+  GetMasterRegistrationData(rpc::ProxyCache* proxy_cache, const HostPort& hp)
+      : proxy(proxy_cache, hp) {}
+};
+
+} // namespace
+
+Status GetMasterEntryForHosts(rpc::ProxyCache* proxy_cache,
+                              const std::vector<HostPort>& hostports,
+                              MonoDelta timeout,
+                              ServerEntryPB* e) {
+  CHECK(!hostports.empty());
+
+  boost::container::stable_vector<GetMasterRegistrationData> datas;
+  datas.reserve(hostports.size());
+  std::atomic<GetMasterRegistrationData*> last_data{nullptr};
+  CountDownLatch latch(hostports.size());
+  for (size_t i = 0; i != hostports.size(); ++i) {
+    datas.emplace_back(proxy_cache, hostports[i]);
+    auto& data = datas.back();
+    data.controller.set_timeout(timeout);
+    data.proxy.GetMasterRegistrationAsync(
+        data.req, &data.resp, &data.controller,
+        [&data, &latch, &last_data] {
+      last_data.store(&data, std::memory_order_release);
+      latch.CountDown();
+    });
   }
-  e->mutable_registration()->CopyFrom(resp.registration());
-  e->set_role(resp.role());
-  return Status::OK();
+
+  latch.Wait();
+
+  for (const auto& data : datas) {
+    if (!data.controller.status().ok() || data.resp.has_error()) {
+      continue;
+    }
+    e->mutable_instance_id()->CopyFrom(data.resp.instance_id());
+    e->mutable_registration()->CopyFrom(data.resp.registration());
+    e->set_role(data.resp.role());
+    return Status::OK();
+  }
+
+  auto last_data_value = last_data.load(std::memory_order_acquire);
+  if (last_data_value->controller.status().ok()) {
+    return StatusFromPB(last_data_value->resp.error().status());
+  } else {
+    return last_data_value->controller.status();
+  }
 }
 
 const HostPortPB& DesiredHostPort(const TSInfoPB& ts_info, const CloudInfoPB& from) {
@@ -69,6 +110,34 @@ void TakeRegistration(ServerRegistrationPB* source, TSInfoPB* dest) {
 
 void CopyRegistration(ServerRegistrationPB source, TSInfoPB* dest) {
   TakeRegistration(&source, dest);
+}
+
+bool IsSystemNamespace(const std::string& namespace_name) {
+  return namespace_name == master::kSystemNamespaceName ||
+      namespace_name == master::kSystemAuthNamespaceName ||
+      namespace_name == master::kSystemDistributedNamespaceName ||
+      namespace_name == master::kSystemSchemaNamespaceName ||
+      namespace_name == master::kSystemTracesNamespaceName;
+}
+
+YQLDatabase GetDefaultDatabaseType(const std::string& keyspace_name) {
+  return keyspace_name == common::kRedisKeyspaceName ? YQLDatabase::YQL_DATABASE_REDIS
+                                                     : YQLDatabase::YQL_DATABASE_CQL;
+}
+
+YQLDatabase GetDatabaseTypeForTable(const TableType table_type) {
+  switch (table_type) {
+    case TableType::YQL_TABLE_TYPE:
+      return YQLDatabase::YQL_DATABASE_CQL;
+    case TableType::REDIS_TABLE_TYPE:
+      return YQLDatabase::YQL_DATABASE_REDIS;
+    case TableType::PGSQL_TABLE_TYPE:
+      return YQLDatabase::YQL_DATABASE_PGSQL;
+    case TableType::TRANSACTION_STATUS_TABLE_TYPE:
+      // Transactions status table is created in "system" keyspace in CQL.
+      return YQLDatabase::YQL_DATABASE_CQL;
+  }
+  return YQL_DATABASE_UNKNOWN;
 }
 
 } // namespace master

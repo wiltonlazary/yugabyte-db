@@ -62,9 +62,19 @@ class QLScanRange {
   };
 
   QLScanRange(const Schema& schema, const QLConditionPB& condition);
+  QLScanRange(const Schema& schema, const PgsqlConditionPB& condition);
 
   // Return the inclusive lower and upper range values to scan.
   std::vector<QLValuePB> range_values(bool lower_bound) const;
+
+  QLRange RangeFor(ColumnId col_id) const {
+    const auto& iter = ranges_.find(col_id);
+    return (iter == ranges_.end() ? QLRange() : iter->second);
+  }
+
+  bool has_in_range_options() const {
+    return has_in_range_options_;
+  }
 
   // Intersect / union / complement operators.
   QLScanRange& operator&=(const QLScanRange& other);
@@ -80,6 +90,10 @@ class QLScanRange {
 
   // Mapping of column id to the column value ranges (inclusive lower/upper bounds) to scan.
   std::unordered_map<ColumnId, QLRange> ranges_;
+
+  // Whether the condition has an IN condition on a range (clustering) column.
+  // Used in doc_ql_scanspec to try to construct the set of options for a multi-point scan.
+  bool has_in_range_options_ = false;
 };
 
 // A scan specification for a QL scan. It may be used to scan either a specified doc key
@@ -90,6 +104,7 @@ class QLScanSpec : public YQLScanSpec {
 
   // Scan for the given hash key and a condition.
   QLScanSpec(const QLConditionPB* condition,
+             const QLConditionPB* if_condition,
              const bool is_forward_scan,
              QLExprExecutor::SharedPtr executor = nullptr);
 
@@ -103,8 +118,12 @@ class QLScanSpec : public YQLScanSpec {
     return is_forward_scan_;
   }
 
+  // Get Schema if available.
+  virtual const Schema* schema() const { return nullptr; }
+
  protected:
   const QLConditionPB* condition_;
+  const QLConditionPB* if_condition_;
   const bool is_forward_scan_;
   QLExprExecutor::SharedPtr executor_;
 };
@@ -116,11 +135,19 @@ class PgsqlScanSpec : public YQLScanSpec {
  public:
   typedef std::unique_ptr<common::PgsqlScanSpec> UniPtr;
 
-  explicit PgsqlScanSpec(QLClient client_type) : YQLScanSpec(client_type) {
+  explicit PgsqlScanSpec(QLClient client_type,
+                         const PgsqlExpressionPB *where_expr,
+                         QLExprExecutor::SharedPtr executor = nullptr);
+
+  virtual ~PgsqlScanSpec();
+
+  const PgsqlExpressionPB *where_expr() {
+    return where_expr_;
   }
 
-  virtual ~PgsqlScanSpec() {
-  }
+ protected:
+  const PgsqlExpressionPB *where_expr_;
+  QLExprExecutor::SharedPtr executor_;
 };
 
 } // namespace common

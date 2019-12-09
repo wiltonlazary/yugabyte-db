@@ -22,8 +22,11 @@
 
 #include "yb/yql/cql/ql/ptree/process_context.h"
 #include "yb/yql/cql/ql/util/ql_env.h"
+#include "yb/yql/cql/ql/util/statement_params.h"
 #include "yb/yql/cql/ql/util/statement_result.h"
 #include "yb/common/common.pb.h"
+#include "yb/client/client.h"
+#include "yb/client/session.h"
 
 namespace yb {
 namespace ql {
@@ -37,40 +40,47 @@ class TnodeContext {
     return tnode_;
   }
 
-  // Access function for start_time.
+  // Access function for start_time and end_time.
   const MonoTime& start_time() const {
     return start_time_;
   }
+  const MonoTime& end_time() const {
+    return end_time_;
+  }
+  void set_end_time(const MonoTime& end_time) {
+    end_time_ = end_time;
+  }
+  MonoDelta execution_time() const {
+    return end_time_ - start_time_;
+  }
 
   // Access function for op.
-  const std::vector<std::shared_ptr<client::YBqlOp>>& ops() const {
+  std::vector<client::YBqlOpPtr>& ops() {
+    return ops_;
+  }
+  const std::vector<client::YBqlOpPtr>& ops() const {
     return ops_;
   }
 
-  // Apply one YBClient read/write operation.
-  CHECKED_STATUS Apply(std::shared_ptr<client::YBqlOp> op, QLEnv* ql_env, bool defer = false) {
-    ops_ = {op};
-    deferred_ = defer;
-    return defer ? Status::OK() : ql_env->Apply(op);
-  }
-
-  // Add an operation -- need to call Apply below to apply all added ops.
-  void AddOperation(std::shared_ptr<client::YBqlOp> op) {
+  // Add an operation.
+  void AddOperation(const client::YBqlOpPtr& op) {
     ops_.push_back(op);
   }
 
-  // Apply all operations.
-  CHECKED_STATUS Apply(QLEnv* ql_env) {
-    deferred_ = false;
-    for (auto& op : ops_) {
-      RETURN_NOT_OK(ql_env->Apply(op));
-    }
-    return Status::OK();
+  // Does this statement have pending operations?
+  bool HasPendingOperations() const;
+
+  // Access function for rows result.
+  RowsResult::SharedPtr& rows_result() {
+    return rows_result_;
   }
 
-  // Is the operation deferred?
-  bool IsDeferred() const {
-    return !ops_.empty() && deferred_;
+  // Append rows result.
+  CHECKED_STATUS AppendRowsResult(RowsResult::SharedPtr&& rows_result);
+
+  // Access functions for row_count.
+  size_t row_count() const {
+    return row_count_;
   }
 
   // Used for multi-partition selects (i.e. with 'IN' conditions on hash columns).
@@ -95,33 +105,54 @@ class TnodeContext {
   // this will do, index: 2 -> 3 and hashed_column_values: [1, 3, 4, 6] -> [1, 3, 5, 6].
   void AdvanceToNextPartition(QLReadRequestPB *req);
 
-  std::unique_ptr<std::vector<std::vector<QLExpressionPB>>>& hash_values_options() {
-    if (hash_values_options_ == nullptr) {
-      hash_values_options_ = std::make_unique<std::vector<std::vector<QLExpressionPB>>>();
+  std::vector<std::vector<QLExpressionPB>>& hash_values_options() {
+    if (!hash_values_options_) {
+      hash_values_options_.emplace();
     }
-    return hash_values_options_;
+    return *hash_values_options_;
   }
 
   uint64_t current_partition_index() const {
     return current_partition_index_;
   }
 
-  void set_partitions_count(uint64_t count) {
+  void set_partitions_count(const uint64_t count) {
     partitions_count_ = count;
   }
+
+  // Access functions for child tnode context.
+  TnodeContext* AddChildTnode(const TreeNode* tnode) {
+    DCHECK(!child_context_);
+    child_context_ = std::make_unique<TnodeContext>(tnode);
+    return child_context_.get();
+  }
+  TnodeContext* child_context() {
+    return child_context_.get();
+  }
+
+  // Access functions for uncovered select op template and primary keys.
+  const client::YBqlReadOpPtr& uncovered_select_op() const {
+    return uncovered_select_op_;
+  }
+  QLRowBlock* keys() {
+    return keys_.get();
+  }
+
+  void SetUncoveredSelectOp(const client::YBqlReadOpPtr& select_op);
 
  private:
   // Tree node of the statement being executed.
   const TreeNode* tnode_ = nullptr;
 
-  // Execution start time.
+  // Execution start and end time.
   const MonoTime start_time_;
+  MonoTime end_time_;
 
   // Read/write operations to execute.
-  std::vector<std::shared_ptr<client::YBqlOp>> ops_;
+  std::vector<client::YBqlOpPtr> ops_;
 
-  // Is the operation deferred?
-  bool deferred_ = false;
+  // Accumulated number of rows fetched by the statement.
+  size_t row_count_ = 0;
 
   // For multi-partition selects (e.g. selects with 'IN' condition on hash cols) we hold the options
   // for each hash column (starting from first 'IN') as we iteratively query each partition.
@@ -129,11 +160,33 @@ class TnodeContext {
   //  hash_values_options_ = [[2, 3], [4, 5], [6]]
   //  partitions_count_ = 4 (i.e. [2,4,6], [2,5,6], [3,4,6], [4,5,6]).
   //  current_partition_index_ starts from 0 unless set in the paging state.
-  std::unique_ptr<std::vector<std::vector<QLExpressionPB>>> hash_values_options_;
+  boost::optional<std::vector<std::vector<QLExpressionPB>>> hash_values_options_;
   uint64_t partitions_count_ = 0;
   uint64_t current_partition_index_ = 0;
+
+  // Rows result of this statement tnode for DML statements.
+  RowsResult::SharedPtr rows_result_;
+
+  // Child context for nested statement.
+  std::unique_ptr<TnodeContext> child_context_;
+
+  // Select op template and primary keys for fetching from indexed table in an uncovered query.
+  client::YBqlReadOpPtr uncovered_select_op_;
+  std::unique_ptr<QLRowBlock> keys_;
 };
 
+// Processing could take a while, we are rescheduling it to our thread pool, if not yet
+// running in it.
+class Rescheduler {
+ public:
+  virtual bool NeedReschedule() = 0;
+  virtual void Reschedule(rpc::ThreadPoolTask* task) = 0;
+ protected:
+  ~Rescheduler() {}
+};
+
+// The context for execution of a statement. Inside the statement parse tree, there may be one or
+// more statement tnodes to be executed.
 class ExecContext : public ProcessContextBase {
  public:
   //------------------------------------------------------------------------------------------------
@@ -146,79 +199,95 @@ class ExecContext : public ProcessContextBase {
 
   // Constructs an execution context to execute a statement. The context saves references to the
   // parse tree and parameters.
-  ExecContext(const ParseTree& parse_tree, const StatementParameters& params, QLEnv *ql_env);
+  ExecContext(const ParseTree& parse_tree, const StatementParameters& params);
   virtual ~ExecContext();
 
-  // Add a statement tree node for execution.
-  void AddTnode(const TreeNode *tnode);
-
-  // Returns the context for the current tnode being executed.
-  TnodeContext* tnode_context() {
-    return &tnode_contexts_.back();
-  }
-
+  // Returns the statement string being executed.
   const std::string& stmt() const override {
     return parse_tree_.stmt();
   }
 
-  // Access function for parse_tree.
+  // Access function for parse_tree and params.
   const ParseTree& parse_tree() const {
     return parse_tree_;
   }
-
-  // Access function for params.
   const StatementParameters& params() const {
     return params_;
   }
 
-  const std::list<TnodeContext>& tnode_contexts() const {
+  // Add a statement tree node to be executed.
+  TnodeContext* AddTnode(const TreeNode *tnode);
+
+  // Return the tnode contexts being executed.
+  std::list<TnodeContext>& tnode_contexts() {
     return tnode_contexts_;
   }
-  std::list<TnodeContext>* tnode_contexts() {
-    return &tnode_contexts_;
+
+  //------------------------------------------------------------------------------------------------
+  // Start a distributed transaction.
+  CHECKED_STATUS StartTransaction(IsolationLevel isolation_level, QLEnv* ql_env);
+
+  // Is a transaction currently in progress?
+  bool HasTransaction() const {
+    return transaction_ != nullptr;
+  }
+
+  // Returns the start time of the transaction.
+  const MonoTime& transaction_start_time() const {
+    return transaction_start_time_;
+  }
+
+  // Prepare a child distributed transaction.
+  CHECKED_STATUS PrepareChildTransaction(ChildTransactionDataPB* data);
+
+  // Apply the result of a child distributed transaction.
+  CHECKED_STATUS ApplyChildTransactionResult(const ChildTransactionResultPB& result);
+
+  // Commit the current distributed transaction.
+  void CommitTransaction(client::CommitCallback callback);
+
+  // Abort the current distributed transaction.
+  void AbortTransaction();
+
+  // Return the transactional session of the statement.
+  client::YBSessionPtr transactional_session() {
+    DCHECK(transaction_ && transactional_session_) << "transaction missing in this statement";
+    return transactional_session_;
+  }
+
+  // Does this statement have pending operations?
+  bool HasPendingOperations() const;
+
+  //------------------------------------------------------------------------------------------------
+  client::Restart restart() const {
+    return restart_;
   }
 
   int64_t num_retries() const {
     return num_retries_;
   }
 
-  int64_t num_flushes() const {
-    return num_flushes_;
-  }
-
-  void inc_num_flushes() {
-    num_flushes_ += 1;
-  }
-
-  // Apply YBClient read/write operation.
-  CHECKED_STATUS Apply(std::shared_ptr<client::YBqlOp> op, const bool defer = false) {
-    return tnode_context()->Apply(op, ql_env_, defer);
-  }
-
-  // Apply YBClient read/write operation.
-  CHECKED_STATUS ApplyAll() {
-    return tnode_context()->Apply(ql_env_);
-  }
-
-  // Reset this ExecContext to re-execute the statement.
-  void Reset();
+  // Reset this ExecContext.
+  void Reset(client::Restart restart, Rescheduler* rescheduler);
 
  private:
-  // Statement parse tree to execute.
+  // Statement parse tree to execute and parameters to execute with.
   const ParseTree& parse_tree_;
-
-  // Statement parameters to execute with.
   const StatementParameters& params_;
 
-  // SQL environment.
-  QLEnv *ql_env_;
+  // Should this statement be restarted?
+  client::Restart restart_ = client::Restart::kFalse;
 
+  // Contexts to execute statement tnodes.
   std::list<TnodeContext> tnode_contexts_;
 
-  int64_t num_retries_ = 0;
+  // Transaction and session to apply transactional write operations in and the start time.
+  client::YBTransactionPtr transaction_;
+  client::YBSessionPtr transactional_session_;
+  MonoTime transaction_start_time_;
 
-  // The number of times we called flush for this exec context.
-  int64_t num_flushes_ = 0;
+  // The number of times this statement has been retried.
+  int64_t num_retries_ = 0;
 };
 
 }  // namespace ql

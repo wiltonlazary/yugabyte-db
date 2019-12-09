@@ -17,15 +17,13 @@ import com.google.common.net.HostAndPort;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.yb.client.TestUtils;
+import org.yb.util.*;
 
 import java.io.*;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-
-import static org.yb.client.TestUtils.CommandResult;
 
 public class MiniYBDaemon {
   private static final Logger LOG = LoggerFactory.getLogger(MiniYBDaemon.class);
@@ -62,12 +60,12 @@ public class MiniYBDaemon {
         return;
       }
       String regexStr = "(\\b" + pidStr + "\\b|out-of-memory|killed process|oom_killer)";
-      CommandResult cmdResult = TestUtils.runShellCommand(
+      CommandResult cmdResult = CommandUtil.runShellCommand(
           String.format(
               "tail -%d '%s' | egrep -i -C %d '%s'", NUM_LAST_SYSLOG_LINES_TO_USE,
               SYSLOG_PATH, SYSLOG_CONTEXT_NUM_LINES, regexStr));
-      cmdResult.logErrorOutput();
-      if (cmdResult.stdoutLines.isEmpty()) {
+      cmdResult.logStderr();
+      if (cmdResult.getStdoutLines().isEmpty()) {
         if (!terminatedNormally()) {
           LOG.warn("Could not find anything in " + SYSLOG_PATH + " relevant to the " +
               "disappearance of process: " + MiniYBDaemon.this);
@@ -75,14 +73,14 @@ public class MiniYBDaemon {
       } else {
         LOG.warn("Potentially relevant lines from " + SYSLOG_PATH +
             " for termination of " + this + ":\n" +
-            TestUtils.joinLinesForLogging(cmdResult.stdoutLines));
+            StringUtil.joinLinesForLogging(cmdResult.getStdoutLines()));
       }
     }
 
     private void analyzeMemoryUsage() throws IOException {
-      CommandResult cmdResult = TestUtils.runShellCommand(
+      CommandResult cmdResult = CommandUtil.runShellCommand(
           "ps -e -orss=,pid=,args= | egrep 'yb-(master|tserver)' | sort -k2,2 -rn");
-      cmdResult.logErrorOutput();
+      cmdResult.logStderr();
       if (!cmdResult.isSuccess()) {
         return;
       }
@@ -91,9 +89,9 @@ public class MiniYBDaemon {
       int numMasters = 0;
       int numTservers = 0;
       List<String> masterTserverPsLines = new ArrayList<String>();
-      for (String line : cmdResult.stdoutLines) {
+      for (String line : cmdResult.getStdoutLines()) {
         // Four parts: RSS, pid, executable path, arguments.
-        String[] items = line.split("\\s+", 4);
+        String[] items = line.trim().split("\\s+", 4);
         if (items.length < 4) {
           LOG.warn("Could not parse a ps output line: " + line + " (got " +
               items.length + " parts, expected 4)");
@@ -127,7 +125,7 @@ public class MiniYBDaemon {
                 ", num tserver processes: " + numTservers +
                 ", total tserver memory usage (MB): " + (totalTserverRssKB / 1024) + "; " +
                 "ps output:\n" +
-                TestUtils.joinLinesForLogging(cmdResult.stdoutLines));
+                StringUtil.joinLinesForLogging(cmdResult.getStdoutLines()));
       } else {
         LOG.info("Did not find any yb-master/yb-tserver processes in 'ps' output");
       }
@@ -182,12 +180,29 @@ public class MiniYBDaemon {
     }
   }
 
-  private String getLogPrefix() {
-    return type.shortStr() + indexForLog + LOG_PREFIX_SEPARATOR + PID_PREFIX +
-        getPidStr() + LOG_PREFIX_SEPARATOR + ":" + rpcPort +
-        (TestUtils.isJenkins() ? "" // No need for a clickable web UI link on Jenkins.
-            : LOG_PREFIX_SEPARATOR + "http://" + getWebHostAndPort()) +
+  public static final int NO_DAEMON_INDEX = -1;
+  public static final int NO_RPC_PORT = -1;
+  public static final String NO_WEB_UI_URL = null;
+
+  public static String makeLogPrefix(
+      String shortDaemonTypeStr,
+      int daemonIndex,
+      String pidAsString,
+      int rpcPort,
+      String webUiUrl) {
+    return shortDaemonTypeStr +
+        (daemonIndex == NO_DAEMON_INDEX ? "" : String.valueOf(daemonIndex)) +
+        LOG_PREFIX_SEPARATOR + PID_PREFIX + pidAsString + LOG_PREFIX_SEPARATOR +
+        (rpcPort == NO_RPC_PORT ? "" : ":" + rpcPort) +
+        (ConfForTesting.isCI() || webUiUrl == null || webUiUrl.isEmpty()
+            ? "" // No need for a clickable web UI link on Jenkins, or if it is not defined.
+            : LOG_PREFIX_SEPARATOR + webUiUrl) +
         " ";
+  }
+
+  private String getLogPrefix() {
+    return makeLogPrefix(
+        type.shortStr(), indexForLog, getPidStr(), rpcPort, "http://" + getWebHostAndPort());
   }
 
   /**
@@ -197,7 +212,7 @@ public class MiniYBDaemon {
    */
   public MiniYBDaemon(
       MiniYBDaemonType type, int indexForLog, String[] commandLine, Process process, String bindIp,
-      int rpcPort, int webPort, int cqlWebPort, int redisWebPort, int pgsqlWebPort,
+      int rpcPort, int webPort, int pgsqlWebPort, int cqlWebPort, int redisWebPort,
       String dataDirPath) {
     this.type = type;
     this.commandLine = commandLine;
@@ -207,18 +222,17 @@ public class MiniYBDaemon {
     this.rpcPort = rpcPort;
     this.webPort = webPort;
     this.cqlWebPort = cqlWebPort;
-    this.redisWebPort = redisWebPort;
     this.pgsqlWebPort = pgsqlWebPort;
+    this.redisWebPort = redisWebPort;
     this.dataDirPath = dataDirPath;
-    final String logPrefix = getLogPrefix();
-    this.stdoutPrinter = new LogPrinter("stdout", process.getInputStream(), logPrefix);
-    this.stderrPrinter = new LogPrinter("stderr", process.getErrorStream(), logPrefix);
+    this.logListener = new ExternalDaemonLogErrorListener(getLogPrefix());
+    this.logPrinter = new LogPrinter(process.getInputStream(), getLogPrefix(), logListener);
     LOG.info("Started stdout/stderr threads for mini YB daemon: " + this);
     new TerminationHandler().startInBackground();
   }
 
-  public List<LogPrinter> getLogPrinters() {
-    return Arrays.asList(new LogPrinter[] { stdoutPrinter, stderrPrinter });
+  public LogPrinter getLogPrinter() {
+    return logPrinter;
   }
 
   public MiniYBDaemonType getType() {
@@ -234,7 +248,7 @@ public class MiniYBDaemon {
   }
 
   public int getPid() throws NoSuchFieldException, IllegalAccessException {
-    return TestUtils.pidOfProcess(process);
+    return ProcessUtil.pidOfProcess(process);
   }
 
   String getPidStr() {
@@ -252,7 +266,7 @@ public class MiniYBDaemon {
   MiniYBDaemon restart() throws Exception {
     return new MiniYBDaemon(type, indexForLog, commandLine,
                             new ProcessBuilder(commandLine).redirectErrorStream(true).start(),
-                            bindIp, rpcPort, webPort, cqlWebPort, redisWebPort, pgsqlWebPort,
+                            bindIp, rpcPort, webPort, cqlWebPort, pgsqlWebPort, redisWebPort,
                             dataDirPath);
   }
 
@@ -270,15 +284,19 @@ public class MiniYBDaemon {
   private final int rpcPort;
   private final int webPort;
   private final int cqlWebPort;
-  private final int redisWebPort;
   private final int pgsqlWebPort;
+  private final int redisWebPort;
   private final String dataDirPath;
   private final CountDownLatch shutdownLatch = new CountDownLatch(1);
-  private final LogPrinter stdoutPrinter;
-  private final LogPrinter stderrPrinter;
+  private final LogPrinter logPrinter;
+  private final ExternalDaemonLogErrorListener logListener;
 
   public HostAndPort getWebHostAndPort() {
     return HostAndPort.fromParts(bindIp, webPort);
+  }
+
+  public HostAndPort getHostAndPort() {
+    return HostAndPort.fromParts(bindIp, rpcPort);
   }
 
   public int getWebPort() {
@@ -298,6 +316,10 @@ public class MiniYBDaemon {
     return bindIp;
   }
 
+  public int getPgsqlWebPort() {
+    return pgsqlWebPort;
+  }
+
   void waitForShutdown() {
     try {
       if (!shutdownLatch.await(10, TimeUnit.SECONDS)) {
@@ -307,6 +329,11 @@ public class MiniYBDaemon {
       LOG.warn("Interrupted when waiting for logging of process shutdown to finish: " + this);
       Thread.currentThread().interrupt();
     }
+  }
+
+  public void waitForServerStartLogMessage(long deadlineMs) throws InterruptedException {
+    logListener.waitForServerStartingLogLine(deadlineMs);
+    LOG.info("Saw an 'RPC server started' message from " + this);
   }
 
 }

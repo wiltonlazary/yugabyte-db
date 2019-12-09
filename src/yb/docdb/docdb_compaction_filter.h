@@ -18,41 +18,83 @@
 #include <memory>
 #include <vector>
 
+#include <boost/container/small_vector.hpp>
+
+#include "yb/gutil/thread_annotations.h"
+#include "yb/util/strongly_typed_bool.h"
+
 #include "yb/rocksdb/compaction_filter.h"
+#include "yb/rocksdb/metadata.h"
 
 #include "yb/common/schema.h"
 #include "yb/common/hybrid_time.h"
+
 #include "yb/docdb/doc_key.h"
+#include "yb/docdb/expiration.h"
 
 namespace yb {
 namespace docdb {
 
-class DocDBCompactionFilter : public rocksdb::CompactionFilter {
- public:
-  DocDBCompactionFilter(HybridTime history_cutoff,
-                        ColumnIdsPtr deleted_cols,
-                        bool is_major_compaction,
-                        MonoDelta table_ttl);
+YB_STRONGLY_TYPED_BOOL(IsMajorCompaction);
 
-  ~DocDBCompactionFilter() override;
-  bool Filter(int level,
-              const rocksdb::Slice& key,
-              const rocksdb::Slice& existing_value,
-              std::string* new_value,
-              bool* value_changed) const override;
-  const char* Name() const override;
+struct Expiration;
 
- private:
+// A "directive" of how a particular compaction should retain old (overwritten or deleted) values.
+struct HistoryRetentionDirective {
   // We will not keep history below this hybrid_time. The view of the database at this hybrid_time
   // is preserved, but after the compaction completes, we should not expect to be able to do
   // consistent scans at DocDB hybrid times lower than this. Those scans will result in missing
   // data. Therefore, it is really important to always set this to a value lower than or equal to
   // the lowest "read point" of any pending read operations.
-  const HybridTime history_cutoff_;
-  const bool is_major_compaction_;
+  HybridTime history_cutoff;
 
-  mutable bool is_first_key_value_;
-  mutable SubDocKey prev_subdoc_key_;
+  // Columns that were deleted at a timestamp lower than the history cutoff.
+  ColumnIdsPtr deleted_cols;
+
+  MonoDelta table_ttl;
+};
+
+// DocDB compaction filter. A new instance of this class is created for every compaction.
+class DocDBCompactionFilter : public rocksdb::CompactionFilter {
+ public:
+  DocDBCompactionFilter(
+      HistoryRetentionDirective retention,
+      IsMajorCompaction is_major_compaction,
+      const KeyBounds* key_bounds);
+
+  ~DocDBCompactionFilter() override;
+  rocksdb::FilterDecision Filter(
+      int level, const Slice& key, const Slice& existing_value, std::string* new_value,
+      bool* value_changed) override;
+  const char* Name() const override;
+
+  // This indicates we don't have a cached TTL. We need this to be different from kMaxTtl
+  // and kResetTtl because a PERSIST call would lead to a cached TTL of kMaxTtl, and kResetTtl
+  // indicates no TTL in Cassandra.
+  const MonoDelta kNoTtl = MonoDelta::FromNanoseconds(-1);
+
+  // This is used to provide the history_cutoff timestamp to the compaction as a field in the
+  // ConsensusFrontier, so that it can be persisted in RocksDB metadata and recovered on bootstrap.
+  rocksdb::UserFrontierPtr GetLargestUserFrontier() const override;
+
+ private:
+  // Assigns prev_subdoc_key_ from memory addressed by data. The length of key is taken from
+  // sub_key_ends_ and same_bytes are reused.
+  void AssignPrevSubDocKey(const char* data, size_t same_bytes);
+
+  // Actual Filter implementation.
+  Result<rocksdb::FilterDecision> DoFilter(
+      int level, const Slice& key, const Slice& existing_value, std::string* new_value,
+      bool* value_changed);
+
+  const HistoryRetentionDirective retention_;
+  const KeyBounds* key_bounds_;
+  const IsMajorCompaction is_major_compaction_;
+
+  std::vector<char> prev_subdoc_key_;
+
+  // Result of DecodeDocKeyAndSubKeyEnds for prev_subdoc_key_.
+  boost::container::small_vector<size_t, 16> sub_key_ends_;
 
   // A stack of highest hybrid_times lower than or equal to history_cutoff_ at which parent
   // subdocuments of the key that has just been processed, or the subdocument / primitive value
@@ -90,56 +132,31 @@ class DocDBCompactionFilter : public rocksdb::CompactionFilter {
   // doc_key1 subkey1 HT(21) -> "value2"  | [20, 23]      | 21 < 23, deleting the entry
   // doc_key1 subkey1 HT(15) -> "value1"  | [20, 23]      | 15 < 23, deleting the entry
 
-  mutable std::vector<DocHybridTime> overwrite_ht_;
+  struct OverwriteData {
+    DocHybridTime doc_ht;
+    Expiration expiration;
+  };
+
+  std::vector<OverwriteData> overwrite_;
 
   // We use this to only log a message that the filter is being used once on the first call to
   // the Filter function.
-  mutable bool filter_usage_logged_;
-
-  // Default TTL of table.
-  MonoDelta table_ttl_;
-
-  ColumnIdsPtr deleted_cols_;
+  bool filter_usage_logged_ = false;
+  bool within_merge_block_ = false;
 };
 
-// A strategy for deciding the history cutoff. We may implement this differently in production and
-// in tests.
+// A strategy for deciding how the history of old database operations should be retained during
+// compactions. We may implement this differently in production and in tests.
 class HistoryRetentionPolicy {
  public:
-  virtual ~HistoryRetentionPolicy() {}
-  virtual HybridTime GetHistoryCutoff() = 0;
-  virtual ColumnIdsPtr GetDeletedColumns() = 0;
-  virtual MonoDelta GetTableTTL() = 0;
-};
-
-// A history retention policy that always returns the same hybrid_time. Useful in tests. This class
-// is thread-safe.
-class FixedHybridTimeRetentionPolicy : public HistoryRetentionPolicy {
- public:
-  explicit FixedHybridTimeRetentionPolicy(HybridTime history_cutoff, MonoDelta table_ttl)
-      : history_cutoff_(history_cutoff), table_ttl_(table_ttl) {
-  }
-
-  HybridTime GetHistoryCutoff() override { return history_cutoff_.load(); }
-  void SetHistoryCutoff(HybridTime history_cutoff) { history_cutoff_.store(history_cutoff); }
-
-  ColumnIdsPtr GetDeletedColumns() override {
-    return std::make_shared<ColumnIds>(deleted_cols_);
-  }
-  void AddDeletedColumn(ColumnId col) { deleted_cols_.insert(col); }
-
-  MonoDelta GetTableTTL() override { return table_ttl_; }
-  void SetTableTTLForTests(MonoDelta ttl) {  table_ttl_ = ttl; }
-
- private:
-  std::atomic<HybridTime> history_cutoff_;
-  ColumnIds deleted_cols_;
-  MonoDelta table_ttl_;
+  virtual ~HistoryRetentionPolicy() = default;
+  virtual HistoryRetentionDirective GetRetentionDirective() = 0;
 };
 
 class DocDBCompactionFilterFactory : public rocksdb::CompactionFilterFactory {
  public:
-  explicit DocDBCompactionFilterFactory(std::shared_ptr<HistoryRetentionPolicy> retention_policy);
+  explicit DocDBCompactionFilterFactory(
+      std::shared_ptr<HistoryRetentionPolicy> retention_policy, const KeyBounds* key_bounds);
   ~DocDBCompactionFilterFactory() override;
   std::unique_ptr<rocksdb::CompactionFilter> CreateCompactionFilter(
       const rocksdb::CompactionFilter::Context& context) override;
@@ -147,6 +164,28 @@ class DocDBCompactionFilterFactory : public rocksdb::CompactionFilterFactory {
 
  private:
   std::shared_ptr<HistoryRetentionPolicy> retention_policy_;
+  const KeyBounds* key_bounds_;
+};
+
+// A history retention policy that can be configured manually. Useful in tests. This class is
+// useful for testing and is thread-safe.
+class ManualHistoryRetentionPolicy : public HistoryRetentionPolicy {
+ public:
+  HistoryRetentionDirective GetRetentionDirective() override;
+
+  void SetHistoryCutoff(HybridTime history_cutoff);
+
+  void AddDeletedColumn(ColumnId col);
+
+  void SetTableTTLForTests(MonoDelta ttl);
+
+ private:
+  std::atomic<HybridTime> history_cutoff_{HybridTime::kMin};
+
+  std::mutex deleted_cols_mtx_;
+  ColumnIds deleted_cols_ GUARDED_BY(deleted_cols_mtx_);
+
+  std::atomic<MonoDelta> table_ttl_{MonoDelta::kMax};
 };
 
 }  // namespace docdb

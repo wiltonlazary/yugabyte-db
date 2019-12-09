@@ -74,7 +74,6 @@ using base::subtle::Barrier_AtomicIncrement;
 using strings::Substitute;
 
 using yb::consensus::MinimumOpId;
-using yb::consensus::RaftConfigPB;
 
 namespace yb {
 namespace tablet {
@@ -84,26 +83,160 @@ const std::string kIntentsSubdir = "intents";
 const std::string kIntentsDBSuffix = ".intents";
 
 // ============================================================================
-//  Tablet Metadata
+//  Raft group metadata
 // ============================================================================
 
-Status TabletMetadata::CreateNew(FsManager* fs_manager,
-                                 const string& table_id,
-                                 const string& tablet_id,
+TableInfo::TableInfo(std::string table_id,
+                     std::string table_name,
+                     TableType table_type,
+                     const Schema& schema,
+                     const IndexMap& index_map,
+                     const boost::optional<IndexInfo>& index_info,
+                     const uint32_t schema_version,
+                     PartitionSchema partition_schema)
+    : table_id(std::move(table_id)),
+      table_name(std::move(table_name)),
+      table_type(table_type),
+      schema(schema),
+      index_map(index_map),
+      index_info(index_info ? new IndexInfo(*index_info) : nullptr),
+      schema_version(schema_version),
+      partition_schema(std::move(partition_schema)) {
+}
+
+TableInfo::TableInfo(const TableInfo& other,
+                     const Schema& schema,
+                     const IndexMap& index_map,
+                     const std::vector<DeletedColumn>& deleted_cols,
+                     const uint32_t schema_version)
+    : table_id(other.table_id),
+      table_name(other.table_name),
+      table_type(other.table_type),
+      schema(schema),
+      index_map(index_map),
+      index_info(other.index_info ? new IndexInfo(*other.index_info) : nullptr),
+      schema_version(schema_version),
+      partition_schema(other.partition_schema),
+      deleted_cols(other.deleted_cols) {
+  this->deleted_cols.insert(this->deleted_cols.end(), deleted_cols.begin(), deleted_cols.end());
+}
+
+Status TableInfo::LoadFromPB(const TableInfoPB& pb) {
+  table_id = pb.table_id();
+  table_name = pb.table_name();
+  table_type = pb.table_type();
+
+  RETURN_NOT_OK(SchemaFromPB(pb.schema(), &schema));
+  if (pb.has_index_info()) {
+    index_info.reset(new IndexInfo(pb.index_info()));
+  }
+  index_map.FromPB(pb.indexes());
+  schema_version = pb.schema_version();
+
+  RETURN_NOT_OK(PartitionSchema::FromPB(pb.partition_schema(), schema, &partition_schema));
+
+  for (const DeletedColumnPB& deleted_col : pb.deleted_cols()) {
+    DeletedColumn col;
+    RETURN_NOT_OK(DeletedColumn::FromPB(deleted_col, &col));
+    deleted_cols.push_back(col);
+  }
+
+  return Status::OK();
+}
+
+void TableInfo::ToPB(TableInfoPB* pb) const {
+  pb->set_table_id(table_id);
+  pb->set_table_name(table_name);
+  pb->set_table_type(table_type);
+
+  DCHECK(schema.has_column_ids());
+  SchemaToPB(schema, pb->mutable_schema());
+  if (index_info) {
+    index_info->ToPB(pb->mutable_index_info());
+  }
+  index_map.ToPB(pb->mutable_indexes());
+  pb->set_schema_version(schema_version);
+
+  partition_schema.ToPB(pb->mutable_partition_schema());
+
+  for (const DeletedColumn& deleted_col : deleted_cols) {
+    deleted_col.CopyToPB(pb->mutable_deleted_cols()->Add());
+  }
+}
+
+Status KvStoreInfo::LoadTablesFromPB(
+    google::protobuf::RepeatedPtrField<TableInfoPB> pbs, TableId primary_table_id) {
+  tables.clear();
+  for (const auto& table_pb : pbs) {
+    auto table_info = std::make_unique<TableInfo>();
+    RETURN_NOT_OK(table_info->LoadFromPB(table_pb));
+    if (table_info->table_id != primary_table_id) {
+      Uuid cotable_id;
+      CHECK_OK(cotable_id.FromHexString(table_info->table_id));
+      // TODO(#79): when adding for multiple KV-stores per Raft group support - check if we need
+      // to set cotable ID.
+      table_info->schema.set_cotable_id(cotable_id);
+    }
+    tables[table_info->table_id] = std::move(table_info);
+  }
+  return Status::OK();
+}
+
+Status KvStoreInfo::LoadFromPB(const KvStoreInfoPB& pb, TableId primary_table_id) {
+  kv_store_id = KvStoreId(pb.kv_store_id());
+  rocksdb_dir = pb.rocksdb_dir();
+  lower_bound_key = pb.lower_bound_key();
+  upper_bound_key = pb.upper_bound_key();
+  return LoadTablesFromPB(pb.tables(), primary_table_id);
+}
+
+void KvStoreInfo::ToPB(TableId primary_table_id, KvStoreInfoPB* pb) const {
+  pb->set_kv_store_id(kv_store_id.ToString());
+  pb->set_rocksdb_dir(rocksdb_dir);
+  if (lower_bound_key.empty()) {
+    pb->clear_lower_bound_key();
+  } else {
+    pb->set_lower_bound_key(lower_bound_key);
+  }
+  if (upper_bound_key.empty()) {
+    pb->clear_upper_bound_key();
+  } else {
+    pb->set_upper_bound_key(upper_bound_key);
+  }
+
+  // Putting primary table first, then all other tables.
+  const auto& it = tables.find(primary_table_id);
+  if (it != tables.end()) {
+    it->second->ToPB(pb->add_tables());
+  }
+  for (const auto& it : tables) {
+    if (it.first != primary_table_id) {
+      it.second->ToPB(pb->add_tables());
+    }
+  }
+}
+
+// ============================================================================
+
+Status RaftGroupMetadata::CreateNew(FsManager* fs_manager,
+                                 const TableId& table_id,
+                                 const RaftGroupId& raft_group_id,
                                  const string& table_name,
                                  const TableType table_type,
                                  const Schema& schema,
+                                 const IndexMap& index_map,
                                  const PartitionSchema& partition_schema,
                                  const Partition& partition,
                                  const boost::optional<IndexInfo>& index_info,
+                                 const uint32_t schema_version,
                                  const TabletDataState& initial_tablet_data_state,
-                                 scoped_refptr<TabletMetadata>* metadata,
+                                 RaftGroupMetadataPtr* metadata,
                                  const string& data_root_dir,
                                  const string& wal_root_dir) {
 
-  // Verify that no existing tablet exists with the same ID.
-  if (fs_manager->env()->FileExists(fs_manager->GetTabletMetadataPath(tablet_id))) {
-    return STATUS(AlreadyPresent, "Tablet already exists", tablet_id);
+  // Verify that no existing Raft group exists with the same ID.
+  if (fs_manager->env()->FileExists(fs_manager->GetRaftGroupMetadataPath(raft_group_id))) {
+    return STATUS(AlreadyPresent, "Raft group already exists", raft_group_id);
   }
 
   auto wal_top_dir = wal_root_dir;
@@ -123,7 +256,7 @@ Status TabletMetadata::CreateNew(FsManager* fs_manager,
   }
 
   auto table_dir = Substitute("table-$0", table_id);
-  auto tablet_dir = Substitute("tablet-$0", tablet_id);
+  auto tablet_dir = Substitute("tablet-$0", raft_group_id);
 
   auto wal_table_top_dir = JoinPathSegments(wal_top_dir, table_dir);
   auto wal_dir = JoinPathSegments(wal_table_top_dir, tablet_dir);
@@ -131,35 +264,37 @@ Status TabletMetadata::CreateNew(FsManager* fs_manager,
   auto rocksdb_dir = JoinPathSegments(
       data_top_dir, FsManager::kRocksDBDirName, table_dir, tablet_dir);
 
-  scoped_refptr<TabletMetadata> ret(new TabletMetadata(fs_manager,
+  RaftGroupMetadataPtr ret(new RaftGroupMetadata(fs_manager,
                                                        table_id,
-                                                       tablet_id,
+                                                       raft_group_id,
                                                        table_name,
                                                        table_type,
                                                        rocksdb_dir,
                                                        wal_dir,
                                                        schema,
+                                                       index_map,
                                                        partition_schema,
                                                        partition,
                                                        index_info,
+                                                       schema_version,
                                                        initial_tablet_data_state));
   RETURN_NOT_OK(ret->Flush());
   metadata->swap(ret);
   return Status::OK();
 }
 
-Status TabletMetadata::Load(FsManager* fs_manager,
-                            const string& tablet_id,
-                            scoped_refptr<TabletMetadata>* metadata) {
-  scoped_refptr<TabletMetadata> ret(new TabletMetadata(fs_manager, tablet_id));
+Status RaftGroupMetadata::Load(FsManager* fs_manager,
+                            const RaftGroupId& raft_group_id,
+                            RaftGroupMetadataPtr* metadata) {
+  RaftGroupMetadataPtr ret(new RaftGroupMetadata(fs_manager, raft_group_id));
   RETURN_NOT_OK(ret->LoadFromDisk());
   metadata->swap(ret);
   return Status::OK();
 }
 
-Status TabletMetadata::LoadOrCreate(FsManager* fs_manager,
+Status RaftGroupMetadata::LoadOrCreate(FsManager* fs_manager,
                                     const string& table_id,
-                                    const string& tablet_id,
+                                    const RaftGroupId& raft_group_id,
                                     const string& table_name,
                                     TableType table_type,
                                     const Schema& schema,
@@ -167,8 +302,8 @@ Status TabletMetadata::LoadOrCreate(FsManager* fs_manager,
                                     const Partition& partition,
                                     const boost::optional<IndexInfo>& index_info,
                                     const TabletDataState& initial_tablet_data_state,
-                                    scoped_refptr<TabletMetadata>* metadata) {
-  Status s = Load(fs_manager, tablet_id, metadata);
+                                    RaftGroupMetadataPtr* metadata) {
+  Status s = Load(fs_manager, raft_group_id, metadata);
   if (s.ok()) {
     if (!(*metadata)->schema().Equals(schema)) {
       return STATUS(Corruption, Substitute("Schema on disk ($0) does not "
@@ -177,20 +312,53 @@ Status TabletMetadata::LoadOrCreate(FsManager* fs_manager,
     }
     return Status::OK();
   } else if (s.IsNotFound()) {
-    return CreateNew(fs_manager, table_id, tablet_id, table_name, table_type,
-                     schema, partition_schema, partition, index_info,
-                     initial_tablet_data_state, metadata);
+    return CreateNew(fs_manager, table_id, raft_group_id, table_name, table_type,
+                     schema, IndexMap(), partition_schema, partition, index_info,
+                     0 /* schema_version */, initial_tablet_data_state, metadata);
   } else {
     return s;
   }
 }
 
-Status TabletMetadata::DeleteTabletData(TabletDataState delete_type,
-                                        const yb::OpId& last_logged_opid) {
+template <class TablesMap>
+CHECKED_STATUS MakeTableNotFound(const TableId& table_id, const RaftGroupId& raft_group_id,
+                                 const TablesMap& tables) {
+#ifndef NDEBUG
+  // This very large message should be logged instead of being appended to STATUS.
+  std::string suffix = Format(". Tables: $0.", tables);
+  VLOG(1) << "Table " << table_id << " not found in Raft group " << raft_group_id << suffix;
+#endif
+  return STATUS_FORMAT(NotFound, "Table $0 not found in Raft group $1", table_id, raft_group_id);
+}
+
+Result<const TableInfo*> RaftGroupMetadata::GetTableInfo(const std::string& table_id) const {
+  std::lock_guard<MutexType> lock(data_mutex_);
+  const auto& tables = kv_store_.tables;
+  const auto id = !table_id.empty() ? table_id : primary_table_id_;
+  const auto iter = tables.find(id);
+  if (iter == tables.end()) {
+    return MakeTableNotFound(table_id, raft_group_id_, tables);
+  }
+  return iter->second.get();
+}
+
+Result<TableInfo*> RaftGroupMetadata::GetTableInfo(const std::string& table_id) {
+  std::lock_guard<MutexType> lock(data_mutex_);
+  const auto& tables = kv_store_.tables;
+  const auto id = !table_id.empty() ? table_id : primary_table_id_;
+  const auto iter = tables.find(id);
+  if (iter == tables.end()) {
+    return MakeTableNotFound(table_id, raft_group_id_, tables);
+  }
+  return iter->second.get();
+}
+
+Status RaftGroupMetadata::DeleteTabletData(TabletDataState delete_type,
+                                           const yb::OpId& last_logged_opid) {
   CHECK(delete_type == TABLET_DATA_DELETED ||
         delete_type == TABLET_DATA_TOMBSTONED)
       << "DeleteTabletData() called with unsupported delete_type on tablet "
-      << tablet_id_ << ": " << TabletDataState_Name(delete_type)
+      << raft_group_id_ << ": " << TabletDataState_Name(delete_type)
       << " (" << delete_type << ")";
 
   // First add all of our blocks to the orphan list
@@ -199,7 +367,7 @@ Status TabletMetadata::DeleteTabletData(TabletDataState delete_type,
   // We also set the state in our persisted metadata to indicate that
   // we have been deleted.
   {
-    std::lock_guard<LockType> l(data_lock_);
+    std::lock_guard<MutexType> lock(data_mutex_);
     tablet_data_state_ = delete_type;
     if (last_logged_opid) {
       tombstone_last_logged_opid_ = last_logged_opid;
@@ -208,21 +376,23 @@ Status TabletMetadata::DeleteTabletData(TabletDataState delete_type,
 
   rocksdb::Options rocksdb_options;
   TabletOptions tablet_options;
+  std::string log_prefix = Format("T $0 P $1: ", raft_group_id_, fs_manager_->uuid());
   docdb::InitRocksDBOptions(
-      &rocksdb_options, tablet_id_, nullptr /* statistics */, tablet_options);
+      &rocksdb_options, log_prefix, nullptr /* statistics */, tablet_options);
 
-  LOG(INFO) << "Destroying regular db at: " << rocksdb_dir_;
-  rocksdb::Status status = rocksdb::DestroyDB(rocksdb_dir_, rocksdb_options);
+  const auto& rocksdb_dir = kv_store_.rocksdb_dir;
+  LOG(INFO) << "Destroying regular db at: " << rocksdb_dir;
+  rocksdb::Status status = rocksdb::DestroyDB(rocksdb_dir, rocksdb_options);
 
   if (!status.ok()) {
-    LOG(ERROR) << "Failed to destroy regular DB at: " << rocksdb_dir_ << ": " << status;
+    LOG(ERROR) << "Failed to destroy regular DB at: " << rocksdb_dir << ": " << status;
   } else {
-    LOG(INFO) << "Successfully destroyed regular DB at: " << rocksdb_dir_;
+    LOG(INFO) << "Successfully destroyed regular DB at: " << rocksdb_dir;
   }
 
-  auto intents_dir = rocksdb_dir_ + kIntentsDBSuffix;
+  const auto intents_dir = rocksdb_dir + kIntentsDBSuffix;
   if (fs_manager_->env()->FileExists(intents_dir)) {
-    auto status = rocksdb::DestroyDB(intents_dir, rocksdb_options);
+    status = rocksdb::DestroyDB(intents_dir, rocksdb_options);
 
     if (!status.ok()) {
       LOG(ERROR) << "Failed to destroy provisional records DB at: " << intents_dir << ": "
@@ -243,78 +413,78 @@ Status TabletMetadata::DeleteTabletData(TabletDataState delete_type,
   return Flush();
 }
 
-Status TabletMetadata::DeleteSuperBlock() {
-  std::lock_guard<LockType> l(data_lock_);
-  if (!orphaned_blocks_.empty()) {
-    return STATUS(InvalidArgument, "The metadata for tablet " + tablet_id_ +
-                                   " still references orphaned blocks. "
-                                   "Call DeleteTabletData() first");
-  }
+Status RaftGroupMetadata::DeleteSuperBlock() {
+  std::lock_guard<MutexType> lock(data_mutex_);
   if (tablet_data_state_ != TABLET_DATA_DELETED) {
     return STATUS(IllegalState,
         Substitute("Tablet $0 is not in TABLET_DATA_DELETED state. "
                    "Call DeleteTabletData(TABLET_DATA_DELETED) first. "
                    "Tablet data state: $1 ($2)",
-                   tablet_id_,
+                   raft_group_id_,
                    TabletDataState_Name(tablet_data_state_),
                    tablet_data_state_));
   }
 
-  string path = fs_manager_->GetTabletMetadataPath(tablet_id_);
+  string path = fs_manager_->GetRaftGroupMetadataPath(raft_group_id_);
   RETURN_NOT_OK_PREPEND(fs_manager_->env()->DeleteFile(path),
-                        "Unable to delete superblock for tablet " + tablet_id_);
+                        "Unable to delete superblock for Raft group " + raft_group_id_);
   return Status::OK();
 }
 
-TabletMetadata::TabletMetadata(FsManager* fs_manager,
-                               string table_id,
-                               string tablet_id,
+RaftGroupMetadata::RaftGroupMetadata(FsManager* fs_manager,
+                               TableId table_id,
+                               RaftGroupId raft_group_id,
                                string table_name,
                                TableType table_type,
                                const string rocksdb_dir,
                                const string wal_dir,
                                const Schema& schema,
+                               const IndexMap& index_map,
                                PartitionSchema partition_schema,
                                Partition partition,
                                const boost::optional<IndexInfo>& index_info,
+                               const uint32_t schema_version,
                                const TabletDataState& tablet_data_state)
     : state_(kNotWrittenYet),
-      table_id_(std::move(table_id)),
-      tablet_id_(std::move(tablet_id)),
+      raft_group_id_(std::move(raft_group_id)),
       partition_(std::move(partition)),
+      primary_table_id_(table_id),
+      kv_store_(KvStoreId(raft_group_id), rocksdb_dir),
       fs_manager_(fs_manager),
-      last_durable_mrs_id_(kNoDurableMemStore),
-      schema_(new Schema(schema)),
-      schema_version_(0),
-      table_name_(std::move(table_name)),
-      table_type_(table_type),
-      index_info_(index_info),
-      rocksdb_dir_(rocksdb_dir),
       wal_dir_(wal_dir),
-      partition_schema_(std::move(partition_schema)),
       tablet_data_state_(tablet_data_state) {
-  CHECK(schema_->has_column_ids());
-  CHECK_GT(schema_->num_key_columns(), 0);
+  CHECK(schema.has_column_ids());
+  CHECK_GT(schema.num_key_columns(), 0);
+  kv_store_.tables.emplace(
+      primary_table_id_,
+      std::make_unique<TableInfo>(
+          std::move(table_id),
+          std::move(table_name),
+          table_type,
+          schema,
+          index_map,
+          index_info,
+          schema_version,
+          std::move(partition_schema)));
 }
 
-TabletMetadata::~TabletMetadata() {
-  STLDeleteElements(&old_schemas_);
-  delete schema_;
+RaftGroupMetadata::~RaftGroupMetadata() {
 }
 
-TabletMetadata::TabletMetadata(FsManager* fs_manager, string tablet_id)
+RaftGroupMetadata::RaftGroupMetadata(FsManager* fs_manager, RaftGroupId raft_group_id)
     : state_(kNotLoadedYet),
-      tablet_id_(std::move(tablet_id)),
-      fs_manager_(fs_manager),
-      schema_(nullptr) {}
+      raft_group_id_(std::move(raft_group_id)),
+      kv_store_(KvStoreId(raft_group_id)),
+      fs_manager_(fs_manager) {
+}
 
-Status TabletMetadata::LoadFromDisk() {
-  TRACE_EVENT1("tablet", "TabletMetadata::LoadFromDisk",
-               "tablet_id", tablet_id_);
+Status RaftGroupMetadata::LoadFromDisk() {
+  TRACE_EVENT1("raft_group", "RaftGroupMetadata::LoadFromDisk",
+               "raft_group_id", raft_group_id_);
 
   CHECK_EQ(state_, kNotLoadedYet);
 
-  TabletSuperBlockPB superblock;
+  RaftGroupReplicaSuperBlockPB superblock;
   RETURN_NOT_OK(ReadSuperBlockFromDisk(&superblock));
   RETURN_NOT_OK_PREPEND(LoadFromSuperBlock(superblock),
                         "Failed to load data from superblock protobuf");
@@ -322,64 +492,34 @@ Status TabletMetadata::LoadFromDisk() {
   return Status::OK();
 }
 
-Status TabletMetadata::LoadFromSuperBlock(const TabletSuperBlockPB& superblock) {
-  vector<BlockId> orphaned_blocks;
+Status RaftGroupMetadata::LoadFromSuperBlock(const RaftGroupReplicaSuperBlockPB& superblock) {
+  if (!superblock.has_kv_store()) {
+    // Backward compatibility for tablet=KV-store=raft-group.
+    RaftGroupReplicaSuperBlockPB superblock_migrated(superblock);
+    RETURN_NOT_OK(MigrateSuperblock(&superblock_migrated));
+    RETURN_NOT_OK(LoadFromSuperBlock(superblock_migrated));
+    return Flush();
+  }
 
-  VLOG(2) << "Loading TabletMetadata from SuperBlockPB:" << std::endl
+  VLOG(2) << "Loading RaftGroupMetadata from SuperBlockPB:" << std::endl
           << superblock.DebugString();
 
   {
-    std::lock_guard<LockType> l(data_lock_);
+    std::lock_guard<MutexType> lock(data_mutex_);
 
-    // Verify that the tablet id matches with the one in the protobuf
-    if (superblock.tablet_id() != tablet_id_) {
-      return STATUS(Corruption, "Expected id=" + tablet_id_ +
-                                " found " + superblock.tablet_id(),
+    // Verify that the Raft group id matches with the one in the protobuf.
+    if (superblock.raft_group_id() != raft_group_id_) {
+      return STATUS(Corruption, "Expected id=" + raft_group_id_ +
+                                " found " + superblock.raft_group_id(),
                                 superblock.DebugString());
     }
+    Partition::FromPB(superblock.partition(), &partition_);
+    primary_table_id_ = superblock.primary_table_id();
 
-    table_id_ = superblock.table_id();
-    last_durable_mrs_id_ = superblock.last_durable_mrs_id();
+    RETURN_NOT_OK(kv_store_.LoadFromPB(superblock.kv_store(), primary_table_id_));
 
-    table_name_ = superblock.table_name();
-    table_type_ = superblock.table_type();
-    index_map_.FromPB(superblock.indexes());
-    if (superblock.has_index_info()) {
-      index_info_.emplace(superblock.index_info());
-    }
-    rocksdb_dir_ = superblock.rocksdb_dir();
     wal_dir_ = superblock.wal_dir();
-
-    uint32_t schema_version = superblock.schema_version();
-    gscoped_ptr<Schema> schema(new Schema());
-    RETURN_NOT_OK_PREPEND(SchemaFromPB(superblock.schema(), schema.get()),
-                          "Failed to parse Schema from superblock " +
-                          superblock.ShortDebugString());
-    SetSchemaUnlocked(schema.Pass(), schema_version);
-
-    // This check provides backwards compatibility with the
-    // flexible-partitioning changes introduced in KUDU-818.
-    if (superblock.has_partition()) {
-      RETURN_NOT_OK(PartitionSchema::FromPB(superblock.partition_schema(),
-                                            *schema_, &partition_schema_));
-      Partition::FromPB(superblock.partition(), &partition_);
-    } else {
-      LOG(FATAL) << "partition field must be set in superblock: " << superblock.ShortDebugString();
-    }
-
     tablet_data_state_ = superblock.tablet_data_state();
-
-    deleted_cols_.clear();
-    for (const DeletedColumnPB& deleted_col : superblock.deleted_cols()) {
-      DeletedColumn col;
-      RETURN_NOT_OK(DeletedColumn::FromPB(deleted_col, &col));
-      deleted_cols_.push_back(col);
-    }
-
-    for (const BlockIdPB& block_pb : superblock.orphaned_blocks()) {
-      orphaned_blocks.push_back(BlockId::FromPB(block_pb));
-    }
-    AddOrphanedBlocksUnlocked(orphaned_blocks);
 
     if (superblock.has_tombstone_last_logged_opid()) {
       tombstone_last_logged_opid_ = yb::OpId::FromPB(superblock.tombstone_last_logged_opid());
@@ -388,115 +528,26 @@ Status TabletMetadata::LoadFromSuperBlock(const TabletSuperBlockPB& superblock) 
     }
   }
 
-  // Now is a good time to clean up any orphaned blocks that may have been
-  // left behind from a crash just after replacing the superblock.
-  if (!fs_manager()->read_only()) {
-    DeleteOrphanedBlocks(orphaned_blocks);
-  }
-
   return Status::OK();
 }
 
-void TabletMetadata::AddOrphanedBlocks(const vector<BlockId>& blocks) {
-  std::lock_guard<LockType> l(data_lock_);
-  AddOrphanedBlocksUnlocked(blocks);
-}
-
-void TabletMetadata::AddOrphanedBlocksUnlocked(const vector<BlockId>& blocks) {
-  DCHECK(data_lock_.is_locked());
-  orphaned_blocks_.insert(blocks.begin(), blocks.end());
-}
-
-void TabletMetadata::DeleteOrphanedBlocks(const vector<BlockId>& blocks) {
-  if (PREDICT_FALSE(!FLAGS_enable_tablet_orphaned_block_deletion)) {
-    LOG_WITH_PREFIX(WARNING) << "Not deleting " << blocks.size()
-        << " block(s) from disk. Block deletion disabled via "
-        << "--enable_tablet_orphaned_block_deletion=false";
-    return;
-  }
-
-  vector<BlockId> deleted;
-  for (const BlockId& b : blocks) {
-    Status s = fs_manager()->DeleteBlock(b);
-    // If we get NotFound, then the block was actually successfully
-    // deleted before. So, we can remove it from our orphaned block list
-    // as if it was a success.
-    if (!s.ok() && !s.IsNotFound()) {
-      WARN_NOT_OK(s, Substitute("Could not delete block $0", b.ToString()));
-      continue;
-    }
-
-    deleted.push_back(b);
-  }
-
-  // Remove the successfully-deleted blocks from the set.
-  {
-    std::lock_guard<LockType> l(data_lock_);
-    for (const BlockId& b : deleted) {
-      orphaned_blocks_.erase(b);
-    }
-  }
-}
-
-void TabletMetadata::PinFlush() {
-  std::lock_guard<LockType> l(data_lock_);
-  CHECK_GE(num_flush_pins_, 0);
-  num_flush_pins_++;
-  VLOG(1) << "Number of flush pins: " << num_flush_pins_;
-}
-
-Status TabletMetadata::UnPinFlush() {
-  std::unique_lock<LockType> l(data_lock_);
-  CHECK_GT(num_flush_pins_, 0);
-  num_flush_pins_--;
-  if (needs_flush_) {
-    l.unlock();
-    RETURN_NOT_OK(Flush());
-  }
-  return Status::OK();
-}
-
-Status TabletMetadata::Flush() {
-  TRACE_EVENT1("tablet", "TabletMetadata::Flush",
-               "tablet_id", tablet_id_);
+Status RaftGroupMetadata::Flush() {
+  TRACE_EVENT1("raft_group", "RaftGroupMetadata::Flush",
+               "raft_group_id", raft_group_id_);
 
   MutexLock l_flush(flush_lock_);
-  vector<BlockId> orphaned;
-  TabletSuperBlockPB pb;
+  RaftGroupReplicaSuperBlockPB pb;
   {
-    std::lock_guard<LockType> l(data_lock_);
-    CHECK_GE(num_flush_pins_, 0);
-    if (num_flush_pins_ > 0) {
-      needs_flush_ = true;
-      LOG(INFO) << "Not flushing: waiting for " << num_flush_pins_ << " pins to be released.";
-      return Status::OK();
-    }
-    needs_flush_ = false;
-
-    RETURN_NOT_OK(ToSuperBlockUnlocked(&pb));
-
-    // Make a copy of the orphaned blocks list which corresponds to the superblock
-    // that we're writing. It's important to take this local copy to avoid a race
-    // in which another thread may add new orphaned blocks to the 'orphaned_blocks_'
-    // set while we're in the process of writing the new superblock to disk. We don't
-    // want to accidentally delete those blocks before that next metadata update
-    // is persisted. See KUDU-701 for details.
-    orphaned.assign(orphaned_blocks_.begin(), orphaned_blocks_.end());
+    std::lock_guard<MutexType> lock(data_mutex_);
+    ToSuperBlockUnlocked(&pb);
   }
   RETURN_NOT_OK(ReplaceSuperBlockUnlocked(pb));
   TRACE("Metadata flushed");
-  l_flush.Unlock();
-
-  // Now that the superblock is written, try to delete the orphaned blocks.
-  //
-  // If we crash just before the deletion, we'll retry when reloading from
-  // disk; the orphaned blocks were persisted as part of the superblock.
-  DeleteOrphanedBlocks(orphaned);
 
   return Status::OK();
 }
 
-Status TabletMetadata::ReplaceSuperBlock(const TabletSuperBlockPB &pb) {
+Status RaftGroupMetadata::ReplaceSuperBlock(const RaftGroupReplicaSuperBlockPB &pb) {
   {
     MutexLock l(flush_lock_);
     RETURN_NOT_OK_PREPEND(ReplaceSuperBlockUnlocked(pb), "Unable to replace superblock");
@@ -508,119 +559,129 @@ Status TabletMetadata::ReplaceSuperBlock(const TabletSuperBlockPB &pb) {
   return Status::OK();
 }
 
-Status TabletMetadata::ReplaceSuperBlockUnlocked(const TabletSuperBlockPB &pb) {
+Status RaftGroupMetadata::ReplaceSuperBlockUnlocked(const RaftGroupReplicaSuperBlockPB &pb) {
   flush_lock_.AssertAcquired();
 
-  string path = fs_manager_->GetTabletMetadataPath(tablet_id_);
+  string path = fs_manager_->GetRaftGroupMetadataPath(raft_group_id_);
   RETURN_NOT_OK_PREPEND(pb_util::WritePBContainerToPath(
                             fs_manager_->env(), path, pb,
                             pb_util::OVERWRITE, pb_util::SYNC),
-                        Substitute("Failed to write tablet metadata $0", tablet_id_));
+                        Substitute("Failed to write Raft group metadata $0", raft_group_id_));
 
   return Status::OK();
 }
 
-Status TabletMetadata::ReadSuperBlockFromDisk(TabletSuperBlockPB* superblock) const {
-  string path = fs_manager_->GetTabletMetadataPath(tablet_id_);
+Status RaftGroupMetadata::ReadSuperBlockFromDisk(RaftGroupReplicaSuperBlockPB* superblock) const {
+  string path = fs_manager_->GetRaftGroupMetadataPath(raft_group_id_);
   RETURN_NOT_OK_PREPEND(
       pb_util::ReadPBContainerFromPath(fs_manager_->env(), path, superblock),
-      Substitute("Could not load tablet metadata from $0", path));
+      Substitute("Could not load Raft group metadata from $0", path));
+  // Migration for backward compatibility with versions which don't have separate
+  // TableType::TRANSACTION_STATUS_TABLE_TYPE.
+  if (superblock->obsolete_table_type() == TableType::REDIS_TABLE_TYPE &&
+      superblock->obsolete_table_name() == kTransactionsTableName) {
+    superblock->set_obsolete_table_type(TableType::TRANSACTION_STATUS_TABLE_TYPE);
+  }
   return Status::OK();
 }
 
-Status TabletMetadata::ToSuperBlock(TabletSuperBlockPB* super_block) const {
+void RaftGroupMetadata::ToSuperBlock(RaftGroupReplicaSuperBlockPB* superblock) const {
   // acquire the lock so that rowsets_ doesn't get changed until we're finished.
-  std::lock_guard<LockType> l(data_lock_);
-  return ToSuperBlockUnlocked(super_block);
+  std::lock_guard<MutexType> lock(data_mutex_);
+  ToSuperBlockUnlocked(superblock);
 }
 
-Status TabletMetadata::ToSuperBlockUnlocked(TabletSuperBlockPB* super_block) const {
-  DCHECK(data_lock_.is_locked());
-  // Convert to protobuf
-  TabletSuperBlockPB pb;
-  pb.set_table_id(table_id_);
-  pb.set_tablet_id(tablet_id_);
+void RaftGroupMetadata::ToSuperBlockUnlocked(RaftGroupReplicaSuperBlockPB* superblock) const {
+  DCHECK(data_mutex_.is_locked());
+  // Convert to protobuf.
+  RaftGroupReplicaSuperBlockPB pb;
+  pb.set_raft_group_id(raft_group_id_);
   partition_.ToPB(pb.mutable_partition());
-  pb.set_last_durable_mrs_id(last_durable_mrs_id_);
-  pb.set_schema_version(schema_version_);
-  partition_schema_.ToPB(pb.mutable_partition_schema());
-  pb.set_table_name(table_name_);
-  pb.set_table_type(table_type_);
-  index_map_.ToPB(pb.mutable_indexes());
-  if (index_info_) {
-    index_info_->ToPB(pb.mutable_index_info());
-  }
-  pb.set_rocksdb_dir(rocksdb_dir_);
+
+  kv_store_.ToPB(primary_table_id_, pb.mutable_kv_store());
+
   pb.set_wal_dir(wal_dir_);
-
-  DCHECK(schema_->has_column_ids());
-  RETURN_NOT_OK_PREPEND(SchemaToPB(*schema_, pb.mutable_schema()),
-                        "Couldn't serialize schema into superblock");
-
   pb.set_tablet_data_state(tablet_data_state_);
   if (tombstone_last_logged_opid_) {
     tombstone_last_logged_opid_.ToPB(pb.mutable_tombstone_last_logged_opid());
   }
 
-  for (const BlockId& block_id : orphaned_blocks_) {
-    block_id.CopyToPB(pb.mutable_orphaned_blocks()->Add());
+  pb.set_primary_table_id(primary_table_id_);
+
+  superblock->Swap(&pb);
+}
+
+void RaftGroupMetadata::SetSchema(const Schema& schema,
+                                  const IndexMap& index_map,
+                                  const std::vector<DeletedColumn>& deleted_cols,
+                                  const uint32_t version) {
+  DCHECK(schema.has_column_ids());
+  std::lock_guard<MutexType> lock(data_mutex_);
+  std::unique_ptr<TableInfo> new_table_info(new TableInfo(*primary_table_info_unlocked(),
+                                                          schema,
+                                                          index_map,
+                                                          deleted_cols,
+                                                          version));
+  kv_store_.tables[primary_table_id_].swap(new_table_info);
+  if (new_table_info) {
+    kv_store_.old_tables.push_back(std::move(new_table_info));
   }
+}
 
-  for (const DeletedColumn& deleted_col : deleted_cols_) {
-    deleted_col.CopyToPB(pb.mutable_deleted_cols()->Add());
+void RaftGroupMetadata::SetPartitionSchema(const PartitionSchema& partition_schema) {
+  std::lock_guard<MutexType> lock(data_mutex_);
+  auto& tables = kv_store_.tables;
+  DCHECK(tables.find(primary_table_id_) != tables.end());
+  tables[primary_table_id_]->partition_schema = partition_schema;
+}
+
+void RaftGroupMetadata::SetTableName(const string& table_name) {
+  std::lock_guard<MutexType> lock(data_mutex_);
+  auto& tables = kv_store_.tables;
+  DCHECK(tables.find(primary_table_id_) != tables.end());
+  tables[primary_table_id_]->table_name = table_name;
+}
+
+void RaftGroupMetadata::AddTable(const std::string& table_id,
+                              const std::string& table_name,
+                              const TableType table_type,
+                              const Schema& schema,
+                              const IndexMap& index_map,
+                              const PartitionSchema& partition_schema,
+                              const boost::optional<IndexInfo>& index_info,
+                              const uint32_t schema_version) {
+  DCHECK(schema.has_column_ids());
+  std::unique_ptr<TableInfo> new_table_info(new TableInfo(table_id,
+                                                          table_name,
+                                                          table_type,
+                                                          schema,
+                                                          index_map,
+                                                          index_info,
+                                                          schema_version,
+                                                          partition_schema));
+  if (table_id != primary_table_id_) {
+    Uuid cotable_id;
+    CHECK_OK(cotable_id.FromHexString(table_id));
+    new_table_info->schema.set_cotable_id(cotable_id);
   }
-
-  super_block->Swap(&pb);
-  return Status::OK();
+  std::lock_guard<MutexType> lock(data_mutex_);
+  auto& tables = kv_store_.tables;
+  tables[table_id].swap(new_table_info);
+  DCHECK(!new_table_info) << "table " << table_id << " already exists";
 }
 
-void TabletMetadata::SetSchema(const Schema& schema, uint32_t version) {
-  gscoped_ptr<Schema> new_schema(new Schema(schema));
-  std::lock_guard<LockType> l(data_lock_);
-  SetSchemaUnlocked(new_schema.Pass(), version);
+void RaftGroupMetadata::RemoveTable(const std::string& table_id) {
+  std::lock_guard<MutexType> lock(data_mutex_);
+  auto& tables = kv_store_.tables;
+  tables.erase(table_id);
 }
 
-void TabletMetadata::SetIndexMap(IndexMap&& index_map) {
-  std::lock_guard<LockType> l(data_lock_);
-  index_map_ = std::move(index_map);
-}
-
-void TabletMetadata::SetSchemaUnlocked(gscoped_ptr<Schema> new_schema, uint32_t version) {
-  DCHECK(new_schema->has_column_ids());
-
-  Schema* old_schema = schema_;
-  // "Release" barrier ensures that, when we publish the new Schema object,
-  // all of its initialization is also visible.
-  base::subtle::Release_Store(reinterpret_cast<AtomicWord*>(&schema_),
-                              reinterpret_cast<AtomicWord>(new_schema.release()));
-  if (PREDICT_TRUE(old_schema)) {
-    old_schemas_.push_back(old_schema);
-  }
-  schema_version_ = version;
-}
-
-void TabletMetadata::SetTableName(const string& table_name) {
-  std::lock_guard<LockType> l(data_lock_);
-  table_name_ = table_name;
-}
-
-string TabletMetadata::table_name() const {
-  std::lock_guard<LockType> l(data_lock_);
-  DCHECK_NE(state_, kNotLoadedYet);
-  return table_name_;
-}
-
-uint32_t TabletMetadata::schema_version() const {
-  std::lock_guard<LockType> l(data_lock_);
-  DCHECK_NE(state_, kNotLoadedYet);
-  return schema_version_;
-}
-
-string TabletMetadata::data_root_dir() const {
-  if (rocksdb_dir_.empty()) {
+string RaftGroupMetadata::data_root_dir() const {
+  const auto& rocksdb_dir = kv_store_.rocksdb_dir;
+  if (rocksdb_dir.empty()) {
     return "";
   } else {
-    auto data_root_dir = DirName(DirName(rocksdb_dir_));
+    auto data_root_dir = DirName(DirName(rocksdb_dir));
     if (strcmp(BaseName(data_root_dir).c_str(), FsManager::kRocksDBDirName) == 0) {
       data_root_dir = DirName(data_root_dir);
     }
@@ -628,7 +689,7 @@ string TabletMetadata::data_root_dir() const {
   }
 }
 
-string TabletMetadata::wal_root_dir() const {
+string RaftGroupMetadata::wal_root_dir() const {
   if (wal_dir_.empty()) {
     return "";
   } else {
@@ -640,18 +701,110 @@ string TabletMetadata::wal_root_dir() const {
   }
 }
 
-void TabletMetadata::set_tablet_data_state(TabletDataState state) {
-  std::lock_guard<LockType> l(data_lock_);
+void RaftGroupMetadata::set_wal_retention_secs(uint32 wal_retention_secs) {
+  std::lock_guard<MutexType> lock(data_mutex_);
+  auto it = kv_store_.tables.find(primary_table_id_);
+  if (it == kv_store_.tables.end()) {
+    LOG_WITH_PREFIX(DFATAL) << "Unable to set WAL retention time for primary table "
+                            << primary_table_id_;
+    return;
+  }
+  it->second->wal_retention_secs = wal_retention_secs;
+  LOG_WITH_PREFIX(INFO) << "Set RaftGroupMetadata wal retention time to "
+                        << wal_retention_secs << " seconds";
+}
+
+uint32_t RaftGroupMetadata::wal_retention_secs() const {
+  std::lock_guard<MutexType> lock(data_mutex_);
+  auto it = kv_store_.tables.find(primary_table_id_);
+  if (it == kv_store_.tables.end()) {
+    return 0;
+  }
+  return it->second->wal_retention_secs;
+}
+
+void RaftGroupMetadata::set_tablet_data_state(TabletDataState state) {
+  std::lock_guard<MutexType> lock(data_mutex_);
   tablet_data_state_ = state;
 }
 
-string TabletMetadata::LogPrefix() const {
-  return Substitute("T $0 P $1: ", tablet_id_, fs_manager_->uuid());
+string RaftGroupMetadata::LogPrefix() const {
+  return Substitute("T $0 P $1: ", raft_group_id_, fs_manager_->uuid());
 }
 
-TabletDataState TabletMetadata::tablet_data_state() const {
-  std::lock_guard<LockType> l(data_lock_);
+TabletDataState RaftGroupMetadata::tablet_data_state() const {
+  std::lock_guard<MutexType> lock(data_mutex_);
   return tablet_data_state_;
+}
+
+Result<RaftGroupMetadataPtr> RaftGroupMetadata::CreateSubtabletMetadata(
+    const RaftGroupId& raft_group_id, const Partition& partition,
+    const std::string& lower_bound_key, const std::string& upper_bound_key) const {
+  RaftGroupReplicaSuperBlockPB superblock;
+  ToSuperBlock(&superblock);
+
+  RaftGroupMetadataPtr metadata(new RaftGroupMetadata(fs_manager_, raft_group_id_));
+  RETURN_NOT_OK(metadata->LoadFromSuperBlock(superblock));
+  metadata->raft_group_id_ = raft_group_id;
+  const auto tablet_dir = Substitute("tablet-$0", raft_group_id);
+  metadata->wal_dir_ = JoinPathSegments(DirName(wal_dir_), tablet_dir);
+  metadata->kv_store_.lower_bound_key = lower_bound_key;
+  metadata->kv_store_.upper_bound_key = upper_bound_key;
+  metadata->kv_store_.rocksdb_dir = JoinPathSegments(DirName(kv_store_.rocksdb_dir), tablet_dir);
+  metadata->partition_ = partition;
+  RETURN_NOT_OK(metadata->Flush());
+  return metadata;
+}
+
+
+namespace {
+// MigrateSuperblockForDXXXX functions are only needed for backward compatibility with
+// YugaByte DB versions which don't have changes from DXXXX revision.
+// Each MigrateSuperblockForDXXXX could be removed after all YugaByte DB installations are
+// upgraded to have revision DXXXX.
+
+CHECKED_STATUS MigrateSuperblockForD5900(RaftGroupReplicaSuperBlockPB* superblock) {
+  // In previous version of superblock format we stored primary table metadata in superblock's
+  // top-level fields (deprecated table_* and other). TableInfo objects were stored inside
+  // RaftGroupReplicaSuperBlockPB.tables.
+  //
+  // In new format TableInfo objects and some other top-level fields are moved from superblock's
+  // top-level fields into RaftGroupReplicaSuperBlockPB.kv_store. Primary table (see
+  // RaftGroupMetadata::primary_table_id_ field description) metadata is stored inside one of
+  // RaftGroupReplicaSuperBlockPB.kv_store.tables objects and is referenced by
+  // RaftGroupReplicaSuperBlockPB.primary_table_id.
+  if (superblock->has_kv_store()) {
+    return Status::OK();
+  }
+
+  LOG(INFO) << "Migrating superblock for raft group " << superblock->raft_group_id();
+
+  KvStoreInfoPB* kv_store_pb = superblock->mutable_kv_store();
+  kv_store_pb->set_kv_store_id(superblock->raft_group_id());
+  kv_store_pb->set_rocksdb_dir(superblock->obsolete_rocksdb_dir());
+  kv_store_pb->mutable_rocksdb_files()->CopyFrom(superblock->obsolete_rocksdb_files());
+  kv_store_pb->mutable_snapshot_files()->CopyFrom(superblock->obsolete_snapshot_files());
+
+  TableInfoPB* primary_table = kv_store_pb->add_tables();
+  primary_table->set_table_id(superblock->primary_table_id());
+  primary_table->set_table_name(superblock->obsolete_table_name());
+  primary_table->set_table_type(superblock->obsolete_table_type());
+  primary_table->mutable_schema()->CopyFrom(superblock->obsolete_schema());
+  primary_table->set_schema_version(superblock->obsolete_schema_version());
+  primary_table->mutable_partition_schema()->CopyFrom(superblock->obsolete_partition_schema());
+  primary_table->mutable_indexes()->CopyFrom(superblock->obsolete_indexes());
+  primary_table->mutable_index_info()->CopyFrom(superblock->obsolete_index_info());
+  primary_table->mutable_deleted_cols()->CopyFrom(superblock->obsolete_deleted_cols());
+
+  kv_store_pb->mutable_tables()->MergeFrom(superblock->obsolete_tables());
+
+  return Status::OK();
+}
+
+} // namespace
+
+Status MigrateSuperblock(RaftGroupReplicaSuperBlockPB* superblock) {
+  return MigrateSuperblockForD5900(superblock);
 }
 
 } // namespace tablet

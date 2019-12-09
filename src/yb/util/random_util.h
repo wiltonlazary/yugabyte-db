@@ -54,10 +54,14 @@ void RandomString(void* dest, size_t n, Random* rng);
 // pid & tid.
 uint32_t GetRandomSeed32();
 
+std::vector<uint8_t> RandomBytes(size_t len, std::mt19937_64* rng = nullptr);
+
 std::string RandomHumanReadableString(int len, Random* rnd);
 
 class RandomDeviceSequence {
  public:
+  typedef std::random_device::result_type result_type;
+
   template<class It>
   void generate(It begin, const It& end) {
     std::generate(begin, end, [this] { return device_(); });
@@ -82,6 +86,16 @@ Int RandomUniformInt(Int min, Int max, std::mt19937_64* rng = nullptr) {
     rng = &ThreadLocalRandom();
   }
   return std::uniform_int_distribution<Int>(min, max)(*rng);
+}
+
+bool RandomUniformBool(std::mt19937_64* rng = nullptr);
+
+template <class Int>
+std::vector<Int> RandomUniformVector(Int min, Int max, uint32_t size,
+                                     std::mt19937_64* rng = nullptr) {
+  std::vector<Int> vec(size);
+  std::generate(vec.begin(), vec.end(), [=] { return RandomUniformInt(min, max, rng); });
+  return vec;
 }
 
 template <class Int>
@@ -122,6 +136,8 @@ typename Collection::const_reference RandomElement(const Collection& collection,
   size_t index = RandomUniformInt<size_t>(0, collection.size() - 1, rng);
   return collection[index];
 }
+
+std::string RandomHumanReadableString(size_t len, std::mt19937_64* rng = nullptr);
 
 } // namespace yb
 

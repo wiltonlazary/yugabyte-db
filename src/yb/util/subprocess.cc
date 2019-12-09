@@ -106,8 +106,7 @@ void EnsureSigPipeDisabled() {
 Status OpenProcFdDir(DIR** dir) {
   *dir = opendir(kProcSelfFd);
   if (PREDICT_FALSE(dir == nullptr)) {
-    return STATUS(IOError, Substitute("opendir(\"$0\") failed", kProcSelfFd),
-                           ErrnoToString(errno), errno);
+    return STATUS(IOError, Substitute("opendir(\"$0\") failed", kProcSelfFd), Errno(errno));
   }
   return Status::OK();
 }
@@ -116,9 +115,9 @@ Status OpenProcFdDir(DIR** dir) {
 // This function is not async-signal-safe.
 void CloseProcFdDir(DIR* dir) {
   if (PREDICT_FALSE(closedir(dir) == -1)) {
-    LOG(WARNING) << "Unable to close fd dir: "
-                 << STATUS(IOError, Substitute("closedir(\"$0\") failed", kProcSelfFd),
-                                    ErrnoToString(errno), errno).ToString();
+    LOG(WARNING)
+        << "Unable to close fd dir: "
+        << STATUS(IOError, Substitute("closedir(\"$0\") failed", kProcSelfFd), Errno(errno));
   }
 }
 
@@ -127,7 +126,7 @@ void CloseProcFdDir(DIR* dir) {
 // This function is called after fork() and must not call malloc().
 // The rule of thumb is to only call async-signal-safe functions in such cases
 // if at all possible.
-void CloseNonStandardFDs(DIR* fd_dir) {
+void CloseNonStandardFDs(DIR* fd_dir, const std::unordered_set<int>& excluding) {
   // This is implemented by iterating over the open file descriptors
   // rather than using sysconf(SC_OPEN_MAX) -- the latter is error prone
   // since it may not represent the highest open fd if the fd soft limit
@@ -157,7 +156,8 @@ void CloseNonStandardFDs(DIR* fd_dir) {
     if (!(fd == STDIN_FILENO  ||
           fd == STDOUT_FILENO ||
           fd == STDERR_FILENO ||
-          fd == dir_fd))  {
+          fd == dir_fd ||
+          excluding.count(fd))) {
       close(fd);
     }
   }
@@ -207,6 +207,10 @@ void Subprocess::SetFdShared(int stdfd, bool share) {
   CHECK_EQ(state_, kNotStarted);
   CHECK_NE(fd_state_[stdfd], DISABLED);
   fd_state_[stdfd] = share? SHARED : PIPED;
+}
+
+void Subprocess::InheritNonstandardFd(int fd) {
+  ns_fds_inherited_.insert(fd);
 }
 
 void Subprocess::DisableStderr() {
@@ -298,7 +302,7 @@ Status Subprocess::Start() {
 
   int ret = fork();
   if (ret == -1) {
-    return STATUS(RuntimeError, "Unable to fork", ErrnoToString(errno), errno);
+    return STATUS(RuntimeError, "Unable to fork", Errno(errno));
   }
   if (ret == 0) { // We are the child
     // Send the child a SIGTERM when the parent dies. This is done as early
@@ -307,7 +311,7 @@ Status Subprocess::Start() {
 #if defined(__linux__)
     // TODO: prctl(PR_SET_PDEATHSIG) is Linux-specific, look into portable ways
     // to prevent orphans when parent is killed.
-    prctl(PR_SET_PDEATHSIG, SIGTERM);
+    prctl(PR_SET_PDEATHSIG, pdeath_signal_);
 #endif
 
     // stdin
@@ -339,7 +343,7 @@ Status Subprocess::Start() {
     default: break;
     }
 
-    CloseNonStandardFDs(fd_dir);
+    CloseNonStandardFDs(fd_dir, ns_fds_inherited_);
 
     for (const auto& env_kv : env_) {
       setenv(env_kv.first.c_str(), env_kv.second.c_str(), /* replace */ true);
@@ -365,7 +369,22 @@ Status Subprocess::Start() {
   return Status::OK();
 }
 
+Status Subprocess::Wait(int* ret) {
+  return DoWait(ret, 0);
+}
+
+Result<int> Subprocess::Wait() {
+  int ret = 0;
+  RETURN_NOT_OK(Wait(&ret));
+  return ret;
+}
+
 Status Subprocess::DoWait(int* ret, int options) {
+  if (!ret) {
+    return STATUS(InvalidArgument, "ret is NULL");
+  }
+  *ret = 0;
+
   pid_t child_pid = 0;
   {
     unique_lock<mutex> l(state_lock_);
@@ -383,9 +402,7 @@ Status Subprocess::DoWait(int* ret, int options) {
 
   int waitpid_ret_val = waitpid(child_pid, ret, options);
   if (waitpid_ret_val == -1) {
-    return STATUS(RuntimeError, "Unable to wait on child",
-                                ErrnoToString(errno),
-                                errno);
+    return STATUS(RuntimeError, "Unable to wait on child", Errno(errno));
   }
   if ((options & WNOHANG) && waitpid_ret_val == 0) {
     return STATUS(TimedOut, "");
@@ -420,9 +437,7 @@ Status Subprocess::KillInternal(int signal, bool must_be_running) {
   CHECK_NE(child_pid_, 0);
 
   if (kill(child_pid_, signal) != 0) {
-    return STATUS(RuntimeError, "Unable to kill",
-                                ErrnoToString(errno),
-                                errno);
+    return STATUS(RuntimeError, "Unable to kill", Errno(errno));
   }
   return Status::OK();
 }
@@ -458,38 +473,54 @@ Status Subprocess::Call(const vector<string>& argv) {
   }
 }
 
-Status Subprocess::Call(const vector<string>& argv, string* stdout_out) {
+Status Subprocess::Call(const vector<string>& argv, string* output, bool read_stderr) {
   Subprocess p(argv[0], argv);
-  p.ShareParentStdout(false);
-  RETURN_NOT_OK_PREPEND(p.Start(), "Unable to fork " + argv[0]);
-  int err = close(p.ReleaseChildStdinFd());
-  if (PREDICT_FALSE(err != 0)) {
-    return STATUS(IOError, "Unable to close child process stdin", ErrnoToString(errno), errno);
+  return p.Call(output, read_stderr);
+}
+
+Status Subprocess::Call(string* output, bool read_stderr) {
+  if (read_stderr) {
+    ShareParentStderr(false);
+  } else {
+    ShareParentStdout(false);
   }
 
-  stdout_out->clear();
+  RETURN_NOT_OK_PREPEND(Start(), "Unable to fork " + argv_[0]);
+  const int err = close(ReleaseChildStdinFd());
+  if (PREDICT_FALSE(err != 0)) {
+    return STATUS(IOError, "Unable to close child process stdin", Errno(errno));
+  }
+
+  output->clear();
   char buf[1024];
+  int fd = -1;
+  if (read_stderr) {
+    fd = from_child_stderr_fd();
+  } else {
+    fd = from_child_stdout_fd();
+  }
+
   while (true) {
-    ssize_t n = read(p.from_child_stdout_fd(), buf, arraysize(buf));
+    ssize_t n = read(fd, buf, arraysize(buf));
     if (n == 0) {
       // EOF
       break;
     }
     if (n < 0) {
       if (errno == EINTR) continue;
-      return STATUS(IOError, "IO error reading from " + argv[0], ErrnoToString(errno), errno);
+      return STATUS(IOError, "IO error reading from " + argv_[0], Errno(errno));
     }
 
-    stdout_out->append(buf, n);
+    output->append(buf, n);
   }
 
   int retcode = 0;
-  RETURN_NOT_OK_PREPEND(p.Wait(&retcode), "Unable to wait() for " + argv[0]);
+  RETURN_NOT_OK_PREPEND(Wait(&retcode), "Unable to wait() for " + argv_[0]);
 
   if (PREDICT_FALSE(retcode != 0)) {
     return STATUS(RuntimeError, Substitute(
         "Subprocess '$0' terminated with non-zero exit status $1",
-        argv[0],
+        argv_[0],
         retcode));
   }
   return Status::OK();
@@ -510,6 +541,10 @@ int Subprocess::ReleaseChildFd(int stdfd) {
   int ret = child_fds_[stdfd];
   child_fds_[stdfd] = -1;
   return ret;
+}
+
+void Subprocess::SetParentDeathSignal(int signal) {
+  pdeath_signal_ = signal;
 }
 
 pid_t Subprocess::pid() const {

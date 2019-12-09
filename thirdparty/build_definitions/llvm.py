@@ -21,7 +21,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from build_definitions import *
 
 class LLVMDependency(Dependency):
-    VERSION = '5.0.0'
+    VERSION = '7.0.1'
 
     def __init__(self):
         url_prefix="http://releases.llvm.org/{0}/"
@@ -35,6 +35,10 @@ class LLVMDependency(Dependency):
             ExtraDownload('compiler-rt', self.version, url_prefix + 'compiler-rt-{0}.src.tar.xz',
                           'projects',
                           ['mv', 'compiler-rt-{}.src'.format(self.version), 'compiler-rt']),
+            ExtraDownload(
+                'clang-tools-extra', self.version, url_prefix + 'clang-tools-extra-{0}.src.tar.xz',
+                'tools/cfe/tools',
+                ['mv', 'clang-tools-extra-{}.src'.format(self.version), 'extra']),
         ]
 
         self.copy_sources = False
@@ -65,7 +69,10 @@ class LLVMDependency(Dependency):
                                   '-DLLVM_TARGETS_TO_BUILD=X86',
                                   '-DLLVM_ENABLE_RTTI=ON',
                                   '-DCMAKE_CXX_FLAGS={}'.format(" ".join(cxx_flags)),
-                                  '-DPYTHON_EXECUTABLE={}'.format(python_executable)])
+                                  '-DPYTHON_EXECUTABLE={}'.format(python_executable),
+                                  '-DCLANG_BUILD_EXAMPLES=ON'
+                                 ],
+                                 use_ninja='auto')
 
         # Create a link from Clang to thirdparty/clang-toolchain. This path is used
         # for all Clang invocations. The link can't point to the Clang installed in
@@ -77,3 +84,6 @@ class LLVMDependency(Dependency):
         list_dest = os.path.relpath(os.getcwd(), builder.tp_dir)
         log("Link {} => {}".format(link_path, list_dest))
         os.symlink(list_dest, link_path)
+
+    def should_build(self, builder):
+        return builder.will_need_clang()

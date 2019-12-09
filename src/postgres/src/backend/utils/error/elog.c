@@ -43,7 +43,7 @@
  * overflow.)
  *
  *
- * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -78,6 +78,8 @@
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
 
+// YB includes.
+#include "pg_yb_utils.h"
 
 /* In this module, access gettext() via err_gettext() */
 #undef _
@@ -226,7 +228,7 @@ err_gettext(const char *str)
  * the stack entry.  Finally, errfinish() will be called to actually process
  * the error report.
  *
- * Returns TRUE in normal case.  Returns FALSE to short-circuit the error
+ * Returns true in normal case.  Returns false to short-circuit the error
  * report (if it's a warning or lower and not to be reported anywhere).
  */
 bool
@@ -285,7 +287,7 @@ errstart(int elevel, const char *filename, int lineno,
 
 	/*
 	 * Now decide whether we need to process this report at all; if it's
-	 * warning or less and not enabled for logging, just return FALSE without
+	 * warning or less and not enabled for logging, just return false without
 	 * starting up any error logging machinery.
 	 */
 
@@ -398,6 +400,13 @@ errstart(int elevel, const char *filename, int lineno,
 	edata->assoc_context = ErrorContext;
 
 	recursion_depth--;
+	if (YBShouldLogStackTraceOnError() && elevel >= ERROR)
+	{
+		YBCLogImpl(
+			/* severity (2=ERROR) */ 2,
+			filename, lineno, /* stack_trace */ true,
+			"Postgres error: %s", YBPgErrorLevelToString(elevel));
+	}
 	return true;
 }
 
@@ -435,7 +444,7 @@ errfinish(int dummy,...)
 	for (econtext = error_context_stack;
 		 econtext != NULL;
 		 econtext = econtext->previous)
-		(*econtext->callback) (econtext->arg);
+		econtext->callback(econtext->arg);
 
 	/*
 	 * If ERROR (not more nor less) we pass it off to the current handler.
@@ -472,12 +481,20 @@ errfinish(int dummy,...)
 	 * progress, so that we can report the message before dying.  (Without
 	 * this, pq_putmessage will refuse to send the message at all, which is
 	 * what we want for NOTICE messages, but not for fatal exits.) This hack
-	 * is necessary because of poor design of old-style copy protocol.  Note
-	 * we must do this even if client is fool enough to have set
-	 * client_min_messages above FATAL, so don't look at output_to_client.
+	 * is necessary because of poor design of old-style copy protocol.
 	 */
-	if (elevel >= FATAL && whereToSendOutput == DestRemote)
-		pq_endcopyout(true);
+	if (elevel >= FATAL)
+	{
+		if (whereToSendOutput == DestRemote)
+			pq_endcopyout(true);
+
+		if (IsYugaByteEnabled())
+			/* When it's FATAL, the memory context that "debug_query_string" points to might have been
+			 * deleted or even corrupted. Set "debug_query_string" to NULL before emitting error.
+			 * The variable "debug_query_string" contains the user statement that is currently executed.
+			 */
+			debug_query_string = NULL;
+	}
 
 	/* Emit the message to the right places */
 	EmitErrorReport();
@@ -580,6 +597,19 @@ errcode(int sqlerrcode)
 	CHECK_STACK_DEPTH();
 
 	edata->sqlerrcode = sqlerrcode;
+
+	return 0;					/* return value does not matter */
+}
+
+int
+yb_txn_errcode(uint16_t txn_errcode)
+{
+	ErrorData  *edata = &errordata[errordata_stack_depth];
+
+	/* we don't bother incrementing recursion_depth */
+	CHECK_STACK_DEPTH();
+
+	edata->yb_txn_errcode = txn_errcode;
 
 	return 0;					/* return value does not matter */
 }
@@ -733,6 +763,10 @@ errcode_for_socket_access(void)
 		} \
 		/* Done with expanded fmt */ \
 		pfree(fmtbuf); \
+		/* In YB debug mode, add stack trace info (to first msg only) */ \
+		if (IsYugaByteEnabled() && yb_debug_mode && !appendval) { \
+			appendStringInfoString(&buf, YBCGetStackTrace()); \
+		} \
 		/* Save the completed message into the stack item */ \
 		if (edata->targetfield) \
 			pfree(edata->targetfield); \
@@ -1758,12 +1792,7 @@ pg_re_throw(void)
 		else
 			edata->output_to_server = (FATAL >= log_min_messages);
 		if (whereToSendOutput == DestRemote)
-		{
-			if (ClientAuthInProgress)
-				edata->output_to_client = true;
-			else
-				edata->output_to_client = (FATAL >= client_min_messages);
-		}
+			edata->output_to_client = true;
 
 		/*
 		 * We can use errfinish() for the rest, but we don't want it to call
@@ -1837,7 +1866,7 @@ GetErrorContextStack(void)
 	for (econtext = error_context_stack;
 		 econtext != NULL;
 		 econtext = econtext->previous)
-		(*econtext->callback) (econtext->arg);
+		econtext->callback(econtext->arg);
 
 	/*
 	 * Clean ourselves off the stack, any allocations done should have been

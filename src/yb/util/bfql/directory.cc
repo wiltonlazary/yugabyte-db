@@ -45,6 +45,9 @@ const DataType TUPLE = DataType::TUPLE;
 const DataType TYPEARGS = DataType::TYPEARGS;
 const DataType DATE = DataType::DATE;
 const DataType TIME = DataType::TIME;
+const DataType JSONB = DataType::JSONB;
+const DataType FROZEN = DataType::FROZEN;
+const DataType UDT = DataType::USER_DEFINED_TYPE;
 
 // IMPORTANT NOTES:
 // - If your cpp_function is defined in a different name space, you must "#include" its header file
@@ -154,24 +157,24 @@ const vector<BFDecl> kBFDirectory = {
   { "ConvertBlobToTuple",     "blobastuple", "",     TUPLE,     {BINARY}, TSOpcode::kNoOp, false },
 
   // CQL Conversions for TimeUUID and date-time types.
-  { "ConvertTimeuuidToDate", "todate", "", DATE, {TIMEUUID}, TSOpcode::kNoOp, false },
-  { "ConvertTimestampToDate", "todate", "", DATE, {TIMESTAMP}, TSOpcode::kNoOp, false },
+  { "ConvertTimeuuidToDate", "todate", "", DATE, {TIMEUUID}, TSOpcode::kNoOp},
+  { "ConvertTimestampToDate", "todate", "", DATE, {TIMESTAMP}, TSOpcode::kNoOp},
 
   { "ConvertTimeuuidToTime", "totime", "", TIME, {TIMEUUID}, TSOpcode::kNoOp, false },
   { "ConvertTimestampToTime", "totime", "", TIME, {TIMESTAMP}, TSOpcode::kNoOp, false },
 
-  { "ConvertDateToTimestamp", "totimestamp", "", TIMESTAMP, {DATE}, TSOpcode::kNoOp, false },
+  { "ConvertDateToTimestamp", "totimestamp", "", TIMESTAMP, {DATE}, TSOpcode::kNoOp},
   { "ConvertTimeuuidToTimestamp", "totimestamp", "", TIMESTAMP, {TIMEUUID}, TSOpcode::kNoOp},
   { "ConvertTimeuuidToTimestamp", "dateof", "", TIMESTAMP, {TIMEUUID}, TSOpcode::kNoOp},
 
-  { "ConvertDateToUnixTimestamp", "tounixtimestamp", "", INT64, {DATE}, TSOpcode::kNoOp, false},
+  { "ConvertDateToUnixTimestamp", "tounixtimestamp", "", INT64, {DATE}, TSOpcode::kNoOp},
   { "ConvertTimestampToUnixTimestamp", "tounixtimestamp", "", INT64, {TIMESTAMP}, TSOpcode::kNoOp},
   { "ConvertTimeuuidToUnixTimestamp", "tounixtimestamp", "", INT64, {TIMEUUID}, TSOpcode::kNoOp},
   { "ConvertTimeuuidToUnixTimestamp", "unixtimestampof", "", INT64, {TIMEUUID}, TSOpcode::kNoOp},
 
   // Converting date-time literals.
-  { "ConvertToMaxTimeuuid", "maxtimeuuid", "", TIMEUUID, {TIMESTAMP}, TSOpcode::kNoOp, false },
-  { "ConvertToMinTimeuuid", "mintimeuuid", "", TIMEUUID, {TIMESTAMP}, TSOpcode::kNoOp, false },
+  { "ConvertToMaxTimeuuid", "maxtimeuuid", "", TIMEUUID, {TIMESTAMP}, TSOpcode::kNoOp },
+  { "ConvertToMinTimeuuid", "mintimeuuid", "", TIMEUUID, {TIMESTAMP}, TSOpcode::kNoOp },
 
   //------------------------------------------------------------------------------------------------
   // CQL standard functions.
@@ -207,7 +210,7 @@ const vector<BFDecl> kBFDirectory = {
   { "IncCounter", "counter+", "", INT64, {INT64, INT64} },
   { "DecCounter", "counter-", "", INT64, {INT64, INT64} },
 
-  // Uuid and timeuuid functions.
+  // Now function.
   { "NowTimeUuid", "now", "", TIMEUUID, {} },
 
   // WRITETIME and TTL functions.
@@ -255,12 +258,37 @@ const vector<BFDecl> kBFDirectory = {
   { "ConvertI16ToVarint",      "cast", "", VARINT,  {INT16, VARINT} },
   { "ConvertI32ToVarint",      "cast", "", VARINT,  {INT32, VARINT} },
   { "ConvertI64ToVarint",      "cast", "", VARINT,  {INT64, VARINT} },
-  { "ConvertToI16",            "cql_cast", "", INT16,  {ANYTYPE, INT16} },
-  { "ConvertToI32",            "cql_cast", "", INT32,  {ANYTYPE, INT32} },
-  { "ConvertToI64",            "cql_cast", "", INT64,  {ANYTYPE, INT64} },
-  { "ConvertToDouble",         "cql_cast", "", DOUBLE, {ANYTYPE, DOUBLE} },
-  { "ConvertToFloat",          "cql_cast", "", FLOAT,  {ANYTYPE, FLOAT} },
-  { "ConvertToString",         "cql_cast", "", STRING,  {ANYTYPE, STRING} },
+  { "ConvertToI16",            "cql_cast", "", INT16,     {ANYTYPE, INT16} },
+  { "ConvertToI32",            "cql_cast", "", INT32,     {ANYTYPE, INT32} },
+  { "ConvertToI64",            "cql_cast", "", INT64,     {ANYTYPE, INT64} },
+  { "ConvertToDouble",         "cql_cast", "", DOUBLE,    {ANYTYPE, DOUBLE} },
+  { "ConvertToFloat",          "cql_cast", "", FLOAT,     {ANYTYPE, FLOAT} },
+  { "ConvertToDecimal",        "cql_cast", "", DECIMAL,   {ANYTYPE, DECIMAL} },
+  { "ConvertToString",         "cql_cast", "", STRING,    {ANYTYPE, STRING} },
+  { "ConvertToTimestamp",      "cql_cast", "", TIMESTAMP, {ANYTYPE, TIMESTAMP} },
+  { "ConvertToDate",           "cql_cast", "", DATE,      {ANYTYPE, DATE} },
+
+  // Current date, time, timestamp and timeuuid functions.
+  { "NowDate",      "currentdate", "",      DATE, {} },
+  { "NowTime",      "currenttime", "",      TIME, {} },
+  { "NowTimestamp", "currenttimestamp", "", TIMESTAMP, {} },
+  { "NowTimeUuid",  "currenttimeuuid", "",  TIMEUUID, {} }, // alias of now() for timeuuid.
+
+  // uuid function.
+  { "GetUuid", "uuid", "", UUID, {} },
+
+  // tojson function.
+  // tojson() for all elementary types and for simple collections - on client side.
+  { "ToJson", "tojson", "", JSONB, {ANYTYPE} },
+  // tojson() for parametric types (UDT, FROZEN, LIST<FROZEN>, MAP<FROZEN>, etc.) - on server side.
+  { "ServerOperator", "server_tojson", "OPCODE_LIST_TO_JSON", JSONB, { LIST }, TSOpcode::kToJson },
+  { "ServerOperator", "server_tojson", "OPCODE_SET_TO_JSON", JSONB, { SET }, TSOpcode::kToJson },
+  { "ServerOperator", "server_tojson", "OPCODE_MAP_TO_JSON", JSONB, { MAP }, TSOpcode::kToJson },
+  { "ServerOperator", "server_tojson", "OPCODE_UDT_TO_JSON", JSONB, { UDT }, TSOpcode::kToJson },
+  { "ServerOperator", "server_tojson", "OPCODE_TUPLE_TO_JSON", JSONB, { TUPLE },
+    TSOpcode::kToJson },
+  { "ServerOperator", "server_tojson", "OPCODE_FROZEN_TO_JSON", JSONB, { FROZEN },
+    TSOpcode::kToJson },
 };
 
 } // namespace bfql

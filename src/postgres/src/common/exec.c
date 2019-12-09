@@ -4,7 +4,7 @@
  *		Functions for finding and validating executable files
  *
  *
- * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -533,6 +533,14 @@ pclose_check(FILE *stream)
 #endif
 	}
 	return exitstatus;
+}
+
+
+/*
+ * YugaByte needed functionality of executing system command and reading first line of output
+ */
+char* exec_pipe_read_line(char *cmd, char *line, int maxsize) {
+  return pipe_read_line(cmd, line, maxsize);
 }
 
 /*

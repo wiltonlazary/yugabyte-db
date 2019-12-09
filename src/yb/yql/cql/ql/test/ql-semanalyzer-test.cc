@@ -28,6 +28,24 @@ class QLTestAnalyzer: public QLTestBase {
   QLTestAnalyzer() : QLTestBase() {
   }
 
+  // TODO(omer): should also input the index_tree, in order to ensure the id found is the id of the
+  // index that should be used, but I do not know how to do this yet, as index_tree has the name of
+  // the index while select_tree has the id.
+  void TestIndexSelection(const string& select_stmt,
+                          const bool use_index,
+                          const bool covers_fully) {
+    ParseTree::UniPtr parse_tree;
+    EXPECT_OK(TestAnalyzer(select_stmt, &parse_tree));
+
+    TreeNode::SharedPtr root = parse_tree->root();
+    CHECK_EQ(TreeNodeOpcode::kPTSelectStmt, root->opcode());
+    PTSelectStmt::SharedPtr pt_select_stmt = std::static_pointer_cast<PTSelectStmt>(root);
+    PTSelectStmt::SharedPtr pt_child_select = pt_select_stmt->child_select();
+    EXPECT_EQ(pt_child_select != nullptr, use_index) << select_stmt;
+    EXPECT_EQ(pt_child_select != nullptr && pt_child_select->covers_fully(), covers_fully)
+        << select_stmt;
+  }
+
   PTJsonColumnWithOperators* RetrieveJsonColumn(const ParseTree::UniPtr& parse_tree,
                                                 const DataType& expected_type) {
     auto select_stmt = std::dynamic_pointer_cast<PTSelectStmt>(parse_tree->root());
@@ -63,7 +81,8 @@ TEST_F(QLTestAnalyzer, TestCreateTablePropertyAnalyzer) {
   PTTableProperty::SharedPtr table_property = table_properties->element(0);
   EXPECT_EQ(std::string("default_time_to_live"), table_property->lhs()->c_str());
   PTConstVarInt::SharedPtr rhs = std::static_pointer_cast<PTConstVarInt>(table_property->rhs());
-  EXPECT_EQ(util::VarInt(1000), util::VarInt(rhs->Eval()->c_str()));
+  auto from_str = ASSERT_RESULT(util::VarInt::CreateFromString(rhs->Eval()->c_str()));
+  EXPECT_EQ(util::VarInt(1000), from_str);
 }
 
 TEST_F(QLTestAnalyzer, TestCreateTableAnalyze) {
@@ -281,13 +300,15 @@ TEST_F(QLTestAnalyzer, TestCreateIndex) {
   ANALYZE_VALID_STMT("CREATE INDEX i ON t (r2, r1, h1, h2) INCLUDE (c1) WITH CLUSTERING ORDER BY "
                      "(r1 DESC, h1 DESC, h2 ASC);", &parse_tree);
 
+  // Duplicate covering columns - should succeed
+  ANALYZE_VALID_STMT("CREATE INDEX i ON t ((r1), r2) INCLUDE (r1);", &parse_tree);
+  ANALYZE_VALID_STMT("CREATE INDEX i ON t ((r1), r2) INCLUDE (r2);", &parse_tree);
+  ANALYZE_VALID_STMT("CREATE INDEX i ON t (r1, r2, c1) INCLUDE (c1);", &parse_tree);
+  ANALYZE_VALID_STMT("CREATE INDEX i ON t (r1, r2) INCLUDE (c1, c1);", &parse_tree);
+
   // Duplicate primary key columns.
   ANALYZE_INVALID_STMT("CREATE INDEX i ON t (r1, r1);", &parse_tree);
-  // Duplicate covering columns.
-  ANALYZE_INVALID_STMT("CREATE INDEX i ON t ((r1), r2) INCLUDE (r1);", &parse_tree);
-  ANALYZE_INVALID_STMT("CREATE INDEX i ON t ((r1), r2) INCLUDE (r2);", &parse_tree);
-  ANALYZE_INVALID_STMT("CREATE INDEX i ON t (r1, r2, c1) INCLUDE (c1);", &parse_tree);
-  ANALYZE_INVALID_STMT("CREATE INDEX i ON t (r1, r2) INCLUDE (c1, c1);", &parse_tree);
+
   // Non-clustering key column in order by.
   ANALYZE_INVALID_STMT("CREATE INDEX i ON t (r2, r1) INCLUDE (c1) WITH CLUSTERING ORDER BY "
                        "(r2 DESC, r1 ASC);", &parse_tree);
@@ -311,6 +332,30 @@ TEST_F(QLTestAnalyzer, TestCreateIndex) {
 
   // Index on non-transactional table.
   ANALYZE_INVALID_STMT("CREATE INDEX i ON t3 (c);", &parse_tree);
+
+  // JSON secondary index on attributes.
+  CHECK_OK(processor->Run("CREATE TABLE t4 (h1 int, h2 text, r1 int, r2 text, j jsonb, "
+                          "PRIMARY KEY ((h1, h2), r1, r2)) "
+                          "with transactions = {'enabled':true};"));
+
+  // Analyze the sql statement.
+  ANALYZE_VALID_STMT("CREATE INDEX i ON t4 (j->>'a');", &parse_tree);
+  ANALYZE_VALID_STMT("CREATE INDEX i ON t4 (j->'a'->>'b');", &parse_tree);
+  ANALYZE_VALID_STMT("CREATE INDEX i ON t4 (j->'a'->'b'->>'c');", &parse_tree);
+  ANALYZE_VALID_STMT("CREATE INDEX i ON t4 ((j->>'a'));", &parse_tree);
+  ANALYZE_VALID_STMT("CREATE INDEX i ON t4 ((j->'a'->>'b'));", &parse_tree);
+  ANALYZE_VALID_STMT("CREATE INDEX i ON t4 ((j->'a'->'b'->>'c'));", &parse_tree);
+  // Multiple JSON columns, as hash and range columns.
+  ANALYZE_VALID_STMT("CREATE INDEX i ON t4 (j->>'a', j->>'x');", &parse_tree);
+  ANALYZE_VALID_STMT("CREATE INDEX i ON t4 ((j->>'a'), j->>'x');", &parse_tree);
+  ANALYZE_VALID_STMT("CREATE INDEX i ON t4 ((j->>'a', j->>'x'));", &parse_tree);
+  ANALYZE_VALID_STMT("CREATE INDEX i ON t4 (j->'a'->>'b', j->'x'->>'y');", &parse_tree);
+  ANALYZE_VALID_STMT("CREATE INDEX i ON t4 ((j->'a'->>'b'), j->'x'->>'y');", &parse_tree);
+  ANALYZE_VALID_STMT("CREATE INDEX i ON t4 ((j->'a'->>'b', j->'x'->>'y'));", &parse_tree);
+  // Covering column.
+  // TODO: sem_context.h:215: Check failed: sem_state_ State variable is not set for the expression
+//  ANALYZE_VALID_STMT("CREATE INDEX i ON t4 (j->>'a') INCLUDE (j->>'x');", &parse_tree);
+//  ANALYZE_VALID_STMT("CREATE INDEX i ON t4 (j->>'a') INCLUDE (j->>'x', j->>'k');", &parse_tree);
 }
 
 TEST_F(QLTestAnalyzer, TestCreateLocalIndex) {
@@ -339,24 +384,7 @@ TEST_F(QLTestAnalyzer, TestCreateLocalIndex) {
 }
 
 
-// TODO(omer): should also input the index_tree, in order to ensure the id found is the id of the
-// index that should be used, but I do not know how to do this yet, as index_tree has the name of
-// the index while select_tree has the id.
-CHECKED_STATUS AnalyzeSelectTree(const ParseTree::UniPtr &select_parse_tree,
-                                 const bool &use_index = false,
-                                 const bool &read_just_index = false) {
-  TreeNode::SharedPtr root = select_parse_tree->root();
-  EXPECT_EQ(TreeNodeOpcode::kPTSelectStmt, root->opcode());
-  PTSelectStmt::SharedPtr pt_select_stmt = std::static_pointer_cast<PTSelectStmt>(root);
-
-  EXPECT_EQ(pt_select_stmt->use_index(), use_index);
-
-  EXPECT_EQ(pt_select_stmt->read_just_index(), read_just_index);
-
-  return Status::OK();
-}
-
-TEST_F(QLTestAnalyzer, TestSelectLocalIndex) {
+TEST_F(QLTestAnalyzer, TestIndexSelection) {
   CreateSimulatedCluster();
   TestQLProcessor *processor = GetQLProcessor();
   EXPECT_OK(processor->Run("CREATE TABLE t (h1 int, h2 int, r1 int, r2 int, c1 int, c2 int, "
@@ -365,9 +393,8 @@ TEST_F(QLTestAnalyzer, TestSelectLocalIndex) {
 
   ParseTree::UniPtr select_parse_tree, parse_tree;
 
-  EXPECT_OK(TestAnalyzer("SELECT * FROM t WHERE h1 = 1 AND h2 = 1 AND r1 = 1", &select_parse_tree));
   // Should not use index if there is no index.
-  EXPECT_OK(AnalyzeSelectTree(select_parse_tree, false, false));
+  TestIndexSelection("SELECT * FROM t WHERE h1 = 1 AND h2 = 1 AND r1 = 1", false, false);
 
   EXPECT_OK(processor->Run("CREATE INDEX i1 ON t ((h1, h2), r1);"));
   EXPECT_OK(processor->Run("CREATE INDEX i2 ON t ((h1, h2), c2, c1);"));
@@ -377,72 +404,57 @@ TEST_F(QLTestAnalyzer, TestSelectLocalIndex) {
   EXPECT_OK(processor->Run("CREATE INDEX i6 ON t ((c1, r2), c2);"));
   EXPECT_OK(processor->Run("CREATE INDEX i7 ON t ((h2, h1), c1) INCLUDE (c2);"));
 
-  client::YBTableName table_name(kDefaultKeyspaceName, "t");
+  client::YBTableName table_name(YQL_DATABASE_CQL, kDefaultKeyspaceName, "t");
   processor->RemoveCachedTableDesc(table_name);
 
-  // Should use the table.
-  EXPECT_OK(TestAnalyzer("SELECT * FROM t WHERE h1 = 1 AND c2 = 1 AND c1 = 1", &select_parse_tree));
-  EXPECT_OK(AnalyzeSelectTree(select_parse_tree, false, false));
-
-  EXPECT_OK(TestAnalyzer("SELECT * FROM t WHERE h1 = 1 AND h2 = 1 AND r1 = 1", &select_parse_tree));
-  EXPECT_OK(AnalyzeSelectTree(select_parse_tree, false, false));
-
-  EXPECT_OK(TestAnalyzer("SELECT * FROM t WHERE h1 = 1 AND c1 = 1 AND c2 = 1", &select_parse_tree));
-  EXPECT_OK(AnalyzeSelectTree(select_parse_tree, false, false));
+  // Should select from the indexed table.
+  TestIndexSelection("SELECT * FROM t WHERE h1 = 1 AND c2 = 1 AND c1 = 1", false, false);
+  TestIndexSelection("SELECT * FROM t WHERE h1 = 1 AND h2 = 1 AND r1 = 1", false, false);
+  TestIndexSelection("SELECT * FROM t WHERE h1 = 1 AND c1 = 1 AND c2 = 1", false, false);
 
   // None for i1, as the table itself is always better.
 
   // Should use i2.
-  EXPECT_OK(TestAnalyzer("SELECT c2, r1 FROM t WHERE h1 = 1 AND h2 = 1 AND c2 = 1 AND c1 = 1",
-                         &select_parse_tree));
-  EXPECT_OK(AnalyzeSelectTree(select_parse_tree, true, true));
-
+  TestIndexSelection("SELECT c2, r1 FROM t WHERE h1 = 1 AND h2 = 1 AND c2 = 1 AND c1 = 1",
+                     true, true);
   // Check that fully specified beats range clauses.
-  EXPECT_OK(TestAnalyzer("SELECT * FROM t WHERE h1 = 1 AND h2 = 1 AND c2 = 1 AND r1 > 0 AND r1 < 2",
-                         &select_parse_tree));
-  EXPECT_OK(AnalyzeSelectTree(select_parse_tree, true, true));
+  TestIndexSelection("SELECT * FROM t WHERE h1 = 1 AND h2 = 1 AND c2 = 1 AND r1 > 0 AND r1 < 2",
+                     true, true);
 
   // Should use i3.
-  EXPECT_OK(TestAnalyzer("SELECT c1 FROM t WHERE h1 = 1 AND h2 = 1 AND r2 = 1",
-                         &select_parse_tree));
-  EXPECT_OK(AnalyzeSelectTree(select_parse_tree, true, true));
+  TestIndexSelection("SELECT c1 FROM t WHERE h1 = 1 AND h2 = 1 AND r2 = 1", true, true);
 
-  // Should use indexed table.
-  EXPECT_OK(TestAnalyzer("SELECT * FROM t WHERE h1 = 1 AND h2 = 1 AND r2 = 1",
-                         &select_parse_tree));
-  EXPECT_OK(AnalyzeSelectTree(select_parse_tree, false, false));
+  // Should use i3 as uncovered index.
+  TestIndexSelection("SELECT * FROM t WHERE h1 = 1 AND h2 = 1 AND r2 = 1", true, false);
 
   // Should use i4.
-  EXPECT_OK(TestAnalyzer("SELECT c2, r1 FROM t WHERE h1 = 1 AND h2 = 1 AND r2 = 1",
-                         &select_parse_tree));
-  EXPECT_OK(AnalyzeSelectTree(select_parse_tree, true, true));
-
-  EXPECT_OK(TestAnalyzer("SELECT h2, c2, r1 FROM t WHERE h1 = 1 AND h2 = 1 AND r2 = 1 AND "
-                         "c2 = 1 AND r1 > 0 AND r1 < 2",
-                         &select_parse_tree));
-  EXPECT_OK(AnalyzeSelectTree(select_parse_tree, true, true));
+  TestIndexSelection("SELECT c2, r1 FROM t WHERE h1 = 1 AND h2 = 1 AND r2 = 1", true, true);
+  TestIndexSelection("SELECT h2, c2, r1 FROM t WHERE h1 = 1 AND h2 = 1 AND r2 = 1 AND "
+                     "c2 = 1 AND r1 > 0 AND r1 < 2", true, true);
 
   // Should use i5.
   // Check that local beats-non-local.
-  EXPECT_OK(TestAnalyzer("SELECT c1 FROM t WHERE h1 = 1 AND h2 = 1 AND c1 = 1",
-                         &select_parse_tree));
-  EXPECT_OK(AnalyzeSelectTree(select_parse_tree, true, true));
+  TestIndexSelection("SELECT c1 FROM t WHERE h1 = 1 AND h2 = 1 AND c1 = 1", true, true);
 
   // Should use i6.
-  EXPECT_OK(TestAnalyzer("SELECT * FROM t WHERE h1 = 1 AND h2 = 1 AND r2 = 1 AND c1 = 1 AND c2 = 1",
-                         &select_parse_tree));
-  EXPECT_OK(AnalyzeSelectTree(select_parse_tree, true, true));
+  TestIndexSelection("SELECT * FROM t WHERE h1 = 1 AND h2 = 1 AND r2 = 1 AND c1 = 1 AND c2 = 1",
+                     true, true);
 
   // Should use i7.
   // Check that non-local beats local if it can perform the read.
-  EXPECT_OK(TestAnalyzer("SELECT * FROM t WHERE h1 = 1 AND h2 = 1 AND c1 = 1",
-                         &select_parse_tree));
-  EXPECT_OK(AnalyzeSelectTree(select_parse_tree, true, true));
+  TestIndexSelection("SELECT * FROM t WHERE h1 = 1 AND h2 = 1 AND c1 = 1", true, true);
+  TestIndexSelection("SELECT c2 FROM t WHERE h1 = 1 AND h2 = 1 AND r2 = 1 AND c1 = 1", true, true);
+}
 
-  EXPECT_OK(TestAnalyzer("SELECT c2 FROM t WHERE h1 = 1 AND h2 = 1 AND r2 = 1 AND c1 = 1",
-                         &select_parse_tree));
-  EXPECT_OK(AnalyzeSelectTree(select_parse_tree, true, true));
+TEST_F(QLTestAnalyzer, TestIndexBasedOnJsonAttribute) {
+  CreateSimulatedCluster();
+  TestQLProcessor *processor = GetQLProcessor();
+  EXPECT_OK(processor->Run("CREATE TABLE t (h1 int, h2 int, r1 int, r2 int, j jsonb, "
+                           "PRIMARY KEY ((h1, h2), r1, r2)) "
+                           "with transactions = {'enabled':true};"));
 
+  EXPECT_OK(processor->Run("CREATE INDEX i1 ON t (j->>'a');"));
+  EXPECT_NOT_OK(processor->Run("CREATE INDEX i2 ON t (j->3);"));
 }
 
 TEST_F(QLTestAnalyzer, TestTruncate) {

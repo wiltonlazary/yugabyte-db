@@ -230,6 +230,10 @@ class StackableDB : public DB {
     return db_->GetEnv();
   }
 
+  Env* GetCheckpointEnv() const override {
+    return db_->GetCheckpointEnv();
+  }
+
   using DB::GetOptions;
   virtual const Options& GetOptions(ColumnFamilyHandle* column_family) const
       override {
@@ -274,8 +278,10 @@ class StackableDB : public DB {
     return db_->GetFlushedFrontier();
   }
 
-  CHECKED_STATUS SetFlushedFrontier(UserFrontierPtr values) override {
-    return db_->SetFlushedFrontier(std::move(values));
+  CHECKED_STATUS ModifyFlushedFrontier(
+      UserFrontierPtr values,
+      FrontierModificationMode mode) override {
+    return db_->ModifyFlushedFrontier(std::move(values), mode);
   }
 
   virtual void GetColumnFamilyMetaData(

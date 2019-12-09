@@ -42,6 +42,7 @@
 #include "yb/rocksdb/memory_monitor.h"
 #include "yb/client/client_fwd.h"
 #include "yb/common/schema.h"
+#include "yb/consensus/consensus_fwd.h"
 #include "yb/consensus/log.pb.h"
 #include "yb/gutil/gscoped_ptr.h"
 #include "yb/gutil/ref_counted.h"
@@ -50,7 +51,6 @@
 #include "yb/tablet/tablet_options.h"
 #include "yb/tablet/tablet_fwd.h"
 #include "yb/util/threadpool.h"
-
 
 namespace yb {
 
@@ -73,7 +73,7 @@ class Clock;
 
 namespace tablet {
 class Tablet;
-class TabletMetadata;
+class RaftGroupMetadata;
 class TransactionCoordinatorContext;
 class TransactionParticipantContext;
 struct TabletOptions;
@@ -82,7 +82,7 @@ struct TabletOptions;
 // piping it into the web UI.
 class TabletStatusListener {
  public:
-  explicit TabletStatusListener(const scoped_refptr<TabletMetadata>& meta);
+  explicit TabletStatusListener(const RaftGroupMetadataPtr& meta);
 
   ~TabletStatusListener();
 
@@ -92,37 +92,42 @@ class TabletStatusListener {
 
   const std::string table_name() const;
 
+  const std::string table_id() const;
+
   const Partition& partition() const;
 
   const Schema& schema() const;
 
   std::string last_status() const {
-    boost::shared_lock<boost::shared_mutex> l(lock_);
+    SharedLock<boost::shared_mutex> l(lock_);
     return last_status_;
   }
 
  private:
   mutable boost::shared_mutex lock_;
 
-  scoped_refptr<TabletMetadata> meta_;
+  RaftGroupMetadataPtr meta_;
   std::string last_status_;
 
   DISALLOW_COPY_AND_ASSIGN(TabletStatusListener);
 };
 
 struct BootstrapTabletData {
-  scoped_refptr<TabletMetadata> meta;
-  std::shared_future<client::YBClientPtr> client_future;
+  RaftGroupMetadataPtr meta;
+  std::shared_future<client::YBClient*> client_future;
   scoped_refptr<server::Clock> clock;
   std::shared_ptr<MemTracker> mem_tracker;
+  std::shared_ptr<MemTracker> block_based_table_mem_tracker;
   MetricRegistry* metric_registry;
   TabletStatusListener* listener;
   scoped_refptr<log::LogAnchorRegistry> log_anchor_registry;
   TabletOptions tablet_options;
+  std::string log_prefix_suffix;
   TransactionParticipantContext* transaction_participant_context;
   client::LocalTabletFilter local_tablet_filter;
   TransactionCoordinatorContext* transaction_coordinator_context;
   ThreadPool* append_pool;
+  consensus::RetryableRequests* retryable_requests;
 };
 
 // Bootstraps a tablet, initializing it with the provided metadata. If the tablet

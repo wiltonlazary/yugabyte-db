@@ -24,6 +24,7 @@
 #include "yb/yql/cql/ql/ptree/pt_create_table.h"
 #include "yb/yql/cql/ql/ptree/pt_alter_table.h"
 #include "yb/yql/cql/ql/ptree/pt_create_type.h"
+#include "yb/yql/cql/ql/ptree/pt_create_index.h"
 #include "yb/yql/cql/ql/ptree/sem_state.h"
 
 namespace yb {
@@ -33,32 +34,27 @@ namespace ql {
 
 struct SymbolEntry {
   // Parse tree node for column. It's used for table creation.
-  PTColumnDefinition *column_;
+  PTColumnDefinition *column_ = nullptr;
 
   // Parse tree node for column alterations.
-  PTAlterColumnDefinition *alter_column_;
+  PTAlterColumnDefinition *alter_column_ = nullptr;
 
   // Parse tree node for table. It's used for table creation.
-  PTCreateTable *create_table_;
-  PTAlterTable *alter_table_;
+  PTCreateTable *create_table_ = nullptr;
+  PTAlterTable *alter_table_ = nullptr;
 
   // Parser tree node for user-defined type. It's used for creating types.
-  PTCreateType *create_type_;
-  PTTypeField *type_field_;
+  PTCreateType *create_type_ = nullptr;
+  PTTypeField *type_field_ = nullptr;
 
   // Column description. It's used for DML statements including select.
-  // Not part of a parse tree, but it is allocated within the parse tree pool because it us
+  // Not part of a parse tree, but it is allocated within the parse tree pool because it is
   // persistent metadata. It represents a column during semantic and execution phases.
   //
   // TODO(neil) Add "column_read_count_" and potentially "column_write_count_" and use them for
   // error check wherever needed. Symbol tables and entries are destroyed after compilation, so
   // data that are used during compilation but not execution should be declared here.
-  ColumnDesc *column_desc_;
-
-  SymbolEntry()
-    : column_(nullptr), alter_column_(nullptr), create_table_(nullptr), alter_table_(nullptr),
-      create_type_(nullptr), type_field_(nullptr), column_desc_(nullptr) {
-  }
+  ColumnDesc *column_desc_ = nullptr;
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -101,21 +97,10 @@ class SemContext : public ProcessContext {
   CHECKED_STATUS LookupTable(const client::YBTableName& name,
                              const YBLocation& loc,
                              bool write_table,
+                             const PermissionType permission_type,
                              std::shared_ptr<client::YBTable>* table,
                              bool* is_system,
-                             MCVector<ColumnDesc>* col_descs = nullptr,
-                             int* num_key_columns = nullptr,
-                             int* num_hash_key_columns = nullptr,
-                             MCVector<PTColumnDefinition::SharedPtr>* column_definitions = nullptr);
-
-  // Load index schema into symbol table.
-  CHECKED_STATUS LookupIndex(const TableId& index_id,
-                             const YBLocation& loc,
-                             std::shared_ptr<client::YBTable>* index_table,
-                             MCVector<ColumnDesc>* col_descs = nullptr,
-                             int* num_key_columns = nullptr,
-                             int* num_hash_key_columns = nullptr,
-                             MCVector<PTColumnDefinition::SharedPtr>* column_definitions = nullptr);
+                             MCVector<ColumnDesc>* col_descs = nullptr);
 
   //------------------------------------------------------------------------------------------------
   // Access functions to current processing table and column.
@@ -132,6 +117,16 @@ class SemContext : public ProcessContext {
 
   void set_current_create_table_stmt(PTCreateTable *table) {
     current_processing_id_.create_table_ = table;
+  }
+
+  PTCreateIndex *current_create_index_stmt() {
+    PTCreateTable* const table = current_create_table_stmt();
+    return (table != nullptr && table->opcode() == TreeNodeOpcode::kPTCreateIndex)
+        ? static_cast<PTCreateIndex*>(table) : nullptr;
+  }
+
+  void set_current_create_index_stmt(PTCreateIndex *index) {
+    set_current_create_table_stmt(index);
   }
 
   PTAlterTable *current_alter_table() {
@@ -172,7 +167,7 @@ class SemContext : public ProcessContext {
 
   // Find column descriptor from symbol table. From the context, the column value will be marked to
   // be read if necessary when executing the QL statement.
-  const ColumnDesc *GetColumnDesc(const MCString& col_name);
+  const ColumnDesc *GetColumnDesc(const MCString& col_name) const;
 
   // Check if the lhs_type is convertible to rhs_type.
   bool IsConvertible(const std::shared_ptr<QLType>& lhs_type,
@@ -211,6 +206,16 @@ class SemContext : public ProcessContext {
   WhereExprState *where_state() const {
     DCHECK(sem_state_) << "State variable is not set for the expression";
     return sem_state_->where_state();
+  }
+
+  IfExprState *if_state() const {
+    DCHECK(sem_state_) << "State variable is not set for the expression";
+    return sem_state_->if_state();
+  }
+
+  bool selecting_from_index() const {
+    DCHECK(sem_state_) << "State variable is not set";
+    return sem_state_->selecting_from_index();
   }
 
   bool processing_column_definition() const {
@@ -275,23 +280,57 @@ class SemContext : public ProcessContext {
     current_dml_stmt_ = stmt;
   }
 
-  std::shared_ptr<client::YBTable> current_table() { return current_table_; }
+  CHECKED_STATUS HasKeyspacePermission(const PermissionType permission,
+                                       const NamespaceName& keyspace_name);
 
-  void set_current_table(std::shared_ptr<client::YBTable> table) {
-    current_table_ = table;
+  // Check whether the current role has the specified permission on the keyspace. Returns an
+  // UNAUTHORIZED error message if not found.
+  CHECKED_STATUS CheckHasKeyspacePermission(const YBLocation& loc,
+                                            const PermissionType permission,
+                                            const NamespaceName& keyspace_name);
+
+  // Check whether the current role has the specified permission on the keyspace or table. Returns
+  // an UNAUTHORIZED error message if not found.
+  CHECKED_STATUS CheckHasTablePermission(const YBLocation& loc,
+                                         const PermissionType permission,
+                                         const NamespaceName& keyspace_name,
+                                         const TableName& table_name);
+
+  // Convenience method.
+  CHECKED_STATUS CheckHasTablePermission(const YBLocation& loc,
+                                         const PermissionType permission,
+                                         client::YBTableName table_name);
+
+  // Check whether the current role has the specified permission on the role. Returns an
+  // UNAUTHORIZED error message if not found.
+  CHECKED_STATUS CheckHasRolePermission(const YBLocation& loc,
+                                        const PermissionType permission,
+                                        const RoleName& role_name);
+
+  // Check whether the current role has the specified permission on 'ALL KEYSPACES'.
+  CHECKED_STATUS CheckHasAllKeyspacesPermission(const YBLocation& loc,
+                                                const PermissionType permission);
+
+  // Check whether the current role has the specified permission on 'ALL ROLES'.
+  CHECKED_STATUS CheckHasAllRolesPermission(const YBLocation& loc,
+                                            const PermissionType permission);
+
+  bool IsUncoveredIndexSelect() const {
+    if (current_dml_stmt_ == nullptr ||
+        current_dml_stmt_->opcode() != TreeNodeOpcode::kPTSelectStmt) {
+      return false;
+    }
+    // Applicable to SELECT statement only.
+    const auto* select_stmt = static_cast<const PTSelectStmt*>(current_dml_stmt_);
+    return !select_stmt->index_id().empty() && !select_stmt->covers_fully();
   }
-
-  void Reset();
 
  private:
   CHECKED_STATUS LoadSchema(const std::shared_ptr<client::YBTable>& table,
-                            MCVector<ColumnDesc>* col_descs = nullptr,
-                            int* num_key_columns = nullptr,
-                            int* num_hash_key_columns = nullptr,
-                            MCVector<PTColumnDefinition::SharedPtr>* column_definitions = nullptr);
+                            MCVector<ColumnDesc>* col_descs = nullptr);
 
   // Find symbol.
-  SymbolEntry *SeekSymbol(const MCString& name);
+  const SymbolEntry *SeekSymbol(const MCString& name) const;
 
   // Symbol table.
   MCMap<MCString, SymbolEntry> symtab_;
@@ -303,20 +342,16 @@ class SemContext : public ProcessContext {
   QLEnv *ql_env_;
 
   // Is metadata cache used?
-  bool cache_used_;
+  bool cache_used_ = false;
 
   // The current dml statement being processed.
-  PTDmlStmt *current_dml_stmt_;
-
-  // The semantic analyzer will set the current table for dml queries.
-  std::shared_ptr<client::YBTable> current_table_;
+  PTDmlStmt *current_dml_stmt_ = nullptr;
 
   // sem_state_ consists of state variables that are used to process one tree node. It is generally
   // set and reset at the beginning and end of the semantic analysis of one treenode.
-  SemState *sem_state_;
+  SemState *sem_state_ = nullptr;
 };
 
 }  // namespace ql
 }  // namespace yb
-
 #endif  // YB_YQL_CQL_QL_PTREE_SEM_CONTEXT_H_

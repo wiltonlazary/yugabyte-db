@@ -35,6 +35,7 @@
 #include <gflags/gflags.h>
 
 #include "yb/gutil/strings/join.h"
+#include "yb/gutil/strings/split.h"
 #include "yb/rpc/yb_rpc.h"
 #include "yb/util/flag_tags.h"
 #include "yb/util/net/net_util.h"
@@ -56,6 +57,10 @@ DEFINE_string(placement_zone, "rack1",
               "The cloud availability zone in which this instance is started.");
 DEFINE_string(placement_uuid, "",
               "The uuid of the tservers cluster/placement.");
+
+DEFINE_int32(master_discovery_timeout_ms, 3600000,
+             "Timeout for masters to discover each other during cluster creation/startup");
+TAG_FLAG(master_discovery_timeout_ms, hidden);
 
 namespace yb {
 namespace server {
@@ -114,46 +119,78 @@ ServerBaseOptions::ServerBaseOptions(const ServerBaseOptions& options)
   SetMasterAddressesNoValidation(options.GetMasterAddresses());
 }
 
-// This implementation is better but it needs support of
-//    atomic_load( shared_ptr<> ), atomic_store( shared_ptr<> )
-//
-// #include <atomic>
-//
-// void ServerBaseOptions::SetMasterAddresses(
-//     addresses_shared_ptr master_addresses) {
-//   std::atomic_store(&master_addresses_, master_addresses);
-// }
-//
-// addresses_shared_ptr ServerBaseOptions::GetMasterAddresses() const {
-//   addresses_shared_ptr local = std::atomic_load(&master_addresses_);
-//   return local;
-// }
-
-void ServerBaseOptions::SetMasterAddressesNoValidation(
-    ServerBaseOptions::addresses_shared_ptr master_addresses) {
+void ServerBaseOptions::SetMasterAddressesNoValidation(MasterAddressesPtr master_addresses) {
   std::lock_guard<std::mutex> l(master_addresses_mtx_);
   master_addresses_ = master_addresses;
 }
 
-ServerBaseOptions::addresses_shared_ptr ServerBaseOptions::GetMasterAddresses() const {
+MasterAddressesPtr ServerBaseOptions::GetMasterAddresses() const {
   std::lock_guard<std::mutex> l(master_addresses_mtx_);
   return master_addresses_;
 }
 
-Status ServerBaseOptions::DetermineMasterAddresses(
+template <class It>
+Result<std::vector<HostPort>> MasterHostPortsFromIterators(It begin, const It& end) {
+  std::vector<HostPort> result;
+  for (;;) {
+    auto split = std::find(begin, end, ',');
+    result.push_back(VERIFY_RESULT(HostPort::FromString(
+        std::string(begin, split), master::kMasterDefaultPort)));
+    if (split == end) {
+      break;
+    }
+    begin = ++split;
+  }
+  return result;
+}
+
+Result<MasterAddresses> ParseMasterAddresses(const std::string& source) {
+  MasterAddresses result;
+  auto token_begin = source.begin();
+  auto end = source.end();
+  for (auto i = source.begin(); i != end; ++i) {
+    if (*i == '{') {
+      if (token_begin != i) {
+        return STATUS_FORMAT(InvalidArgument, "'{' in the middle of token in $0", source);
+      }
+      ++i;
+      auto token_end = std::find(i, end, '}');
+      if (token_end == end) {
+        return STATUS_FORMAT(InvalidArgument, "'{' is not terminated in $0", source);
+      }
+      result.push_back(VERIFY_RESULT(MasterHostPortsFromIterators(i, token_end)));
+      i = token_end;
+      ++i;
+      token_begin = i;
+      if (i == end) {
+        break;
+      }
+      if (*i != ',') {
+        return STATUS_FORMAT(InvalidArgument, "',' expected after '}' in $0", source);
+      }
+      ++token_begin;
+    } else if (*i == ',') {
+      result.push_back(VERIFY_RESULT(MasterHostPortsFromIterators(token_begin, i)));
+      token_begin = i;
+      ++token_begin;
+    }
+  }
+  if (token_begin != end) {
+    result.push_back(VERIFY_RESULT(MasterHostPortsFromIterators(token_begin, end)));
+  }
+  return std::move(result);
+}
+
+Status DetermineMasterAddresses(
     const std::string& master_addresses_flag_name, const std::string& master_addresses_flag,
-    uint64_t master_replication_factor, std::vector<HostPort>* master_addresses,
+    uint64_t master_replication_factor, MasterAddresses* master_addresses,
     std::string* master_addresses_resolved_str) {
   const auto kResolvePeriod = 1s;
 
-  master_addresses->clear();
-  if (!master_addresses_flag.empty()) {
-    Status s = HostPort::ParseStrings(master_addresses_flag,
-                                      master::kMasterDefaultPort,
-                                      master_addresses);
-    RETURN_NOT_OK_PREPEND(s, "Couldn't parse the " + master_addresses_flag_name + " flag ('" +
-        master_addresses_flag + "')");
-  }
+  *master_addresses = VERIFY_RESULT_PREPEND(
+      ParseMasterAddresses(master_addresses_flag),
+      Format("Couldn't parse the $0 flag ('$1')",
+             master_addresses_flag_name, master_addresses_flag));
 
   if (master_replication_factor <= 0) {
     *master_addresses_resolved_str = master_addresses_flag;
@@ -163,10 +200,10 @@ Status ServerBaseOptions::DetermineMasterAddresses(
   std::vector<Endpoint> addrs;
   for (;;) {
     addrs.clear();
-    for (auto hp : *master_addresses) {
-      auto s = hp.ResolveAddresses(&addrs);
-      if (!s.ok()) {
-        LOG(WARNING) << s;
+    for (const auto& list : *master_addresses) {
+      for (const auto& hp : list) {
+        auto s = hp.ResolveAddresses(&addrs);
+        LOG_IF(WARNING, !s.ok()) << s;
       }
     }
     if (addrs.size() >= master_replication_factor) {
@@ -181,14 +218,66 @@ Status ServerBaseOptions::DetermineMasterAddresses(
   }
   LOG(INFO) << Format("Resolved master addresses: $0", yb::ToString(addrs));
   master_addresses->clear();
-  vector<string> master_addr_strings(addrs.size());
+  std::vector<std::string> master_addr_strings(addrs.size());
   for (const auto& addr : addrs) {
     auto hp = HostPort(addr);
-    master_addresses->emplace_back(hp);
+    master_addresses->emplace_back(std::vector<HostPort>(1, hp));
     master_addr_strings.emplace_back(hp.ToString());
   }
   *master_addresses_resolved_str = JoinStrings(master_addr_strings, ",");
   return Status::OK();
+}
+
+Status ResolveMasterAddresses(MasterAddressesPtr master_addresses,
+                              std::vector<Endpoint>* resolved_addresses) {
+  const auto resolve_sleep_interval_sec = 1;
+  auto resolve_max_iterations =
+      (FLAGS_master_discovery_timeout_ms / 1000) / resolve_sleep_interval_sec;
+  if (resolve_max_iterations < 120) {
+    resolve_max_iterations = 120;
+  }
+
+  for (const auto &list : *master_addresses) {
+    for (const auto &master_addr : list) {
+      // Retry resolving master address for 'master_discovery_timeout' period of time
+      int num_iters = 0;
+      Status s = master_addr.ResolveAddresses(resolved_addresses);
+      while (!s.ok()) {
+        num_iters++;
+        if (num_iters > resolve_max_iterations) {
+          return STATUS_FORMAT(ConfigurationError, "Couldn't resolve master service address '$0'",
+              master_addr);
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(resolve_sleep_interval_sec));
+        s = master_addr.ResolveAddresses(resolved_addresses);
+      }
+    }
+  }
+  return Status::OK();
+}
+
+std::string MasterAddressesToString(const MasterAddresses& addresses) {
+  std::string result;
+  bool first_master = true;
+  for (const auto& list : addresses) {
+    if (first_master) {
+      first_master = false;
+    } else {
+      result += ',';
+    }
+    result += '{';
+    bool first_address = true;
+    for (const auto& hp : list) {
+      if (first_address) {
+        first_address = false;
+      } else {
+        result += ',';
+      }
+      result += hp.ToString();
+    }
+    result += '}';
+  }
+  return result;
 }
 
 CloudInfoPB ServerBaseOptions::MakeCloudInfoPB() const {

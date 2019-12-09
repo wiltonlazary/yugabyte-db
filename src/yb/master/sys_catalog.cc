@@ -43,8 +43,10 @@
 #include "yb/common/schema.h"
 #include "yb/common/wire_protocol.h"
 #include "yb/common/ql_value.h"
+#include "yb/common/ql_protocol_util.h"
 
 #include "yb/consensus/log_anchor_registry.h"
+#include "yb/consensus/consensus.h"
 #include "yb/consensus/consensus_meta.h"
 #include "yb/consensus/consensus_peers.h"
 #include "yb/consensus/opid_util.h"
@@ -84,7 +86,6 @@ using yb::log::Log;
 using yb::log::LogAnchorRegistry;
 using yb::tablet::LatchOperationCompletionCallback;
 using yb::tablet::TabletClass;
-using yb::tablet::TabletPeerClass;
 using yb::tserver::WriteRequestPB;
 using yb::tserver::WriteResponsePB;
 using strings::Substitute;
@@ -98,10 +99,6 @@ DEFINE_bool(notify_peer_of_removal_from_cluster, true,
 TAG_FLAG(notify_peer_of_removal_from_cluster, hidden);
 TAG_FLAG(notify_peer_of_removal_from_cluster, advanced);
 
-DEFINE_int32(master_discovery_timeout_ms, 3600000,
-             "Timeout for masters to discover each other during cluster creation/startup");
-TAG_FLAG(master_discovery_timeout_ms, hidden);
-
 METRIC_DEFINE_histogram(
   server, dns_resolve_latency_during_sys_catalog_setup,
   "yb.master.SysCatalogTable.SetupConfig DNS Resolve",
@@ -109,6 +106,7 @@ METRIC_DEFINE_histogram(
   "Microseconds spent resolving DNS requests during SysCatalogTable::SetupConfig",
   60000000LU, 2);
 
+DECLARE_int32(master_discovery_timeout_ms);
 
 namespace yb {
 namespace master {
@@ -122,16 +120,16 @@ std::string SysCatalogTable::schema_column_metadata() { return kSysCatalogTableC
 SysCatalogTable::SysCatalogTable(Master* master, MetricRegistry* metrics,
                                  ElectedLeaderCallback leader_cb)
     : metric_registry_(metrics),
+      metric_entity_(METRIC_ENTITY_server.Instantiate(metric_registry_, "yb.master")),
       master_(master),
       leader_cb_(std::move(leader_cb)) {
-  CHECK_OK(ThreadPoolBuilder("apply").Build(&apply_pool_));
+  CHECK_OK(ThreadPoolBuilder("inform_removed_master").Build(&inform_removed_master_pool_));
   CHECK_OK(ThreadPoolBuilder("raft").Build(&raft_pool_));
   CHECK_OK(ThreadPoolBuilder("prepare").set_min_threads(1).Build(&tablet_prepare_pool_));
   CHECK_OK(ThreadPoolBuilder("append").set_min_threads(1).Build(&append_pool_));
 
-  auto metric_entity = METRIC_ENTITY_server.Instantiate(metric_registry_, "yb.master");
   setup_config_dns_histogram_ = METRIC_dns_resolve_latency_during_sys_catalog_setup.Instantiate(
-      metric_entity);
+      metric_entity_);
 }
 
 SysCatalogTable::~SysCatalogTable() {
@@ -141,7 +139,7 @@ void SysCatalogTable::Shutdown() {
   if (tablet_peer()) {
     std::atomic_load(&tablet_peer_)->Shutdown();
   }
-  apply_pool_->Shutdown();
+  inform_removed_master_pool_->Shutdown();
   raft_pool_->Shutdown();
   tablet_prepare_pool_->Shutdown();
 }
@@ -149,19 +147,23 @@ void SysCatalogTable::Shutdown() {
 Status SysCatalogTable::ConvertConfigToMasterAddresses(
     const RaftConfigPB& config,
     bool check_missing_uuids) {
-  std::shared_ptr<std::vector<HostPort>> loaded_master_addresses =
-    std::make_shared<std::vector<HostPort>>();
+  auto loaded_master_addresses = std::make_shared<server::MasterAddresses>();
   bool has_missing_uuids = false;
-  auto cloud_info = master_->MakeCloudInfoPB();
   for (const auto& peer : config.peers()) {
-    HostPort hp = HostPortFromPB(DesiredHostPort(peer, cloud_info));
     if (check_missing_uuids && !peer.has_permanent_uuid()) {
-      LOG(WARNING) << "No uuid for master peer at " << hp.ToString();
+      LOG(WARNING) << "No uuid for master peer: " << peer.ShortDebugString();
       has_missing_uuids = true;
       break;
     }
 
-    loaded_master_addresses->push_back(hp);
+    loaded_master_addresses->push_back({});
+    auto& list = loaded_master_addresses->back();
+    for (const auto& hp : peer.last_known_private_addr()) {
+      list.push_back(HostPortFromPB(hp));
+    }
+    for (const auto& hp : peer.last_known_broadcast_addr()) {
+      list.push_back(HostPortFromPB(hp));
+    }
   }
 
   if (has_missing_uuids) {
@@ -192,13 +194,23 @@ Status SysCatalogTable::CreateAndFlushConsensusMeta(
 Status SysCatalogTable::Load(FsManager* fs_manager) {
   LOG(INFO) << "Trying to load previous SysCatalogTable data from disk";
   // Load Metadata Information from disk
-  scoped_refptr<tablet::TabletMetadata> metadata;
-  RETURN_NOT_OK(tablet::TabletMetadata::Load(fs_manager, kSysCatalogTabletId, &metadata));
+  scoped_refptr<tablet::RaftGroupMetadata> metadata;
+  RETURN_NOT_OK(tablet::RaftGroupMetadata::Load(fs_manager, kSysCatalogTabletId, &metadata));
 
   // Verify that the schema is the current one
   if (!metadata->schema().Equals(BuildTableSchema())) {
     // TODO: In this case we probably should execute the migration step.
     return(STATUS(Corruption, "Unexpected schema", metadata->schema().ToString()));
+  }
+
+  // Update partition schema of old SysCatalogTable. SysCatalogTable should be non-partitioned.
+  if (metadata->partition_schema().IsHashPartitioning()) {
+    LOG(INFO) << "Updating partition schema of SysCatalogTable ...";
+    PartitionSchema partition_schema;
+    RETURN_NOT_OK(PartitionSchema::FromPB(PartitionSchemaPB(), metadata->schema(),
+                                          &partition_schema));
+    metadata->SetPartitionSchema(partition_schema);
+    RETURN_NOT_OK(metadata->Flush());
   }
 
   // TODO(bogdan) we should revisit this as well as next step to understand what happens if you
@@ -212,7 +224,7 @@ Status SysCatalogTable::Load(FsManager* fs_manager) {
   // 1. We always believe the local config options for who is in the consensus configuration.
   // 2. We always want to look up all node's UUIDs on start (via RPC).
   //    - TODO: Cache UUIDs. See KUDU-526.
-  string tablet_id = metadata->tablet_id();
+  string tablet_id = metadata->raft_group_id();
   std::unique_ptr<ConsensusMetadata> cmeta;
   RETURN_NOT_OK_PREPEND(ConsensusMetadata::Load(fs_manager, tablet_id, fs_manager->uuid(), &cmeta),
                         "Unable to load consensus metadata for tablet " + tablet_id);
@@ -248,7 +260,7 @@ Status SysCatalogTable::Load(FsManager* fs_manager) {
 Status SysCatalogTable::CreateNew(FsManager *fs_manager) {
   LOG(INFO) << "Creating new SysCatalogTable data";
   // Create the new Metadata
-  scoped_refptr<tablet::TabletMetadata> metadata;
+  scoped_refptr<tablet::RaftGroupMetadata> metadata;
   Schema schema = BuildTableSchema();
   PartitionSchema partition_schema;
   RETURN_NOT_OK(PartitionSchema::FromPB(PartitionSchemaPB(), schema, &partition_schema));
@@ -258,15 +270,18 @@ Status SysCatalogTable::CreateNew(FsManager *fs_manager) {
   RETURN_NOT_OK(partition_schema.CreatePartitions(split_rows, schema, &partitions));
   DCHECK_EQ(1, partitions.size());
 
-  RETURN_NOT_OK(tablet::TabletMetadata::CreateNew(
+  RETURN_NOT_OK(tablet::RaftGroupMetadata::CreateNew(
     fs_manager,
     kSysCatalogTableId,
     kSysCatalogTabletId,
     table_name(),
     TableType::YQL_TABLE_TYPE,
-    schema, partition_schema,
+    schema,
+    IndexMap(),
+    partition_schema,
     partitions[0],
     boost::none /* index_info */,
+    0 /* schema_version */,
     tablet::TABLET_DATA_READY,
     &metadata));
 
@@ -281,46 +296,31 @@ Status SysCatalogTable::CreateNew(FsManager *fs_manager) {
 
 Status SysCatalogTable::SetupConfig(const MasterOptions& options,
                                     RaftConfigPB* committed_config) {
-  RaftConfigPB new_config;
-  new_config.set_opid_index(consensus::kInvalidOpIdIndex);
-
   // Build the set of followers from our server options.
   auto master_addresses = options.GetMasterAddresses();  // ENG-285
-  for (const HostPort& host_port : *master_addresses) {
-    RaftPeerPB peer;
-    // TODO(public_ip)
-    RETURN_NOT_OK(HostPortToPB(host_port, peer.mutable_last_known_private_addr()->Add()));
-    peer.set_member_type(RaftPeerPB::VOTER);
-    new_config.add_peers()->CopyFrom(peer);
-  }
 
   // Now resolve UUIDs.
   // By the time a SysCatalogTable is created and initted, the masters should be
   // starting up, so this should be fine to do.
   DCHECK(master_->messenger());
-  RaftConfigPB resolved_config = new_config;
-  resolved_config.clear_peers();
+  RaftConfigPB resolved_config;
+  resolved_config.set_opid_index(consensus::kInvalidOpIdIndex);
 
   ScopedDnsTracker dns_tracker(setup_config_dns_histogram_);
-  for (const RaftPeerPB& peer : new_config.peers()) {
-    if (peer.has_permanent_uuid()) {
-      resolved_config.add_peers()->CopyFrom(peer);
-    } else {
-      LOG(INFO) << peer.ShortDebugString()
-                << " has no permanent_uuid. Determining permanent_uuid...";
-      RaftPeerPB new_peer = peer;
-      // TODO: Use ConsensusMetadata to cache the results of these lookups so
-      // we only require RPC access to the full consensus configuration on first startup.
-      // See KUDU-526.
-      RETURN_NOT_OK_PREPEND(
-        consensus::SetPermanentUuidForRemotePeer(
-          &master_->proxy_cache(),
-          std::chrono::milliseconds(FLAGS_master_discovery_timeout_ms),
-          master_->MakeCloudInfoPB(),
-          &new_peer),
-        Substitute("Unable to resolve UUID for peer $0", peer.ShortDebugString()));
-      resolved_config.add_peers()->CopyFrom(new_peer);
-    }
+  for (const auto& list : *options.GetMasterAddresses()) {
+    LOG(INFO) << "Determining permanent_uuid for " + yb::ToString(list);
+    RaftPeerPB new_peer;
+    // TODO: Use ConsensusMetadata to cache the results of these lookups so
+    // we only require RPC access to the full consensus configuration on first startup.
+    // See KUDU-526.
+    RETURN_NOT_OK_PREPEND(
+      consensus::SetPermanentUuidForRemotePeer(
+        &master_->proxy_cache(),
+        std::chrono::milliseconds(FLAGS_master_discovery_timeout_ms),
+        list,
+        &new_peer),
+      Format("Unable to resolve UUID for $0", yb::ToString(list)));
+    resolved_config.add_peers()->Swap(&new_peer);
   }
 
   LOG(INFO) << "Setting up raft configuration: " << resolved_config.ShortDebugString();
@@ -423,7 +423,7 @@ void SysCatalogTable::SysCatalogStateChanged(
                                       &peer),
                   Substitute("Could not find uuid=$0 in config.", context->remove_uuid));
       WARN_NOT_OK(
-          apply_pool_->SubmitFunc(
+          inform_removed_master_pool_->SubmitFunc(
               std::bind(&Master::InformRemovedMaster, master_,
                         DesiredHostPort(peer, master_->MakeCloudInfoPB()))),
           Substitute("Error submitting removal task for uuid=$0", context->remove_uuid));
@@ -447,26 +447,28 @@ Status SysCatalogTable::GoIntoShellMode() {
   RETURN_NOT_OK(master_->fs_manager()->DeleteFileSystemLayout());
   std::shared_ptr<tablet::TabletPeer> null_tablet_peer(nullptr);
   std::atomic_store(&tablet_peer_, null_tablet_peer);
-  apply_pool_.reset();
+  inform_removed_master_pool_.reset();
   raft_pool_.reset();
   tablet_prepare_pool_.reset();
 
   return Status::OK();
 }
 
-void SysCatalogTable::SetupTabletPeer(const scoped_refptr<tablet::TabletMetadata>& metadata) {
+void SysCatalogTable::SetupTabletPeer(const scoped_refptr<tablet::RaftGroupMetadata>& metadata) {
   InitLocalRaftPeerPB();
 
   // TODO: handle crash mid-creation of tablet? do we ever end up with a
   // partially created tablet here?
-  std::shared_ptr<tablet::TabletPeer> tablet_peer = std::make_shared<TabletPeerClass>(
-      metadata, local_peer_pb_, apply_pool_.get(),
-      Bind(&SysCatalogTable::SysCatalogStateChanged, Unretained(this), metadata->tablet_id()));
+  auto tablet_peer = std::make_shared<tablet::TabletPeer>(
+      metadata, local_peer_pb_, scoped_refptr<server::Clock>(master_->clock()),
+      metadata->fs_manager()->uuid(),
+      Bind(&SysCatalogTable::SysCatalogStateChanged, Unretained(this), metadata->raft_group_id()),
+      metric_registry_);
 
   std::atomic_store(&tablet_peer_, tablet_peer);
 }
 
-Status SysCatalogTable::SetupTablet(const scoped_refptr<tablet::TabletMetadata>& metadata) {
+Status SysCatalogTable::SetupTablet(const scoped_refptr<tablet::RaftGroupMetadata>& metadata) {
   SetupTabletPeer(metadata);
 
   RETURN_NOT_OK(OpenTablet(metadata));
@@ -474,40 +476,44 @@ Status SysCatalogTable::SetupTablet(const scoped_refptr<tablet::TabletMetadata>&
   return Status::OK();
 }
 
-Status SysCatalogTable::OpenTablet(const scoped_refptr<tablet::TabletMetadata>& metadata) {
+Status SysCatalogTable::OpenTablet(const scoped_refptr<tablet::RaftGroupMetadata>& metadata) {
   CHECK(tablet_peer());
 
   shared_ptr<TabletClass> tablet;
   scoped_refptr<Log> log;
   consensus::ConsensusBootstrapInfo consensus_info;
-  tablet_peer()->SetBootstrapping();
+  RETURN_NOT_OK(tablet_peer()->SetBootstrapping());
   tablet::TabletOptions tablet_options;
-  tablet::BootstrapTabletData data = { metadata,
-                                       std::shared_future<client::YBClientPtr>(),
-                                       scoped_refptr<server::Clock>(master_->clock()),
-                                       master_->mem_tracker(),
-                                       metric_registry_,
-                                       tablet_peer()->status_listener(),
-                                       tablet_peer()->log_anchor_registry(),
-                                       tablet_options,
-                                       nullptr, // transaction_participant_context
-                                       client::LocalTabletFilter(),
-                                       nullptr, // transaction_coordinator_context
-                                       append_pool()};
+  tablet::BootstrapTabletData data = {
+      metadata,
+      std::shared_future<client::YBClient*>(),
+      scoped_refptr<server::Clock>(master_->clock()),
+      master_->mem_tracker(),
+      MemTracker::FindOrCreateTracker("BlockBasedTable", master_->mem_tracker()),
+      metric_registry_,
+      tablet_peer()->status_listener(),
+      tablet_peer()->log_anchor_registry(),
+      tablet_options,
+      " P " + tablet_peer()->permanent_uuid(),
+      nullptr, // transaction_participant_context
+      client::LocalTabletFilter(),
+      nullptr, // transaction_coordinator_context
+      append_pool()};
   RETURN_NOT_OK(BootstrapTablet(data, &tablet, &log, &consensus_info));
 
   // TODO: Do we have a setSplittable(false) or something from the outside is
   // handling split in the TS?
 
   RETURN_NOT_OK_PREPEND(tablet_peer()->InitTabletPeer(tablet,
-                                                     std::shared_future<client::YBClientPtr>(),
-                                                     scoped_refptr<server::Clock>(master_->clock()),
+                                                     std::shared_future<client::YBClient*>(),
+                                                     master_->mem_tracker(),
                                                      master_->messenger(),
                                                      &master_->proxy_cache(),
                                                      log,
                                                      tablet->GetMetricEntity(),
                                                      raft_pool(),
-                                                     tablet_prepare_pool()),
+                                                     tablet_prepare_pool(),
+                                                     nullptr /* retryable_requests */),
                         "Failed to Init() TabletPeer");
 
   RETURN_NOT_OK_PREPEND(tablet_peer()->Start(consensus_info),
@@ -551,17 +557,41 @@ Status SysCatalogTable::WaitUntilRunning() {
 
 CHECKED_STATUS SysCatalogTable::SyncWrite(SysCatalogWriter* writer) {
   tserver::WriteResponsePB resp;
+  // If this is a PG write, them the pgsql write batch is not empty.
+  //
+  // If this is a QL write, then it is a normal sys_catalog write, so ignore writes that might
+  // have filtered out all of the writes from the batch, as they were the same payload as the cow
+  // objects that are backing them.
+  if (writer->req().ql_write_batch().empty() && writer->req().pgsql_write_batch().empty()) {
+    return Status::OK();
+  }
 
   CountDownLatch latch(1);
   auto txn_callback = std::make_unique<LatchOperationCompletionCallback<WriteResponsePB>>(
       &latch, &resp);
   auto operation_state = std::make_unique<tablet::WriteOperationState>(
-      tablet_peer()->tablet(), &writer->req_, &resp);
+      tablet_peer()->tablet(), &writer->req(), &resp);
   operation_state->set_completion_callback(std::move(txn_callback));
 
-  tablet_peer()->WriteAsync(std::move(operation_state), MonoTime::Max());
-  while (!latch.WaitFor(15s)) {
-    LOG(DFATAL) << "SyncWrite hang";
+  tablet_peer()->WriteAsync(
+      std::move(operation_state), writer->leader_term(), CoarseTimePoint::max() /* deadline */);
+
+  {
+    int num_iterations = 0;
+    static constexpr auto kWarningInterval = 10s;
+    static constexpr int kMaxNumIterations = 6;
+    while (!latch.WaitFor(kWarningInterval)) {
+      ++num_iterations;
+      const auto waited_so_far = num_iterations * kWarningInterval;
+      LOG(WARNING) << "Waited for "
+                   << waited_so_far << " for synchronous write to complete. "
+                   << "Continuing to wait.";
+      if (num_iterations >= kMaxNumIterations) {
+        LOG(ERROR) << "Already waited for a total of " << waited_so_far << ". "
+                   << "Returning a timeout from SyncWrite.";
+        return STATUS_FORMAT(TimedOut, "SyncWrite timed out after $0", waited_so_far);
+      }
+    }
   }
 
   if (resp.has_error()) {
@@ -617,22 +647,133 @@ Status SysCatalogTable::Visit(VisitorBase* visitor) {
   const int metadata_col_idx = schema_.find_column(kSysCatalogTableColMetadata);
   CHECK(type_col_idx != Schema::kColumnNotFound);
 
-  auto iter = tablet_peer()->tablet()->NewRowIterator(schema_, boost::none);
+  auto tablet = tablet_peer()->shared_tablet();
+  if (!tablet) {
+    return STATUS(ShutdownInProgress, "SysConfig is shutting down.");
+  }
+  auto iter = tablet->NewRowIterator(schema_, boost::none);
   RETURN_NOT_OK(iter);
 
-  Arena arena(32_KB, 256_KB);
+  auto doc_iter = dynamic_cast<yb::docdb::DocRowwiseIterator*>(iter->get());
+  CHECK(doc_iter != nullptr);
+  QLConditionPB cond;
+  cond.set_op(QL_OP_AND);
+  QLAddInt8Condition(&cond, schema_with_ids_.column_id(type_col_idx), QL_OP_EQUAL, tables_entry);
+  yb::docdb::DocQLScanSpec spec(
+      schema_with_ids_, boost::none /* hash_code */, boost::none /* max_hash_code */,
+      {} /* hashed_components */, &cond, nullptr /* if_req */, rocksdb::kDefaultQueryId);
+  RETURN_NOT_OK(doc_iter->Init(spec));
+
   QLTableRow value_map;
   QLValue entry_type, entry_id, metadata;
-  while ((**iter).HasNext()) {
+  uint64_t count = 0;
+  auto start = CoarseMonoClock::Now();
+  while (VERIFY_RESULT((**iter).HasNext())) {
+    ++count;
     RETURN_NOT_OK((**iter).NextRow(&value_map));
     RETURN_NOT_OK(value_map.GetValue(schema_with_ids_.column_id(type_col_idx), &entry_type));
-    if (entry_type.int8_value() != tables_entry) {
-      continue;
-    }
+    CHECK_EQ(entry_type.int8_value(), tables_entry);
     RETURN_NOT_OK(value_map.GetValue(schema_with_ids_.column_id(entry_id_col_idx), &entry_id));
     RETURN_NOT_OK(value_map.GetValue(schema_with_ids_.column_id(metadata_col_idx), &metadata));
     RETURN_NOT_OK(visitor->Visit(entry_id.binary_value(), metadata.binary_value()));
   }
+  auto duration = CoarseMonoClock::Now() - start;
+  string id = Format("num_entries_with_type_$0_loaded", std::to_string(tables_entry));
+  if (visitor_duration_metrics_.find(id) == visitor_duration_metrics_.end()) {
+    string description = id + " metric for SysCatalogTable::Visit";
+    std::unique_ptr<GaugePrototype<uint64>> counter_gauge =
+        std::make_unique<OwningGaugePrototype<uint64>>(
+            "server", id, description, yb::MetricUnit::kEntries, description,
+            yb::EXPOSE_AS_COUNTER);
+    visitor_duration_metrics_[id] = metric_entity_->FindOrCreateGauge(
+        std::move(counter_gauge), static_cast<uint64>(0) /* initial_value */);
+  }
+  visitor_duration_metrics_[id]->IncrementBy(count);
+
+  id = Format("duration_ms_loading_entries_with_type_$0", std::to_string(tables_entry));
+  if (visitor_duration_metrics_.find(id) == visitor_duration_metrics_.end()) {
+    string description = id + " metric for SysCatalogTable::Visit";
+    std::unique_ptr<GaugePrototype<uint64>> duration_gauge =
+        std::make_unique<OwningGaugePrototype<uint64>>(
+            "server", id, description, yb::MetricUnit::kMilliseconds, description);
+    visitor_duration_metrics_[id] = metric_entity_->FindOrCreateGauge(
+        std::move(duration_gauge), static_cast<uint64>(0) /* initial_value */);
+  }
+  visitor_duration_metrics_[id]->IncrementBy(ToMilliseconds(duration));
+  return Status::OK();
+}
+
+Status SysCatalogTable::CopyPgsqlTable(const TableId& source_table_id,
+                                       const TableId& target_table_id,
+                                       const int64_t leader_term) {
+  TRACE_EVENT0("master", "CopyPgsqlTable");
+
+  const auto* tablet = tablet_peer()->tablet();
+  const auto* meta = tablet->metadata();
+  const tablet::TableInfo* source_table_info = VERIFY_RESULT(meta->GetTableInfo(source_table_id));
+  const tablet::TableInfo* target_table_info = VERIFY_RESULT(meta->GetTableInfo(target_table_id));
+
+  const Schema source_projection = source_table_info->schema.CopyWithoutColumnIds();
+  std::unique_ptr<common::YQLRowwiseIteratorIf> iter =
+      VERIFY_RESULT(tablet->NewRowIterator(source_projection, boost::none, source_table_id));
+  QLTableRow source_row;
+  std::unique_ptr<SysCatalogWriter> writer = NewWriter(leader_term);
+  while (VERIFY_RESULT(iter->HasNext())) {
+    RETURN_NOT_OK(iter->NextRow(&source_row));
+    RETURN_NOT_OK(writer->InsertPgsqlTableRow(
+        source_table_info->schema, source_row, target_table_id, target_table_info->schema,
+        target_table_info->schema_version, true /* is_upsert */));
+  }
+
+  VLOG(1) << Format("Copied $0 rows from $1 to $2", writer->req().pgsql_write_batch_size(),
+                    source_table_id, target_table_id);
+
+  return writer->req().pgsql_write_batch().empty() ? Status::OK() : SyncWrite(writer.get());
+}
+
+Status SysCatalogTable::CopyPgsqlTables(
+    const vector<TableId>& source_table_ids, const vector<TableId>& target_table_ids,
+    const int64_t leader_term) {
+  TRACE_EVENT0("master", "CopyPgsqlTables");
+
+  std::unique_ptr<SysCatalogWriter> writer = NewWriter(leader_term);
+
+  DSCHECK_EQ(
+      source_table_ids.size(), target_table_ids.size(), InvalidArgument,
+      "size mismatch between source tables and target tables");
+
+  for (int i = 0; i < source_table_ids.size(); ++i) {
+    auto& source_table_id = source_table_ids[i];
+    auto& target_table_id = target_table_ids[i];
+
+    const auto* tablet = tablet_peer()->tablet();
+    const auto* meta = tablet->metadata();
+    const tablet::TableInfo* source_table_info = VERIFY_RESULT(meta->GetTableInfo(source_table_id));
+    const tablet::TableInfo* target_table_info = VERIFY_RESULT(meta->GetTableInfo(target_table_id));
+
+    const Schema source_projection = source_table_info->schema.CopyWithoutColumnIds();
+    std::unique_ptr<common::YQLRowwiseIteratorIf> iter =
+        VERIFY_RESULT(tablet->NewRowIterator(source_projection, boost::none, source_table_id));
+    QLTableRow source_row;
+    int count = 0;
+    while (VERIFY_RESULT(iter->HasNext())) {
+      RETURN_NOT_OK(iter->NextRow(&source_row));
+
+      RETURN_NOT_OK(writer->InsertPgsqlTableRow(
+          source_table_info->schema, source_row, target_table_id, target_table_info->schema,
+          target_table_info->schema_version, true /* is_upsert */));
+      ++count;
+    }
+    LOG(INFO) << Format("Copied $0 rows from $1 to $2", count, source_table_id, target_table_id);
+  }
+  LOG(INFO) << Format("Copied total $0 rows", writer->req().pgsql_write_batch_size());
+  LOG(INFO) << Format("Copied total $0 bytes", writer->req().SpaceUsedLong());
+
+  return writer->req().pgsql_write_batch().empty() ? Status::OK() : SyncWrite(writer.get());
+}
+
+Status SysCatalogTable::DeleteYsqlSystemTable(const string& table_id) {
+  tablet_peer()->tablet_metadata()->RemoveTable(table_id);
   return Status::OK();
 }
 

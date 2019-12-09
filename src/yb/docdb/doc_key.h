@@ -21,18 +21,20 @@
 
 #include "yb/rocksdb/env.h"
 #include "yb/rocksdb/filter_policy.h"
-#include "yb/util/slice.h"
-#include "yb/util/strongly_typed_bool.h"
 
 #include "yb/common/schema.h"
+
+#include "yb/docdb/docdb_fwd.h"
 #include "yb/docdb/primitive_value.h"
+
+#include "yb/util/ref_cnt_buffer.h"
+#include "yb/util/slice.h"
+#include "yb/util/strongly_typed_bool.h"
 
 namespace yb {
 namespace docdb {
 
 using DocKeyHash = uint16_t;
-
-class DocPath;
 
 // ------------------------------------------------------------------------------------------------
 // DocKey
@@ -61,9 +63,13 @@ enum class DocKeyPart {
   HASHED_PART_ONLY
 };
 
+class DocKeyDecoder;
+
 YB_STRONGLY_TYPED_BOOL(HybridTimeRequired)
 
-
+// Whether to allow parts of the range component of a doc key that should not be present in stored
+// doc key, but could be used during read, for instance kLowest and kHighest.
+YB_STRONGLY_TYPED_BOOL(AllowSpecial)
 
 class DocKey {
  public:
@@ -71,7 +77,7 @@ class DocKey {
   DocKey();
 
   // Construct a document key with only a range component, but no hashed component.
-  explicit DocKey(const std::vector<PrimitiveValue>& range_components);
+  explicit DocKey(std::vector<PrimitiveValue> range_components);
 
   // Construct a document key including a hashed component and a range component. The hash value has
   // to be calculated outside of the constructor, and we're not assuming any specific hash function
@@ -81,17 +87,48 @@ class DocKey {
   // @param hashed_components Components of the key that go into computing the hash prefix.
   // @param range_components Components of the key that we want to be able to do range scans on.
   DocKey(DocKeyHash hash,
-         const std::vector<PrimitiveValue>& hashed_components,
-         const std::vector<PrimitiveValue>& range_components = std::vector<PrimitiveValue>());
+         std::vector<PrimitiveValue> hashed_components,
+         std::vector<PrimitiveValue> range_components = std::vector<PrimitiveValue>());
+
+  DocKey(const Uuid& cotable_id,
+         DocKeyHash hash,
+         std::vector<PrimitiveValue> hashed_components,
+         std::vector<PrimitiveValue> range_components = std::vector<PrimitiveValue>());
+
+  explicit DocKey(const Uuid& cotable_id);
+
+  // Constructors to create a DocKey for the given schema to support co-located tables.
+  explicit DocKey(const Schema& schema);
+  DocKey(const Schema& schema, DocKeyHash hash);
+  DocKey(const Schema& schema, std::vector<PrimitiveValue> range_components);
+  DocKey(const Schema& schema, DocKeyHash hash,
+         std::vector<PrimitiveValue> hashed_components,
+         std::vector<PrimitiveValue> range_components = std::vector<PrimitiveValue>());
 
   KeyBytes Encode() const;
   void AppendTo(KeyBytes* out) const;
+
+  // Encodes DocKey to binary representation returning result as RefCntPrefix.
+  RefCntPrefix EncodeAsRefCntPrefix() const;
 
   // Resets the state to an empty document key.
   void Clear();
 
   // Clear the range components of the document key only.
   void ClearRangeComponents();
+
+  // Resize the range components:
+  //  - drop elements (primitive values) from the end if new_size is smaller than the old size.
+  //  - append default primitive values (kNullLow) if new_size is bigger than the old size.
+  void ResizeRangeComponents(int new_size);
+
+  const Uuid& cotable_id() const {
+    return cotable_id_;
+  }
+
+  bool has_cotable_id() const {
+    return !cotable_id_.IsNil();
+  }
 
   DocKeyHash hash() const {
     return hash_;
@@ -105,22 +142,42 @@ class DocKey {
     return range_group_;
   }
 
+  std::vector<PrimitiveValue>& hashed_group() {
+    return hashed_group_;
+  }
+
+  std::vector<PrimitiveValue>& range_group() {
+    return range_group_;
+  }
+
   // Decodes a document key from the given RocksDB key.
   // slice (in/out) - a slice corresponding to a RocksDB key. Any consumed bytes are removed.
   // part_to_decode specifies which part of key to decode.
-  CHECKED_STATUS DecodeFrom(rocksdb::Slice* slice,
-      DocKeyPart part_to_decode = DocKeyPart::WHOLE_DOC_KEY);
+  CHECKED_STATUS DecodeFrom(
+      Slice* slice,
+      DocKeyPart part_to_decode = DocKeyPart::WHOLE_DOC_KEY,
+      AllowSpecial allow_special = AllowSpecial::kFalse);
 
   // Decodes a document key from the given RocksDB key similar to the above but return the number
   // of bytes decoded from the input slice.
-  Result<size_t> DecodeFrom(const rocksdb::Slice& slice,
-      DocKeyPart part_to_decode = DocKeyPart::WHOLE_DOC_KEY);
+  Result<size_t> DecodeFrom(
+      const Slice& slice,
+      DocKeyPart part_to_decode = DocKeyPart::WHOLE_DOC_KEY,
+      AllowSpecial allow_special = AllowSpecial::kFalse);
 
   // Splits given RocksDB key into vector of slices that forms range_group of document key.
-  static CHECKED_STATUS PartiallyDecode(rocksdb::Slice* slice,
+  static CHECKED_STATUS PartiallyDecode(Slice* slice,
                                         boost::container::small_vector_base<Slice>* out);
 
-  static Result<size_t> EncodedSize(Slice slice, DocKeyPart part);
+  // Decode just the hash code of a DocKey.
+  static Result<DocKeyHash> DecodeHash(const Slice& slice);
+
+  static Result<size_t> EncodedSize(
+      Slice slice, DocKeyPart part, AllowSpecial allow_special = AllowSpecial::kFalse);
+
+  // Returns size of encoded hash part and whole part of DocKey.
+  static Result<std::pair<size_t, size_t>> EncodedHashPartAndDocKeySizes(
+      Slice slice, AllowSpecial allow_special = AllowSpecial::kFalse);
 
   // Decode the current document key from the given slice, but expect all bytes to be consumed, and
   // return an error status if that is not the case.
@@ -128,6 +185,7 @@ class DocKey {
 
   // Converts the document key to a human-readable representation.
   std::string ToString() const;
+  static std::string DebugSliceToString(Slice slice);
 
   // Check if it is an empty key.
   bool empty() const {
@@ -143,6 +201,8 @@ class DocKey {
   bool HashedComponentsEqual(const DocKey& other) const;
 
   void AddRangeComponent(const PrimitiveValue& val);
+
+  void SetRangeComponent(const PrimitiveValue& val, int idx);
 
   int CompareTo(const DocKey& other) const;
 
@@ -162,6 +222,23 @@ class DocKey {
     return CompareTo(other) >= 0;
   }
 
+  bool BelongsTo(const Schema& schema) const {
+    return cotable_id_ == schema.cotable_id();
+  }
+
+  void set_cotable_id(const Uuid& cotable_id) {
+    cotable_id_ = cotable_id;
+  }
+
+  void set_hash(DocKeyHash hash) {
+    hash_ = hash;
+    hash_present_ = true;
+  }
+
+  bool has_hash() const {
+    return hash_present_;
+  }
+
   // Converts a redis string key to a doc key
   static DocKey FromRedisKey(uint16_t hash, const string& key);
   static KeyBytes EncodedFromRedisKey(uint16_t hash, const std::string &key);
@@ -171,15 +248,149 @@ class DocKey {
   friend class DecodeFromCallback;
 
   template<class Callback>
-  static CHECKED_STATUS DoDecode(rocksdb::Slice* slice,
+  static CHECKED_STATUS DoDecode(DocKeyDecoder* decoder,
                                  DocKeyPart part_to_decode,
+                                 AllowSpecial allow_special,
                                  const Callback& callback);
 
+  // Uuid of the non-primary table this DocKey belongs to co-located in a tablet. Nil for the
+  // primary or single-tenant table.
+  Uuid cotable_id_;
+
+  // TODO: can we get rid of this field and just use !hashed_group_.empty() instead?
   bool hash_present_;
+
   DocKeyHash hash_;
   std::vector<PrimitiveValue> hashed_group_;
   std::vector<PrimitiveValue> range_group_;
 };
+
+template <class Collection>
+void AppendDocKeyItems(const Collection& doc_key_items, KeyBytes* result) {
+  for (const auto& item : doc_key_items) {
+    item.AppendToKey(result);
+  }
+  result->AppendValueType(ValueType::kGroupEnd);
+}
+
+class DocKeyEncoderAfterHashStep {
+ public:
+  explicit DocKeyEncoderAfterHashStep(KeyBytes* out) : out_(out) {}
+
+  template <class Collection>
+  void Range(const Collection& range_group) {
+    AppendDocKeyItems(range_group, out_);
+  }
+
+ private:
+  KeyBytes* out_;
+};
+
+class DocKeyEncoderAfterCotableIdStep {
+ public:
+  explicit DocKeyEncoderAfterCotableIdStep(KeyBytes* out) : out_(out) {
+  }
+
+  template <class Collection>
+  DocKeyEncoderAfterHashStep Hash(
+      bool hash_present, uint16_t hash, const Collection& hashed_group) {
+    if (!hash_present) {
+      return DocKeyEncoderAfterHashStep(out_);
+    }
+
+    return Hash(hash, hashed_group);
+  }
+
+  template <class Collection>
+  DocKeyEncoderAfterHashStep Hash(uint16_t hash, const Collection& hashed_group) {
+    // We are not setting the "more items in group" bit on the hash field because it is not part
+    // of "hashed" or "range" groups.
+    out_->AppendValueType(ValueType::kUInt16Hash);
+    out_->AppendUInt16(hash);
+    AppendDocKeyItems(hashed_group, out_);
+
+    return DocKeyEncoderAfterHashStep(out_);
+  }
+
+  template <class HashCollection, class RangeCollection>
+  void HashAndRange(uint16_t hash, const HashCollection& hashed_group,
+                    const RangeCollection& range_collection) {
+    Hash(hash, hashed_group).Range(range_collection);
+  }
+
+  void HashAndRange(uint16_t hash, const std::initializer_list<PrimitiveValue>& hashed_group,
+                    const std::initializer_list<PrimitiveValue>& range_collection) {
+    Hash(hash, hashed_group).Range(range_collection);
+  }
+
+ private:
+  KeyBytes* out_;
+};
+
+class DocKeyEncoder {
+ public:
+  explicit DocKeyEncoder(KeyBytes* out) : out_(out) {}
+
+  DocKeyEncoderAfterCotableIdStep CotableId(const Uuid& cotable_id);
+
+ private:
+  KeyBytes* out_;
+};
+
+class DocKeyDecoder {
+ public:
+  explicit DocKeyDecoder(const Slice& input) : input_(input) {}
+
+  Result<bool> DecodeCotableId(Uuid* uuid = nullptr);
+  Result<bool> HasPrimitiveValue();
+
+  Result<bool> DecodeHashCode(
+      uint16_t* out = nullptr, AllowSpecial allow_special = AllowSpecial::kFalse);
+
+  Result<bool> DecodeHashCode(AllowSpecial allow_special) {
+    return DecodeHashCode(nullptr /* out */, allow_special);
+  }
+
+  CHECKED_STATUS DecodePrimitiveValue(
+      PrimitiveValue* out = nullptr, AllowSpecial allow_special = AllowSpecial::kFalse);
+
+  CHECKED_STATUS DecodePrimitiveValue(AllowSpecial allow_special) {
+    return DecodePrimitiveValue(nullptr /* out */, allow_special);
+  }
+
+  CHECKED_STATUS ConsumeGroupEnd();
+
+  bool GroupEnded() const;
+
+  const Slice& left_input() const {
+    return input_;
+  }
+
+  size_t ConsumedSizeFrom(const uint8_t* start) const {
+    return input_.data() - start;
+  }
+
+  Slice* mutable_input() {
+    return &input_;
+  }
+
+  CHECKED_STATUS DecodeToRangeGroup();
+
+ private:
+  Slice input_;
+};
+
+// Clears range components from provided key. Returns true if they were exists.
+Result<bool> ClearRangeComponents(KeyBytes* out, AllowSpecial allow_special = AllowSpecial::kFalse);
+
+Result<bool> HashedComponentsEqual(const Slice& lhs, const Slice& rhs);
+
+bool DocKeyBelongsTo(Slice doc_key, const Schema& schema);
+
+// Consumes single primitive value from start of slice.
+// Returns true when value was consumed, false when group end is found. The group end byte is
+// consumed in the latter case.
+Result<bool> ConsumePrimitiveValueFromKey(Slice* slice);
 
 // Consume a group of document key components, ending with ValueType::kGroupEnd.
 // @param slice - the current point at which we are decoding a key
@@ -262,17 +473,25 @@ class SubDocKey {
     return subkeys_;
   }
 
+  std::vector<PrimitiveValue>& subkeys() {
+    return subkeys_;
+  }
+
   // Append a sequence of sub-keys to this key.
   template<class ...T>
   void AppendSubKeysAndMaybeHybridTime(PrimitiveValue subdoc_key,
                                        T... subkeys_and_maybe_hybrid_time) {
-    subkeys_.emplace_back(subdoc_key);
+    subkeys_.push_back(std::move(subdoc_key));
     AppendSubKeysAndMaybeHybridTime(subkeys_and_maybe_hybrid_time...);
+  }
+
+  void AppendSubKey(PrimitiveValue subkey) {
+    subkeys_.emplace_back(std::move(subkey));
   }
 
   template<class ...T>
   void AppendSubKeysAndMaybeHybridTime(PrimitiveValue subdoc_key) {
-    subkeys_.emplace_back(subdoc_key);
+    subkeys_.emplace_back(std::move(subdoc_key));
   }
 
   template<class ...T>
@@ -320,8 +539,6 @@ class SubDocKey {
   CHECKED_STATUS DecodeFrom(rocksdb::Slice* slice,
                             HybridTimeRequired require_hybrid_time = HybridTimeRequired::kTrue);
 
-  static Result<bool> DecodeSubkey(Slice* slice, PrimitiveValue* out);
-
   // Similar to DecodeFrom, but requires that the entire slice is decoded, and thus takes a const
   // reference to a slice. This still respects the require_hybrid_time parameter, but in case a
   // hybrid_time is omitted, we don't allow any extra bytes to be present in the slice.
@@ -334,6 +551,34 @@ class SubDocKey {
   static CHECKED_STATUS PartiallyDecode(Slice* slice,
                                         boost::container::small_vector_base<Slice>* out);
 
+  // Splits the given RocksDB sub key into a vector of slices that forms the range group of document
+  // key and sub keys.
+  //
+  // We don't use Result<...> to be able to reuse memory allocated by out.
+  //
+  // When key does not start with a hash component, the returned prefix would start with the first
+  // range component.
+  //
+  // For instance, for a (hash_value, h1, h2, r1, r2, s1) doc key the following values will be
+  // returned:
+  // encoded_length(hash_value, h1, h2) <-------------- (includes the kGroupEnd of the hashed part)
+  // encoded_length(hash_value, h1, h2, r1)
+  // encoded_length(hash_value, h1, h2, r1, r2)
+  // encoded_length(hash_value, h1, h2, r1, r2, s1) <------- (includes kGroupEnd of the range part).
+  static CHECKED_STATUS DecodePrefixLengths(
+      Slice slice, boost::container::small_vector_base<size_t>* out);
+
+  // Fills out with ends of SubDocKey components. First item in out will be size of DocKey,
+  // second size of DocKey + size of first subkey and so on.
+  //
+  // If out is not empty, then it will be interpreted as partial result for this decoding operation
+  // and the appropriate prefix will be skipped.
+  static CHECKED_STATUS DecodeDocKeyAndSubKeyEnds(
+      Slice slice, boost::container::small_vector_base<size_t>* out);
+
+  // Attempts to decode a subkey at the beginning of the given slice, consuming the corresponding
+  // prefix of the slice. Returns false if there is no next subkey, as indicated by the slice being
+  // empty or encountering an encoded hybrid time.
   static Result<bool> DecodeSubkey(Slice* slice);
 
   CHECKED_STATUS FullyDecodeFromKeyWithOptionalHybridTime(const rocksdb::Slice& slice) {
@@ -342,8 +587,13 @@ class SubDocKey {
 
   std::string ToString() const;
   static std::string DebugSliceToString(Slice slice);
+  static Result<std::string> DebugSliceToStringAsResult(Slice slice);
 
   const DocKey& doc_key() const {
+    return doc_key_;
+  }
+
+  DocKey& doc_key() {
     return doc_key_;
   }
 
@@ -408,10 +658,6 @@ class SubDocKey {
   bool has_hybrid_time() const {
     return doc_ht_.is_valid();
   }
-
-  // @return The number of initial components (including document key and subkeys) that this
-  //         SubDocKey shares with another one. This does not care about the hybrid_time field.
-  int NumSharedPrefixComponents(const SubDocKey& other) const;
 
   // Generate a RocksDB key that would allow us to seek to the smallest SubDocKey that has a
   // lexicographically higher sequence of subkeys than this one, but is not an extension of this
@@ -531,13 +777,43 @@ class DocDbAwareFilterPolicy : public rocksdb::FilterPolicy {
   std::unique_ptr<const rocksdb::FilterPolicy> builtin_policy_;
 };
 
+// Optional inclusive lower bound and exclusive upper bound for keys served by DocDB.
+// Could be used to split tablet without doing actual splitting of RocksDB files.
+// DocDBCompactionFilter also respects these bounds, so it will filter out non-relevant keys
+// during compaction.
+// Both bounds should be encoded DocKey or its part to avoid splitting DocDB row.
+struct KeyBounds {
+  KeyBytes lower;
+  KeyBytes upper;
+
+  static const KeyBounds kNoBounds;
+
+  KeyBounds() = default;
+  KeyBounds(const Slice& _lower, const Slice& _upper) : lower(_lower), upper(_upper) {}
+
+  bool IsWithinBounds(const Slice& key) const {
+    return (lower.empty() || key.compare(lower) >= 0) &&
+           (upper.empty() || key.compare(upper) < 0);
+  }
+
+  std::string ToString() const {
+    return Format("{ lower: $0 upper: $1 }", lower, upper);
+  }
+};
+
 // Combined DB to store regular records and intents.
+// TODO: move this to a more appropriate header file.
 struct DocDB {
   rocksdb::DB* regular;
   rocksdb::DB* intents;
+  const KeyBounds* key_bounds;
 
-  static DocDB FromRegular(rocksdb::DB* regular) {
-    return {regular, nullptr /* intents */};
+  static DocDB FromRegularUnbounded(rocksdb::DB* regular) {
+    return {regular, nullptr /* intents */, &KeyBounds::kNoBounds};
+  }
+
+  DocDB WithoutIntents() {
+    return {regular, nullptr /* intents */, key_bounds};
   }
 };
 

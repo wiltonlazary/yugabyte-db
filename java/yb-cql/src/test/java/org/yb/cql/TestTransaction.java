@@ -16,18 +16,19 @@ import java.util.*;
 
 import org.junit.Test;
 
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertTrue;
-
-import org.yb.minicluster.Metrics;
-import org.yb.minicluster.MiniYBCluster;
-import org.yb.minicluster.MiniYBDaemon;
+import static org.yb.AssertionWrappers.assertNotNull;
+import static org.yb.AssertionWrappers.assertEquals;
+import static org.yb.AssertionWrappers.assertTrue;
 
 import com.datastax.driver.core.Row;
 import com.datastax.driver.core.PreparedStatement;
 import com.datastax.driver.core.ResultSetFuture;
 
+import org.yb.YBTestRunner;
+
+import org.junit.runner.RunWith;
+
+@RunWith(value=YBTestRunner.class)
 public class TestTransaction extends BaseCQLTest {
 
   public int getTestMethodTimeoutSec() {
@@ -124,8 +125,7 @@ public class TestTransaction extends BaseCQLTest {
       session.execute("insert into test_txn1 (k, c1, c2) values (?, ?, ?);",
                       Integer.valueOf(i), Integer.valueOf(i), "v" + i);
     }
-    assertQuery("select * from test_txn1;",
-                new HashSet<String>(Arrays.asList("Row[1, 1, v1]", "Row[2, 2, v2]")));
+    assertQueryRowsUnordered("select * from test_txn1;", "Row[1, 1, v1]", "Row[2, 2, v2]");
 
     // Test a mix of insert/update/delete in the same transaction.
     session.execute("begin transaction" +
@@ -386,9 +386,9 @@ public class TestTransaction extends BaseCQLTest {
     }
 
     // Also verify that the rows are inserted indeed.
-    assertQuery("select k, v from test_write_conflicts",
-                new HashSet<>(Arrays.asList("Row[1, 1000]",
-                                            "Row[2, 2000]")));
+    assertQueryRowsUnordered("select k, v from test_write_conflicts",
+                             "Row[1, 1000]",
+                             "Row[2, 2000]");
   }
 
   @Test
@@ -469,7 +469,7 @@ public class TestTransaction extends BaseCQLTest {
             Integer.valueOf(3), Integer.valueOf(3), "v3");
 
     thrown.expect(com.datastax.driver.core.exceptions.InvalidQueryException.class);
-    thrown.expectMessage("Table Not Found");
+    thrown.expectMessage("Object Not Found");
     Iterator<Row> rows = session.execute("SELECT * FROM system.transactions").iterator();
   }
 

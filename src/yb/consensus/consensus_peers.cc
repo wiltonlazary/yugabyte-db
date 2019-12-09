@@ -38,20 +38,23 @@
 #include <utility>
 #include <vector>
 
-#include <boost/bind.hpp>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <boost/optional.hpp>
 
 #include "yb/common/wire_protocol.h"
+#include "yb/consensus/consensus.h"
 #include "yb/consensus/consensus.proxy.h"
 #include "yb/consensus/consensus_meta.h"
 #include "yb/consensus/consensus_queue.h"
 #include "yb/consensus/log.h"
+#include "yb/consensus/replicate_msgs_holder.h"
+
 #include "yb/gutil/map-util.h"
 #include "yb/gutil/stl_util.h"
 #include "yb/gutil/strings/substitute.h"
 #include "yb/rpc/messenger.h"
+#include "yb/rpc/periodic.h"
 #include "yb/tserver/tserver.pb.h"
 
 #include "yb/util/backoff_waiter.h"
@@ -63,12 +66,20 @@
 #include "yb/util/net/net_util.h"
 #include "yb/util/status_callback.h"
 #include "yb/util/threadpool.h"
+#include "yb/util/tsan_util.h"
 
 using namespace std::literals;
+using namespace std::placeholders;
 
 DEFINE_int32(consensus_rpc_timeout_ms, 3000,
              "Timeout used for all consensus internal RPC communications.");
 TAG_FLAG(consensus_rpc_timeout_ms, advanced);
+
+DEFINE_int32(max_wait_for_processresponse_before_closing_ms,
+             yb::RegularBuildVsSanitizers(5000, 60000),
+             "Maximum amount of time we will wait in Peer::Close() for Peer::ProcessResponse() to "
+             "finish before returning proceding to close the Peer and return");
+TAG_FLAG(max_wait_for_processresponse_before_closing_ms, advanced);
 
 DECLARE_int32(raft_heartbeat_interval_ms);
 
@@ -83,6 +94,8 @@ DEFINE_test_flag(bool, enable_remote_bootstrap, true,
                  "detects that a follower is out of date or does not have a tablet "
                  "replica.");
 
+DECLARE_int32(log_change_config_every_n);
+
 namespace yb {
 namespace consensus {
 
@@ -90,38 +103,22 @@ using log::Log;
 using log::LogEntryBatch;
 using std::shared_ptr;
 using rpc::Messenger;
+using rpc::PeriodicTimer;
 using rpc::RpcController;
 using strings::Substitute;
 
-Result<PeerPtr> Peer::NewRemotePeer(const RaftPeerPB& peer_pb,
-                                    const string& tablet_id,
-                                    const string& leader_uuid,
-                                    PeerMessageQueue* queue,
-                                    ThreadPoolToken* raft_pool_token,
-                                    PeerProxyPtr proxy,
-                                    Consensus* consensus) {
-
-  PeerPtr new_peer(new Peer(
-      peer_pb, tablet_id, leader_uuid, std::move(proxy), queue, raft_pool_token, consensus));
-  RETURN_NOT_OK(new_peer->Init());
-  return Result<PeerPtr>(std::move(new_peer));
-}
-
 Peer::Peer(
     const RaftPeerPB& peer_pb, string tablet_id, string leader_uuid, PeerProxyPtr proxy,
-    PeerMessageQueue* queue, ThreadPoolToken* raft_pool_token, Consensus* consensus)
+    PeerMessageQueue* queue, ThreadPoolToken* raft_pool_token, Consensus* consensus,
+    rpc::Messenger* messenger)
     : tablet_id_(std::move(tablet_id)),
       leader_uuid_(std::move(leader_uuid)),
       peer_pb_(peer_pb),
       proxy_(std::move(proxy)),
       queue_(queue),
-      sem_(1),
-      heartbeater_(
-          peer_pb.permanent_uuid(), MonoDelta::FromMilliseconds(FLAGS_raft_heartbeat_interval_ms),
-          std::bind(&Peer::SignalRequest, this, RequestTriggerMode::kAlwaysSend)),
       raft_pool_token_(raft_pool_token),
-      state_(kPeerCreated),
-      consensus_(consensus) {}
+      consensus_(consensus),
+      messenger_(messenger) {}
 
 void Peer::SetTermForTest(int term) {
   response_.set_responder_term(term);
@@ -130,7 +127,18 @@ void Peer::SetTermForTest(int term) {
 Status Peer::Init() {
   std::lock_guard<simple_spinlock> lock(peer_lock_);
   queue_->TrackPeer(peer_pb_.permanent_uuid());
-  RETURN_NOT_OK(heartbeater_.Start());
+  // Capture a weak_ptr reference into the functor so it can safely handle
+  // outliving the peer.
+  std::weak_ptr<Peer> weak_peer = shared_from_this();
+  heartbeater_ = PeriodicTimer::Create(
+      messenger_,
+      [weak_peer]() {
+        if (auto p = weak_peer.lock()) {
+          Status s = p->SignalRequest(RequestTriggerMode::kAlwaysSend);
+        }
+      },
+      MonoDelta::FromMilliseconds(FLAGS_raft_heartbeat_interval_ms));
+  heartbeater_->Start();
   state_ = kPeerStarted;
   return Status::OK();
 }
@@ -138,15 +146,14 @@ Status Peer::Init() {
 Status Peer::SignalRequest(RequestTriggerMode trigger_mode) {
   // If the peer is currently sending, return Status::OK().
   // If there are new requests in the queue we'll get them on ProcessResponse().
-  std::unique_lock<Semaphore> lock(sem_, std::try_to_lock);
-  if (!lock.owns_lock()) {
+  auto performing_lock = LockPerforming(std::try_to_lock);
+  if (!performing_lock.owns_lock()) {
     return Status::OK();
   }
 
   {
-    std::lock_guard<simple_spinlock> l(peer_lock_);
-
-    if (PREDICT_FALSE(state_ == kPeerClosed)) {
+    auto processing_lock = StartProcessingUnlocked();
+    if (!processing_lock.owns_lock()) {
       return STATUS(IllegalState, "Peer was closed.");
     }
 
@@ -169,20 +176,27 @@ Status Peer::SignalRequest(RequestTriggerMode trigger_mode) {
     if (failed_attempts_ > 0 && trigger_mode == RequestTriggerMode::kNonEmptyOnly) {
       return Status::OK();
     }
-  }
 
-  auto status = raft_pool_token_->SubmitClosure(
-      Bind(&Peer::SendNextRequest, Unretained(this), trigger_mode));
+    using_thread_pool_.fetch_add(1, std::memory_order_acq_rel);
+  }
+  auto status = raft_pool_token_->SubmitFunc(
+      std::bind(&Peer::SendNextRequest, shared_from_this(), trigger_mode));
+  using_thread_pool_.fetch_sub(1, std::memory_order_acq_rel);
   if (status.ok()) {
-    lock.release();
+    performing_lock.release();
   }
   return status;
 }
 
 void Peer::SendNextRequest(RequestTriggerMode trigger_mode) {
-  DCHECK_EQ(sem_.GetValue(), 0) << "Cannot send request";
+  auto retain_self = shared_from_this();
+  DCHECK(performing_mutex_.is_locked()) << "Cannot send request";
 
-  std::unique_lock<Semaphore> lock(sem_, std::adopt_lock);
+  auto performing_lock = LockPerforming(std::adopt_lock);
+  auto processing_lock = StartProcessingUnlocked();
+  if (!processing_lock.owns_lock()) {
+    return;
+  }
 
   // The peer has no pending request nor is sending: send the request.
   bool needs_remote_bootstrap = false;
@@ -190,24 +204,37 @@ void Peer::SendNextRequest(RequestTriggerMode trigger_mode) {
   RaftPeerPB::MemberType member_type = RaftPeerPB::UNKNOWN_MEMBER_TYPE;
   int64_t commit_index_before = request_.has_committed_index() ?
       request_.committed_index().index() : kMinimumOpIdIndex;
-  Status s = queue_->RequestForPeer(peer_pb_.permanent_uuid(), &request_,
-      &replicate_msg_refs_, &needs_remote_bootstrap, &member_type, &last_exchange_successful);
+  ReplicateMsgsHolder msgs_holder;
+  Status s = queue_->RequestForPeer(
+      peer_pb_.permanent_uuid(), &request_, &msgs_holder, &needs_remote_bootstrap,
+      &member_type, &last_exchange_successful);
   int64_t commit_index_after = request_.has_committed_index() ?
       request_.committed_index().index() : kMinimumOpIdIndex;
 
   if (PREDICT_FALSE(!s.ok())) {
-    LOG_WITH_PREFIX_UNLOCKED(INFO) << "Could not obtain request from queue for peer: "
-        << peer_pb_.permanent_uuid() << ". Status: " << s.ToString();
+    LOG_WITH_PREFIX(INFO) << "Could not obtain request from queue for peer: " << s;
     return;
   }
 
   if (PREDICT_FALSE(needs_remote_bootstrap)) {
-    Status s = SendRemoteBootstrapRequest();
-    if (!s.ok()) {
-      LOG_WITH_PREFIX_UNLOCKED(WARNING) << "Unable to generate remote bootstrap request for peer: "
-                                        << s.ToString();
+    Status status;
+    if (!FLAGS_enable_remote_bootstrap) {
+      failed_attempts_++;
+      status = STATUS(NotSupported, "remote bootstrap is disabled");
     } else {
-      lock.release();
+      status = queue_->GetRemoteBootstrapRequestForPeer(peer_pb_.permanent_uuid(), &rb_request_);
+    }
+    if (!status.ok()) {
+      LOG_WITH_PREFIX(WARNING) << "Unable to generate remote bootstrap request for peer: "
+                               << status;
+      return;
+    }
+
+    using_thread_pool_.fetch_add(1, std::memory_order_acq_rel);
+    s = SendRemoteBootstrapRequest();
+    using_thread_pool_.fetch_sub(1, std::memory_order_acq_rel);
+    if (s.ok()) {
+      performing_lock.release();
     }
     return;
   }
@@ -218,7 +245,8 @@ void Peer::SendNextRequest(RequestTriggerMode trigger_mode) {
       (member_type == RaftPeerPB::PRE_VOTER || member_type == RaftPeerPB::PRE_OBSERVER)) {
     if (PREDICT_TRUE(consensus_)) {
       auto uuid = peer_pb_.permanent_uuid();
-      lock.unlock();
+      processing_lock.unlock();
+      performing_lock.unlock();
       consensus::ChangeConfigRequestPB req;
       consensus::ChangeConfigResponsePB resp;
 
@@ -230,15 +258,17 @@ void Peer::SendNextRequest(RequestTriggerMode trigger_mode) {
       boost::optional<tserver::TabletServerErrorPB::Code> error_code;
 
       // If another ChangeConfig is being processed, our request will be rejected.
-      LOG(INFO) << "Sending ChangeConfig request";
+      YB_LOG_EVERY_N(INFO, FLAGS_log_change_config_every_n)
+          << "Sending ChangeConfig request to promote peer";
       auto status = consensus_->ChangeConfig(req, &DoNothingStatusCB, &error_code);
       if (PREDICT_FALSE(!status.ok())) {
-        LOG(WARNING) << "Unable to change role for peer " << uuid << ": " << status.ToString(false);
+        YB_LOG_EVERY_N(INFO, FLAGS_log_change_config_every_n)
+            << "Unable to change role for peer " << uuid << ": " << status;
         // Since we released the semaphore, we need to call SignalRequest again to send a message
         status = SignalRequest(RequestTriggerMode::kAlwaysSend);
         if (PREDICT_FALSE(!status.ok())) {
           LOG(WARNING) << "Unexpected error when trying to send request: "
-                       << status.ToString(false);
+                       << status;
         }
       }
       return;
@@ -259,26 +289,48 @@ void Peer::SendNextRequest(RequestTriggerMode trigger_mode) {
 
   // If we're actually sending ops there's no need to heartbeat for a while, reset the heartbeater.
   if (req_has_ops) {
-    heartbeater_.Reset();
+    heartbeater_->Snooze();
   }
 
   MAYBE_FAULT(FLAGS_fault_crash_on_leader_request_fraction);
-  controller_.Reset();
 
-  lock.release();
+  processing_lock.unlock();
+  performing_lock.release();
+
+  // We will cleanup ops from request in ProcessResponse, because otherwise there could be race
+  // condition. When rest of this function is running in parallel to ProcessResponse.
+  msgs_holder.ReleaseOps();
+
   proxy_->UpdateAsync(&request_, trigger_mode, &response_, &controller_,
-                      std::bind(&Peer::ProcessResponse, this));
+                      std::bind(&Peer::ProcessResponse, retain_self));
+}
+
+std::unique_lock<simple_spinlock> Peer::StartProcessingUnlocked() {
+  std::unique_lock<simple_spinlock> lock(peer_lock_);
+
+  if (state_ == kPeerClosed) {
+    lock.unlock();
+  }
+
+  return lock;
 }
 
 void Peer::ProcessResponse() {
-  // Note: This method runs on the reactor thread.
+  request_.mutable_ops()->ExtractSubrange(0, request_.ops().size(), nullptr /* elements */);
 
-  DCHECK_EQ(sem_.GetValue(), 0) << "Got a response when nothing was pending";
+  DCHECK(performing_mutex_.is_locked()) << "Got a response when nothing was pending";
+  Status status = controller_.status();
+  controller_.Reset();
 
-  std::unique_lock<Semaphore> lock(sem_, std::adopt_lock);
+  auto performing_lock = LockPerforming(std::adopt_lock);
 
-  if (!controller_.status().ok()) {
-    if (controller_.status().IsRemoteError()) {
+  auto processing_lock = StartProcessingUnlocked();
+  if (!processing_lock.owns_lock()) {
+    return;
+  }
+
+  if (!status.ok()) {
+    if (status.IsRemoteError()) {
       // Most controller errors are caused by network issues or corner cases like shutdown and
       // failure to serialize a protobuf. Therefore, we generally consider these errors to indicate
       // an unreachable peer.  However, a RemoteError wraps some other error propagated from the
@@ -286,8 +338,12 @@ void Peer::ProcessResponse() {
       // remote is responsive.
       queue_->NotifyPeerIsResponsiveDespiteError(peer_pb_.permanent_uuid());
     }
-    ProcessResponseError(controller_.status());
+    ProcessResponseError(status);
     return;
+  }
+
+  if (response_.has_propagated_hybrid_time()) {
+    queue_->clock()->Update(HybridTime(response_.propagated_hybrid_time()));
   }
 
   // We should try to evict a follower which returns a WRONG UUID error.
@@ -315,95 +371,104 @@ void Peer::ProcessResponse() {
     return;
   }
 
-  // The queue's handling of the peer response may generate IO (reads against the WAL) and
-  // SendNextRequest() may do the same thing. So we run the rest of the response handling logic on
-  // our thread pool and not on the reactor thread.
-  Status s = raft_pool_token_->SubmitClosure(Bind(&Peer::DoProcessResponse, Unretained(this)));
-  if (PREDICT_FALSE(!s.ok())) {
-    LOG_WITH_PREFIX_UNLOCKED(WARNING) << "Unable to process peer response: " << s.ToString()
-        << ": " << response_.ShortDebugString();
-  } else {
-    lock.release();
-  }
-}
-
-void Peer::DoProcessResponse() {
-  DCHECK_EQ(0, sem_.GetValue());
-  std::unique_lock<Semaphore> lock(sem_, std::adopt_lock);
-
   failed_attempts_ = 0;
   bool more_pending = false;
   queue_->ResponseFromPeer(peer_pb_.permanent_uuid(), response_, &more_pending);
 
-  if (more_pending && state_.load(std::memory_order_acquire) != kPeerClosed) {
-    lock.release();
+  if (more_pending) {
+    processing_lock.unlock();
+    performing_lock.release();
     SendNextRequest(RequestTriggerMode::kAlwaysSend);
   }
 }
 
 Status Peer::SendRemoteBootstrapRequest() {
-  if (!FLAGS_enable_remote_bootstrap) {
-    failed_attempts_++;
-    return STATUS(NotSupported, "remote bootstrap is disabled");
-  }
-
-  LOG_WITH_PREFIX_UNLOCKED(INFO) << "Sending request to remotely bootstrap";
-  RETURN_NOT_OK(queue_->GetRemoteBootstrapRequestForPeer(peer_pb_.permanent_uuid(), &rb_request_));
-  controller_.Reset();
-  proxy_->StartRemoteBootstrap(
-      &rb_request_, &rb_response_, &controller_,
-      std::bind(&Peer::ProcessRemoteBootstrapResponse, this));
-  return Status::OK();
+  YB_LOG_WITH_PREFIX_EVERY_N_SECS(INFO, 30) << "Sending request to remotely bootstrap";
+  return raft_pool_token_->SubmitFunc([retain_self = shared_from_this()]() {
+    retain_self->proxy_->StartRemoteBootstrap(
+      &retain_self->rb_request_, &retain_self->rb_response_, &retain_self->controller_,
+      std::bind(&Peer::ProcessRemoteBootstrapResponse, retain_self));
+  });
 }
 
 void Peer::ProcessRemoteBootstrapResponse() {
-  std::unique_lock<Semaphore> lock(sem_, std::adopt_lock);
+  Status status = controller_.status();
+  controller_.Reset();
 
-  // We treat remote bootstrap as fire-and-forget.
+  auto performing_lock = LockPerforming(std::adopt_lock);
+  auto processing_lock = StartProcessingUnlocked();
+  if (!processing_lock.owns_lock()) {
+    return;
+  }
+
+  if (!status.ok()) {
+    LOG_WITH_PREFIX(WARNING) << "Unable to begin remote bootstrap on peer: " << status;
+    return;
+  }
+
   if (rb_response_.has_error()) {
-    LOG_WITH_PREFIX_UNLOCKED(WARNING) << "Unable to begin remote bootstrap on peer: "
-                                      << rb_response_.ShortDebugString();
+    if (rb_response_.error().code() == tserver::TabletServerErrorPB::ALREADY_IN_PROGRESS) {
+      queue_->NotifyPeerIsResponsiveDespiteError(peer_pb_.permanent_uuid());
+      YB_LOG_WITH_PREFIX_EVERY_N_SECS(WARNING, 30)
+        << ":::Unable to begin remote bootstrap on peer: " << rb_response_.ShortDebugString();
+    } else {
+      LOG_WITH_PREFIX(WARNING) << "Unable to begin remote bootstrap on peer: "
+                               << rb_response_.ShortDebugString();
+    }
   }
 }
 
 void Peer::ProcessResponseError(const Status& status) {
-  DCHECK_EQ(0, sem_.GetValue());
+  DCHECK(performing_mutex_.is_locked());
   failed_attempts_++;
-  YB_LOG_WITH_PREFIX_UNLOCKED_EVERY_N_SECS(WARNING, 5) << "Couldn't send request. "
+  YB_LOG_WITH_PREFIX_EVERY_N_SECS(WARNING, 5) << "Couldn't send request. "
       << " Status: " << status.ToString() << ". Retrying in the next heartbeat period."
       << " Already tried " << failed_attempts_ << " times. State: " << state_;
 }
 
-string Peer::LogPrefixUnlocked() const {
+string Peer::LogPrefix() const {
   return Format("T $0 P $1 -> Peer $2 ($3, $4): ",
                 tablet_id_, leader_uuid_, peer_pb_.permanent_uuid(),
                 peer_pb_.last_known_private_addr(), peer_pb_.last_known_broadcast_addr());
 }
 
 void Peer::Close() {
-  WARN_NOT_OK(heartbeater_.Stop(), "Could not stop heartbeater");
+  if (heartbeater_) {
+    heartbeater_->Stop();
+  }
 
   // If the peer is already closed return.
   {
-    std::lock_guard<simple_spinlock> lock(peer_lock_);
-    if (state_ == kPeerClosed) return;
+    std::lock_guard<simple_spinlock> processing_lock(peer_lock_);
+    if (using_thread_pool_.load(std::memory_order_acquire) > 0) {
+      auto deadline = std::chrono::steady_clock::now() +
+                      FLAGS_max_wait_for_processresponse_before_closing_ms * 1ms;
+      BackoffWaiter waiter(deadline, 100ms);
+      while (using_thread_pool_.load(std::memory_order_acquire) > 0) {
+        if (!waiter.Wait()) {
+          LOG_WITH_PREFIX(DFATAL)
+              << "Timed out waiting for ThreadPoolToken::SubmitFunc() to finish. "
+              << "Number of pending calls: " << using_thread_pool_.load(std::memory_order_acquire);
+          break;
+        }
+      }
+    }
+    if (state_ == kPeerClosed) {
+      return;
+    }
     DCHECK(state_ == kPeerRunning || state_ == kPeerStarted) << "Unexpected state: " << state_;
     state_ = kPeerClosed;
+    LOG_WITH_PREFIX(INFO) << "Closing peer";
   }
-  LOG_WITH_PREFIX_UNLOCKED(INFO) << "Closing peer: " << peer_pb_.permanent_uuid();
 
-  // Acquire the semaphore to wait for any concurrent request to finish.  They will see the state_
-  // == kPeerClosed and not start any new requests, but we can't currently cancel the already-sent
-  // ones. (see KUDU-699)
-  std::lock_guard<Semaphore> l(sem_);
+  auto retain_self = shared_from_this();
+
   queue_->UntrackPeer(peer_pb_.permanent_uuid());
-  // We don't own the ops (the queue does).
-  request_.mutable_ops()->ExtractSubrange(0, request_.ops_size(), /* elements */ nullptr);
-  replicate_msg_refs_.clear();
 }
 
 Peer::~Peer() {
-  Close();
+  std::lock_guard<simple_spinlock> processing_lock(peer_lock_);
+  CHECK_EQ(state_, kPeerClosed) << "Peer cannot be implicitly closed";
 }
 
 RpcPeerProxy::RpcPeerProxy(HostPort hostport, ConsensusServiceProxyPtr consensus_proxy)
@@ -451,8 +516,8 @@ void RpcPeerProxy::StartRemoteBootstrap(const StartRemoteBootstrapRequestPB* req
 RpcPeerProxy::~RpcPeerProxy() {}
 
 RpcPeerProxyFactory::RpcPeerProxyFactory(
-    shared_ptr<Messenger> messenger, rpc::ProxyCache* proxy_cache, CloudInfoPB from)
-    : messenger_(std::move(messenger)), proxy_cache_(proxy_cache), from_(std::move(from)) {}
+    Messenger* messenger, rpc::ProxyCache* proxy_cache, CloudInfoPB from)
+    : messenger_(messenger), proxy_cache_(proxy_cache), from_(std::move(from)) {}
 
 PeerProxyPtr RpcPeerProxyFactory::NewProxy(const RaftPeerPB& peer_pb) {
   auto hostport = HostPortFromPB(DesiredHostPort(peer_pb, from_));
@@ -462,49 +527,92 @@ PeerProxyPtr RpcPeerProxyFactory::NewProxy(const RaftPeerPB& peer_pb) {
 
 RpcPeerProxyFactory::~RpcPeerProxyFactory() {}
 
-std::shared_ptr<rpc::Messenger> RpcPeerProxyFactory::messenger() const { return messenger_; }
+rpc::Messenger* RpcPeerProxyFactory::messenger() const { return messenger_; }
+
+struct GetNodeInstanceRequest {
+  GetNodeInstanceRequestPB req;
+  GetNodeInstanceResponsePB resp;
+  rpc::RpcController controller;
+  ConsensusServiceProxy proxy;
+
+  GetNodeInstanceRequest(rpc::ProxyCache* proxy_cache, const HostPort& hostport)
+      : proxy(proxy_cache, hostport) {}
+};
 
 Status SetPermanentUuidForRemotePeer(
     rpc::ProxyCache* proxy_cache,
     std::chrono::steady_clock::duration timeout,
-    const CloudInfoPB& from,
+    const std::vector<HostPort>& endpoints,
     RaftPeerPB* remote_peer) {
 
   DCHECK(!remote_peer->has_permanent_uuid());
-  HostPort hostport = HostPortFromPB(DesiredHostPort(*remote_peer, from));
   auto deadline = std::chrono::steady_clock::now() + timeout;
 
-  auto proxy = std::make_unique<ConsensusServiceProxy>(proxy_cache, hostport);
+  std::vector<GetNodeInstanceRequest> requests;
+  requests.reserve(endpoints.size());
+  for (const auto& hp : endpoints) {
+    requests.emplace_back(proxy_cache, hp);
+  }
 
-  GetNodeInstanceRequestPB req;
-  GetNodeInstanceResponsePB resp;
-  rpc::RpcController controller;
-
+  CountDownLatch latch(requests.size());
   const auto kMaxWait = 10s;
   BackoffWaiter waiter(deadline, kMaxWait);
   for (;;) {
-    VLOG(2) << "Getting uuid from remote peer. Request: " << req.ShortDebugString();
+    latch.Reset(requests.size());
+    std::atomic<GetNodeInstanceRequest*> last_reply{nullptr};
+    for (auto& request : requests) {
+      request.controller.Reset();
+      request.controller.set_timeout(kMaxWait);
+      VLOG(2) << "Getting uuid from remote peer. Request: " << request.req.ShortDebugString();
 
-    controller.Reset();
-    Status s = proxy->GetNodeInstance(req, &resp, &controller);
-    if (s.ok()) {
-      if (controller.status().ok()) {
-        break;
-      }
-      s = controller.status();
+      request.proxy.GetNodeInstanceAsync(
+          request.req, &request.resp, &request.controller,
+          [&latch, &request, &last_reply] {
+        if (!request.controller.status().IsTimedOut()) {
+          last_reply.store(&request, std::memory_order_release);
+        }
+        latch.CountDown();
+      });
     }
 
-    LOG(WARNING) << "Error getting permanent uuid from config peer " << hostport << ": " << s;
+    latch.Wait();
+
+    for (auto& request : requests) {
+      auto status = request.controller.status();
+      if (status.ok()) {
+        remote_peer->set_permanent_uuid(request.resp.node_instance().permanent_uuid());
+        remote_peer->set_member_type(RaftPeerPB::VOTER);
+        if (request.resp.has_registration()) {
+          CopyRegistration(request.resp.registration(), remote_peer);
+        } else {
+          // Required for backward compatibility.
+          HostPortsToPBs(endpoints, remote_peer->mutable_last_known_private_addr());
+        }
+        return Status::OK();
+      }
+    }
+
+    auto* last_reply_value = last_reply.load(std::memory_order_acquire);
+    if (last_reply_value == nullptr) {
+      last_reply_value = &requests.front();
+    }
+
+    LOG(WARNING) << "Error getting permanent uuid from config peer " << yb::ToString(endpoints)
+                 << ": " << last_reply_value->controller.status();
+
+    if (last_reply_value->controller.status().IsAborted()) {
+      return last_reply_value->controller.status();
+    }
+
     if (!waiter.Wait()) {
-      return STATUS_FORMAT(TimedOut, "Getting permanent uuid from $0 timed out after $1: $2",
-                           hostport, timeout, s);
+      return STATUS_FORMAT(
+          TimedOut, "Getting permanent uuid from $0 timed out after $1: $2",
+          endpoints, timeout, last_reply_value->controller.status());
     }
 
     LOG(INFO) << "Retrying to get permanent uuid for remote peer: "
-        << remote_peer->ShortDebugString() << " attempt: " << waiter.attempt();
+              << yb::ToString(endpoints) << " attempt: " << waiter.attempt();
   }
-  remote_peer->set_permanent_uuid(resp.node_instance().permanent_uuid());
-  return Status::OK();
 }
 
 }  // namespace consensus

@@ -39,6 +39,8 @@ import "yb/common/common.proto";
 import "yb/common/wire_protocol.proto";
 import "yb/consensus/metadata.proto";
 import "yb/tablet/metadata.proto";
+import "yb/util/encryption.proto";
+import "yb/cdc/cdc_consumer.proto";
 
 ////////////////////////////////////////////////////////////
 // Common data structures
@@ -57,11 +59,11 @@ message MasterErrorPB {
     // The schema provided for a request was not well-formed.
     INVALID_SCHEMA = 2;
 
-    // The requested table does not exist
-    TABLE_NOT_FOUND = 3;
+    // The requested table or index does not exist
+    OBJECT_NOT_FOUND = 3;
 
-    // The name requested for the table is already in use
-    TABLE_ALREADY_PRESENT = 4;
+    // The name requested for the table or index is already in use
+    OBJECT_ALREADY_PRESENT = 4;
 
     // The number of tablets requested for a new table is over the per TS limit.
     TOO_MANY_TABLETS = 5;
@@ -113,15 +115,21 @@ message MasterErrorPB {
     PARALLEL_SNAPSHOT_OPERATION = 25;
     SNAPSHOT_IS_NOT_READY = 26;
 
-    // Invalid Roles
+    // Roles and permissions errors.
     ROLE_ALREADY_PRESENT = 27;
     ROLE_NOT_FOUND = 28;
     INVALID_REQUEST = 29;
+    NOT_AUTHORIZED = 32;
 
     // Indicator to client that the are leaders on preferred only operation can be retried.
     CAN_RETRY_ARE_LEADERS_ON_PREFERRED_ONLY_CHECK = 30;
 
     REDIS_CONFIG_NOT_FOUND = 31;
+
+    // Indicator to client that load balancer was recently active.
+    LOAD_BALANCER_RECENTLY_ACTIVE = 33;
+
+    INTERNAL_ERROR = 34;
   }
 
   // The error code.
@@ -148,7 +156,7 @@ message NamespaceIdentifierPB {
   optional string name = 2;
 
   // Database type.
-  optional YQLDatabase database_type = 3 [ default = YQL_DATABASE_UNDEFINED ];
+  optional YQLDatabase database_type = 3 [ default = YQL_DATABASE_CQL ];
 }
 
 message TableIdentifierPB {
@@ -162,7 +170,7 @@ message TableIdentifierPB {
   optional NamespaceIdentifierPB namespace = 3;
 }
 
-// This reprensents one instance of a placement constraint for a table. It is
+// This represents one instance of a placement constraint for a table. It is
 // used to dictate what is the minimum number of expected replicas in a certain
 // cloud/region/zone combo.
 message PlacementBlockPB {
@@ -202,9 +210,11 @@ message ReplicationInfoPB {
 message BlacklistPB {
   repeated HostPortPB hosts = 1;
 
-  // Field to track the number of replicas in current set of tablets which have a blacklist server.
-  // Client should not set this. Set by server side when persisting the blacklist load.
+  // Fields to track the number of replicas/leaders in current set of tablets which have a
+  // blacklist server/leader. Client should not set this. Set by server side when persisting
+  // the blacklist load.
   optional int32 initial_replica_load = 2;
+  optional int32 initial_leader_load = 3;
 }
 
 ////////////////////////////////////////////////////////////
@@ -225,6 +235,9 @@ message SysRowEntry {
     ROLE = 6;
     SNAPSHOT = 7;
     REDIS_CONFIG = 8;
+    SYS_CONFIG = 9;
+    CDC_STREAM = 10;
+    UNIVERSE_REPLICATION = 11;
   }
 
   // The type of entry we are storing. Since the data is serialized, we cannot
@@ -258,8 +271,8 @@ message SysTabletsEntryPB {
   }
 
   // DEPRECATED. Replaced by 'partition'.
-  optional bytes DEPRECATED_start_key = 1;
-  optional bytes DEPRECATED_end_key = 2;
+  optional bytes OBSOLETE_start_key = 1;
+  optional bytes OBSOLETE_end_key = 2;
 
   // Tablet partition.
   optional PartitionPB partition = 7;
@@ -325,16 +338,23 @@ message SysTablesEntryPB {
   optional State state = 6 [ default = UNKNOWN ];
   optional bytes state_msg = 7;
 
+  // TODO(neil) OLDER INDEXes will always have the deprecated fields. To remove the old format, we
+  // first need to come up with a way to convert existing catalog content to new format.
   // Secondary indexes of the table.
   repeated IndexInfoPB indexes = 12;
 
   // For index table: [to be deprecated and replaced by "index_info"]
   optional bytes indexed_table_id = 13; // Indexed table id of this index.
-  optional bool is_local_index = 14 [ default = false ]; // Whether this is a local index.
+  optional bool is_local_index = 14 [ default = false ];  // Whether this is a local index.
   optional bool is_unique_index = 15 [ default = false ]; // Whether this is a unique index.
 
   // For index table: information about this index.
   optional IndexInfoPB index_info = 22;
+
+  // For Postgres:
+  optional bool is_pg_shared_table = 16 [ default = false ]; // Is this a shared table?
+
+  optional uint32 wal_retention_secs = 24;
 }
 
 // The data part of a SysRowEntry in the sys.catalog table for a namespace.
@@ -346,7 +366,10 @@ message SysNamespaceEntryPB {
   optional bytes name = 1;
 
   // Namespace/Database type.
-  optional YQLDatabase database_type = 2 [ default = YQL_DATABASE_UNDEFINED ];
+  optional YQLDatabase database_type = 2 [ default = YQL_DATABASE_CQL ];
+
+  // For Postgres:
+  optional uint32 next_pg_oid = 3; // Next oid to assign.
 }
 
 // The data part of a SysRowEntry in the sys.catalog table for a User Defined Type.
@@ -357,14 +380,112 @@ message SysUDTypeEntryPB {
   repeated QLTypePB field_types = 4;
 }
 
-
-// The data part of a SysRowEntry in the sys.catalog table for a User Defined Type.
+// The data part of a SysRowEntry in the sys.catalog table for Redis Config.
 message SysRedisConfigEntryPB {
   optional string key = 1;
   repeated bytes args = 2;
 }
 
-// The on-disk entry in the sys.catalog table for configuration information
+// The data part of a SysRowEntry in the sys.catalog table for a CDC stream.
+message SysCDCStreamEntryPB {
+  optional string table_id = 1;
+  repeated CDCStreamOptionsPB options = 2;
+}
+
+// The data part of a SysRowEntry in the sys.catalog table for a universe replication record.
+message SysUniverseReplicationEntryPB {
+  enum State {
+    // Setting up replication.
+    INITIALIZING = 0;
+    // Validated table schemas.
+    VALIDATED = 1;
+    // Active.
+    ACTIVE = 2;
+    // Failed.
+    // Setting up universe replication consists of a sequence of steps like validating schemas,
+    // creating CDC streams, starting subscribers. If any of these fail, we set the universe
+    // replication state to FAILED.
+    FAILED = 3;
+    // Disabled.
+    DISABLED = 6;
+    // Deleted.
+    DELETED = 4;
+    // Error while cleaning up state of deleted entry. This indicates that universe replication has
+    // been deleted but there is still some uncleaned up state - for example, there may be left over
+    // CDC streams.
+    DELETED_ERROR = 5;
+  }
+
+  optional string producer_id = 1;
+  repeated HostPortPB producer_master_addresses = 2;
+
+  // producer table IDs.
+  repeated string tables = 3;
+
+  optional State state = 4 [default = INITIALIZING];
+
+  // producer table ID -> consumer table ID map.
+  map<string, string> validated_tables = 5;
+
+  // producer table ID -> producer CDC stream map.
+  map<string, string> table_streams = 6;
+}
+
+message ChangeEncryptionInfoRequestPB {
+  optional bool encryption_enabled = 1;
+  optional string key_path = 2;
+  optional string version_id = 3;
+  optional bool in_memory = 4;
+}
+
+message ChangeEncryptionInfoResponsePB {
+  optional MasterErrorPB error = 1;
+}
+
+message IsEncryptionEnabledRequestPB {
+}
+
+message IsEncryptionEnabledResponsePB {
+  optional bool encryption_enabled = 1;
+  optional string key_id = 2;
+  optional MasterErrorPB error = 3;
+}
+
+message EncryptionInfoPB {
+  optional bool encryption_enabled = 1;
+  optional bytes universe_key_registry_encoded = 2;
+  optional string key_path = 3;
+  optional string latest_version_id = 4;
+  optional bool key_in_memory = 5;
+}
+
+message AddUniverseKeysRequestPB {
+  optional UniverseKeysPB universe_keys = 1;
+}
+
+message AddUniverseKeysResponsePB {
+  optional MasterErrorPB error = 1;
+}
+
+message GetUniverseKeyRegistryRequestPB {
+}
+
+message GetUniverseKeyRegistryResponsePB {
+  optional MasterErrorPB error = 1;
+  optional UniverseKeysPB universe_keys = 2;
+}
+
+message HasUniverseKeyInMemoryRequestPB {
+  optional string version_id = 1;
+}
+
+message HasUniverseKeyInMemoryResponsePB {
+  optional bool has_key = 1;
+  optional MasterErrorPB error = 2;
+}
+
+
+// The on-disk entry in the sys.catalog table for configuration vinformation
 // that are relevant to the entire cluster. This has a version entry that is
 // used for ensuring that client read-modify-writes are valid.
 message SysClusterConfigEntryPB {
@@ -372,6 +493,9 @@ message SysClusterConfigEntryPB {
   optional string cluster_uuid = 4;
   optional ReplicationInfoPB replication_info = 2;
   optional BlacklistPB server_blacklist = 3;
+  optional BlacklistPB leader_blacklist = 7;
+  optional EncryptionInfoPB encryption_info = 5;
+  optional cdc.ConsumerRegistryPB consumer_registry = 6;
 }
 
 message SysRoleEntryPB {
@@ -381,6 +505,34 @@ message SysRoleEntryPB {
   repeated bytes member_of = 4;
   optional bytes salted_hash = 5;
   repeated ResourcePermissionsPB resources = 7;
+}
+
+// Cluster security configuration.
+message SysSecurityConfigEntryPB {
+  // Roles configuration version. Every time a role gets created/deleted, or a permission gets
+  // added/removed, we increase the version.
+  optional uint64 roles_version = 1;
+}
+
+// Metadata about the YSQL catalog (current only version).
+message SysYSQLCatalogConfigEntryPB {
+  // YSQL catalog version. Every time the catalog tables are changed (i.e. by DDL statements)
+  // this version gets incremented.
+  optional uint64 version = 1;
+
+  // This is true if the master ran initdb and it finished, succesfully or not.
+  optional bool initdb_done = 2;
+
+  // If this is set, initdb has failed.
+  optional string initdb_error = 5;
+}
+
+// Various cluster configuration.
+message SysConfigEntryPB {
+  oneof config {
+    SysSecurityConfigEntryPB security_config = 1;
+    SysYSQLCatalogConfigEntryPB ysql_catalog_config = 2;
+  }
 }
 
 message ResourcePermissionsPB {
@@ -401,12 +553,13 @@ message ResourcePermissionsPB {
 message TSRegistrationPB {
   optional ServerRegistrationPB common = 1;
 
-  // TODO: add stuff like software version, etc.
+  // Capabilities supported byt this TS.
+  repeated fixed32 capabilities = 2;
 }
 
 message ReportedTabletPB {
   required bytes tablet_id = 1;
-  optional tablet.TabletStatePB state = 2 [ default = UNKNOWN ];
+  optional tablet.RaftGroupStatePB state = 2 [ default = UNKNOWN ];
   optional tablet.TabletDataState tablet_data_state = 6 [ default = TABLET_DATA_UNKNOWN ];
 
   // The latest _committed_ consensus state.
@@ -457,6 +610,9 @@ message TServerMetricsPB {
   optional int64 total_ram_usage = 2;
   optional double read_ops_per_sec = 3;
   optional double write_ops_per_sec = 4;
+  optional int64 uncompressed_sst_file_size = 5;
+  optional uint64 uptime_seconds = 6;
+  optional uint64 num_sst_files = 7;
 }
 
 // Heartbeat sent from the tablet-server to the master
@@ -487,6 +643,8 @@ message TSHeartbeatRequestPB {
 
   // Number of tablets for which this ts is a leader.
   optional int32 leader_count = 7;
+
+  optional int32 cluster_config_version = 8;
 }
 
 message TSHeartbeatResponsePB {
@@ -519,6 +677,16 @@ message TSHeartbeatResponsePB {
 
   // Cluster UUID. Sent by the master only after registration.
   optional string cluster_uuid = 9;
+
+  // Current YSQL catalog schema version.
+  // Used by tservers and postgres backends to decide if a cache refresh is needed.
+  optional uint64 ysql_catalog_version = 10;
+
+  optional UniverseKeyRegistryPB universe_key_registry = 11;
+
+  optional cdc.ConsumerRegistryPB consumer_registry = 12;
+
+  optional int32 cluster_config_version = 13;
 }
 
 message TSInformationPB {
@@ -554,6 +722,8 @@ message TabletLocationsPB {
   required bool stale = 5;
 
   optional bytes table_id = 7;
+  // Table ids for all the tables on this tablet.
+  repeated bytes table_ids = 8;
 }
 
 // Info about a single tablet server, returned to the client as part
@@ -571,6 +741,9 @@ message TSInfoPB {
   optional CloudInfoPB cloud_info = 3;
 
   optional bytes placement_uuid = 4;
+
+  // Capabilities of tablet server.
+  repeated fixed32 capabilities = 6;
 }
 
 message GetTabletLocationsRequestPB {
@@ -607,9 +780,18 @@ message CreateTableRequestPB {
   optional NamespaceIdentifierPB namespace = 8;
 
   // For index table.
+  optional IndexInfoPB index_info = 16;
   optional bytes indexed_table_id = 9; // Indexed table id of this index.
   optional bool is_local_index = 10 [ default = false ];  // Is a local index?
   optional bool is_unique_index = 11 [ default = false ]; // Is a unique index?
+
+  // For RBAC.
+  optional string creator_role_name = 12;
+
+  // For Postgres:
+  optional bytes table_id = 13; // id to assign to this table.
+  optional bool is_pg_catalog_table = 14 [ default = false ]; // Is this a sys catalog table?
+  optional bool is_pg_shared_table = 15 [ default = false ];  // Is this a shared table?
 }
 
 message CreateTableResponsePB {
@@ -632,7 +814,7 @@ message IsCreateTableDoneResponsePB {
 }
 
 message TruncateTableRequestPB {
-  optional bytes table_id = 1;
+  repeated bytes table_ids = 1;
 }
 
 message TruncateTableResponsePB {
@@ -679,6 +861,12 @@ message IsDeleteTableDoneResponsePB {
   optional bool done = 2;
 }
 
+enum RelationType {
+  SYSTEM_TABLE_RELATION = 1;
+  USER_TABLE_RELATION = 2;
+  INDEX_TABLE_RELATION = 3;
+}
+
 message ListTablesRequestPB {
   // When used, only returns tables that satisfy a substring match on name_filter.
   optional string name_filter = 1;
@@ -688,6 +876,9 @@ message ListTablesRequestPB {
 
   // Exclude system tables.
   optional bool exclude_system_tables = 3 [default = false];
+
+  // Can be used to filter tables based on RelationType
+  repeated RelationType relation_type_filter = 4;
 }
 
 message ListTablesResponsePB {
@@ -699,6 +890,7 @@ message ListTablesResponsePB {
     required string name = 2;
     optional TableType table_type = 3;
     optional NamespaceIdentifierPB namespace = 4;
+    optional RelationType relation_type = 5 [default = USER_TABLE_RELATION];
   }
 
   repeated TableInfo tables = 2;
@@ -765,6 +957,7 @@ message AlterTableRequestPB {
   optional string new_table_name = 3;
   optional NamespaceIdentifierPB new_namespace = 4;
   optional TablePropertiesPB alter_properties = 5;
+  optional uint32 wal_retention_secs = 6;
 }
 
 message AlterTableResponsePB {
@@ -823,8 +1016,11 @@ message GetTableSchemaResponsePB {
   // Secondary indexes of the table.
   repeated IndexInfoPB indexes = 10;
 
-  // For index table: indexed table id of this index.
-  optional bytes indexed_table_id = 11;
+  // For index table: [to be deprecated and replaced by "index_info"]
+  optional bytes OBSOLETE_indexed_table_id = 11; // Indexed table id of this index.
+
+  // For index table: information about this index.
+  optional IndexInfoPB index_info = 12;
 }
 
 // ============================================================================
@@ -945,15 +1141,42 @@ message ChangeMasterClusterConfigResponsePB {
   optional MasterErrorPB error = 1;
 }
 
+message SetPreferredZonesRequestPB {
+  repeated CloudInfoPB preferred_zones = 1;
+}
+
+message SetPreferredZonesResponsePB {
+  optional MasterErrorPB error = 1;
+}
+
 // Get the percentage of tablet data that got moved as part of a blacklist config change.
 // Handled by the master leader and picked up by new leader on failover.
 message GetLoadMovePercentRequestPB {
 }
 
+// Get the percentage of tablet leadership that got moved as part of a leader blacklist config
+// change. Handled by the master leader and picked up by new leader on failover.
+message GetLeaderBlacklistPercentRequestPB {
+}
+
 // When no errors, the percent reflects the progress of load removal from the blacklisted tservers.
 message GetLoadMovePercentResponsePB {
   optional MasterErrorPB error = 1;
+
+  // To be deprecated. Replaced by "100 * (total - remaining) / total".
   optional double percent = 2;
+
+  optional uint64 remaining = 3;
+  optional uint64 total = 4;
+}
+
+// Is load balancer idle.
+message IsLoadBalancerIdleRequestPB {
+}
+
+// When no errors, load balancer is active.
+message IsLoadBalancerIdleResponsePB {
+  optional MasterErrorPB error = 1;
 }
 
 // Get a master's notion being ready as the leader.
@@ -996,7 +1219,16 @@ message CreateNamespaceRequestPB {
   optional string name = 1;
 
   // Database type.
-  optional YQLDatabase database_type = 2 [ default = YQL_DATABASE_UNDEFINED ];
+  optional YQLDatabase database_type = 2 [ default = YQL_DATABASE_CQL ];
+
+  // For RBAC.
+  optional string creator_role_name = 3;
+
+  // For Postgres:
+  optional bytes namespace_id = 4; // id to assign to this namespace.
+  optional bytes source_namespace_id = 5; // namespace id of the source database to copy from.
+  optional uint32 next_pg_oid = 6; // Next oid to assign. Ingored when source_namespace_id is given
+                                   // and the next_pg_oid from source namespace will be used.
 }
 
 message CreateNamespaceResponsePB {
@@ -1012,7 +1244,7 @@ message DeleteNamespaceRequestPB {
   optional NamespaceIdentifierPB namespace = 1;
 
   // Database type.
-  optional YQLDatabase database_type = 2 [ default = YQL_DATABASE_UNDEFINED ];
+  optional YQLDatabase database_type = 2 [ default = YQL_DATABASE_CQL ];
 }
 // Fails if the namespace is NOT empty
 
@@ -1021,22 +1253,20 @@ message DeleteNamespaceResponsePB {
   optional MasterErrorPB error = 1;
 }
 
-message GrantPermissionRequestPB {
-  optional PermissionType permission = 1;
-  optional ResourceType resource_type = 2;
-  optional string canonical_resource = 3;
-  optional string resource_name = 4;
-  optional NamespaceIdentifierPB namespace = 5;
-  optional string role_name = 6;
+message AlterNamespaceRequestPB {
+  optional NamespaceIdentifierPB namespace = 1;
+
+  // New name for the namespace in the alter operation.
+  optional string new_name = 2;
 }
 
-message GrantPermissionResponsePB {
+message AlterNamespaceResponsePB {
   // The error, if an error occurred with this request.
   optional MasterErrorPB error = 1;
 }
 
 message ListNamespacesRequestPB {
-  optional YQLDatabase database_type = 1 [ default = YQL_DATABASE_UNDEFINED ];
+  optional YQLDatabase database_type = 1 [ default = YQL_DATABASE_CQL ];
 }
 
 message ListNamespacesResponsePB {
@@ -1055,6 +1285,8 @@ message CreateRoleRequestPB {
   optional string salted_hash = 2;
   optional bool login = 3;
   optional bool superuser = 4;
+  // Name of the role creating this role.
+  optional string creator_role_name = 5;
 }
 
 message CreateRoleResponsePB {
@@ -1067,6 +1299,9 @@ message AlterRoleRequestPB {
   optional string salted_hash = 2;
   optional bool login = 3;
   optional bool superuser = 4;
+
+  // Name of the role trying to alter the role.
+  optional string current_role = 5;
 }
 
 message AlterRoleResponsePB {
@@ -1076,6 +1311,9 @@ message AlterRoleResponsePB {
 
 message DeleteRoleRequestPB {
   optional string name = 1;
+
+  // Name of the role trying to drop the role.
+  optional string current_role = 2;
 }
 
 message DeleteRoleResponsePB {
@@ -1083,14 +1321,59 @@ message DeleteRoleResponsePB {
   optional MasterErrorPB error = 1;
 }
 
-message GrantRoleRequestPB {
+message GrantRevokeRoleRequestPB {
   optional string granted_role = 1;
   optional string recipient_role = 2;
+
+  // true if this is a revoke request.
+  optional bool revoke = 3 [ default = false ];
 }
 
-message GrantRoleResponsePB {
+message GrantRevokeRoleResponsePB {
   // The error, if an error occurred with this request.
   optional MasterErrorPB error = 1;
+}
+
+message GrantRevokePermissionRequestPB {
+  optional PermissionType permission = 1;
+  optional ResourceType resource_type = 2;
+  optional string canonical_resource = 3;
+  optional string resource_name = 4;
+  optional NamespaceIdentifierPB namespace = 5;
+  optional string role_name = 6;
+
+  // true if this is a revoke request.
+  optional bool revoke = 7 [ default = false ];
+}
+
+message GrantRevokePermissionResponsePB {
+  // The error, if an error occurred with this request.
+  optional MasterErrorPB error = 1;
+}
+
+message GetPermissionsRequestPB {
+  // Only get the permissions if the cache version in the master is greater than this version.
+  optional uint64 if_version_greater_than = 1;
+}
+
+message ResourcePermissionInfoPB {
+  optional string canonical_resource = 1;
+  // Bitmap representing the permissions.
+  optional uint32 permissions = 2;
+}
+
+message RolePermissionInfoPB {
+  optional string role = 1;
+  // Bitmap representing the permissions for 'ALL KEYSPACES' and 'ALL ROLES'.
+  optional uint32 all_keyspaces_permissions = 2;
+  optional uint32 all_roles_permissions = 3;
+  repeated ResourcePermissionInfoPB resource_permissions = 4;
+}
+
+message GetPermissionsResponsePB {
+  optional uint64 version = 1;
+  optional MasterErrorPB error = 2;
+  repeated RolePermissionInfoPB role_permissions = 3;
 }
 
 message RedisConfigSetRequestPB {
@@ -1178,8 +1461,72 @@ message UDTypeInfoPB {
   optional NamespaceIdentifierPB namespace = 5;
 }
 
+// ============================================================================
+//  CDC Stream
+// ============================================================================
+
+message CreateCDCStreamRequestPB {
+  optional string table_id = 1;
+  repeated CDCStreamOptionsPB options = 2;
+}
+
+// Options for CDC stream. This will include details such as:
+// Stream sink: YB Universe / Kafka / Elastic Search.
+// Log retention time: Amount of time to retain logs for CDC.
+// Sink details: For example, Kafka cluster IP, port.
+message CDCStreamOptionsPB {
+  optional string key = 1;
+  optional bytes value = 2;
+}
+
+message CreateCDCStreamResponsePB {
+  // The error, if an error occurred with this request.
+  optional MasterErrorPB error = 1;
+  optional bytes stream_id = 2;
+}
+
+message DeleteCDCStreamRequestPB {
+  repeated bytes stream_id = 1;
+}
+
+message DeleteCDCStreamResponsePB {
+  // The error, if an error occurred with this request.
+  optional MasterErrorPB error = 1;
+}
+
+message ListCDCStreamsRequestPB {
+  optional string table_id = 1;
+}
+
+message ListCDCStreamsResponsePB {
+  // The error, if an error occurred with this request.
+  optional MasterErrorPB error = 1;
+  repeated CDCStreamInfoPB streams = 2;
+}
+
+message GetCDCStreamRequestPB {
+  optional bytes stream_id = 1;
+}
+
+message GetCDCStreamResponsePB {
+  // The error, if an error occurred with this request.
+  optional MasterErrorPB error = 1;
+  optional CDCStreamInfoPB stream = 2;
+}
+
+message CDCStreamInfoPB {
+  optional bytes stream_id = 1;
+  optional bytes table_id = 2;
+  repeated CDCStreamOptionsPB options = 3;
+}
+
+// TODO: rename to FlushOrCompact TablesRequestPB
+// https://github.com/YugaByte/yugabyte-db/issues/729
 message FlushTablesRequestPB {
   repeated TableIdentifierPB tables = 1;
+
+  // Whether we want to compact the tablets instead of flushing them.
+  optional bool is_compaction = 2;
 }
 
 message FlushTablesResponsePB {
@@ -1200,6 +1547,81 @@ message IsFlushTablesDoneResponsePB {
 
   // true if the flush tables operation is successfull.
   optional bool success = 3;
+}
+
+// Reserve Postgres oid
+message ReservePgsqlOidsRequestPB {
+  optional bytes namespace_id = 1; // The namespace id of the Postgres database.
+  optional uint32 next_oid = 2;    // The next oid to reserve.
+  optional uint32 count = 3;       // The number of oids to reserve.
+}
+
+message ReservePgsqlOidsResponsePB {
+  // The error, if an error occurred with this request.
+  optional MasterErrorPB error = 1;
+  optional uint32 begin_oid = 2; // The beginning oid reserved. Can be higher than requested.
+  optional uint32 end_oid = 3;   // The end (exclusive) oid reserved.
+}
+
+message GetYsqlCatalogConfigRequestPB {
+}
+
+message GetYsqlCatalogConfigResponsePB {
+  optional MasterErrorPB error = 1;
+  optional uint64 version = 2;
+}
+
+message IsInitDbDoneRequestPB {
+}
+
+message IsInitDbDoneResponsePB {
+  optional MasterErrorPB error = 1;
+
+  // Someone started running initdb, as indicated by the existence of template1.pg_proc.
+  optional bool pg_proc_exists = 2;
+
+  // This is true if the master ran initdb and it finished, succesfully or not.
+  optional bool done = 4;
+
+  // If this is set to a non-empty string, initdb has failed.
+  optional string initdb_error = 5;
+}
+
+message SetupUniverseReplicationRequestPB {
+  optional string producer_id = 1;
+  repeated HostPortPB producer_master_addresses = 2;
+  repeated string producer_table_ids = 3;
+}
+
+message SetupUniverseReplicationResponsePB {
+  optional MasterErrorPB error = 1;
+}
+
+message DeleteUniverseReplicationRequestPB {
+  optional string producer_id = 1;
+}
+
+message DeleteUniverseReplicationResponsePB {
+  optional MasterErrorPB error = 1;
+}
+
+
+message SetUniverseReplicationEnabledRequestPB {
+  optional string producer_id = 1;
+  optional bool is_enabled = 2;
+}
+
+message SetUniverseReplicationEnabledResponsePB {
+  optional MasterErrorPB error = 1;
+}
+
+message GetUniverseReplicationRequestPB {
+  optional string producer_id = 1;
+}
+
+message GetUniverseReplicationResponsePB {
+  optional MasterErrorPB error = 1;
+  optional SysUniverseReplicationEntryPB entry = 2;
 }
 
 service MasterService {
@@ -1225,21 +1647,34 @@ service MasterService {
   rpc GetTableLocations(GetTableLocationsRequestPB) returns (GetTableLocationsResponsePB);
   rpc GetTableSchema(GetTableSchemaRequestPB) returns (GetTableSchemaResponsePB);
 
-  rpc GrantPermission(GrantPermissionRequestPB) returns (GrantPermissionResponsePB);
-
   rpc CreateNamespace(CreateNamespaceRequestPB) returns (CreateNamespaceResponsePB);
   rpc DeleteNamespace(DeleteNamespaceRequestPB) returns (DeleteNamespaceResponsePB);
+  rpc AlterNamespace(AlterNamespaceRequestPB) returns (AlterNamespaceResponsePB);
   rpc ListNamespaces(ListNamespacesRequestPB) returns (ListNamespacesResponsePB);
 
+  // For Postgres:
+  rpc ReservePgsqlOids(ReservePgsqlOidsRequestPB) returns (ReservePgsqlOidsResponsePB);
+  rpc GetYsqlCatalogConfig(GetYsqlCatalogConfigRequestPB) returns (GetYsqlCatalogConfigResponsePB);
+
+  //  Authentication and Authorization.
   rpc CreateRole(CreateRoleRequestPB) returns (CreateRoleResponsePB);
   rpc AlterRole(AlterRoleRequestPB) returns (AlterRoleResponsePB);
   rpc DeleteRole(DeleteRoleRequestPB) returns (DeleteRoleResponsePB);
-  rpc GrantRole(GrantRoleRequestPB) returns (GrantRoleResponsePB);
+  rpc GrantRevokeRole(GrantRevokeRoleRequestPB) returns (GrantRevokeRoleResponsePB);
+  rpc GrantRevokePermission(GrantRevokePermissionRequestPB)
+      returns (GrantRevokePermissionResponsePB);
+  rpc GetPermissions(GetPermissionsRequestPB) returns (GetPermissionsResponsePB);
 
   rpc CreateUDType(CreateUDTypeRequestPB) returns (CreateUDTypeResponsePB);
   rpc DeleteUDType(DeleteUDTypeRequestPB) returns (DeleteUDTypeResponsePB);
   rpc ListUDTypes(ListUDTypesRequestPB) returns (ListUDTypesResponsePB);
   rpc GetUDTypeInfo(GetUDTypeInfoRequestPB) returns (GetUDTypeInfoResponsePB);
+
+  // CDC stream RPCs.
+  rpc CreateCDCStream(CreateCDCStreamRequestPB) returns (CreateCDCStreamResponsePB);
+  rpc DeleteCDCStream(DeleteCDCStreamRequestPB) returns (DeleteCDCStreamResponsePB);
+  rpc ListCDCStreams(ListCDCStreamsRequestPB) returns (ListCDCStreamsResponsePB);
+  rpc GetCDCStream(GetCDCStreamRequestPB) returns (GetCDCStreamResponsePB);
 
   // Redis Config
   rpc RedisConfigSet(RedisConfigSetRequestPB) returns (RedisConfigSetResponsePB);
@@ -1265,17 +1700,42 @@ service MasterService {
 
   rpc RemovedMasterUpdate(RemovedMasterUpdateRequestPB) returns (RemovedMasterUpdateResponsePB);
 
+  rpc SetPreferredZones(SetPreferredZonesRequestPB) returns (SetPreferredZonesResponsePB);
   rpc GetMasterClusterConfig(GetMasterClusterConfigRequestPB)
       returns (GetMasterClusterConfigResponsePB);
   rpc ChangeMasterClusterConfig(ChangeMasterClusterConfigRequestPB)
       returns (ChangeMasterClusterConfigResponsePB);
   rpc GetLoadMoveCompletion(GetLoadMovePercentRequestPB)
       returns (GetLoadMovePercentResponsePB);
+  rpc GetLeaderBlacklistCompletion(GetLeaderBlacklistPercentRequestPB)
+      returns (GetLoadMovePercentResponsePB);
   rpc IsLoadBalanced(IsLoadBalancedRequestPB)
       returns (IsLoadBalancedResponsePB);
+  rpc IsLoadBalancerIdle(IsLoadBalancerIdleRequestPB)
+      returns (IsLoadBalancerIdleResponsePB);
   rpc AreLeadersOnPreferredOnly(AreLeadersOnPreferredOnlyRequestPB)
       returns (AreLeadersOnPreferredOnlyResponsePB);
 
   rpc FlushTables(FlushTablesRequestPB) returns (FlushTablesResponsePB);
   rpc IsFlushTablesDone(IsFlushTablesDoneRequestPB) returns (IsFlushTablesDoneResponsePB);
+
+  rpc IsInitDbDone(IsInitDbDoneRequestPB) returns (IsInitDbDoneResponsePB);
+
+  rpc ChangeEncryptionInfo(ChangeEncryptionInfoRequestPB) returns (ChangeEncryptionInfoResponsePB);
+
+  rpc IsEncryptionEnabled(IsEncryptionEnabledRequestPB) returns (IsEncryptionEnabledResponsePB);
+
+  rpc SetupUniverseReplication(SetupUniverseReplicationRequestPB)
+      returns (SetupUniverseReplicationResponsePB);
+  rpc DeleteUniverseReplication(DeleteUniverseReplicationRequestPB)
+      returns (DeleteUniverseReplicationResponsePB);
+  rpc SetUniverseReplicationEnabled(SetUniverseReplicationEnabledRequestPB)
+      returns (SetUniverseReplicationEnabledResponsePB);
+  rpc GetUniverseReplication(GetUniverseReplicationRequestPB)
+      returns (GetUniverseReplicationResponsePB);
+  rpc AddUniverseKeys(AddUniverseKeysRequestPB)  returns (AddUniverseKeysResponsePB);
+  rpc GetUniverseKeyRegistry(GetUniverseKeyRegistryRequestPB)
+      returns (GetUniverseKeyRegistryResponsePB);
+  rpc HasUniverseKeyInMemory(HasUniverseKeyInMemoryRequestPB)
+      returns (HasUniverseKeyInMemoryResponsePB);
 }

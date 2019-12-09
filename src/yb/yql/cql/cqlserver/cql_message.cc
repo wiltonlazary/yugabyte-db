@@ -17,12 +17,17 @@
 #include <regex>
 
 #include "yb/client/client.h"
+
 #include "yb/common/ql_protocol.pb.h"
+#include "yb/common/ql_value.h"
+
 #include "yb/yql/cql/cqlserver/cql_message.h"
 #include "yb/yql/cql/cqlserver/cql_processor.h"
 
 #include "yb/gutil/endian.h"
 #include "yb/gutil/strings/substitute.h"
+
+#include "yb/util/random_util.h"
 
 namespace yb {
 namespace cqlserver {
@@ -54,6 +59,10 @@ constexpr char CQLMessage::kNoCompactOption[];
 
 constexpr char CQLMessage::kLZ4Compression[];
 constexpr char CQLMessage::kSnappyCompression[];
+
+constexpr char CQLMessage::kTopologyChangeEvent[];
+constexpr char CQLMessage::kStatusChangeEvent[];
+constexpr char CQLMessage::kSchemaChangeEvent[];
 
 Status CQLMessage::QueryParameters::GetBindVariable(const std::string& name,
                                                     const int64_t pos,
@@ -151,8 +160,8 @@ Status CQLMessage::QueryParameters::ValidateConsistency() {
       break;
     }
     default:
-      LOG(WARNING) << "Consistency level " << static_cast<uint16_t>(consistency)
-                   << " is not supported, defaulting to strong consistency";
+      YB_LOG_EVERY_N_SECS(WARNING, 10) << "Consistency level " << static_cast<uint16_t>(consistency)
+                                       << " is not supported, defaulting to strong consistency";
       set_yb_consistency_level(YBConsistencyLevel::STRONG);
   }
   return Status::OK();
@@ -237,7 +246,7 @@ bool CQLRequest::ParseRequest(
       return false;
     }
     switch (compression_scheme) {
-      case CompressionScheme::LZ4: {
+      case CompressionScheme::kLz4: {
         if (body_size < sizeof(uint32_t)) {
           error_response->reset(
               new ErrorResponse(
@@ -263,7 +272,7 @@ bool CQLRequest::ParseRequest(
         body_size = uncomp_size;
         break;
       }
-      case CompressionScheme::SNAPPY: {
+      case CompressionScheme::kSnappy: {
         size_t uncomp_size = 0;
         if (GetUncompressedLength(to_char_ptr(body_data), body_size, &uncomp_size)) {
           buffer = std::make_unique<uint8_t[]>(uncomp_size);
@@ -279,7 +288,7 @@ bool CQLRequest::ParseRequest(
                 "Error occurred when uncompressing CQL message"));
         break;
       }
-      case CompressionScheme::NONE:
+      case CompressionScheme::kNone:
         error_response->reset(
             new ErrorResponse(
                 header.stream_id, ErrorResponse::Code::PROTOCOL_ERROR,
@@ -508,6 +517,7 @@ Status CQLRequest::ParseQueryParameters(QueryParameters* params) {
   RETURN_NOT_OK(ParseConsistency(&params->consistency));
   RETURN_NOT_OK(params->ValidateConsistency());
   RETURN_NOT_OK(ParseByte(&params->flags));
+  params->set_request_id(RandomUniformInt<uint64_t>());
   if (params->flags & CQLMessage::QueryParameters::kWithValuesFlag) {
     const bool with_name = (params->flags & CQLMessage::QueryParameters::kWithNamesForValuesFlag);
     uint16_t count = 0;
@@ -529,7 +539,7 @@ Status CQLRequest::ParseQueryParameters(QueryParameters* params) {
   if (params->flags & CQLMessage::QueryParameters::kWithPagingStateFlag) {
     string paging_state;
     RETURN_NOT_OK(ParseBytes(&paging_state));
-    RETURN_NOT_OK(params->set_paging_state(paging_state));
+    RETURN_NOT_OK(params->SetPagingState(paging_state));
   }
   if (params->flags & CQLMessage::QueryParameters::kWithSerialConsistencyFlag) {
     RETURN_NOT_OK(ParseConsistency(&params->serial_consistency));
@@ -721,7 +731,23 @@ RegisterRequest::~RegisterRequest() {
 }
 
 Status RegisterRequest::ParseBody() {
-  return ParseStringList(&event_types_);
+  vector<string> event_types;
+  RETURN_NOT_OK(ParseStringList(&event_types));
+  events_ = kNoEvents;
+
+  for (const string& event_type : event_types) {
+    if (event_type == kTopologyChangeEvent) {
+      events_ |= kTopologyChange;
+    } else if (event_type == kStatusChangeEvent) {
+      events_ |= kStatusChange;
+    } else if (event_type == kSchemaChangeEvent) {
+      events_ |= kSchemaChange;
+    } else {
+      return STATUS(NetworkError, "Invalid event type in register request");
+    }
+  }
+
+  return Status::OK();
 }
 
 // --------------------------- Serialization utility functions -------------------------------
@@ -912,13 +938,13 @@ CQLResponse::~CQLResponse() {
 
 void CQLResponse::Serialize(const CompressionScheme compression_scheme, faststring* mesg) const {
   const size_t start_pos = mesg->size(); // save the start position
-  const bool compress = (compression_scheme != CQLMessage::CompressionScheme::NONE);
+  const bool compress = (compression_scheme != CQLMessage::CompressionScheme::kNone);
   SerializeHeader(compress, mesg);
   if (compress) {
     faststring body;
     SerializeBody(&body);
     switch (compression_scheme) {
-      case CQLMessage::CompressionScheme::LZ4: {
+      case CQLMessage::CompressionScheme::kLz4: {
         SerializeInt(static_cast<int32_t>(body.size()), mesg);
         const size_t curr_size = mesg->size();
         const int max_comp_size = LZ4_compressBound(body.size());
@@ -931,7 +957,7 @@ void CQLResponse::Serialize(const CompressionScheme compression_scheme, faststri
         mesg->resize(curr_size + comp_size);
         break;
       }
-      case CQLMessage::CompressionScheme::SNAPPY: {
+      case CQLMessage::CompressionScheme::kSnappy: {
         const size_t curr_size = mesg->size();
         const size_t max_comp_size = MaxCompressedLength(body.size());
         size_t comp_size = 0;
@@ -941,7 +967,7 @@ void CQLResponse::Serialize(const CompressionScheme compression_scheme, faststri
         mesg->resize(curr_size + comp_size);
         break;
       }
-      case CQLMessage::CompressionScheme::NONE:
+      case CQLMessage::CompressionScheme::kNone:
         LOG(FATAL) << "No compression scheme";
         break;
     }
@@ -1231,6 +1257,12 @@ ResultResponse::RowsMetadata::Type::Type(const shared_ptr<QLType>& ql_type) {
     case DataType::TIMESTAMP:
       id = Id::TIMESTAMP;
       return;
+    case DataType::DATE:
+      id = Id::DATE;
+      return;
+    case DataType::TIME:
+      id = Id::TIME;
+      return;
     case DataType::INET:
       id = Id::INET;
       return;
@@ -1282,8 +1314,6 @@ ResultResponse::RowsMetadata::Type::Type(const shared_ptr<QLType>& ql_type) {
     case DataType::NULL_VALUE_TYPE: FALLTHROUGH_INTENDED;
     case DataType::TUPLE: FALLTHROUGH_INTENDED;
     case DataType::TYPEARGS: FALLTHROUGH_INTENDED;
-    case DataType::DATE: FALLTHROUGH_INTENDED;
-    case DataType::TIME: FALLTHROUGH_INTENDED;
 
     case DataType::UINT8:  FALLTHROUGH_INTENDED;
     case DataType::UINT16: FALLTHROUGH_INTENDED;
@@ -1596,10 +1626,13 @@ SchemaChangeResultResponse::~SchemaChangeResultResponse() {
 void SchemaChangeResultResponse::Serialize(const CompressionScheme compression_scheme,
                                            faststring* mesg) const {
   ResultResponse::Serialize(compression_scheme, mesg);
-  // TODO: Replace this hack that piggybacks a SCHEMA_CHANGE event along a SCHEMA_CHANGE result
-  // response with a formal event notification mechanism.
-  SchemaChangeEventResponse event(change_type_, target_, keyspace_, object_, argument_types_);
-  event.Serialize(compression_scheme, mesg);
+
+  if (registered_events() & kSchemaChange) {
+    // TODO: Replace this hack that piggybacks a SCHEMA_CHANGE event along a SCHEMA_CHANGE result
+    // response with a formal event notification mechanism.
+    SchemaChangeEventResponse event(change_type_, target_, keyspace_, object_, argument_types_);
+    event.Serialize(compression_scheme, mesg);
+  }
 }
 
 void SchemaChangeResultResponse::SerializeResultBody(faststring* mesg) const {
@@ -1637,7 +1670,7 @@ std::string EventResponse::ToString() const {
 //----------------------------------------------------------------------------------------
 TopologyChangeEventResponse::TopologyChangeEventResponse(const string& topology_change_type,
                                                          const Endpoint& node)
-    : EventResponse("TOPOLOGY_CHANGE"), topology_change_type_(topology_change_type),
+    : EventResponse(kTopologyChangeEvent), topology_change_type_(topology_change_type),
       node_(node) {
 }
 
@@ -1656,7 +1689,7 @@ std::string TopologyChangeEventResponse::BodyToString() const {
 //----------------------------------------------------------------------------------------
 StatusChangeEventResponse::StatusChangeEventResponse(const string& status_change_type,
                                                      const Endpoint& node)
-    : EventResponse("STATUS_CHANGE"), status_change_type_(status_change_type),
+    : EventResponse(kStatusChangeEvent), status_change_type_(status_change_type),
       node_(node) {
 }
 
@@ -1678,7 +1711,7 @@ const vector<string> SchemaChangeEventResponse::kEmptyArgumentTypes = {};
 SchemaChangeEventResponse::SchemaChangeEventResponse(
     const string& change_type, const string& target,
     const string& keyspace, const string& object, const vector<string>& argument_types)
-    : EventResponse("SCHEMA_CHANGE"), change_type_(change_type), target_(target),
+    : EventResponse(kSchemaChangeEvent), change_type_(change_type), target_(target),
       keyspace_(keyspace), object_(object), argument_types_(argument_types) {
 }
 
@@ -1732,11 +1765,11 @@ CQLServerEvent::CQLServerEvent(std::unique_ptr<EventResponse> event_response)
     : event_response_(std::move(event_response)) {
   CHECK_NOTNULL(event_response_.get());
   faststring temp;
-  event_response_->Serialize(CQLMessage::CompressionScheme::NONE, &temp);
+  event_response_->Serialize(CQLMessage::CompressionScheme::kNone, &temp);
   serialized_response_ = RefCntBuffer(temp);
 }
 
-void CQLServerEvent::Serialize(std::deque<RefCntBuffer>* output) const {
+void CQLServerEvent::Serialize(boost::container::small_vector_base<RefCntBuffer>* output) const {
   output->push_back(serialized_response_);
 }
 
@@ -1753,7 +1786,8 @@ void CQLServerEventList::Transferred(const Status& status, rpc::Connection*) {
   }
 }
 
-void CQLServerEventList::Serialize(std::deque<RefCntBuffer>* output) const {
+void CQLServerEventList::Serialize(
+    boost::container::small_vector_base<RefCntBuffer>* output) {
   for (const auto& cql_server_event : cql_server_events_) {
     cql_server_event->Serialize(output);
   }

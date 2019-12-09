@@ -29,6 +29,7 @@
 
 #include <inttypes.h>
 
+#include <algorithm>
 #include <vector>
 
 #include "yb/rocksdb/compaction_filter.h"
@@ -36,6 +37,7 @@
 #include "yb/rocksdb/db/version_set.h"
 #include "yb/rocksdb/util/logging.h"
 #include "yb/rocksdb/util/sync_point.h"
+#include "yb/util/logging.h"
 
 namespace rocksdb {
 
@@ -72,12 +74,30 @@ uint64_t TotalFileSize(const std::vector<FileMetaData*>& files) {
   return sum;
 }
 
-void Compaction::SetInputVersion(Version* _input_version) {
-  input_version_ = _input_version;
-  cfd_ = input_version_->cfd();
+bool Compaction::IsCompactionStyleUniversal() const {
+  return cfd_->ioptions()->compaction_style == kCompactionStyleUniversal;
+}
 
+void Compaction::SetInputVersion(Version* input_version) {
+  input_version_number_ = input_version->GetVersionNumber();
+  input_version_level0_non_overlapping_ = input_version->storage_info()->level0_non_overlapping();
+  vset_ = input_version->version_set();
+  cfd_ = input_version->cfd();
   cfd_->Ref();
-  input_version_->Ref();
+
+  if (IsCompactionStyleUniversal()) {
+    // We don't need to lock the whole input version for universal compaction, only need input
+    // files.
+    for (auto& input_level : inputs_) {
+      for (auto* f : input_level.files) {
+        ++f->refs;
+      }
+    }
+  } else {
+    input_version_ = input_version;
+    input_version_->Ref();
+  }
+
   edit_.SetColumnFamily(cfd_->GetID());
 }
 
@@ -238,6 +258,13 @@ Compaction::Compaction(VersionStorageInfo* vstorage,
 Compaction::~Compaction() {
   if (input_version_ != nullptr) {
     input_version_->Unref();
+  } else if (cfd_ != nullptr) {
+    // If we don't hold input_version_, unref each input file separately.
+    for (auto& input_level : inputs_) {
+      for (auto f : input_level.files) {
+        vset_->UnrefFile(cfd_, f);
+      }
+    }
   }
   if (cfd_ != nullptr) {
     if (cfd_->Unref()) {
@@ -247,7 +274,9 @@ Compaction::~Compaction() {
 }
 
 bool Compaction::InputCompressionMatchesOutput() const {
-  int base_level = input_version_->storage_info()->base_level();
+  int base_level = IsCompactionStyleUniversal()
+      ? -1
+      : input_version_->storage_info()->base_level();
   bool matches = (GetCompressionType(*cfd_->ioptions(), start_level_,
                                      base_level) == output_compression_);
   if (matches) {
@@ -266,8 +295,7 @@ bool Compaction::IsTrivialMove() const {
   // filter to be applied to that level, and thus cannot be a trivial move.
 
   // Check if start level have files with overlapping ranges
-  if (start_level_ == 0 &&
-      input_version_->storage_info()->level0_non_overlapping() == false) {
+  if (start_level_ == 0 && !input_version_level0_non_overlapping_) {
     // We cannot move files from L0 to L1 if the files are overlapping
     return false;
   }
@@ -303,13 +331,13 @@ void Compaction::AddInputDeletions(VersionEdit* out_edit) {
 
 bool Compaction::KeyNotExistsBeyondOutputLevel(
     const Slice& user_key, std::vector<size_t>* level_ptrs) const {
-  assert(input_version_ != nullptr);
   assert(level_ptrs != nullptr);
   assert(level_ptrs->size() == static_cast<size_t>(number_levels_));
   assert(cfd_->ioptions()->compaction_style != kCompactionStyleFIFO);
-  if (cfd_->ioptions()->compaction_style == kCompactionStyleUniversal) {
+  if (IsCompactionStyleUniversal()) {
     return bottommost_level_;
   }
+  DCHECK_ONLY_NOTNULL(input_version_);
   // Maybe use binary search to find right entry instead of linear search?
   const Comparator* user_cmp = cfd_->user_comparator();
   for (int lvl = output_level_ + 1; lvl < number_levels_; lvl++) {
@@ -411,8 +439,10 @@ void Compaction::ReleaseCompactionFiles(Status status) {
 }
 
 void Compaction::ResetNextCompactionIndex() {
-  assert(input_version_ != nullptr);
-  input_version_->storage_info()->ResetNextCompactionIndex(start_level_);
+  if (!IsCompactionStyleUniversal()) {
+    DCHECK_ONLY_NOTNULL(input_version_);
+    input_version_->storage_info()->ResetNextCompactionIndex(start_level_);
+  }
 }
 
 namespace {
@@ -439,8 +469,7 @@ void Compaction::Summary(char* output, int len) {
   int write =
       snprintf(output, len, "Base version %" PRIu64
                             " Base level %d, inputs: [",
-               input_version_->GetVersionNumber(),
-               start_level_);
+               input_version_number_, start_level_);
   if (write < 0 || write >= len) {
     return;
   }
@@ -475,9 +504,10 @@ uint64_t Compaction::OutputFilePreallocationSize() {
       preallocation_size += f->fd.GetTotalFileSize();
     }
   }
+  constexpr uint64_t kMaxPreAllocationSize = 1_GB;
   // Over-estimate slightly so we don't end up just barely crossing
   // the threshold
-  return preallocation_size + (preallocation_size / 10);
+  return std::min(kMaxPreAllocationSize, preallocation_size + (preallocation_size / 10));
 }
 
 std::unique_ptr<CompactionFilter> Compaction::CreateCompactionFilter() const {
@@ -503,7 +533,7 @@ bool Compaction::ShouldFormSubcompactions() const {
   }
   if (cfd_->ioptions()->compaction_style == kCompactionStyleLevel) {
     return start_level_ == 0 && !IsOutputLevelEmpty();
-  } else if (cfd_->ioptions()->compaction_style == kCompactionStyleUniversal) {
+  } else if (IsCompactionStyleUniversal()) {
     return number_levels_ > 1 && output_level_ > 0;
   } else {
     return false;

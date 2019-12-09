@@ -20,6 +20,7 @@
 #include <vector>
 #include <boost/function.hpp>
 
+#include "yb/docdb/docdb_fwd.h"
 #include "yb/rocksdb/db.h"
 
 #include "yb/common/doc_hybrid_time.h"
@@ -27,15 +28,15 @@
 #include "yb/common/read_hybrid_time.h"
 #include "yb/common/transaction.h"
 
+#include "yb/docdb/docdb_types.h"
 #include "yb/docdb/doc_key.h"
 #include "yb/docdb/doc_kv_util.h"
-#include "yb/docdb/doc_operation.h"
 #include "yb/docdb/doc_path.h"
 #include "yb/docdb/doc_write_batch.h"
-#include "yb/docdb/doc_write_batch_cache.h"
 #include "yb/docdb/docdb.pb.h"
+#include "yb/docdb/expiration.h"
 #include "yb/docdb/intent.h"
-#include "yb/docdb/internal_doc_iterator.h"
+#include "yb/docdb/lock_batch.h"
 #include "yb/docdb/primitive_value.h"
 #include "yb/docdb/shared_lock_manager_fwd.h"
 #include "yb/docdb/value.h"
@@ -44,7 +45,7 @@
 #include "yb/util/status.h"
 #include "yb/util/strongly_typed_bool.h"
 
-// Document DB mapping on top of the key-value map in RocksDB:
+// DocDB mapping on top of the key-value map in RocksDB:
 // <document_key> <hybrid_time> -> <doc_type>
 // <document_key> <hybrid_time> <key_a> <gen_ts_a> -> <subdoc_a_type_or_value>
 //
@@ -83,6 +84,9 @@ class Histogram;
 
 namespace docdb {
 
+class DeadlineInfo;
+class DocOperation;
+
 // This function prepares the transaction by taking locks. The set of keys locked are returned to
 // the caller via the keys_locked argument (because they need to be saved and unlocked when the
 // transaction commits). A flag is also returned to indicate if any of the write operations
@@ -101,13 +105,23 @@ namespace docdb {
 //
 // Input: doc_write_ops
 // Context: lock_manager
-// Outputs: write_batch, need_read_snapshot
-void PrepareDocWriteOperation(const std::vector<std::unique_ptr<DocOperation>>& doc_write_ops,
-                              const scoped_refptr<Histogram>& write_lock_latency,
-                              IsolationLevel isolation_level,
-                              SharedLockManager *lock_manager,
-                              LockBatch *keys_locked,
-                              bool *need_read_snapshot);
+
+struct PrepareDocWriteOperationResult {
+  LockBatch lock_batch;
+  bool need_read_snapshot = false;
+};
+
+Result<PrepareDocWriteOperationResult> PrepareDocWriteOperation(
+    const std::vector<std::unique_ptr<DocOperation>>& doc_write_ops,
+    const google::protobuf::RepeatedPtrField<KeyValuePairPB>& read_pairs,
+    const scoped_refptr<Histogram>& write_lock_latency,
+    const IsolationLevel isolation_level,
+    const OperationKind operation_kind,
+    const RowMarkType row_mark_type,
+    bool transactional_table,
+    CoarseTimePoint deadline,
+    PartialRangeKeyIntents partial_range_key_intents,
+    SharedLockManager *lock_manager);
 
 // This constructs a DocWriteBatch using the given list of DocOperations, reading the previous
 // state of data from RocksDB when necessary.
@@ -119,7 +133,7 @@ void PrepareDocWriteOperation(const std::vector<std::unique_ptr<DocOperation>>& 
 // operation that happens after Raft replication.
 CHECKED_STATUS ExecuteDocWriteOperation(
     const std::vector<std::unique_ptr<DocOperation>>& doc_write_ops,
-    MonoTime deadline,
+    CoarseTimePoint deadline,
     const ReadHybridTime& read_time,
     const DocDB& doc_db,
     KeyValueWriteBatchPB* write_batch,
@@ -133,7 +147,7 @@ void PrepareNonTransactionWriteBatch(
     rocksdb::WriteBatch* rocksdb_write_batch);
 
 // Enumerates intents corresponding to provided key value pairs.
-// For each key in generates a strong intent and for each parent of each it generates a weak one.
+// For each key it generates a strong intent and for each parent of each it generates a weak one.
 // functor should accept 3 arguments:
 // intent_kind - kind of intent weak or strong
 // value_slice - value of intent
@@ -146,9 +160,15 @@ void PrepareNonTransactionWriteBatch(
 // from it triggers heap allocation."
 // So, we use boost::function which doesn't have such issue:
 // http://www.boost.org/doc/libs/1_65_1/doc/html/function/misc.html
+typedef boost::function<Status(IntentStrength, Slice, KeyBytes*)> EnumerateIntentsCallback;
+
 CHECKED_STATUS EnumerateIntents(
-    const google::protobuf::RepeatedPtrField<yb::docdb::KeyValuePairPB> &kv_pairs,
-    boost::function<Status(IntentKind, Slice, KeyBytes*)> functor);
+    const google::protobuf::RepeatedPtrField<yb::docdb::KeyValuePairPB>& kv_pairs,
+    const EnumerateIntentsCallback& functor, PartialRangeKeyIntents partial_range_key_intents);
+
+CHECKED_STATUS EnumerateIntents(
+    Slice key, const Slice& intent_value, const EnumerateIntentsCallback& functor,
+    KeyBytes* encoded_key_buffer, PartialRangeKeyIntents partial_range_key_intents);
 
 void PrepareTransactionWriteBatch(
     const docdb::KeyValueWriteBatchPB& put_batch,
@@ -156,10 +176,11 @@ void PrepareTransactionWriteBatch(
     rocksdb::WriteBatch* rocksdb_write_batch,
     const TransactionId& transaction_id,
     IsolationLevel isolation_level,
+    PartialRangeKeyIntents partial_range_key_intents,
     IntraTxnWriteId* write_id);
 
 CHECKED_STATUS PrepareApplyIntentsBatch(
-    const TransactionId& transaction_id, HybridTime commit_ht,
+    const TransactionId& transaction_id, HybridTime commit_ht, const KeyBounds* key_bounds,
     rocksdb::WriteBatch* regular_batch,
     rocksdb::DB* intents_db, rocksdb::WriteBatch* intents_batch);
 
@@ -233,21 +254,6 @@ class SubDocKeyBound : public SubDocKey {
   const bool is_lower_bound_;
 };
 
-YB_DEFINE_ENUM(BoundType,
-    (kInvalid)
-    (kExclusiveLower)
-    (kInclusiveLower)
-    (kExclusiveUpper)
-    (kInclusiveUpper));
-
-inline BoundType LowerBound(bool exclusive) {
-  return exclusive ? BoundType::kExclusiveLower : BoundType::kInclusiveLower;
-}
-
-inline BoundType UpperBound(bool exclusive) {
-  return exclusive ? BoundType::kExclusiveUpper : BoundType::kInclusiveUpper;
-}
-
 class SliceKeyBound {
  public:
   SliceKeyBound() {}
@@ -315,23 +321,29 @@ class IndexBound {
   static const IndexBound& Empty();
 
  private:
-  const int64 index_;
-  const bool is_lower_bound_;
+  int64 index_;
+  bool is_lower_bound_;
 };
 
 // Pass data to GetSubDocument function.
 struct GetSubDocumentData {
   GetSubDocumentData(
-      const Slice& subdoc_key, SubDocument* result_, bool* doc_found_ = nullptr)
+    const Slice& subdoc_key, SubDocument* result_,
+    bool* doc_found_ = nullptr, MonoDelta default_ttl = Value::kMaxTtl)
       : subdocument_key(subdoc_key),
         result(result_),
-        doc_found(doc_found_) {}
+        doc_found(doc_found_),
+        exp(default_ttl) {}
 
   Slice subdocument_key;
   SubDocument* result;
   bool* doc_found;
 
-  MonoDelta table_ttl = Value::kMaxTtl;
+  DeadlineInfo* deadline_info = nullptr;
+
+  // The TTL and hybrid time are return values external to the SubDocument
+  // which occasionally need to be accessed for TTL calculation.
+  mutable Expiration exp;
   bool return_type_only = false;
 
   // Represent bounds on the first and last subkey to be considered.
@@ -351,7 +363,8 @@ struct GetSubDocumentData {
   GetSubDocumentData Adjusted(
       const Slice& subdoc_key, SubDocument* result_, bool* doc_found_ = nullptr) const {
     GetSubDocumentData result(subdoc_key, result_, doc_found_);
-    result.table_ttl = table_ttl;
+    result.deadline_info = deadline_info;
+    result.exp = exp;
     result.return_type_only = return_type_only;
     result.low_subkey = low_subkey;
     result.high_subkey = high_subkey;
@@ -362,16 +375,38 @@ struct GetSubDocumentData {
   }
 
   std::string ToString() const {
-    return Format("{ subdocument_key: $0 table_ttl: $1 return_type_only: $2 low_subkey: $3 "
-                      "high_subkey: $4 }",
-                  SubDocKey::DebugSliceToString(subdocument_key), table_ttl, return_type_only,
-                  *low_subkey, *high_subkey);
+    return Format("{ subdocument_key: $0 ttl: $1 write_time: $2 return_type_only: $3 "
+                      "low_subkey: $4 high_subkey: $5 }",
+                  SubDocKey::DebugSliceToString(subdocument_key), exp.ttl,
+                  exp.write_ht, return_type_only, *low_subkey, *high_subkey);
   }
 };
 
 inline std::ostream& operator<<(std::ostream& out, const GetSubDocumentData& data) {
   return out << data.ToString();
 }
+
+// If there is a key equal to key_bytes_without_ht + some timestamp, which is later than
+// max_overwrite_time, we update max_overwrite_time, and result_value (unless it is nullptr).
+// If there is a TTL with write time later than the write time in expiration, it is updated with
+// the new write time and TTL, unless its value is kMaxTTL.
+// When the TTL found is kMaxTTL and it is not a merge record, then it is assumed not to be
+// explicitly set. Because it does not override the default table ttl, exp, which was initialized
+// to the table ttl, is not updated.
+// Observe that exp updates based on the first record found, while max_overwrite_time updates
+// based on the first non-merge record found.
+// This should not be used for leaf nodes. - Why? Looks like it is already used for leaf nodes
+// also.
+// Note: it is responsibility of caller to make sure key_bytes_without_ht doesn't have hybrid
+// time.
+// TODO: We could also check that the value is kTombStone or kObject type for sanity checking - ?
+// It could be a simple value as well, not necessarily kTombstone or kObject.
+yb::Status FindLastWriteTime(
+    IntentAwareIterator* iter,
+    const Slice& key_without_ht,
+    DocHybridTime* max_overwrite_time,
+    Expiration* exp,
+    Value* result_value = nullptr);
 
 // Indicates if we can get away by only seeking forward, or if we must do a regular seek.
 YB_STRONGLY_TYPED_BOOL(SeekFwdSuffices);
@@ -406,11 +441,16 @@ yb::Status GetSubDocument(
     const GetSubDocumentData& data,
     const rocksdb::QueryId query_id,
     const TransactionOperationContextOpt& txn_op_context,
-    MonoTime deadline,
+    CoarseTimePoint deadline,
     const ReadHybridTime& read_time = ReadHybridTime::Max());
 
-YB_STRONGLY_TYPED_BOOL(IncludeBinary);
-YB_DEFINE_ENUM(StorageDbType, (kRegular)(kIntents));
+// This retrieves the TTL for a key.
+yb::Status GetTtl(const Slice& encoded_subdoc_key,
+                  IntentAwareIterator* iter,
+                  bool* doc_found,
+                  Expiration* exp);
+
+using DocDbDumpLineFilter = boost::function<bool(const std::string&)>;
 
 // Create a debug dump of the document database. Tries to decode all keys/values despite failures.
 // Reports all errors to the output stream and returns the status of the first failed operation,
@@ -419,11 +459,26 @@ void DocDBDebugDump(
     rocksdb::DB* rocksdb,
     std::ostream& out,
     StorageDbType db_type,
-    IncludeBinary include_binary = IncludeBinary::kFalse);
+    IncludeBinary include_binary = IncludeBinary::kFalse,
+    const DocDbDumpLineFilter& filter = DocDbDumpLineFilter());
 
 std::string DocDBDebugDumpToStr(
     rocksdb::DB* rocksdb, StorageDbType db_type = StorageDbType::kRegular,
+    IncludeBinary include_binary = IncludeBinary::kFalse,
+    const DocDbDumpLineFilter& filter = DocDbDumpLineFilter());
+
+std::string DocDBDebugDumpToStr(
+    DocDB docdb, IncludeBinary include_binary = IncludeBinary::kFalse,
+    const DocDbDumpLineFilter& line_filter = DocDbDumpLineFilter());
+
+template <class T>
+void DocDBDebugDumpToContainer(
+    rocksdb::DB* rocksdb, T* out, StorageDbType db_type = StorageDbType::kRegular,
     IncludeBinary include_binary = IncludeBinary::kFalse);
+
+template <class T>
+void DocDBDebugDumpToContainer(
+    DocDB docdb, T* out, IncludeBinary include_binary = IncludeBinary::kFalse);
 
 void ConfigureDocDBRocksDBOptions(rocksdb::Options* options);
 

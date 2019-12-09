@@ -73,6 +73,7 @@
 #include "yb/util/net/net_util.h"
 #include "yb/util/url-coding.h"
 #include "yb/util/version_info.h"
+#include "yb/util/shared_lock.h"
 
 #if defined(__APPLE__)
 typedef sig_t sighandler_t;
@@ -110,10 +111,10 @@ void Webserver::RootHandler(const Webserver::WebRequest& args, stringstream* out
 }
 
 void Webserver::BuildArgumentMap(const string& args, ArgumentMap* output) {
-  vector<StringPiece> arg_pairs = strings::Split(args, "&");
+  vector<GStringPiece> arg_pairs = strings::Split(args, "&");
 
-  for (const StringPiece& arg_pair : arg_pairs) {
-    vector<StringPiece> key_value = strings::Split(arg_pair, "=");
+  for (const GStringPiece& arg_pair : arg_pairs) {
+    vector<GStringPiece> key_value = strings::Split(arg_pair, "=");
     if (key_value.empty()) continue;
 
     string key;
@@ -291,7 +292,7 @@ int Webserver::BeginRequestCallback(struct sq_connection* connection,
                                     struct sq_request_info* request_info) {
   PathHandler* handler;
   {
-    boost::shared_lock<boost::shared_mutex> lock(lock_);
+    SharedLock<boost::shared_mutex> lock(lock_);
     PathHandlerMap::const_iterator it = path_handlers_.find(request_info->uri);
     if (it == path_handlers_.end()) {
       // Let Mongoose deal with this request; returning NULL will fall through
@@ -376,11 +377,13 @@ int Webserver::RunPathHandler(const PathHandler& handler,
     sq_printf(connection, "HTTP/1.1 200 OK\r\n"
               "Content-Type: text/plain\r\n"
               "Content-Length: %zd\r\n"
+              "Access-Control-Allow-Origin: *\r\n"
               "\r\n", str.length());
   } else {
     sq_printf(connection, "HTTP/1.1 200 OK\r\n"
               "Content-Type: text/html\r\n"
               "Content-Length: %zd\r\n"
+              "Access-Control-Allow-Origin: *\r\n"
               "\r\n", str.length());
   }
 
@@ -411,8 +414,8 @@ const char* const PAGE_HEADER = "<!DOCTYPE html>"
 "    <link rel='shortcut icon' href='/favicon.ico'>"
 "    <link href='/bootstrap/css/bootstrap.min.css' rel='stylesheet' media='screen' />"
 "    <link href='/bootstrap/css/bootstrap-theme.min.css' rel='stylesheet' media='screen' />"
-"    <link rel=\"stylesheet\" href=\"/font-awesome/css/font-awesome.min.css\" />"
-"    <link href='/yb.css' rel='stylesheet' />"
+"    <link href='/font-awesome/css/font-awesome.min.css' rel='stylesheet' media='screen' />"
+"    <link href='/yb.css' rel='stylesheet' media='screen' />"
 "  </head>"
 "\n"
 "<body>"
@@ -461,10 +464,10 @@ void Webserver::set_footer_html(const std::string& html) {
 }
 
 void Webserver::BootstrapPageFooter(stringstream* output) {
-  boost::shared_lock<boost::shared_mutex> l(lock_);
-  *output << "</div>\n"; // end bootstrap 'container' div
+  SharedLock<boost::shared_mutex> l(lock_);
+  *output << "<div class='yb-bottom-spacer'></div></div>\n"; // end bootstrap 'container' div
   if (!footer_html_.empty()) {
-    *output << "<footer class=\"footer\"><div class=\"yb-footer container text-muted\">";
+    *output << "<footer class='footer'><div class='yb-footer container text-muted'>";
     *output << footer_html_;
     *output << "</div></footer>";
   }

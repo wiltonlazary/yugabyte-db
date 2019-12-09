@@ -53,7 +53,8 @@ class PTTableProperty : public PTProperty {
     kMaxIndexInterval,
     kReadRepairChance,
     kSpeculativeRetry,
-    kTransactions
+    kTransactions,
+    kNumTablets
   };
 
   //------------------------------------------------------------------------------------------------
@@ -65,14 +66,14 @@ class PTTableProperty : public PTProperty {
   // Constructor and destructor.
   // Constructor for PropertyType::kTableProperty.
   PTTableProperty(MemoryContext *memctx,
-           YBLocation::SharedPtr loc,
-           const MCSharedPtr<MCString>& lhs_,
-           const PTExpr::SharedPtr& rhs_);
+                  YBLocation::SharedPtr loc,
+                  const MCSharedPtr<MCString>& lhs_,
+                  const PTExpr::SharedPtr& rhs_);
 
   // Constructor for PropertyType::kClusteringOrder.
   PTTableProperty(MemoryContext *memctx,
                   YBLocation::SharedPtr loc,
-                  const MCSharedPtr<MCString>& name,
+                  const PTExpr::SharedPtr& expr,
                   const PTOrderBy::Direction direction);
 
   // Constructor for PropertyType::kCoPartitionTable
@@ -101,9 +102,9 @@ class PTTableProperty : public PTProperty {
     return property_type_;
   }
 
-  const MCString& name() const {
+  string name() const {
     DCHECK_EQ(property_type_, PropertyType::kClusteringOrder);
-    return *name_;
+    return order_expr_->QLName();
   }
 
   PTOrderBy::Direction direction() const {
@@ -116,17 +117,14 @@ class PTTableProperty : public PTProperty {
     return *copartition_table_name_;
   }
 
-  TableId copartition_table_id() const {
-    DCHECK_EQ(property_type_, PropertyType::kCoPartitionTable);
-    return copartition_table_->id();
-  }
+  TableId copartition_table_id() const;
 
  protected:
   bool IsValidProperty(const string& property_name) {
     return kPropertyDataTypes.find(property_name) != kPropertyDataTypes.end();
   }
 
-  MCSharedPtr<MCString> name_;
+  PTExpr::SharedPtr order_expr_;
   PTOrderBy::Direction direction_;
   PropertyType property_type_;
   PTQualifiedName::SharedPtr copartition_table_name_;

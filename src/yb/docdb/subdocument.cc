@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "yb/common/ql_bfunc.h"
+#include "yb/common/ql_value.h"
 
 using std::endl;
 using std::make_pair;
@@ -41,11 +42,12 @@ SubDocument::SubDocument(ValueType value_type) : PrimitiveValue(value_type) {
 SubDocument::~SubDocument() {
   switch (type_) {
     case ValueType::kObject: FALLTHROUGH_INTENDED;
-    case ValueType::kRedisTS: FALLTHROUGH_INTENDED;
+    case ValueType::kRedisList: FALLTHROUGH_INTENDED;
     case ValueType::kRedisSortedSet: FALLTHROUGH_INTENDED;
+    case ValueType::kRedisSet: FALLTHROUGH_INTENDED;
+    case ValueType::kRedisTS: FALLTHROUGH_INTENDED;
     case ValueType::kSSForward: FALLTHROUGH_INTENDED;
-    case ValueType::kSSReverse: FALLTHROUGH_INTENDED;
-    case ValueType::kRedisSet:
+    case ValueType::kSSReverse:
       if (has_valid_container()) {
         delete &object_container();
       }
@@ -140,6 +142,7 @@ void SubDocument::MoveFrom(SubDocument* other) {
     new(this) PrimitiveValue(std::move(*other));
   } else {
     // For objects/arrays the internal state is just a type and a pointer.
+    extend_order_ = other->extend_order_;
     type_ = other->type_;
     ttl_seconds_ = other->ttl_seconds_;
     write_time_ = other->write_time_;
@@ -147,9 +150,9 @@ void SubDocument::MoveFrom(SubDocument* other) {
     // The internal state of the other subdocument is now owned by this one.
 #ifndef NDEBUG
     // Another layer of protection against trying to use the old state in debug mode.
-    memset(other, 0xab, sizeof(SubDocument));  // Fill with a random value.
+    memset(static_cast<void*>(other), 0xab, sizeof(SubDocument));  // Fill with a random value.
 #endif
-    other->type_ = ValueType::kNull;  // To avoid deallocation of the old object's memory.
+    other->type_ = ValueType::kNullLow;  // To avoid deallocation of the old object's memory.
   }
 }
 
@@ -162,8 +165,11 @@ Status SubDocument::ConvertToRedisSet() {
 }
 
 Status SubDocument::ConvertToRedisSortedSet() {
-  type_ = ValueType::kRedisSortedSet;
-  return Status::OK();
+  return ConvertToCollection(ValueType::kRedisSortedSet);
+}
+
+Status SubDocument::ConvertToRedisList() {
+  return ConvertToCollection(ValueType::kRedisList);
 }
 
 Status SubDocument::NumChildren(size_t *num_children) {
@@ -284,6 +290,7 @@ void SubDocumentToStreamInternal(ostream& out,
     case ValueType::kArray: {
       out << "[";
       if (subdoc.container_allocated()) {
+        out << (subdoc.GetExtendOrder() == ListExtendOrder::APPEND ? "APPEND" : "PREPEND") << "\n";
         const auto& list = subdoc.array_container();
         int i = 0;
         for (; i < list.size(); i++) {
@@ -302,6 +309,10 @@ void SubDocumentToStreamInternal(ostream& out,
     }
     case ValueType::kRedisSet: {
       SubDocCollectionToStreamInternal(out, subdoc, indent, "(", ")");
+      break;
+    }
+    case ValueType::kRedisList: {
+      SubDocCollectionToStreamInternal(out, subdoc, indent, "[", "]");
       break;
     }
     case ValueType::kRedisTS: {

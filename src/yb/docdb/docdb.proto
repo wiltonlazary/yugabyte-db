@@ -22,15 +22,22 @@ option java_package = "org.yb.docdb";
 message KeyValuePairPB {
   optional bytes key = 1;
   optional bytes value = 2;
+  optional fixed64 external_hybrid_time = 3;
 }
 
 // A set of key/value pairs to be written into RocksDB.
 message KeyValueWriteBatchPB {
-  repeated KeyValuePairPB kv_pairs = 1;
+  repeated KeyValuePairPB write_pairs = 1;
   optional TransactionMetadataPB transaction = 2;
+  optional bool DEPRECATED_may_have_metadata = 3;
+  // Used by serializable isolation transactions and row locking statements to store read intents.
+  // In case of read-modify-write operation both read_pairs and write_pairs could present.
+  repeated KeyValuePairPB read_pairs = 5;
+  optional RowMarkType row_mark_type = 6;
 }
 
 message ConsensusFrontierPB {
   optional OpIdPB op_id = 1;
   optional fixed64 hybrid_time = 2;
+  optional fixed64 history_cutoff = 3;
 }

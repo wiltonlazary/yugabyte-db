@@ -34,9 +34,11 @@
 
 #include <string>
 #include <vector>
+#include <unordered_map>
 
 #include "yb/master/catalog_manager.h"
 #include "yb/master/master.pb.h"
+#include "yb/master/sys_catalog_constants.h"
 #include "yb/server/metadata.h"
 #include "yb/tablet/tablet_peer.h"
 #include "yb/util/pb_util.h"
@@ -60,12 +62,6 @@ class MasterOptions;
 class VisitorBase;
 class SysCatalogWriter;
 
-static const char* const kSysCatalogTabletId = "00000000000000000000000000000000";
-static const char* const kSysCatalogTableId = "sys.catalog.uuid";
-static const char* const kSysCatalogTableColType = "entry_type";
-static const char* const kSysCatalogTableColId = "entry_id";
-static const char* const kSysCatalogTableColMetadata = "metadata";
-
 // SysCatalogTable is a YB table that keeps track of table and
 // tablet metadata.
 // - SysCatalogTable has only one tablet.
@@ -84,8 +80,7 @@ class SysCatalogTable {
   // the consensus configuration's progress, any long running tasks (e.g., scanning
   // tablets) should be performed asynchronously (by, e.g., submitting
   // them to a to a separate threadpool).
-  SysCatalogTable(Master* master, MetricRegistry* metrics,
-                  ElectedLeaderCallback leader_cb);
+  SysCatalogTable(Master* master, MetricRegistry* metrics, ElectedLeaderCallback leader_cb);
 
   ~SysCatalogTable();
 
@@ -102,29 +97,29 @@ class SysCatalogTable {
   // Templated CRUD methods for items in sys.catalog.
   // ==================================================================
   template <class Item>
-  CHECKED_STATUS AddItem(Item* item);
+  CHECKED_STATUS AddItem(Item* item, int64_t leader_term);
+  template <class Item>
+  CHECKED_STATUS AddItems(const vector<Item*>& items, int64_t leader_term);
 
   template <class Item>
-  CHECKED_STATUS AddItems(const vector<Item*>& items);
+  CHECKED_STATUS UpdateItem(Item* item, int64_t leader_term);
+  template <class Item>
+  CHECKED_STATUS UpdateItems(const vector<Item*>& items, int64_t leader_term);
 
   template <class Item>
-  CHECKED_STATUS UpdateItem(Item* item);
-  template <class Item>
-  CHECKED_STATUS UpdateItems(const vector<Item*>& items);
+  CHECKED_STATUS AddAndUpdateItems(const vector<Item*>& added_items,
+                                   const vector<Item*>& updated_items,
+                                   int64_t leader_term);
 
   template <class Item>
-  CHECKED_STATUS AddAndUpdateItems(
-      const vector<Item*>& added_items,
-      const vector<Item*>& updated_items);
+  CHECKED_STATUS DeleteItem(Item* item, int64_t leader_term);
+  template <class Item>
+  CHECKED_STATUS DeleteItems(const vector<Item*>& items, int64_t leader_term);
 
   template <class Item>
-  CHECKED_STATUS DeleteItem(Item* item);
-  template <class Item>
-  CHECKED_STATUS DeleteItems(const vector<Item*>& items);
-
-  template <class Item>
-  CHECKED_STATUS MutateItems(
-      const vector<Item*>& items, const QLWriteRequestPB::QLStmtType& op_type);
+  CHECKED_STATUS MutateItems(const vector<Item*>& items,
+                             const QLWriteRequestPB::QLStmtType& op_type,
+                             int64_t leader_term);
 
   // ==================================================================
   // Static schema related methods.
@@ -142,7 +137,7 @@ class SysCatalogTable {
   }
 
   // Create a new tablet peer with information from the metadata
-  void SetupTabletPeer(const scoped_refptr<tablet::TabletMetadata>& metadata);
+  void SetupTabletPeer(const scoped_refptr<tablet::RaftGroupMetadata>& metadata);
 
   // Update the in-memory master addresses. Report missing uuid's in the
   // config when check_missing_uuids is set to true.
@@ -158,12 +153,25 @@ class SysCatalogTable {
 
   CHECKED_STATUS Visit(VisitorBase* visitor);
 
+  // Copy the content of a co-located table in sys catalog.
+  CHECKED_STATUS CopyPgsqlTable(const TableId& source_table_id,
+                                const TableId& target_table_id,
+                                int64_t leader_term);
+
+  // Copy the content of co-located tables in sys catalog as a batch.
+  CHECKED_STATUS CopyPgsqlTables(const std::vector<TableId>& source_table_ids,
+                                 const std::vector<TableId>& target_table_ids,
+                                 int64_t leader_term);
+
+  // Drop YSQL table by removing the table metadata in sys-catalog.
+  CHECKED_STATUS DeleteYsqlSystemTable(const string& table_id);
+
  private:
   friend class CatalogManager;
 
-  inline std::unique_ptr<SysCatalogWriter> NewWriter();
+  inline std::unique_ptr<SysCatalogWriter> NewWriter(int64_t leader_term);
 
-  const char *table_name() const { return "sys.catalog"; }
+  const char *table_name() const { return kSysCatalogTableName; }
 
   // Return the schema of the table.
   // NOTE: This is the "server-side" schema, so it must have the column IDs.
@@ -175,9 +183,9 @@ class SysCatalogTable {
   void SysCatalogStateChanged(const std::string& tablet_id,
                               std::shared_ptr<consensus::StateChangeContext> context);
 
-  CHECKED_STATUS SetupTablet(const scoped_refptr<tablet::TabletMetadata>& metadata);
+  CHECKED_STATUS SetupTablet(const scoped_refptr<tablet::RaftGroupMetadata>& metadata);
 
-  CHECKED_STATUS OpenTablet(const scoped_refptr<tablet::TabletMetadata>& metadata);
+  CHECKED_STATUS OpenTablet(const scoped_refptr<tablet::RaftGroupMetadata>& metadata);
 
   // Use the master options to generate a new consensus configuration.
   // In addition, resolve all UUIDs of this consensus configuration.
@@ -215,7 +223,9 @@ class SysCatalogTable {
 
   MetricRegistry* metric_registry_;
 
-  gscoped_ptr<ThreadPool> apply_pool_;
+  scoped_refptr<MetricEntity> metric_entity_;
+
+  gscoped_ptr<ThreadPool> inform_removed_master_pool_;
 
   // Thread pool for Raft-related operations
   gscoped_ptr<ThreadPool> raft_pool_;
@@ -235,6 +245,8 @@ class SysCatalogTable {
   consensus::RaftPeerPB local_peer_pb_;
 
   scoped_refptr<Histogram> setup_config_dns_histogram_;
+
+  std::unordered_map<std::string, scoped_refptr<AtomicGauge<uint64>>> visitor_duration_metrics_;
 
   DISALLOW_COPY_AND_ASSIGN(SysCatalogTable);
 };

@@ -19,9 +19,10 @@
 #include <mutex>
 #include <thread>
 
-#include <boost/lockfree/queue.hpp>
-#include <boost/scope_exit.hpp>
+#include <cds/container/basket_queue.h>
+#include <cds/gc/dhp.h>
 
+#include "yb/util/scope_exit.h"
 #include "yb/util/thread.h"
 
 namespace yb {
@@ -31,8 +32,8 @@ namespace {
 
 class Worker;
 
-typedef boost::lockfree::queue<ThreadPoolTask*> TaskQueue;
-typedef boost::lockfree::queue<Worker*> WaitingWorkers;
+typedef cds::container::BasketQueue<cds::gc::DHP, ThreadPoolTask*> TaskQueue;
+typedef cds::container::BasketQueue<cds::gc::DHP, Worker*> WaitingWorkers;
 
 struct ThreadPoolShare {
   ThreadPoolOptions options;
@@ -40,14 +41,13 @@ struct ThreadPoolShare {
   WaitingWorkers waiting_workers;
 
   explicit ThreadPoolShare(ThreadPoolOptions o)
-      : options(std::move(o)),
-        task_queue(options.queue_limit),
-        waiting_workers(options.max_workers) {
-  }
+      : options(std::move(o)) {}
 };
 
 namespace {
+
 const std::string kRpcThreadCategory = "rpc_thread_pool";
+
 } // namespace
 
 class Worker {
@@ -92,6 +92,7 @@ class Worker {
   // Meaning that we does not have work (task queue empty) or
   // does not have free hands (worker queue empty)
   void Execute() {
+    Thread::current_thread()->SetUserData(share_);
     while (!stop_requested_) {
       ThreadPoolTask* task = nullptr;
       if (PopTask(&task)) {
@@ -109,9 +110,9 @@ class Worker {
     }
     std::unique_lock<std::mutex> lock(mutex_);
     waiting_task_ = true;
-    BOOST_SCOPE_EXIT(&waiting_task_) {
-        waiting_task_ = false;
-    } BOOST_SCOPE_EXIT_END;
+    auto se = ScopeExit([this] {
+      waiting_task_ = false;
+    });
 
     while (!stop_requested_) {
       AddToWaitingWorkers();
@@ -137,8 +138,8 @@ class Worker {
 
   void AddToWaitingWorkers() {
     if (!added_to_waiting_workers_) {
-      auto pushed = share_->waiting_workers.bounded_push(this);
-      CHECK(pushed);
+      auto pushed = share_->waiting_workers.push(this);
+      DCHECK(pushed); // BasketQueue always succeed.
       added_to_waiting_workers_ = true;
     }
   }
@@ -178,18 +179,16 @@ class ThreadPool::Impl {
       task->Done(shutdown_status_);
       return false;
     }
-    bool added = share_.task_queue.bounded_push(task);
-    --adding_;
-    if (!added) {
-      task->Done(queue_full_status_);
-      return false;
-    }
+    bool added = share_.task_queue.push(task);
+    DCHECK(added); // BasketQueue always succeed.
     Worker* worker = nullptr;
     while (share_.waiting_workers.pop(worker)) {
       if (worker->Notify()) {
+        --adding_;
         return true;
       }
     }
+    --adding_;
 
     // We increment created_workers_ every time, the first max_worker increments would produce
     // a new worker. And after that, we will just increment it doing nothing after that.
@@ -223,17 +222,21 @@ class ThreadPool::Impl {
         worker->Stop();
       }
     }
-    workers_.clear();
     // Shutdown is quite rare situation otherwise enqueue is quite frequent.
     // Because of this we use "atomic lock" in enqueue and busy wait in shutdown.
     // So we could process enqueue quickly, and stuck in shutdown for sometime.
-    while(adding_ != 0) {
+    while (adding_ != 0) {
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
+    workers_.clear();
     ThreadPoolTask* task = nullptr;
     while (share_.task_queue.pop(task)) {
       task->Done(shutdown_status_);
     }
+  }
+
+  bool Owns(Thread* thread) {
+    return thread && thread->user_data() == &share_;
   }
 
  private:
@@ -281,6 +284,14 @@ void ThreadPool::Shutdown() {
 
 const ThreadPoolOptions& ThreadPool::options() const {
   return impl_->options();
+}
+
+bool ThreadPool::Owns(Thread* thread) {
+  return impl_->Owns(thread);
+}
+
+bool ThreadPool::OwnsThisThread() {
+  return Owns(Thread::current_thread());
 }
 
 } // namespace rpc

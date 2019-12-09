@@ -94,29 +94,40 @@ ADD_YB_LIBRARY(pgsql_protocol_proto
 
 set(COMMON_SRCS
   id_mapping.cc
+  entity_ids.cc
   key_encoder.cc
   partial_row.cc
   partition.cc
   row_key-util.cc
+  row_mark.cc
   schema.cc
   index.cc
   jsonb.cc
+  json_util.cc
   hybrid_time.cc
   doc_hybrid_time.cc
   consistent_read_point.cc
   transaction.cc
+  transaction_error.cc
   types.cc
   wire_protocol.cc
+  ql_bfunc.cc
+  ql_datatype.cc
+  ql_name.cc
   ql_type.cc
   ql_value.cc
-  ql_bfunc.cc
   ql_protocol_util.cc
   ql_scanspec.cc
   ql_rowblock.cc
   ql_resultset.cc
   ql_expr.cc
-  flags.cc
-  pgsql_resultset.cc)
+  common_flags.cc
+  pgsql_error.cc
+  pgsql_resultset.cc
+  roles_permissions.cc
+  ybc_util.cc
+  ybc-internal.cc
+  )
 
 # Workaround for clang bug https://llvm.org/bugs/show_bug.cgi?id=23757
 # in which it incorrectly optimizes row_key-util.cc and causes incorrect results.
@@ -148,6 +159,11 @@ ADD_YB_LIBRARY(yb_common
   SRCS ${COMMON_SRCS}
   DEPS ${COMMON_LIBS})
 add_dependencies(yb_common yb_bfql yb_bfpg)
+
+add_library(yb_common_test_util
+            transaction-test-util.cc)
+target_link_libraries(yb_common_test_util
+                      yb_common)
 
 set(YB_TEST_LINK_LIBS yb_common ${YB_MIN_TEST_LIBS})
 ADD_YB_TEST(id_mapping-test)

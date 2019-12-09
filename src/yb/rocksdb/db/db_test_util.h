@@ -81,6 +81,35 @@ uint64_t TestGetTickerCount(const Options& options, Tickers ticker_type) {
   return options.statistics->getTickerCount(ticker_type);
 }
 
+class OnFileDeletionListener : public EventListener {
+ public:
+  OnFileDeletionListener() :
+      matched_count_(0),
+      expected_file_name_("") {}
+
+  void SetExpectedFileName(
+      const std::string file_name) {
+    expected_file_name_ = file_name;
+  }
+
+  void VerifyMatchedCount(size_t expected_value) {
+    ASSERT_EQ(matched_count_, expected_value);
+  }
+
+  void OnTableFileDeleted(
+      const TableFileDeletionInfo& info) override {
+    if (expected_file_name_ != "") {
+      ASSERT_EQ(expected_file_name_, info.file_path);
+      expected_file_name_ = "";
+      matched_count_++;
+    }
+  }
+
+ private:
+  size_t matched_count_;
+  std::string expected_file_name_;
+};
+
 namespace anon {
 class AtomicCounter {
  public:
@@ -374,19 +403,18 @@ class SpecialEnv : public EnvWrapper {
   Status NewRandomAccessFile(const std::string& f,
                              unique_ptr<RandomAccessFile>* r,
                              const EnvOptions& soptions) override {
-    class CountingFile : public RandomAccessFile {
+    class CountingFile : public yb::RandomAccessFileWrapper {
      public:
-      CountingFile(unique_ptr<RandomAccessFile>&& target,
+      CountingFile(std::unique_ptr<RandomAccessFile>&& target,
                    anon::AtomicCounter* counter)
-          : target_(std::move(target)), counter_(counter) {}
-      virtual Status Read(uint64_t offset, size_t n, Slice* result,
-                          char* scratch) const override {
+          : RandomAccessFileWrapper(std::move(target)), counter_(counter) {}
+
+      Status Read(uint64_t offset, size_t n, Slice* result, uint8_t* scratch) const override {
         counter_->Increment();
-        return target_->Read(offset, n, result, scratch);
+        return RandomAccessFileWrapper::Read(offset, n, result, scratch);
       }
 
      private:
-      unique_ptr<RandomAccessFile> target_;
       anon::AtomicCounter* counter_;
     };
 
@@ -400,19 +428,18 @@ class SpecialEnv : public EnvWrapper {
 
   Status NewSequentialFile(const std::string& f, unique_ptr<SequentialFile>* r,
                            const EnvOptions& soptions) override {
-    class CountingFile : public SequentialFile {
+    class CountingFile : public yb::SequentialFileWrapper {
      public:
-      CountingFile(unique_ptr<SequentialFile>&& target,
+      CountingFile(std::unique_ptr<SequentialFile>&& target,
                    anon::AtomicCounter* counter)
-          : target_(std::move(target)), counter_(counter) {}
-      virtual Status Read(size_t n, Slice* result, char* scratch) override {
+          : yb::SequentialFileWrapper(std::move(target)), counter_(counter) {}
+
+      Status Read(size_t n, Slice* result, uint8_t* scratch) override {
         counter_->Increment();
-        return target_->Read(n, result, scratch);
+        return SequentialFileWrapper::Read(n, result, scratch);
       }
-      virtual Status Skip(uint64_t n) override { return target_->Skip(n); }
 
      private:
-      unique_ptr<SequentialFile> target_;
       anon::AtomicCounter* counter_;
     };
 

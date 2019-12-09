@@ -36,6 +36,7 @@
 #include <gtest/gtest.h>
 
 #include "yb/client/client.h"
+#include "yb/client/table_creator.h"
 #include "yb/common/schema.h"
 #include "yb/gutil/strings/substitute.h"
 #include "yb/integration-tests/mini_cluster.h"
@@ -58,12 +59,11 @@ using client::YBSchemaBuilder;
 using client::YBTable;
 using client::YBTableCreator;
 using client::YBTableName;
-using client::YBTableType;
 using std::shared_ptr;
 
 const std::string kKeyspaceName("my_keyspace");
-const YBTableName kTableName1(kKeyspaceName, "testMasterReplication-1");
-const YBTableName kTableName2(kKeyspaceName, "testMasterReplication-2");
+const YBTableName kTableName1(YQL_DATABASE_CQL, kKeyspaceName, "testMasterReplication-1");
+const YBTableName kTableName2(YQL_DATABASE_CQL, kKeyspaceName, "testMasterReplication-2");
 
 const int kNumTabletServerReplicas = 3;
 
@@ -104,7 +104,7 @@ class MasterReplicationTest : public YBMiniClusterTestBase<MiniCluster> {
     }
   }
 
-  Status CreateClient(shared_ptr<YBClient>* out) {
+  Result<std::unique_ptr<client::YBClient>> CreateClient() {
     YBClientBuilder builder;
     for (int i = 0; i < num_masters_; i++) {
       if (!cluster_->mini_master(i)->master()->IsShutdown()) {
@@ -112,11 +112,12 @@ class MasterReplicationTest : public YBMiniClusterTestBase<MiniCluster> {
       }
     }
 
-    RETURN_NOT_OK(builder.Build(out));
-    return (*out)->CreateNamespaceIfNotExists(kKeyspaceName);
+    auto client = VERIFY_RESULT(builder.Build());
+    RETURN_NOT_OK(client->CreateNamespaceIfNotExists(kKeyspaceName));
+    return client;
   }
 
-  Status CreateTable(const shared_ptr<YBClient>& client,
+  Status CreateTable(YBClient* client,
                      const YBTableName& table_name) {
     YBSchema schema;
     YBSchemaBuilder b;
@@ -127,10 +128,11 @@ class MasterReplicationTest : public YBMiniClusterTestBase<MiniCluster> {
     gscoped_ptr<YBTableCreator> table_creator(client->NewTableCreator());
     return table_creator->table_name(table_name)
         .schema(&schema)
+        .hash_schema(YBHashSchema::kMultiColumnHash)
         .Create();
   }
 
-  void VerifyTableExists(const shared_ptr<YBClient>& client,
+  void VerifyTableExists(YBClient* client,
                          const YBTableName& table_name) {
     LOG(INFO) << "Verifying that " << table_name.ToString() << " exists on leader..";
     vector<YBTableName> tables;
@@ -180,20 +182,18 @@ TEST_F(MasterReplicationTest, TestMasterClusterCreate) {
 // the leader and ensure that the appropriate table/tablet info is
 // replicated to the newly elected leader.
 TEST_F(MasterReplicationTest, TestSysTablesReplication) {
-  shared_ptr<YBClient> client;
-
   // Create the first table.
-  ASSERT_OK(CreateClient(&client));
-  ASSERT_OK(CreateTable(client, kTableName1));
+  auto client = ASSERT_RESULT(CreateClient());
+  ASSERT_OK(CreateTable(client.get(), kTableName1));
 
   // TODO: once fault tolerant DDL is in, remove the line below.
-  ASSERT_OK(CreateClient(&client));
+  client = ASSERT_RESULT(CreateClient());
 
   ASSERT_OK(cluster_->WaitForTabletServerCount(kNumTabletServerReplicas));
 
   // Repeat the same for the second table.
-  ASSERT_OK(CreateTable(client, kTableName2));
-  ASSERT_NO_FATALS(VerifyTableExists(client, kTableName2));
+  ASSERT_OK(CreateTable(client.get(), kTableName2));
+  ASSERT_NO_FATALS(VerifyTableExists(client.get(), kTableName2));
 }
 
 // When all masters are down, test that we can timeout the connection
@@ -204,13 +204,12 @@ TEST_F(MasterReplicationTest, TestTimeoutWhenAllMastersAreDown) {
 
   cluster_->Shutdown();
 
-  shared_ptr<YBClient> client;
   YBClientBuilder builder;
   builder.master_server_addrs(master_addrs);
   builder.default_rpc_timeout(MonoDelta::FromMilliseconds(100));
-  Status s = builder.Build(&client);
-  EXPECT_TRUE(!s.ok());
-  EXPECT_TRUE(s.IsTimedOut());
+  auto result = builder.Build();
+  EXPECT_TRUE(!result.ok());
+  EXPECT_TRUE(result.status().IsTimedOut());
 
   // We need to reset 'cluster_' so that TearDown() can run correctly.
   cluster_.reset();
@@ -237,14 +236,13 @@ TEST_F(MasterReplicationTest, TestCycleThroughAllMasters) {
 
   // Verify that the client doesn't give up even though the entire
   // cluster is down for 100 milliseconds.
-  shared_ptr<YBClient> client;
   YBClientBuilder builder;
   builder.master_server_addrs(master_addrs);
   // Bumped up timeout from 15 sec to 30 sec because master election can take longer than 15 sec.
   // https://yugabyte.atlassian.net/browse/ENG-51
   // Test log: https://gist.githubusercontent.com/mbautin/9f4269292e6ecb5b9a2fc644e2ee4398/raw
   builder.default_admin_operation_timeout(MonoDelta::FromSeconds(30));
-  EXPECT_OK(builder.Build(&client));
+  EXPECT_OK(builder.Build());
 
   ASSERT_OK(ThreadJoiner(start_thread.get()).Join());
 }

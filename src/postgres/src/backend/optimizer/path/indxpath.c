@@ -4,7 +4,7 @@
  *	  Routines to determine which indexes are usable for scanning a
  *	  given relation, and create Paths accordingly.
  *
- * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -40,9 +40,7 @@
 #include "utils/selfuncs.h"
 
 
-#define IsBooleanOpfamily(opfamily) \
-	((opfamily) == BOOL_BTREE_FAM_OID || (opfamily) == BOOL_HASH_FAM_OID)
-
+/* XXX see PartCollMatchesExprColl */
 #define IndexCollMatchesExprColl(idxcollation, exprcollation) \
 	((idxcollation) == InvalidOid || (idxcollation) == (exprcollation))
 
@@ -69,6 +67,7 @@ typedef struct
 	List	   *quals;			/* the WHERE clauses it uses */
 	List	   *preds;			/* predicates of its partial index(es) */
 	Bitmapset  *clauseids;		/* quals+preds represented as a bitmapset */
+	bool		unclassifiable; /* has too many quals+preds to process? */
 } PathClauseUsage;
 
 /* Callback argument for ec_member_matches_indexcol */
@@ -838,12 +837,12 @@ get_index_paths(PlannerInfo *root, RelOptInfo *rel,
  *
  * If skip_nonnative_saop is non-NULL, we ignore ScalarArrayOpExpr clauses
  * unless the index AM supports them directly, and we set *skip_nonnative_saop
- * to TRUE if we found any such clauses (caller must initialize the variable
- * to FALSE).  If it's NULL, we do not ignore ScalarArrayOpExpr clauses.
+ * to true if we found any such clauses (caller must initialize the variable
+ * to false).  If it's NULL, we do not ignore ScalarArrayOpExpr clauses.
  *
  * If skip_lower_saop is non-NULL, we ignore ScalarArrayOpExpr clauses for
- * non-first index columns, and we set *skip_lower_saop to TRUE if we found
- * any such clauses (caller must initialize the variable to FALSE).  If it's
+ * non-first index columns, and we set *skip_lower_saop to true if we found
+ * any such clauses (caller must initialize the variable to false).  If it's
  * NULL, we do not ignore non-first ScalarArrayOpExpr clauses, but they will
  * result in considering the scan's output to be unordered.
  *
@@ -1449,9 +1448,18 @@ choose_bitmap_and(PlannerInfo *root, RelOptInfo *rel, List *paths)
 		Path	   *ipath = (Path *) lfirst(l);
 
 		pathinfo = classify_index_clause_usage(ipath, &clauselist);
+
+		/* If it's unclassifiable, treat it as distinct from all others */
+		if (pathinfo->unclassifiable)
+		{
+			pathinfoarray[npaths++] = pathinfo;
+			continue;
+		}
+
 		for (i = 0; i < npaths; i++)
 		{
-			if (bms_equal(pathinfo->clauseids, pathinfoarray[i]->clauseids))
+			if (!pathinfoarray[i]->unclassifiable &&
+				bms_equal(pathinfo->clauseids, pathinfoarray[i]->clauseids))
 				break;
 		}
 		if (i < npaths)
@@ -1486,6 +1494,10 @@ choose_bitmap_and(PlannerInfo *root, RelOptInfo *rel, List *paths)
 	 * For each surviving index, consider it as an "AND group leader", and see
 	 * whether adding on any of the later indexes results in an AND path with
 	 * cheaper total cost than before.  Then take the cheapest AND group.
+	 *
+	 * Note: paths that are either clauseless or unclassifiable will have
+	 * empty clauseids, so that they will not be rejected by the clauseids
+	 * filter here, nor will they cause later paths to be rejected by it.
 	 */
 	for (i = 0; i < npaths; i++)
 	{
@@ -1713,6 +1725,21 @@ classify_index_clause_usage(Path *path, List **clauselist)
 	result->preds = NIL;
 	find_indexpath_quals(path, &result->quals, &result->preds);
 
+	/*
+	 * Some machine-generated queries have outlandish numbers of qual clauses.
+	 * To avoid getting into O(N^2) behavior even in this preliminary
+	 * classification step, we want to limit the number of entries we can
+	 * accumulate in *clauselist.  Treat any path with more than 100 quals +
+	 * preds as unclassifiable, which will cause calling code to consider it
+	 * distinct from all other paths.
+	 */
+	if (list_length(result->quals) + list_length(result->preds) > 100)
+	{
+		result->clauseids = NULL;
+		result->unclassifiable = true;
+		return result;
+	}
+
 	/* Build up a bitmapset representing the quals and preds */
 	clauseids = NULL;
 	foreach(lc, result->quals)
@@ -1730,6 +1757,7 @@ classify_index_clause_usage(Path *path, List **clauselist)
 								   find_list_position(node, clauselist));
 	}
 	result->clauseids = clauseids;
+	result->unclassifiable = false;
 
 	return result;
 }
@@ -2164,7 +2192,7 @@ match_eclass_clauses_to_index(PlannerInfo *root, IndexOptInfo *index,
 	if (!index->rel->has_eclass_joins)
 		return;
 
-	for (indexcol = 0; indexcol < index->ncolumns; indexcol++)
+	for (indexcol = 0; indexcol < index->nkeycolumns; indexcol++)
 	{
 		ec_member_matches_arg arg;
 		List	   *clauses;
@@ -2246,8 +2274,8 @@ match_clause_to_index(IndexOptInfo *index,
 	if (!restriction_is_securely_promotable(rinfo, index->rel))
 		return;
 
-	/* OK, check each index column for a match */
-	for (indexcol = 0; indexcol < index->ncolumns; indexcol++)
+	/* OK, check each index key column for a match */
+	for (indexcol = 0; indexcol < index->nkeycolumns; indexcol++)
 	{
 		if (match_clause_to_indexcol(index,
 									 indexcol,
@@ -2331,8 +2359,8 @@ match_clause_to_indexcol(IndexOptInfo *index,
 {
 	Expr	   *clause = rinfo->clause;
 	Index		index_relid = index->rel->relid;
-	Oid			opfamily = index->opfamily[indexcol];
-	Oid			idxcollation = index->indexcollations[indexcol];
+	Oid			opfamily;
+	Oid			idxcollation;
 	Node	   *leftop,
 			   *rightop;
 	Relids		left_relids;
@@ -2340,6 +2368,11 @@ match_clause_to_indexcol(IndexOptInfo *index,
 	Oid			expr_op;
 	Oid			expr_coll;
 	bool		plain_op;
+
+	Assert(indexcol < index->nkeycolumns);
+
+	opfamily = index->opfamily[indexcol];
+	idxcollation = index->indexcollations[indexcol];
 
 	/* First check for boolean-index cases. */
 	if (IsBooleanOpfamily(opfamily))
@@ -2485,8 +2518,8 @@ match_rowcompare_to_indexcol(IndexOptInfo *index,
 	Oid			expr_op;
 	Oid			expr_coll;
 
-	/* Forget it if we're not dealing with a btree index */
-	if (index->relam != BTREE_AM_OID)
+	/* Forget it if we're not dealing with a btree or lsm index */
+	if (index->relam != BTREE_AM_OID && index->relam != LSM_AM_OID)
 		return false;
 
 	/*
@@ -2680,14 +2713,19 @@ match_clause_to_ordering_op(IndexOptInfo *index,
 							Expr *clause,
 							Oid pk_opfamily)
 {
-	Oid			opfamily = index->opfamily[indexcol];
-	Oid			idxcollation = index->indexcollations[indexcol];
+	Oid			opfamily;
+	Oid			idxcollation;
 	Node	   *leftop,
 			   *rightop;
 	Oid			expr_op;
 	Oid			expr_coll;
 	Oid			sortfamily;
 	bool		commuted;
+
+	Assert(indexcol < index->nkeycolumns);
+
+	opfamily = index->opfamily[indexcol];
+	idxcollation = index->indexcollations[indexcol];
 
 	/*
 	 * Clause must be a binary opclause.
@@ -2923,11 +2961,16 @@ ec_member_matches_indexcol(PlannerInfo *root, RelOptInfo *rel,
 {
 	IndexOptInfo *index = ((ec_member_matches_arg *) arg)->index;
 	int			indexcol = ((ec_member_matches_arg *) arg)->indexcol;
-	Oid			curFamily = index->opfamily[indexcol];
-	Oid			curCollation = index->indexcollations[indexcol];
+	Oid			curFamily;
+	Oid			curCollation;
+
+	Assert(indexcol < index->nkeycolumns);
+
+	curFamily = index->opfamily[indexcol];
+	curCollation = index->indexcollations[indexcol];
 
 	/*
-	 * If it's a btree index, we can reject it if its opfamily isn't
+	 * If it's a btree or lsm index, we can reject it if its opfamily isn't
 	 * compatible with the EC, since no clause generated from the EC could be
 	 * used with the index.  For non-btree indexes, we can't easily tell
 	 * whether clauses generated from the EC could be used with the index, so
@@ -2936,7 +2979,7 @@ ec_member_matches_indexcol(PlannerInfo *root, RelOptInfo *rel,
 	 * generate_implied_equalities_for_column; see
 	 * match_eclass_clauses_to_index.
 	 */
-	if (index->relam == BTREE_AM_OID &&
+	if ((index->relam == BTREE_AM_OID || index->relam == LSM_AM_OID) &&
 		!list_member_oid(ec->ec_opfamilies, curFamily))
 		return false;
 
@@ -3453,7 +3496,7 @@ match_special_index_operator(Expr *clause, Oid opfamily, Oid idxcollation,
 	/*
 	 * Must also check that index's opfamily supports the operators we will
 	 * want to apply.  (A hash index, for example, will not support ">=".)
-	 * Currently, only btree and spgist support the operators we need.
+	 * Currently, only btree, lsm and spgist support the operators we need.
 	 *
 	 * Note: actually, in the Pattern_Prefix_Exact case, we only need "=" so a
 	 * hash index would work.  Currently it doesn't seem worth checking for
@@ -3477,8 +3520,10 @@ match_special_index_operator(Expr *clause, Oid opfamily, Oid idxcollation,
 		case OID_TEXT_ICREGEXEQ_OP:
 			isIndexable =
 				(opfamily == TEXT_PATTERN_BTREE_FAM_OID) ||
+				(opfamily == TEXT_PATTERN_LSM_FAM_OID) ||
 				(opfamily == TEXT_SPGIST_FAM_OID) ||
-				(opfamily == TEXT_BTREE_FAM_OID &&
+				((opfamily == TEXT_BTREE_FAM_OID ||
+				  opfamily == TEXT_LSM_FAM_OID) &&
 				 (pstatus == Pattern_Prefix_Exact ||
 				  lc_collate_is_c(idxcollation)));
 			break;
@@ -3489,7 +3534,9 @@ match_special_index_operator(Expr *clause, Oid opfamily, Oid idxcollation,
 		case OID_BPCHAR_ICREGEXEQ_OP:
 			isIndexable =
 				(opfamily == BPCHAR_PATTERN_BTREE_FAM_OID) ||
-				(opfamily == BPCHAR_BTREE_FAM_OID &&
+				(opfamily == BPCHAR_PATTERN_LSM_FAM_OID) ||
+				((opfamily == BPCHAR_BTREE_FAM_OID ||
+				  opfamily == BPCHAR_LSM_FAM_OID) &&
 				 (pstatus == Pattern_Prefix_Exact ||
 				  lc_collate_is_c(idxcollation)));
 			break;
@@ -3499,16 +3546,16 @@ match_special_index_operator(Expr *clause, Oid opfamily, Oid idxcollation,
 		case OID_NAME_REGEXEQ_OP:
 		case OID_NAME_ICREGEXEQ_OP:
 			/* name uses locale-insensitive sorting */
-			isIndexable = (opfamily == NAME_BTREE_FAM_OID);
+			isIndexable = (opfamily == NAME_BTREE_FAM_OID || opfamily == NAME_LSM_FAM_OID);
 			break;
 
 		case OID_BYTEA_LIKE_OP:
-			isIndexable = (opfamily == BYTEA_BTREE_FAM_OID);
+			isIndexable = (opfamily == BYTEA_BTREE_FAM_OID || opfamily == BYTEA_LSM_FAM_OID);
 			break;
 
 		case OID_INET_SUB_OP:
 		case OID_INET_SUBEQ_OP:
-			isIndexable = (opfamily == NETWORK_BTREE_FAM_OID);
+			isIndexable = (opfamily == NETWORK_BTREE_FAM_OID || opfamily == NETWORK_LSM_FAM_OID);
 			break;
 	}
 
@@ -3550,8 +3597,13 @@ expand_indexqual_conditions(IndexOptInfo *index,
 		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lcc);
 		int			indexcol = lfirst_int(lci);
 		Expr	   *clause = rinfo->clause;
-		Oid			curFamily = index->opfamily[indexcol];
-		Oid			curCollation = index->indexcollations[indexcol];
+		Oid			curFamily;
+		Oid			curCollation;
+
+		Assert(indexcol < index->nkeycolumns);
+
+		curFamily = index->opfamily[indexcol];
+		curCollation = index->indexcollations[indexcol];
 
 		/* First check for boolean cases */
 		if (IsBooleanOpfamily(curFamily))
@@ -3918,18 +3970,19 @@ adjust_rowcompare_for_index(RowCompareExpr *clause,
 			break;				/* no good, volatile comparison value */
 
 		/*
-		 * The Var side can match any column of the index.
+		 * The Var side can match any key column of the index.
 		 */
-		for (i = 0; i < index->ncolumns; i++)
+		for (i = 0; i < index->nkeycolumns; i++)
 		{
 			if (match_index_to_operand(varop, i, index) &&
 				get_op_opfamily_strategy(expr_op,
 										 index->opfamily[i]) == op_strategy &&
 				IndexCollMatchesExprColl(index->indexcollations[i],
 										 lfirst_oid(collids_cell)))
+
 				break;
 		}
-		if (i >= index->ncolumns)
+		if (i >= index->nkeycolumns)
 			break;				/* no match found */
 
 		/* Add column number to returned list */
@@ -4059,21 +4112,27 @@ prefix_quals(Node *leftop, Oid opfamily, Oid collation,
 	switch (opfamily)
 	{
 		case TEXT_BTREE_FAM_OID:
+		case TEXT_LSM_FAM_OID:
 		case TEXT_PATTERN_BTREE_FAM_OID:
+		case TEXT_PATTERN_LSM_FAM_OID:
 		case TEXT_SPGIST_FAM_OID:
 			datatype = TEXTOID;
 			break;
 
 		case BPCHAR_BTREE_FAM_OID:
+		case BPCHAR_LSM_FAM_OID:
 		case BPCHAR_PATTERN_BTREE_FAM_OID:
+		case BPCHAR_PATTERN_LSM_FAM_OID:
 			datatype = BPCHAROID;
 			break;
 
 		case NAME_BTREE_FAM_OID:
+		case NAME_LSM_FAM_OID:
 			datatype = NAMEOID;
 			break;
 
 		case BYTEA_BTREE_FAM_OID:
+		case BYTEA_LSM_FAM_OID:
 			datatype = BYTEAOID;
 			break;
 

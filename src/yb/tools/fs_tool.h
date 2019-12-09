@@ -46,11 +46,10 @@ namespace yb {
 
 class FsManager;
 class Schema;
-class BlockId;
 class RandomAccessFile;
 
 namespace tablet {
-class TabletMetadata;
+class RaftGroupMetadata;
 }
 
 namespace tools {

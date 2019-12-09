@@ -60,6 +60,7 @@
 
 #include "yb/util/net/sockaddr.h"
 #include "yb/util/net/tunnel.h"
+#include "yb/util/scope_exit.h"
 #include "yb/util/status.h"
 
 using std::pair;
@@ -91,9 +92,11 @@ MiniTabletServer::MiniTabletServer(const string& fs_root,
   // Start RPC server on loopback.
   FLAGS_rpc_server_allow_ephemeral_ports = true;
   opts_.rpc_opts.rpc_bind_addresses = server::TEST_RpcBindEndpoint(index_, rpc_port);
+  // A.B.C.D.xip.io resolves to A.B.C.D so it is very useful for testing.
   opts_.broadcast_addresses = {
       HostPort(server::TEST_RpcAddress(index_, server::Private::kFalse), rpc_port) };
   opts_.webserver_opts.port = 0;
+  opts_.webserver_opts.bind_interface = opts_.broadcast_addresses.front().host();
   if (!opts_.has_placement_cloud()) {
     opts_.SetPlacement(Format("cloud$0", (index_ + 1) / 2), Format("rack$0", index_), "zone");
   }
@@ -114,22 +117,40 @@ Result<std::unique_ptr<MiniTabletServer>> MiniTabletServer::CreateMiniTabletServ
 Status MiniTabletServer::Start() {
   CHECK(!started_);
 
-  gscoped_ptr<TabletServer> server(new YB_EDITION_NS_PREFIX TabletServer(opts_));
+  gscoped_ptr<TabletServer> server(new enterprise::TabletServer(opts_));
   RETURN_NOT_OK(server->Init());
+
+  server::TEST_SetupConnectivity(server->messenger(), index_);
+
   RETURN_NOT_OK(server->Start());
 
   server_.swap(server);
 
-  server::TEST_BreakConnectivity(server_->messenger().get(), index_);
-
   tunnel_ = std::make_unique<Tunnel>(&server_->messenger()->io_service());
+  auto se = ScopeExit([this] {
+    if (!started_) {
+      tunnel_->Shutdown();
+    }
+  });
+
   std::vector<Endpoint> local;
   RETURN_NOT_OK(opts_.broadcast_addresses[0].ResolveAddresses(&local));
   Endpoint remote = VERIFY_RESULT(ParseEndpoint(opts_.rpc_opts.rpc_bind_addresses, 0));
-  RETURN_NOT_OK(tunnel_->Start(local.front(), remote));
+  RETURN_NOT_OK(tunnel_->Start(
+      local.front(), remote, [messenger = server_->messenger()](const IpAddress& address) {
+    return !messenger->TEST_ShouldArtificiallyRejectIncomingCallsFrom(address);
+  }));
 
   started_ = true;
   return Status::OK();
+}
+
+void MiniTabletServer::SetIsolated(bool isolated) {
+  if (isolated) {
+    server::TEST_Isolate(server_->messenger());
+  } else {
+    server::TEST_SetupConnectivity(server_->messenger(), index_);
+  }
 }
 
 Status MiniTabletServer::WaitStarted() {
@@ -169,12 +190,25 @@ CHECKED_STATUS ForAllTablets(
 
 }  // namespace
 
-Status MiniTabletServer::FlushTablets(tablet::FlushFlags flags) {
+Status MiniTabletServer::FlushTablets(tablet::FlushMode mode, tablet::FlushFlags flags) {
   if (!server_) {
     return Status::OK();
   }
-  return ForAllTablets(this, [flags](TabletPeer* tablet_peer) {
-    return tablet_peer->tablet()->Flush(tablet::FlushMode::kSync, flags);
+  return ForAllTablets(this, [mode, flags](TabletPeer* tablet_peer) -> Status {
+    if (!tablet_peer->tablet()) {
+      return Status::OK();
+    }
+    return tablet_peer->tablet()->Flush(mode, flags);
+  });
+}
+
+Status MiniTabletServer::CompactTablets() {
+  if (!server_) {
+    return Status::OK();
+  }
+  return ForAllTablets(this, [](TabletPeer* tablet_peer) {
+    tablet_peer->tablet()->ForceRocksDBCompactInTest();
+    return Status::OK();
   });
 }
 

@@ -39,6 +39,7 @@
 
 #include "yb/rpc/connection.h"
 #include "yb/rpc/inbound_call.h"
+#include "yb/rpc/local_call.h"
 #include "yb/rpc/outbound_call.h"
 #include "yb/rpc/service_if.h"
 #include "yb/rpc/reactor.h"
@@ -128,7 +129,8 @@ RpcContext::RpcContext(std::shared_ptr<LocalYBInboundCall> call,
 
 void RpcContext::RespondSuccess() {
   if (response_pb_->ByteSize() > FLAGS_rpc_max_message_size) {
-    RespondFailure(STATUS(InvalidArgument, "RPC message too long"));
+    RespondFailure(STATUS_FORMAT(InvalidArgument, "RPC message too long: $0 vs $1",
+                                 response_pb_->ByteSize(), FLAGS_rpc_max_message_size));
     return;
   }
   call_->RecordHandlingCompleted(metrics_.handler_latency);
@@ -171,6 +173,14 @@ Status RpcContext::AddRpcSidecar(RefCntBuffer car, int* idx) {
   return call_->AddRpcSidecar(car, idx);
 }
 
+int RpcContext::RpcSidecarsSize() const {
+  return call_->RpcSidecarsSize();
+}
+
+const RefCntBuffer& RpcContext::RpcSidecar(int idx) const {
+  return call_->RpcSidecar(idx);
+}
+
 void RpcContext::ResetRpcSidecars() {
   call_->ResetRpcSidecars();
 }
@@ -187,7 +197,7 @@ std::string RpcContext::requestor_string() const {
   return yb::ToString(call_->remote_address());
 }
 
-MonoTime RpcContext::GetClientDeadline() const {
+CoarseTimePoint RpcContext::GetClientDeadline() const {
   return call_->GetClientDeadline();
 }
 
@@ -218,7 +228,11 @@ void RpcContext::CloseConnection() {
   auto connection = call_->connection();
   connection->reactor()->ScheduleReactorFunctor([connection](Reactor*) {
     connection->Close();
-  });
+  }, SOURCE_LOCATION());
+}
+
+std::string RpcContext::ToString() const {
+  return call_->ToString();
 }
 
 void PanicRpc(RpcContext* context, const char* file, int line_number, const std::string& message) {

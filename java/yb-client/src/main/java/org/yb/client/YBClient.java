@@ -32,14 +32,17 @@
 package org.yb.client;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Executor;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.yb.ColumnSchema;
 import org.yb.Common.TableType;
+import org.yb.Common.YQLDatabase;
 import org.yb.Schema;
 import org.yb.Type;
 import org.yb.annotations.InterfaceAudience;
@@ -50,6 +53,7 @@ import org.yb.tserver.Tserver;
 
 import com.google.common.net.HostAndPort;
 import com.stumbleupon.async.Deferred;
+import org.yb.util.Pair;
 
 /**
  * A synchronous and thread-safe client for YB.
@@ -77,9 +81,6 @@ public class YBClient implements AutoCloseable {
 
   // Redis key column name.
   public static final String REDIS_KEY_COLUMN_NAME = "key";
-
-  // 2 power 16
-  public static final int TWO_POWER_SIXTEEN = (int)Math.pow(2, 16);
 
   // Number of response errors to tolerate.
   private static final int MAX_ERRORS_TO_IGNORE = 2500;
@@ -116,6 +117,15 @@ public class YBClient implements AutoCloseable {
     return cto;
   }
 
+  public void createRedisNamespace() throws Exception {
+    CreateKeyspaceResponse resp = this.createKeyspace(REDIS_KEYSPACE_NAME,
+                                                      YQLDatabase.YQL_DATABASE_REDIS);
+    if (resp.hasError()) {
+      throw new RuntimeException("Could not create keyspace " + REDIS_KEYSPACE_NAME +
+                                 ". Error :" + resp.errorMessage());
+    }
+  }
+
   /**
    * Create a redis table on the cluster with the specified name and tablet count.
    * @param name Tables name
@@ -123,11 +133,7 @@ public class YBClient implements AutoCloseable {
    * @return an object to communicate with the created table.
    */
   public YBTable createRedisTable(String name, int numTablets) throws Exception {
-    CreateKeyspaceResponse resp = this.createKeyspace(REDIS_KEYSPACE_NAME);
-    if (resp.hasError()) {
-      throw new RuntimeException("Could not create keyspace " + REDIS_KEYSPACE_NAME +
-                                 ". Error :" + resp.errorMessage());
-    }
+    createRedisNamespace();
     return createTable(REDIS_KEYSPACE_NAME, name, getRedisSchema(),
                        getRedisTableOptions(numTablets));
   }
@@ -138,11 +144,11 @@ public class YBClient implements AutoCloseable {
    * @return an object to communicate with the created table.
    */
   public YBTable createRedisTable(String name) throws Exception {
-    CreateKeyspaceResponse resp = this.createKeyspace(REDIS_KEYSPACE_NAME);
-    if (resp.hasError()) {
-      throw new RuntimeException("Could not create keyspace " + REDIS_KEYSPACE_NAME +
-                                 ". Error :" + resp.errorMessage());
-    }
+    createRedisNamespace();
+    return createRedisTableOnly(name);
+  }
+
+  public YBTable createRedisTableOnly(String name) throws Exception {
     return createTable(REDIS_KEYSPACE_NAME, name, getRedisSchema(),
                        new CreateTableOptions().setTableType(TableType.REDIS_TABLE_TYPE));
   }
@@ -181,6 +187,16 @@ public class YBClient implements AutoCloseable {
   public CreateKeyspaceResponse createKeyspace(String keyspace)
       throws Exception {
     Deferred<CreateKeyspaceResponse> d = asyncClient.createKeyspace(keyspace);
+    return d.join(getDefaultAdminOperationTimeoutMs());
+  }
+
+  /*
+   * Create a keyspace (namespace) for the specified database type.
+   * @param non-null name of the keyspace.
+   */
+  public CreateKeyspaceResponse createKeyspace(String keyspace, YQLDatabase databaseType)
+      throws Exception {
+    Deferred<CreateKeyspaceResponse> d = asyncClient.createKeyspace(keyspace, databaseType);
     return d.join(getDefaultAdminOperationTimeoutMs());
   }
 
@@ -321,6 +337,22 @@ public class YBClient implements AutoCloseable {
   }
 
   /**
+   * Get the tablet load move completion percentage for blacklisted nodes, if any.
+   * @return the response with percent load completed.
+   */
+  public GetLoadMovePercentResponse getLeaderBlacklistCompletion()
+      throws Exception {
+    Deferred<GetLoadMovePercentResponse> d;
+    GetLoadMovePercentResponse resp;
+    int numTries = 0;
+    do {
+      d = asyncClient.getLeaderBlacklistCompletion();
+      resp = d.join(getDefaultAdminOperationTimeoutMs());
+    } while (resp.hasRetriableError() && numTries++ < MAX_NUM_RETRIES);
+    return resp;
+  }
+
+  /**
    * Check if the tablet load is balanced as per the master leader.
    * @param numServers expected number of servers across which the load needs to balanced.
    *                   Zero implies load distribution can be checked across all servers
@@ -333,11 +365,28 @@ public class YBClient implements AutoCloseable {
   }
 
   /**
+   * Check if the load balancer is idle as per the master leader.
+   * @return a deferred object that yields if the load is balanced.
+   */
+  public IsLoadBalancerIdleResponse getIsLoadBalancerIdle() throws Exception {
+    Deferred<IsLoadBalancerIdleResponse> d = asyncClient.getIsLoadBalancerIdle();
+    return d.join(getDefaultAdminOperationTimeoutMs());
+  }
+
+  /**
    * Check if the tablet leader load is balanced as per the master leader.
    * @return a deferred object that yields if the load is balanced.
    */
   public AreLeadersOnPreferredOnlyResponse getAreLeadersOnPreferredOnly() throws Exception {
     Deferred<AreLeadersOnPreferredOnlyResponse> d = asyncClient.getAreLeadersOnPreferredOnly();
+    return d.join(getDefaultAdminOperationTimeoutMs());
+  }
+
+  /**
+   * Check if initdb executed by the master is done running.
+   */
+  public IsInitDbDoneResponse getIsInitDbDone() throws Exception {
+    Deferred<IsInitDbDoneResponse> d = asyncClient.getIsInitDbDone();
     return d.join(getDefaultAdminOperationTimeoutMs());
   }
 
@@ -633,6 +682,79 @@ public class YBClient implements AutoCloseable {
   }
 
   /**
+   * Enable encryption at rest using the key file specified
+   */
+  public boolean enableEncryptionAtRestInMemory(final String versionId) throws Exception {
+    Deferred<ChangeEncryptionInfoInMemoryResponse> d;
+    d = asyncClient.enableEncryptionAtRestInMemory(versionId);
+    d.join(getDefaultAdminOperationTimeoutMs());
+    return d.join(getDefaultAdminOperationTimeoutMs()).hasError();
+  }
+
+  /**
+   * Disable encryption at rest
+   */
+  public boolean disableEncryptionAtRestInMemory() throws Exception {
+    Deferred<ChangeEncryptionInfoInMemoryResponse> d;
+    d = asyncClient.disableEncryptionAtRestInMemory();
+    return !d.join(getDefaultAdminOperationTimeoutMs()).hasError();
+  }
+
+  /**
+  * Enable encryption at rest using the key file specified
+  */
+  public boolean enableEncryptionAtRest(final String file) throws Exception {
+    Deferred<ChangeEncryptionInfoResponse> d;
+    d = asyncClient.enableEncryptionAtRest(file);
+    return !d.join(getDefaultAdminOperationTimeoutMs()).hasError();
+  }
+
+  /**
+   * Disable encryption at rest
+   */
+  public boolean disableEncryptionAtRest() throws Exception {
+    Deferred<ChangeEncryptionInfoResponse> d;
+    d = asyncClient.disableEncryptionAtRest();
+    return !d.join(getDefaultAdminOperationTimeoutMs()).hasError();
+  }
+
+  public Pair<Boolean, String> isEncryptionEnabled() throws Exception {
+    Deferred<IsEncryptionEnabledResponse> d = asyncClient.isEncryptionEnabled();
+    IsEncryptionEnabledResponse resp = d.join(getDefaultAdminOperationTimeoutMs());
+    if (resp.getServerError() != null) {
+      throw new RuntimeException("Could not check isEnabledEncryption with error: " +
+                                 resp.getServerError().getStatus().getMessage());
+    }
+    return new Pair(resp.getIsEnabled(), resp.getUniverseKeyId());
+  }
+
+  /**
+  * Add universe keys in memory to a master at hp, with universe keys in format <id -> key>
+  */
+  public void addUniverseKeys(Map<String, byte[]> universeKeys, HostAndPort hp) throws Exception {
+    Deferred<AddUniverseKeysResponse> d = asyncClient.addUniverseKeys(universeKeys, hp);
+    AddUniverseKeysResponse resp = d.join();
+    if (resp.getServerError() != null) {
+      throw new RuntimeException("Could not add universe keys to " + hp.toString() +
+                                 " with error: " + resp.getServerError().getStatus().getMessage());
+    }
+  }
+
+  /**
+   * Check if a master at hp has universe key universeKeyId. Returns true if it does.
+   */
+  public boolean hasUniverseKeyInMemory(String universeKeyId, HostAndPort hp) throws Exception {
+    Deferred<HasUniverseKeyInMemoryResponse> d =
+            asyncClient.hasUniverseKeyInMemory(universeKeyId, hp);
+    HasUniverseKeyInMemoryResponse resp = d.join();
+    if (resp.getServerError() != null) {
+      throw new RuntimeException("Could not add universe keys to " + hp.toString() +
+                                 " with error: " + resp.getServerError().getStatus().getMessage());
+    }
+    return resp.hasKey();
+  }
+
+  /**
   * Ping a certain server to see if it is responding to RPC requests.
   * @param host the hostname or IP of the server
   * @param port the port number of the server
@@ -670,6 +792,18 @@ public class YBClient implements AutoCloseable {
     return d.join(getDefaultAdminOperationTimeoutMs()).getMasterAddresses();
   }
 
+  /**
+   * Check if the server is ready to serve requests.
+   * @param hp the host and port of the server.
+   * @param isTserver true if host/port is for tserver, else its master.
+   * @return server readiness response.
+   */
+  public IsServerReadyResponse isServerReady(HostAndPort hp, boolean isTserver)
+     throws Exception {
+    Deferred<IsServerReadyResponse> d = asyncClient.isServerReady(hp, isTserver);
+    return d.join(getDefaultAdminOperationTimeoutMs());
+  }
+
   public interface Condition {
     boolean get() throws Exception;
   }
@@ -703,6 +837,19 @@ public class YBClient implements AutoCloseable {
     }
   }
 
+  /**
+   * Checks whether the IsLoadBalancerIdleResponse has no error.
+   */
+  private class LoadBalancerIdleCondition implements Condition {
+    public LoadBalancerIdleCondition() {
+    }
+    @Override
+    public boolean get() throws Exception {
+      IsLoadBalancerIdleResponse resp = getIsLoadBalancerIdle();
+      return !resp.hasError();
+    }
+  }
+
   private class AreLeadersOnPreferredOnlyCondition implements Condition {
     @Override
     public boolean get() throws Exception {
@@ -727,6 +874,20 @@ public class YBClient implements AutoCloseable {
       Map<String, List<List<Integer>>> replicaMap =
           table.getMemberTypeCountsForEachTSType(deadline);
       return replicaMap.equals(replicaMapExpected);
+    }
+  }
+
+  private class MasterHasUniverseKeyInMemoryCondition implements Condition {
+    private String universeKeyId;
+    private HostAndPort hp;
+    public MasterHasUniverseKeyInMemoryCondition(String universeKeyId, HostAndPort hp) {
+      this.universeKeyId = universeKeyId;
+      this.hp = hp;
+    }
+
+    @Override
+    public boolean get() throws Exception {
+      return hasUniverseKeyInMemory(universeKeyId, hp);
     }
   }
 
@@ -823,6 +984,16 @@ public class YBClient implements AutoCloseable {
   }
 
   /**
+  * Wait for the tablet load to be balanced by master leader.
+  * @param timeoutMs the amount of time, in MS, to wait
+  * @return true if the master leader does not return any error balance check.
+  */
+  public boolean waitForLoadBalancerIdle(final long timeoutMs) {
+    Condition loadBalancerIdleCondition = new LoadBalancerIdleCondition();
+    return waitForCondition(loadBalancerIdleCondition, timeoutMs);
+  }
+
+  /**
    * Wait for the leader load to be balanced by master leader.
    * @param timeoutMs the amount of time, in MS, to wait.
    * @return true iff the leader count is balanced within timeoutMs.
@@ -850,6 +1021,12 @@ public class YBClient implements AutoCloseable {
     return waitForCondition(replicaMapCondition, timeoutMs);
   }
 
+  public boolean waitForMasterHasUniverseKeyInMemory(
+          final long timeoutMs, String universeKeyId, HostAndPort hp) {
+    Condition universeKeyCondition = new MasterHasUniverseKeyInMemoryCondition(universeKeyId, hp);
+    return waitForCondition(universeKeyCondition, timeoutMs);
+  }
+
   /**
    * Change master server configuration.
    * @return status of the step down via a response.
@@ -862,11 +1039,20 @@ public class YBClient implements AutoCloseable {
   }
 
   /**
-   * Get the list of all the tables.
-   * @return a list of all the tables
+   * Get the list of all YSQL, YCQL, and YEDIS non-system tables.
+   * @return a list of all the non-system tables
    */
   public ListTablesResponse getTablesList() throws Exception {
-    return getTablesList(null);
+    // YEDIS tables are stored as system tables, so they have to be separated.
+    ListTablesResponse nonSystemTables = getTablesList(null, true, null);
+    ListTablesResponse yedisTables;
+    // If YEDIS is not enabled, getTablesList will error out on this call.
+    try {
+      yedisTables  = getTablesList(null, false, REDIS_KEYSPACE_NAME);
+    } catch (MasterErrorException e) {
+      yedisTables = null;
+    }
+    return nonSystemTables.mergeWith(yedisTables);
   }
 
   /**
@@ -876,7 +1062,35 @@ public class YBClient implements AutoCloseable {
    * @return a deferred that contains the list of table names
    */
   public ListTablesResponse getTablesList(String nameFilter) throws Exception {
-    Deferred<ListTablesResponse> d = asyncClient.getTablesList(nameFilter);
+    return getTablesList(nameFilter, false, null);
+  }
+
+  /**
+   * Get a list of table names. Passing a null filter returns all the tables. When a filter is
+   * specified, it only returns tables that satisfy a substring match. Passing excludeSysfilters
+   * will return only non-system tables (index and user tables).
+   * @param nameFilter an optional table name filter
+   * @param excludeSystemTables an optional filter to search only non-system tables
+   * @param namespace an optional filter to search tables in specific namespace
+   * @return a deferred that contains the list of table names
+   */
+  public ListTablesResponse getTablesList(
+      String nameFilter, boolean excludeSystemTables, String namespace)
+  throws Exception {
+    Deferred<ListTablesResponse> d = asyncClient.getTablesList(
+        nameFilter, excludeSystemTables, namespace);
+    return d.join(getDefaultAdminOperationTimeoutMs());
+  }
+
+  /**
+   * Create for a given tablet and stream.
+   * @param hp host port of the server.
+   * @param tableId the table id to subscribe to.
+   * @return a deferred object for the response from server.
+   */
+  public CreateCDCStreamResponse createCDCStream(
+          final HostAndPort hp, String tableId) throws Exception{
+    Deferred<CreateCDCStreamResponse> d = asyncClient.createCDCStream(hp, tableId);
     return d.join(getDefaultAdminOperationTimeoutMs());
   }
 
@@ -942,6 +1156,21 @@ public class YBClient implements AutoCloseable {
   public YBTable openTable(final String keyspace, final String name) throws Exception {
     Deferred<YBTable> d = asyncClient.openTable(keyspace, name);
     return d.join(getDefaultAdminOperationTimeoutMs());
+  }
+
+  /**
+   * Get the list of tablet UUIDs of a table with the given name.
+   * @param keyspace the keyspace name to which the table belongs.
+   * @param name the table name
+   * @return the set of tablet UUIDs of the table.
+   */
+  public Set<String> getTabletUUIDs(final String keyspace, final String name) throws Exception {
+    Set<String> ids = new HashSet<>();
+    YBTable table = openTable(keyspace, name);
+    for (LocatedTablet tablet : table.getTabletsLocations(getDefaultAdminOperationTimeoutMs())) {
+      ids.add(new String(tablet.getTabletId()));
+    }
+    return ids;
   }
 
   /**
@@ -1060,6 +1289,19 @@ public class YBClient implements AutoCloseable {
      */
     public YBClientBuilder defaultSocketReadTimeoutMs(long timeoutMs) {
       clientBuilder.defaultSocketReadTimeoutMs(timeoutMs);
+      return this;
+    }
+
+    /**
+     * Sets the certificate file in case SSL is enabled.
+     * Optional.
+     * If not provided, defaults to null.
+     * A value of null disables an SSL connection.
+     * @param certFile the path to the certificate.
+     * @return this builder
+     */
+    public YBClientBuilder sslCertFile(String certFile) {
+      clientBuilder.sslCertFile(certFile);
       return this;
     }
 

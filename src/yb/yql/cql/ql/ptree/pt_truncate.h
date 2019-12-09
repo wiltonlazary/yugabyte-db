@@ -66,12 +66,14 @@ class PTTruncateStmt : public TreeNode {
   }
 
   // Id of the table being truncated.
-  const std::string& table_id() const {
-    return table_->id();
-  }
+  const std::string& table_id() const;
 
   client::YBTableName yb_table_name() const {
     return names_->element(0)->ToTableName();
+  }
+
+  const std::shared_ptr<client::YBTable>& table() const {
+    return table_;
   }
 
  private:

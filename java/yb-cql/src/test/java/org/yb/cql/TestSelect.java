@@ -14,7 +14,9 @@ package org.yb.cql;
 
 import java.util.*;
 import java.util.stream.Collectors;
+import java.text.SimpleDateFormat;
 
+import com.datastax.driver.core.LocalDate;
 import com.datastax.driver.core.SimpleStatement;
 import com.datastax.driver.core.Statement;
 import com.yugabyte.driver.core.TableSplitMetadata;
@@ -32,10 +34,16 @@ import com.datastax.driver.core.ResultSet;
 import com.datastax.driver.core.Row;
 import com.datastax.driver.core.exceptions.InvalidQueryException;
 
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
+import static org.yb.AssertionWrappers.assertTrue;
+import static org.yb.AssertionWrappers.assertEquals;
+import static org.yb.AssertionWrappers.assertFalse;
+import static org.yb.AssertionWrappers.assertNull;
 
+import org.yb.YBTestRunner;
+
+import org.junit.runner.RunWith;
+
+@RunWith(value=YBTestRunner.class)
 public class TestSelect extends BaseCQLTest {
   @Test
   public void testSimpleQuery() throws Exception {
@@ -314,7 +322,7 @@ public class TestSelect extends BaseCQLTest {
     assertQuery(stmt, expected);
   }
 
-  private void testScansWithOffset(int pageSize) {
+  private void testMultiShardScansWithOffset(int pageSize) {
     assertQueryWithPageSize("SELECT * FROM test_offset LIMIT 9 OFFSET 0",
         "Row[5, 5, 5]" +
         "Row[1, 1, 1]" +
@@ -404,6 +412,35 @@ public class TestSelect extends BaseCQLTest {
         "Row[3, 3, 3]", pageSize);
   }
 
+  private void testSingleShardScansWithOffset() {
+    assertQueryWithPageSize(
+        "SELECT * FROM test_offset WHERE h1 = 1 ORDER BY r1 DESC LIMIT 2 OFFSET 3",
+        "Row[1, 2, 2]" +
+        "Row[1, 1, 1]", Integer.MAX_VALUE);
+    assertQueryWithPageSize(
+        "SELECT * FROM test_offset WHERE h1 = 1 ORDER BY r1 DESC LIMIT 2 OFFSET 4",
+        "Row[1, 1, 1]", Integer.MAX_VALUE);
+    assertQueryWithPageSize("SELECT * FROM test_offset WHERE h1 = 1 ORDER BY r1 DESC OFFSET 2",
+                            "Row[1, 3, 3]" +
+                            "Row[1, 2, 2]" +
+                            "Row[1, 1, 1]", Integer.MAX_VALUE);
+
+    // Offset applies only to matching rows.
+    assertQueryWithPageSize(
+        "SELECT * FROM test_offset WHERE c1 <= 4 AND h1 = 1 ORDER BY r1 DESC LIMIT 2 OFFSET 2",
+        "Row[1, 2, 2]" +
+        "Row[1, 1, 1]", Integer.MAX_VALUE);
+    assertQueryWithPageSize(
+        "SELECT * FROM test_offset WHERE c1 IN (1, 3, 5) AND h1 = 1 ORDER BY r1 DESC LIMIT 2 " +
+        "OFFSET 1",
+        "Row[1, 3, 3]" +
+        "Row[1, 1, 1]", Integer.MAX_VALUE);
+    assertQueryWithPageSize(
+        "SELECT * FROM test_offset WHERE c1 IN (1, 3, 5) AND h1 = 1 ORDER BY r1 DESC LIMIT 2 " +
+         "OFFSET 2",
+        "Row[1, 1, 1]", Integer.MAX_VALUE);
+  }
+
   @Test
   public void testSelectWithOffset() throws Exception {
     session.execute("CREATE TABLE test_offset (h1 int, r1 int, c1 int, PRIMARY KEY(h1, r1))");
@@ -415,6 +452,7 @@ public class TestSelect extends BaseCQLTest {
     session.execute("INSERT INTO test_offset (h1, r1, c1) VALUES (1, 4, 4)");
     session.execute("INSERT INTO test_offset (h1, r1, c1) VALUES (1, 5, 5)");
 
+    // Test full scan but with single-shard data.
     assertQueryWithPageSize("SELECT * FROM test_offset LIMIT 2 OFFSET 3",
         "Row[1, 4, 4]" +
         "Row[1, 5, 5]", Integer.MAX_VALUE);
@@ -428,18 +466,6 @@ public class TestSelect extends BaseCQLTest {
         "Row[1, 4, 4]" +
         "Row[1, 5, 5]", Integer.MAX_VALUE);
 
-    assertQueryWithPageSize(
-        "SELECT * FROM test_offset WHERE h1 = 1 ORDER BY r1 DESC LIMIT 2 OFFSET 3",
-        "Row[1, 2, 2]" +
-        "Row[1, 1, 1]", Integer.MAX_VALUE);
-    assertQueryWithPageSize(
-        "SELECT * FROM test_offset WHERE h1 = 1 ORDER BY r1 DESC LIMIT 2 OFFSET 4",
-        "Row[1, 1, 1]", Integer.MAX_VALUE);
-    assertQueryWithPageSize("SELECT * FROM test_offset WHERE h1 = 1 ORDER BY r1 DESC OFFSET 2",
-        "Row[1, 3, 3]" +
-        "Row[1, 2, 2]" +
-        "Row[1, 1, 1]", Integer.MAX_VALUE);
-
     // Offset applies only to matching rows.
     assertQueryWithPageSize("SELECT * FROM test_offset WHERE c1 >= 2 LIMIT 2 OFFSET 2",
         "Row[1, 4, 4]" +
@@ -450,19 +476,16 @@ public class TestSelect extends BaseCQLTest {
     assertQueryWithPageSize("SELECT * FROM test_offset WHERE c1 IN (1, 3, 5) LIMIT 2 OFFSET 2",
         "Row[1, 5, 5]", Integer.MAX_VALUE);
 
-    assertQueryWithPageSize(
-        "SELECT * FROM test_offset WHERE c1 <= 4 AND h1 = 1 ORDER BY r1 DESC LIMIT 2 OFFSET 2",
-        "Row[1, 2, 2]" +
-        "Row[1, 1, 1]", Integer.MAX_VALUE);
-    assertQueryWithPageSize(
-        "SELECT * FROM test_offset WHERE c1 IN (1, 3, 5) AND h1 = 1 ORDER BY r1 DESC LIMIT 2 " +
-        "OFFSET 1",
-        "Row[1, 3, 3]" +
-        "Row[1, 1, 1]", Integer.MAX_VALUE);
-    assertQueryWithPageSize(
-        "SELECT * FROM test_offset WHERE c1 IN (1, 3, 5) AND h1 = 1 ORDER BY r1 DESC LIMIT 2 " +
-        "OFFSET 2",
-        "Row[1, 1, 1]", Integer.MAX_VALUE);
+    // Test single-shard scan.
+    testSingleShardScansWithOffset();
+
+    // Test single-shard scan with dense data (other rows in the database).
+    // Insert a bunch of other hashes to ensure there are rows before/after the target range on that
+    // tablet. This ensure the start/end detection works correctly.
+    for (Integer h1 = 0; h1 < 100; h1++) {
+      session.execute("INSERT INTO test_offset (h1, r1, c1) VALUES (?, 1, 1)", h1);
+    }
+    testSingleShardScansWithOffset();
 
     // Test multi-shard offset and limits.
     // Delete and re-create the table first.
@@ -477,10 +500,22 @@ public class TestSelect extends BaseCQLTest {
           i, i, i));
     }
 
-    testScansWithOffset(Integer.MAX_VALUE);
+    testMultiShardScansWithOffset(Integer.MAX_VALUE);
     for (int i = 0; i <= totalShards; i++) {
-      testScansWithOffset(i);
+      testMultiShardScansWithOffset(i);
     }
+
+    // Test select with offset and limit. Fetch the exact number of rows. Verify that the query
+    // ends explicitly with an empty paging state.
+    for (int i = 0; i < 10; i++) {
+      session.execute(String.format("INSERT INTO test_offset (h1, r1, c1) VALUES (%d, %d, %d)",
+          100, i, i));
+    }
+    ResultSet rs = session.execute("SELECT * FROM test_offset WHERE h1 = 100 OFFSET 3 LIMIT 4");
+    for (int i = 3; i < 3 + 4; i++) {
+      assertEquals(String.format("Row[100, %d, %d]", i, i), rs.one().toString());
+    }
+    assertNull(rs.getExecutionInfo().getPagingState());
 
     // Test Invalid offsets.
     runInvalidStmt("SELECT * FROM test_offset OFFSET -1");
@@ -748,6 +783,16 @@ public class TestSelect extends BaseCQLTest {
       assertTrue(expected_values.isEmpty());
     }
 
+    // Test basic IN condition on both hash and range columns.
+    {
+      String stmt = "SELECT h1 FROM in_test WHERE " +
+          "h1 IN (3, -1, 4, 7, 1) AND h2 in ('h7', 'h3', 'h1', 'h4') AND " +
+          "r1 IN (107, -100, 101, 104) and r2 IN ('r101', 'foo', 'r107', 'r104')";
+
+      // Check rows: expecting no duplicates and ascending order.
+      assertQueryRowsOrdered(stmt, "Row[1]", "Row[4]", "Row[7]");
+    }
+
     // Test basic IN condition on regular column.
     {
       ResultSet rs = session.execute("SELECT * FROM in_test WHERE v1 IN (1006, 1002, -1)");
@@ -884,24 +929,30 @@ public class TestSelect extends BaseCQLTest {
 
     // Setup the table.
     session.execute("CREATE TABLE parallel_in_test(h1 int, h2 int, r1 int, v1 int," +
-                        "primary key ((h1, h2), r1))");
+                        "PRIMARY KEY ((h1, h2), r1))");
 
     PreparedStatement insert = session.prepare(
-        "INSERT INTO parallel_in_test(h1, h2, r1, v1) VALUES (?, ?, ?, ?)");
-    for (Integer i = 0; i < 400; i++) {
-      session.execute(insert.bind(i / 20, i % 20, new Integer(1), new Integer(1)));
+        "INSERT INTO parallel_in_test(h1, h2, r1, v1) VALUES (?, ?, 1, 1)");
+
+    for (Integer h1 = 0; h1 < 20; h1++) {
+      for (Integer h2 = 0; h2 < 20; h2++) {
+        session.execute(insert.bind(h1, h2));
+      }
     }
 
-    // SELECT statement: 200 options, 100 with actual results (i.e. for r = 1).
+    // SELECT statement: 200 (10 * 10 * 2), 100 with actual results (i.e. for r1 = 1).
+    // We expect 100 internal queries, one for each hash key option (the 2 range key options are
+    // handled in one multi-point query).
     String select = "SELECT * FROM parallel_in_test WHERE " +
-        "h1 IN (0,2,4,6,8,10,12,14,16,18) AND h2 IN (1,3,5,7,9,11,13,15,17,19) AND r1 IN (1,2)";
+        "h1 IN (0,2,4,6,8,10,12,14,16,18) AND h2 IN (1,3,5,7,9,11,13,15,17,19) AND " +
+        "r1 IN (0,1)";
 
     // Compute expected rows.
     List<String> expectedRows = new ArrayList<>();
     String rowTemplate = "Row[%d, %d, 1, 1]";
-    for (int i = 0; i < 20; i += 2) {
-      for (int j = 1; j < 20; j += 2) {
-        expectedRows.add(String.format(rowTemplate, i, j));
+    for (int h1 = 0; h1 < 20; h1 += 2) {
+      for (int h2 = 1; h2 < 20; h2 += 2) {
+        expectedRows.add(String.format(rowTemplate, h1, h2));
       }
     }
 
@@ -925,6 +976,461 @@ public class TestSelect extends BaseCQLTest {
   }
 
   @Test
+  public void testClusteringInSparseData() throws Exception {
+    String createStmt = "CREATE TABLE in_sparse_cols_test(" +
+        "h int, r1 int, r2 int, r3 int, r4 int, r5 int, v int, " +
+        "PRIMARY KEY (h, r1, r2, r3, r4, r5)) " +
+        "WITH CLUSTERING ORDER BY (r1 DESC, r2 DESC, r3 DESC, r4 DESC, r5 DESC);";
+    session.execute(createStmt);
+
+    // Testing sparse table data with dense in queries, load only 5 rows.
+    String insertTemplate = "INSERT INTO in_sparse_cols_test(h, r1, r2, r3, r4, r5, v) " +
+        "VALUES (1, %d, %d, %d, %d, %d, 100)";
+    for (int i = 0; i < 50; i += 10) {
+      session.execute(String.format(insertTemplate, i % 50, (i + 10) % 50, (i + 20) % 50,
+                                    (i + 30) % 50, (i + 40) % 50));
+    }
+
+    // Up to 16 opts per column so around 1 mil total options.
+    String allOpts = "(-1, -3, 0, 4, 8, 10, 12, 20, 21, 22, 30, 32, 37, 40, 41, 43)";
+    String partialOpts = "(8, 10, 12, 20, 21, 22, 30, 32, 33, 37)";
+    String selectTemplate = "SELECT * FROM in_sparse_cols_test WHERE h = 1 AND " +
+        "r1 IN %s AND r2 IN %s AND r3 IN %s AND r4 IN %s AND r5 IN %s";
+
+
+    // Test basic select.
+    assertQueryRowsOrdered(
+        String.format(selectTemplate, allOpts, allOpts, allOpts, allOpts, allOpts),
+        "Row[1, 40, 0, 10, 20, 30, 100]",
+        "Row[1, 30, 40, 0, 10, 20, 100]",
+        "Row[1, 20, 30, 40, 0, 10, 100]",
+        "Row[1, 10, 20, 30, 40, 0, 100]",
+        "Row[1, 0, 10, 20, 30, 40, 100]");
+
+    // Test reverse order.
+    assertQueryRowsOrdered(String.format(selectTemplate + " ORDER BY r1 ASC",
+                                         allOpts, allOpts, allOpts, allOpts, allOpts),
+                           "Row[1, 0, 10, 20, 30, 40, 100]",
+                           "Row[1, 10, 20, 30, 40, 0, 100]",
+                           "Row[1, 20, 30, 40, 0, 10, 100]",
+                           "Row[1, 30, 40, 0, 10, 20, 100]",
+                           "Row[1, 40, 0, 10, 20, 30, 100]");
+
+    // Test partial options (missing 0 and 40 for r1)
+    assertQueryRowsOrdered(
+        String.format(selectTemplate, partialOpts, allOpts, allOpts, allOpts, allOpts),
+        "Row[1, 30, 40, 0, 10, 20, 100]",
+        "Row[1, 20, 30, 40, 0, 10, 100]",
+        "Row[1, 10, 20, 30, 40, 0, 100]");
+
+    // Test partial options (missing 0 and 40 for r5) plus reverse order.
+    assertQueryRowsOrdered(String.format(selectTemplate + " ORDER BY r1 ASC",
+                                         allOpts, allOpts, allOpts, allOpts, partialOpts),
+        "Row[1, 20, 30, 40, 0, 10, 100]",
+        "Row[1, 30, 40, 0, 10, 20, 100]",
+        "Row[1, 40, 0, 10, 20, 30, 100]");
+
+    // Test partial options (missing 0 and 40 for r3 and r4)
+    assertQueryRowsOrdered(
+        String.format(selectTemplate, allOpts, allOpts, partialOpts, partialOpts, allOpts),
+        "Row[1, 40, 0, 10, 20, 30, 100]",
+        "Row[1, 0, 10, 20, 30, 40, 100]");
+  }
+
+  @Test
+  public void testClusteringInSeeks() throws Exception {
+    String createTable = "CREATE TABLE in_range_test(h int, r1 int, r2 text, v int," +
+            " PRIMARY KEY((h), r1, r2)) WITH CLUSTERING ORDER BY (r1 DESC, r2 ASC)";
+    session.execute(createTable);
+
+    String insertTemplate = "INSERT INTO in_range_test(h, r1, r2, v) VALUES (%d, %d, '%d', %d)";
+
+    for (int h = 0; h < 10; h++) {
+      for (int r1 = 0; r1 < 10; r1++) {
+        for (int r2 = 0; r2 < 10; r2++) {
+          int v = h * 100 + r1 * 10 + r2;
+          // Multiplying range keys by 10 so we can test sparser data with dense keys later.
+          // (i.e. several key options given by IN condition, in between two actual rows).
+          session.execute(String.format(insertTemplate, h, r1 * 10, r2 * 10, v));
+        }
+      }
+    }
+
+    // Test basic IN results and ordering.
+    {
+      String query = "SELECT * FROM in_range_test WHERE h = 1 AND r1 IN (60, 80, 10) AND " +
+              "r2 IN ('70', '30')";
+
+      String[] rows = {"Row[1, 80, 30, 183]",
+              "Row[1, 80, 70, 187]",
+              "Row[1, 60, 30, 163]",
+              "Row[1, 60, 70, 167]",
+              "Row[1, 10, 30, 113]",
+              "Row[1, 10, 70, 117]"};
+
+      RocksDBMetrics metrics = assertPartialRangeSpec("in_range_test", query, rows);
+      // 3 * 2 = 6 options.
+      assertEquals(6, metrics.seekCount);
+    }
+
+    // Test IN results and ordering with non-existing keys.
+    {
+      String query = "SELECT * FROM in_range_test WHERE h = 1 AND r1 IN (70, -10, 20) AND " +
+              "r2 IN ('40', '10', '-10')";
+
+      String[] rows = {"Row[1, 70, 10, 171]",
+              "Row[1, 70, 40, 174]",
+              "Row[1, 20, 10, 121]",
+              "Row[1, 20, 40, 124]"};
+
+      RocksDBMetrics metrics = assertPartialRangeSpec("in_range_test", query, rows);
+      // 9 options, but the first seek should jump over 3 options (with r1 = -10).
+      assertEquals(7, metrics.seekCount);
+    }
+
+    // Test combining IN and equality conditions.
+    {
+      String query =
+              "SELECT * FROM in_range_test WHERE h = 1 AND r1 IN (80, -10, 0, 30) AND r2 = '50'";
+
+      String[] rows = {"Row[1, 80, 50, 185]",
+              "Row[1, 30, 50, 135]",
+              "Row[1, 0, 50, 105]"};
+
+      RocksDBMetrics metrics = assertPartialRangeSpec("in_range_test", query, rows);
+      // 1 * 4 = 4 options.
+      assertEquals(4, metrics.seekCount);
+    }
+
+    // Test ORDER BY clause with IN (reverse scan).
+    {
+      String query = "SELECT * FROM in_range_test WHERE h = 1 AND " +
+              "r1 IN (70, 20) AND r2 IN ('40', '10') ORDER BY r1 ASC, r2 DESC";
+
+      String[] rows = {"Row[1, 20, 40, 124]",
+              "Row[1, 20, 10, 121]",
+              "Row[1, 70, 40, 174]",
+              "Row[1, 70, 10, 171]"};
+
+      RocksDBMetrics metrics = assertPartialRangeSpec("in_range_test", query, rows);
+      // 4 options, but reverse scans do 2 seeks for each option since PrevDocKey calls Seek twice
+      // internally.
+      assertEquals(8, metrics.seekCount);
+    }
+
+    // Test single IN option (equivalent to just using equality constraint).
+    {
+      String query = "SELECT * FROM in_range_test WHERE h = 1 AND r1 IN (90) AND r2 IN ('40')";
+
+      String[] rows = {"Row[1, 90, 40, 194]"};
+
+      RocksDBMetrics metrics = assertPartialRangeSpec("in_range_test", query, rows);
+      assertEquals(1, metrics.seekCount);
+    }
+
+    // Test dense IN target keys (with sparse table rows).
+    {
+      String query = "SELECT * FROM in_range_test WHERE h = 1 AND " +
+              "r1 IN (57, 59, 60, 61, 63, 65, 67, 73, 75, 80, 82, 83) AND " +
+              "r2 IN ('18', '19', '20', '23', '27', '31', '36', '40', '42', '43')";
+
+      String[] rows = {"Row[1, 80, 20, 182]",
+              "Row[1, 80, 40, 184]",
+              "Row[1, 60, 20, 162]",
+              "Row[1, 60, 40, 164]"};
+
+      RocksDBMetrics metrics = assertPartialRangeSpec("in_range_test", query, rows);
+      // There are 12 * 10 = 120 total target keys, but we should skip most of them as one seek in
+      // the DB will invalidate (jump over) several target keys:
+      // 1. Initialize start seek target as smallest target key.
+      // 2. Seek for current target key (will find the first DB key equal or bigger than target).
+      // 3. If that matches the current (or a bigger) target key we add to the result.
+      // 4. We continue seeking from the next target key.
+      // Note that r1 is sorted DESC, and r2 is sorted ASC, so e.g. [83, "18"] is the smallest key
+      // Seek No.   Seek For       Find       Matches
+      //    1      [83, "18"]    [80, "0"]       N
+      //    2      [80, "18"]    [80, "20"]      Y (Result row 1)
+      //    3      [80, "23"]    [80, "30"]      N
+      //    4      [80, "31"]    [80, "40"]      Y (Result row 2)
+      //    5      [80, "42"]    [80, "50"]      N
+      //    6      [75, "18"]    [70, "0"]       N
+      //    7      [67, "18"]    [60, "0"]       N
+      //    8      [60, "18"]    [60, "20"]      Y (Result row 3)
+      //    9      [60, "23"]    [60, "30"]      N
+      //   10      [60, "31"]    [60, "40"]      Y (Result row 4)
+      //   11      [60, "42"]    [60, "50"]      N
+      //   12      [59, "18"]    [50, "0"]       N (Bigger than largest target key so we are done)
+      assertEquals(12, metrics.seekCount);
+    }
+  }
+
+  @Test
+  public void testSeekWithRangeFilter() throws Exception {
+    String createTable = "CREATE TABLE in_range_test(h int, r1 int, r2 text, v int," +
+        " PRIMARY KEY((h), r1, r2)) WITH CLUSTERING ORDER BY (r1 DESC, r2 ASC)";
+    session.execute(createTable);
+
+    String insertTemplate = "INSERT INTO in_range_test(h, r1, r2, v) VALUES (%d, %d, '%d', %d)";
+
+    for (int h = 0; h < 10; h++) {
+      for (int r1 = 0; r1 < 10; r1++) {
+        for (int r2 = 0; r2 < 10; r2++) {
+          int v = h * 100 + r1 * 10 + r2;
+          // Multiplying range keys by 10 so we can test sparser data with dense keys later.
+          // (i.e. several key options given by IN condition, in between two actual rows).
+          session.execute(String.format(insertTemplate, h, r1 * 10, r2 * 10, v));
+        }
+      }
+    }
+
+    // Test basic seek optimisation with fwd scans.
+    {
+      String query = "SELECT * FROM in_range_test WHERE h = 1 AND r1 > 50 AND r1 < 90 AND " +
+              "r2  > '20' AND r2 < '50'";
+
+      String[] rows = {
+              "Row[1, 80, 30, 183]",
+              "Row[1, 80, 40, 184]",
+              "Row[1, 70, 30, 173]",
+              "Row[1, 70, 40, 174]",
+              "Row[1, 60, 30, 163]",
+              "Row[1, 60, 40, 164]"};
+
+      RocksDBMetrics metrics = assertPartialRangeSpec("in_range_test", query, rows);
+      // There are n = 5 values of r1 to look at (90, 80, 70, 60, 50).
+      // For each r1 we have m = 4 values to look for in the range (20, 30, 40, 50). But, we only
+      // seek to the very first one. Then do Next(s) until we get out of range for r2.
+      // If there are more r1's to look at, we'd seek to r2=Max.
+      // We will be performing (n - 1) seeks to the Max value for finding the next r1
+      // Thus, this scan will have to Seek to n * 1 + (n - 1) = 5 * 1 + (5 - 1) = 9 locations.
+      // For example,
+      //   Seeking to DocKey(0x0a73, [1], [90, "20"])
+      //   Seeking to DocKey(0x0a73, [1], [90, +Inf])
+      //   Seeking to DocKey(0x0a73, [1], [80, "20"])
+      //   Seeking to DocKey(0x0a73, [1], [80, +Inf])
+      //   Seeking to DocKey(0x0a73, [1], [70, "20"])
+      //   Seeking to DocKey(0x0a73, [1], [70, +Inf])
+      //   Seeking to DocKey(0x0a73, [1], [60, "20"])
+      //   Seeking to DocKey(0x0a73, [1], [60, +Inf])
+      //   Seeking to DocKey(0x0a73, [1], [50, "20"])
+      assertEquals(9, metrics.seekCount);
+    }
+
+    // Test basic seek optimisation with fwd scans.
+    {
+      String query = "SELECT * FROM in_range_test WHERE h = 1 AND r1 >= 60 AND r1 <= 80 AND " +
+              "r2  >= '30' AND r2 <= '40'";
+
+      String[] rows = {
+              "Row[1, 80, 30, 183]",
+              "Row[1, 80, 40, 184]",
+              "Row[1, 70, 30, 173]",
+              "Row[1, 70, 40, 174]",
+              "Row[1, 60, 30, 163]",
+              "Row[1, 60, 40, 164]"};
+
+      RocksDBMetrics metrics = assertPartialRangeSpec("in_range_test", query, rows);
+      // There are n = 3 values of r1 to look at (80, 70, 60).
+      // For each r1 we have m = 2 values to look for in the range (30, 40). But, we only
+      // seek to the very first one. Then do Next(s) until we get out of range for r2.
+      // If there are more r1's to look at, we'd seek to r2=Max.
+      // We will be performing (n - 1) seeks to the Max value for finding the next r1
+      // Thus, this scan will have to Seek to n * 1 + (n - 1) = 3 * 1 + (3 - 1) = 5 locations.
+      assertEquals(5, metrics.seekCount);
+    }
+
+    // Test basic seek optimisation with fwd scans. No hash componenet specified.
+    {
+      String query = "SELECT * FROM in_range_test WHERE r1 = 80 AND r2 = '90'";
+
+      String[] rows = {
+              "Row[0, 80, 90, 89]",
+              "Row[1, 80, 90, 189]",
+              "Row[2, 80, 90, 289]",
+              "Row[3, 80, 90, 389]",
+              "Row[4, 80, 90, 489]",
+              "Row[5, 80, 90, 589]",
+              "Row[6, 80, 90, 689]",
+              "Row[7, 80, 90, 789]",
+              "Row[8, 80, 90, 889]",
+              "Row[9, 80, 90, 989]"
+      };
+
+      // use unordered because the hash keys could go in random order.
+      RocksDBMetrics metrics = assertUnorderedPartialRangeSpec("in_range_test", query, rows);
+      // For each Hash key in 0 .. 9 we'll have 2 of these seeks.
+      // Seeking to DocKey(0x0a73, [h], [80, "90"])
+      // Seeking to DocKey(0x0a73, [h], [+Inf])
+      // Additionally, one
+      //   Seeking to DocKey([], []) per tablet.
+      // Overall, 2 * 10 + 9
+      assertEquals(29, metrics.seekCount);
+    }
+
+    {
+      String query =
+              "SELECT * FROM in_range_test WHERE r1 > 50 AND r1 < 90 AND r2  > '20' AND r2 < '50'";
+
+      String[] rows = {
+              "Row[0, 80, 30, 83]",
+              "Row[0, 80, 40, 84]",
+              "Row[0, 70, 30, 73]",
+              "Row[0, 70, 40, 74]",
+              "Row[0, 60, 30, 63]",
+              "Row[0, 60, 40, 64]",
+              "Row[1, 80, 30, 183]",
+              "Row[1, 80, 40, 184]",
+              "Row[1, 70, 30, 173]",
+              "Row[1, 70, 40, 174]",
+              "Row[1, 60, 30, 163]",
+              "Row[1, 60, 40, 164]",
+              "Row[2, 80, 30, 283]",
+              "Row[2, 80, 40, 284]",
+              "Row[2, 70, 30, 273]",
+              "Row[2, 70, 40, 274]",
+              "Row[2, 60, 30, 263]",
+              "Row[2, 60, 40, 264]",
+              "Row[3, 80, 30, 383]",
+              "Row[3, 80, 40, 384]",
+              "Row[3, 70, 30, 373]",
+              "Row[3, 70, 40, 374]",
+              "Row[3, 60, 30, 363]",
+              "Row[3, 60, 40, 364]",
+              "Row[4, 80, 30, 483]",
+              "Row[4, 80, 40, 484]",
+              "Row[4, 70, 30, 473]",
+              "Row[4, 70, 40, 474]",
+              "Row[4, 60, 30, 463]",
+              "Row[4, 60, 40, 464]",
+              "Row[5, 80, 30, 583]",
+              "Row[5, 80, 40, 584]",
+              "Row[5, 70, 30, 573]",
+              "Row[5, 70, 40, 574]",
+              "Row[5, 60, 30, 563]",
+              "Row[5, 60, 40, 564]",
+              "Row[6, 80, 30, 683]",
+              "Row[6, 80, 40, 684]",
+              "Row[6, 70, 30, 673]",
+              "Row[6, 70, 40, 674]",
+              "Row[6, 60, 30, 663]",
+              "Row[6, 60, 40, 664]",
+              "Row[7, 80, 30, 783]",
+              "Row[7, 80, 40, 784]",
+              "Row[7, 70, 30, 773]",
+              "Row[7, 70, 40, 774]",
+              "Row[7, 60, 30, 763]",
+              "Row[7, 60, 40, 764]",
+              "Row[8, 80, 30, 883]",
+              "Row[8, 80, 40, 884]",
+              "Row[8, 70, 30, 873]",
+              "Row[8, 70, 40, 874]",
+              "Row[8, 60, 30, 863]",
+              "Row[8, 60, 40, 864]",
+              "Row[9, 80, 30, 983]",
+              "Row[9, 80, 40, 984]",
+              "Row[9, 70, 30, 973]",
+              "Row[9, 70, 40, 974]",
+              "Row[9, 60, 30, 963]",
+              "Row[9, 60, 40, 964]"
+      };
+
+      // use unordered because the hash keys could go in random order.
+      RocksDBMetrics metrics = assertUnorderedPartialRangeSpec("in_range_test", query, rows);
+      // For each Hash key in 0 .. 9 we'll have 11 of these seeks.
+      // Seeking to DocKey(0x0a73, [h], [90, "20"])
+      // Seeking to DocKey(0x0a73, [h], [90, +Inf])
+      // Seeking to DocKey(0x0a73, [h], [80, "20"])
+      // Seeking to DocKey(0x0a73, [h], [80, +Inf])
+      // Seeking to DocKey(0x0a73, [h], [70, "20"])
+      // Seeking to DocKey(0x0a73, [h], [70, +Inf])
+      // Seeking to DocKey(0x0a73, [h], [60, "20"])
+      // Seeking to DocKey(0x0a73, [h], [60, +Inf])
+      // Seeking to DocKey(0x0a73, [h], [50, "20"])
+      // Seeking to DocKey(0x0a73, [h], [50, +Inf])
+      // Seeking to DocKey(0x0a73, [h], [+Inf])
+      // Additionally, one
+      //   Seeking to DocKey([], []) per tablet.
+      // Overall, 11 * 10 + 9
+      assertEquals(119, metrics.seekCount);
+    }
+
+    // Test ORDER BY clause (reverse scan).
+    {
+      String query = "SELECT * FROM in_range_test WHERE h = 1 AND " +
+              "r1 >= 20 AND r1 <= 30 AND r2  >= '30' AND r2 <= '40' ORDER BY r1 ASC, r2 DESC";
+
+      String[] rows = {
+              "Row[1, 20, 40, 124]",
+              "Row[1, 20, 30, 123]",
+              "Row[1, 30, 40, 134]",
+              "Row[1, 30, 30, 133]"};
+
+      RocksDBMetrics metrics = assertPartialRangeSpec("in_range_test", query, rows);
+      // There are n = 2 values of r1 to look at. For each r1 we have m = 2 values to look for
+      // in the range. During the scan, for each r1 we look at m + 1 = 3 values before deciding
+      // to seek out of r1 by going to r2=Max. We will be performing (n - 1) seeks to the Max
+      // value for finding the next r1.
+      // Thus, this scan will have to Seek to n * (m + 1) + (n - 1) = 7 locations.
+      // But reverse scans do 2 seeks for each option since PrevDocKey calls Seek twice internally.
+      // So the total number of seeks will be 7 * 2 = 14
+      //Seek(SubDocKey(DocKey(0x1210, [kInt32 : 1], [kInt32Descending : 20, kString : "40"]), []))
+      //Seek(SubDocKey(DocKey(0x1210, [kInt32 : 1], [kInt32Descending : 20, kString : "30"]), []))
+      //Seek(SubDocKey(DocKey(0x1210, [kInt32 : 1], [kInt32Descending : 20, kString : "20"]), []))
+      // Trying to seek out of r1 = 20. [1, 20, _]
+      //Seek(SubDocKey(DocKey(0x1210, [kInt32 : 1], [kInt32Descending : 30, kString : "90"]), []))
+      // Try to get into the range for r2.
+      //Seek(SubDocKey(DocKey(0x1210, [kInt32 : 1], [kInt32Descending : 30, kString : "40"]), []))
+      //Seek(SubDocKey(DocKey(0x1210, [kInt32 : 1], [kInt32Descending : 30, kString : "30"]), []))
+      //Seek(SubDocKey(DocKey(0x1210, [kInt32 : 1], [kInt32Descending : 30, kString : "20"]), []))
+      assertEquals(14, metrics.seekCount);
+    }
+
+    {
+      String query = "SELECT * FROM in_range_test WHERE h = 1 AND " +
+              "r1 >= 20 AND r1 < 40 AND r2  > '20' AND r2 < '50' ORDER BY r1 ASC, r2 DESC";
+
+      String[] rows = {
+              "Row[1, 20, 40, 124]",
+              "Row[1, 20, 30, 123]",
+              "Row[1, 30, 40, 134]",
+              "Row[1, 30, 30, 133]"};
+
+      RocksDBMetrics metrics = assertPartialRangeSpec("in_range_test", query, rows);
+      // Similar to above. But would stop at 2 extra values of r2 for each r1. (due to </> instead
+      // of <=/>=) so n = 3, m = 4
+      // There are n = 3 values of r1 to look at. For each r1 we have m = 4 values to look for in
+      // the range. During the scan, for each r1 we look at m + 1 = 5 values before deciding to
+      // seek out of r1 by going to r2=Max
+      // We will be performing (n - 1) seeks to the Max value for finding the next r1
+      // Thus, this scan will have to Seek to n * (m + 1) + (n - 1) = 3 * 5 + 2 = 17 locations.
+      // But reverse scans do 2 seeks for each option since PrevDocKey calls Seek twice internally.
+      // So, the expected number of seeks = 17 * 2 = 34
+      //  Seek(SubDocKey(DocKey(0x1210, [kInt32 : 1], [kInt32Descending : 20, kString : "50"]), []))
+      //  Seek(SubDocKey(DocKey(0x1210, [kInt32 : 1], [kInt32Descending : 20, kString : "40"]), []))
+      //  Seek(SubDocKey(DocKey(0x1210, [kInt32 : 1], [kInt32Descending : 20, kString : "30"]), []))
+      //  Seek(SubDocKey(DocKey(0x1210, [kInt32 : 1], [kInt32Descending : 20, kString : "20"]), []))
+      //  Seek(SubDocKey(DocKey(0x1210, [kInt32 : 1], [kInt32Descending : 20, kString : "10"]), []))
+      // Trying to seek out of r1 = 20. [1, 20, _]
+      // Seek(SubDocKey(DocKey(0x1210, [kInt32 : 1], [kInt32Descending : 30, kString : "90"]), []))
+      // Try to get into the range for r2.
+      //  Seek(SubDocKey(DocKey(0x1210, [kInt32 : 1], [kInt32Descending : 30, kString : "50"]), []))
+      //  Seek(SubDocKey(DocKey(0x1210, [kInt32 : 1], [kInt32Descending : 30, kString : "40"]), []))
+      //  Seek(SubDocKey(DocKey(0x1210, [kInt32 : 1], [kInt32Descending : 30, kString : "30"]), []))
+      //  Seek(SubDocKey(DocKey(0x1210, [kInt32 : 1], [kInt32Descending : 30, kString : "20"]), []))
+      //  Seek(SubDocKey(DocKey(0x1210, [kInt32 : 1], [kInt32Descending : 30, kString : "10"]), []))
+      // Trying to seek out of r1 = 30. [1, 30, _]
+      //Seek(SubDocKey(DocKey(0x1210, [kInt32 : 1], [kInt32Descending : 40, kString : "90"]), []))
+      // Try to get into the range for r2.
+      //  Seek(SubDocKey(DocKey(0x1210, [kInt32 : 1], [kInt32Descending : 40, kString : "50"]), []))
+      //  Seek(SubDocKey(DocKey(0x1210, [kInt32 : 1], [kInt32Descending : 40, kString : "40"]), []))
+      //  Seek(SubDocKey(DocKey(0x1210, [kInt32 : 1], [kInt32Descending : 40, kString : "30"]), []))
+      //  Seek(SubDocKey(DocKey(0x1210, [kInt32 : 1], [kInt32Descending : 40, kString : "20"]), []))
+      //  Seek(SubDocKey(DocKey(0x1210, [kInt32 : 1], [kInt32Descending : 40, kString : "10"]), []))
+      assertEquals(34, metrics.seekCount);
+    }
+  }
+
+  @Test
   public void testStatementList() throws Exception {
     // Verify handling of empty statements.
     assertEquals(0, session.execute("").all().size());
@@ -936,15 +1442,35 @@ public class TestSelect extends BaseCQLTest {
     runInvalidStmt("SELECT * FROM test_select; SELECT * FROM test_select;");
   }
 
-  // Execute query, assert results and return RocksDB metrics.
-  private RocksDBMetrics assertPartialRangeSpec(String tableName, String query, Set<String> rows)
+  private RocksDBMetrics assertUnorderedPartialRangeSpec(String tableName,
+                                                         String query,
+                                                         String... rows)
+      throws Exception {
+    return assertPartialRangeSpecOrderedOrUnorderd(/* ordered */ false,
+                                                   tableName, query, rows);
+  }
+
+  private RocksDBMetrics assertPartialRangeSpec(String tableName, String query,
+                                                String... rows)
+      throws Exception {
+    return assertPartialRangeSpecOrderedOrUnorderd(/* ordered */ true,
+                                                   tableName, query, rows);
+  }
+
+  private RocksDBMetrics
+  assertPartialRangeSpecOrderedOrUnorderd(boolean ordered, String tableName,
+                                          String query, String... rows)
       throws Exception {
     RocksDBMetrics beforeMetrics = getRocksDBMetric(tableName);
     LOG.info(tableName + " metric before: " + beforeMetrics);
-    assertQuery(query, rows);
+    if (ordered) {
+      assertQueryRowsOrdered(query, rows);
+    } else {
+      assertQueryRowsUnordered(query, rows);
+    }
     RocksDBMetrics afterMetrics = getRocksDBMetric(tableName);
     LOG.info(tableName + " metric after: " + afterMetrics);
-    return afterMetrics.subtract(afterMetrics);
+    return afterMetrics.subtract(beforeMetrics);
   }
 
   @Test
@@ -964,12 +1490,12 @@ public class TestSelect extends BaseCQLTest {
 
       // Specify only r1 range in SELECT. Verify result.
       String query = "SELECT * FROM test_range WHERE h = 2 AND r1 >= 'r2' AND r1 <= 'r3';";
-      Set<String> rows = new HashSet<>(Arrays.asList("Row[2, r2, 1, 1]",
-                                                     "Row[2, r2, 2, 2]",
-                                                     "Row[2, r2, 3, 3]",
-                                                     "Row[2, r3, 1, 1]",
-                                                     "Row[2, r3, 2, 2]",
-                                                     "Row[2, r3, 3, 3]"));
+      String[] rows = {"Row[2, r2, 1, 1]",
+                       "Row[2, r2, 2, 2]",
+                       "Row[2, r2, 3, 3]",
+                       "Row[2, r3, 1, 1]",
+                       "Row[2, r3, 2, 2]",
+                       "Row[2, r3, 3, 3]"};
       RocksDBMetrics metrics1 = assertPartialRangeSpec("test_range", query, rows);
 
       // Insert some more rows
@@ -1013,18 +1539,18 @@ public class TestSelect extends BaseCQLTest {
       // Specify only r1 and r3 ranges in SELECT. Verify result.
       String query = "SELECT * FROM test_range WHERE " +
                      "h = 2 AND r1 >= 2 AND r1 <= 3 AND r3 >= 4 and r3 <= 5;";
-      Set<String> rows = new HashSet<>(Arrays.asList("Row[2, 2, r1, 4, 4]",
-                                                     "Row[2, 2, r1, 5, 5]",
-                                                     "Row[2, 2, r2, 4, 4]",
-                                                     "Row[2, 2, r2, 5, 5]",
-                                                     "Row[2, 2, r3, 4, 4]",
-                                                     "Row[2, 2, r3, 5, 5]",
-                                                     "Row[2, 3, r1, 4, 4]",
-                                                     "Row[2, 3, r1, 5, 5]",
-                                                     "Row[2, 3, r2, 4, 4]",
-                                                     "Row[2, 3, r2, 5, 5]",
-                                                     "Row[2, 3, r3, 4, 4]",
-                                                     "Row[2, 3, r3, 5, 5]"));
+      String[] rows = {"Row[2, 2, r1, 4, 4]",
+                       "Row[2, 2, r1, 5, 5]",
+                       "Row[2, 2, r2, 4, 4]",
+                       "Row[2, 2, r2, 5, 5]",
+                       "Row[2, 2, r3, 4, 4]",
+                       "Row[2, 2, r3, 5, 5]",
+                       "Row[2, 3, r1, 4, 4]",
+                       "Row[2, 3, r1, 5, 5]",
+                       "Row[2, 3, r2, 4, 4]",
+                       "Row[2, 3, r2, 5, 5]",
+                       "Row[2, 3, r3, 4, 4]",
+                       "Row[2, 3, r3, 5, 5]"};
       RocksDBMetrics metrics1 = assertPartialRangeSpec("test_range", query, rows);
 
       // Insert some more rows
@@ -1201,6 +1727,14 @@ public class TestSelect extends BaseCQLTest {
     assertEquals(result, session.execute(query).one().getDouble(0), 1e-13);
   }
 
+  private void selectAndVerify(String query, Date result)  {
+    assertEquals(result, session.execute(query).one().getTimestamp(0));
+  }
+
+  private void selectAndVerify(String query, LocalDate result)  {
+    assertEquals(result, session.execute(query).one().getDate(0));
+  }
+
   @Test
   public void testIntegerBounds() throws Exception {
     session.execute("CREATE TABLE test_int_bounds(h int primary key, " +
@@ -1239,9 +1773,10 @@ public class TestSelect extends BaseCQLTest {
   public void testCasts() throws Exception {
     // Create test table.
     session.execute("CREATE TABLE test_local (c1 int PRIMARY KEY, c2 float, c3 double, c4 " +
-        "smallint, c5 bigint, c6 text);");
-    session.execute("INSERT INTO test_local (c1, c2, c3, c4, c5, c6) values (1, 2.5, 3.3, 4, 5, " +
-        "'100')");
+        "smallint, c5 bigint, c6 text, c7 date, c8 time, c9 timestamp);");
+    session.execute("INSERT INTO test_local (c1, c2, c3, c4, c5, c6, c7, c8, c9) values " +
+        "(1, 2.5, 3.3, 4, 5, '100', '2018-2-14', '1:2:3.123456789', " +
+        "'2018-2-14 13:24:56.987+01:00')");
     selectAndVerify("SELECT CAST(c1 as integer) FROM test_local", 1);
     selectAndVerify("SELECT CAST(c1 as int) FROM test_local", 1);
     selectAndVerify("SELECT CAST(c1 as smallint) FROM test_local", (short)1);
@@ -1283,6 +1818,25 @@ public class TestSelect extends BaseCQLTest {
     selectAndVerify("SELECT CAST(c6 as double) FROM test_local", 100d);
     selectAndVerify("SELECT CAST(c6 as text) FROM test_local", "100");
 
+    selectAndVerify("SELECT CAST(c7 as timestamp) FROM test_local",
+        new SimpleDateFormat("yyyy-MM-dd Z").parse("2018-02-14 +0000"));
+    selectAndVerify("SELECT CAST(c7 as text) FROM test_local", "2018-02-14");
+
+    selectAndVerify("SELECT CAST(c8 as text) FROM test_local", "01:02:03.123456789");
+
+    selectAndVerify("SELECT CAST(c9 as date) FROM test_local",
+        LocalDate.fromYearMonthDay(2018, 2, 14));
+    selectAndVerify("SELECT CAST(c9 as text) FROM test_local",
+        "2018-02-14T12:24:56.987000+0000");
+
+    // Test aliases and related functions of CAST.
+    selectAndVerify("SELECT TODATE(c9) FROM test_local",
+        LocalDate.fromYearMonthDay(2018, 2, 14));
+    selectAndVerify("SELECT TOTIMESTAMP(c7) FROM test_local",
+        new SimpleDateFormat("yyyy-MM-dd Z").parse("2018-02-14 +0000"));
+    selectAndVerify("SELECT TOUNIXTIMESTAMP(c7) FROM test_local", 1518566400000L);
+    selectAndVerify("SELECT TOUNIXTIMESTAMP(c9) FROM test_local", 1518611096987L);
+
     // Try edge cases.
     session.execute("INSERT INTO test_local (c1, c2, c3, c4, c5, c6) values (2147483647, 2.5, " +
         "3.3, 32767, 9223372036854775807, '2147483647')");
@@ -1304,5 +1858,226 @@ public class TestSelect extends BaseCQLTest {
         "2147483647");
     selectAndVerify("SELECT CAST(c5 as text) FROM test_local WHERE c1 = 2147483647",
         "9223372036854775807");
+
+    // Verify invalid CAST target type.
+    runInvalidQuery("SELECT CAST(c1 as unixtimestamp) FROM test_local");
+  }
+
+  @Test
+  public void testCurrentTimeFunctions() throws Exception {
+    // Create test table and insert with current date/time/timestamp functions.
+    session.execute("create table test_current (k int primary key, d date, t time, ts timestamp);");
+    session.execute("insert into test_current (k, d, t, ts) values " +
+                    "(1, currentdate(), currenttime(), currenttimestamp());");
+
+    // Verify date, time and timestamp to be with range.
+    LocalDate d = session.execute("select d from test_current").one().getDate("d");
+    long date_diff = java.time.temporal.ChronoUnit.DAYS.between(
+        java.time.LocalDate.ofEpochDay(d.getDaysSinceEpoch()),
+        java.time.LocalDateTime.now(java.time.ZoneOffset.UTC).toLocalDate());
+    assertTrue("Current date is " + d, date_diff >= 0 && date_diff <= 1);
+
+    long t = session.execute("select t from test_current").one().getTime("t");
+    long nowTime = java.time.LocalTime.now(java.time.ZoneOffset.UTC).toNanoOfDay();
+    if (nowTime < t) { // Handle day wrap.
+      nowTime += 86400000000000L;
+    }
+    long time_diff_sec = (nowTime - t) / 1000000000;
+    assertTrue("Current time is " + t, time_diff_sec >= 0 && time_diff_sec <= 60);
+
+    Date ts = session.execute("select ts from test_current").one().getTimestamp("ts");
+    long timestamp_diff_sec = (System.currentTimeMillis() - ts.getTime()) / 1000;
+    assertTrue("Current timestamp is " + ts, timestamp_diff_sec >= 0 && timestamp_diff_sec <= 60);
+  }
+
+  @Test
+  public void testDistinct() throws Exception {
+    // Create test table with hash/range and static/non-static columns.
+    session.execute("create table test_distinct (h int, r int, s int static, c int," +
+                    " primary key ((h), r));");
+
+    // Verify that the WHERE clause of a SELECT DISTINCT allows reference to hash/static column
+    // but not range or non-static columns.
+    assertQuery("select distinct h, s from test_distinct where h = 0;", "");
+    assertQuery("select distinct h, s from test_distinct where s > 0;", "");
+    runInvalidQuery("select distinct h, s from test_distinct where r > 0;");
+    runInvalidQuery("select distinct h, s from test_distinct where c < 0;");
+  }
+
+  @Test
+  public void testToJson() throws Exception {
+    // Create test table.
+    session.execute("CREATE TABLE test_tojson (c1 int PRIMARY KEY, c2 float, c3 double, c4 " +
+        "smallint, c5 bigint, c6 text, c7 date, c8 time, c9 timestamp, c10 blob, " +
+        "c11 tinyint, c12 inet, c13 varint, c14 decimal, c15 boolean, c16 uuid);");
+    session.execute("INSERT INTO test_tojson " +
+        "(c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15, c16) values " +
+        "(1, 2.5, 3.25, 4, 5, 'value', '2018-2-14', '1:2:3.123456789', " +
+        "'2018-2-14 13:24:56.987+01:00', 0xDEADBEAF, -128, '1.2.3.4', -123456, " +
+        "-123456.125, true, 87654321-DEAD-BEAF-0000-deadbeaf0000)");
+
+    selectAndVerify("SELECT tojson(c1) FROM test_tojson", "1");
+    selectAndVerify("SELECT toJson(c2) FROM test_tojson", "2.5");
+    selectAndVerify("SELECT Tojson(c3) FROM test_tojson", "3.25");
+    selectAndVerify("SELECT ToJson(c4) FROM test_tojson", "4");
+    selectAndVerify("SELECT TOjson(c5) FROM test_tojson", "5");
+    selectAndVerify("SELECT toJSON(c6) FROM test_tojson", "\"value\"");
+    selectAndVerify("SELECT TOJSON(c7) FROM test_tojson", "\"2018-02-14\"");
+    selectAndVerify("SELECT ToJsOn(c8) FROM test_tojson", "\"01:02:03.123456789\"");
+    selectAndVerify("SELECT tOjSoN(c9) FROM test_tojson", "\"2018-02-14T12:24:56.987000+0000\"");
+    selectAndVerify("SELECT TojsoN(c10) FROM test_tojson", "\"0xdeadbeaf\"");
+    selectAndVerify("SELECT tOJSOn(c11) FROM test_tojson", "-128");
+    selectAndVerify("SELECT tOjson(c12) FROM test_tojson", "\"1.2.3.4\"");
+    selectAndVerify("SELECT toJson(c13) FROM test_tojson", "-123456");
+    selectAndVerify("SELECT tojSon(c14) FROM test_tojson", "-123456.125");
+    selectAndVerify("SELECT tojsOn(c15) FROM test_tojson", "true");
+    selectAndVerify("SELECT tojsoN(c16) FROM test_tojson",
+                    "\"87654321-dead-beaf-0000-deadbeaf0000\"");
+
+    // Test NaN/Infinity.
+    session.execute("INSERT INTO test_tojson (c1, c2, c3) values (2, NaN, nan)");
+    session.execute("INSERT INTO test_tojson (c1, c2, c3) values (3, +NaN, +nan)");
+    session.execute("INSERT INTO test_tojson (c1, c2, c3) values (4, -NaN, -nan)");
+    session.execute("INSERT INTO test_tojson (c1, c2, c3) values (5, Infinity, infinity)");
+    session.execute("INSERT INTO test_tojson (c1, c2, c3) values (6, +Infinity, +infinity)");
+    session.execute("INSERT INTO test_tojson (c1, c2, c3) values (7, -Infinity, -infinity)");
+
+    selectAndVerify("SELECT tojson(c2) FROM test_tojson where c1=2;", "null");
+    selectAndVerify("SELECT tojson(c3) FROM test_tojson where c1=2;", "null");
+    selectAndVerify("SELECT tojson(c2) FROM test_tojson where c1=3;", "null");
+    selectAndVerify("SELECT tojson(c3) FROM test_tojson where c1=3;", "null");
+    selectAndVerify("SELECT tojson(c2) FROM test_tojson where c1=4;", "null");
+    selectAndVerify("SELECT tojson(c3) FROM test_tojson where c1=4;", "null");
+    selectAndVerify("SELECT tojson(c2) FROM test_tojson where c1=5;", "null");
+    selectAndVerify("SELECT tojson(c3) FROM test_tojson where c1=5;", "null");
+    selectAndVerify("SELECT tojson(c2) FROM test_tojson where c1=6;", "null");
+    selectAndVerify("SELECT tojson(c3) FROM test_tojson where c1=6;", "null");
+    selectAndVerify("SELECT tojson(c2) FROM test_tojson where c1=7;", "null");
+    selectAndVerify("SELECT tojson(c3) FROM test_tojson where c1=7;", "null");
+
+    // No keyword 'Inf' (there is 'Infinity').
+    runInvalidQuery("INSERT INTO test_tojson (c1, c2, c3) values (8, Inf, Inf)");
+
+    // === TEST COLLECTIONS. ===
+    session.execute("CREATE TABLE test_coll (h int PRIMARY KEY, s SET<int>, " +
+                    "l list<int>, m map<int, int>)");
+    session.execute("INSERT INTO test_coll (h, s, l, m) values (1, " +
+                    "{11,22}, [33,44], {55:66,77:88})");
+    selectAndVerify("SELECT tojson(h) FROM test_coll;", "1");
+    selectAndVerify("SELECT tojson(s) FROM test_coll;", "[11,22]");
+    selectAndVerify("SELECT tojson(l) FROM test_coll;", "[33,44]");
+    selectAndVerify("SELECT tojson(m) FROM test_coll;", "{\"55\":66,\"77\":88}");
+
+    // === TEST FROZEN. ===
+    // Test SET<FROZEN<SET>.
+    session.execute("CREATE TABLE test_frozen1 (h int PRIMARY KEY, " +
+                    "f FROZEN<set<int>>, sf SET<FROZEN<set<int>>>)");
+    session.execute("INSERT INTO test_frozen1 (h, f, sf) values (1, {33,44}, {{55,66}})");
+    selectAndVerify("SELECT tojson(h) FROM test_frozen1;", "1");
+    selectAndVerify("SELECT tojson(f) FROM test_frozen1", "[33,44]");
+    selectAndVerify("SELECT tojson(sf) FROM test_frozen1", "[[55,66]]");
+
+    // Test MAP<FROZEN<SET>:FROZEN<LIST>>.
+    session.execute("CREATE TABLE test_frozen2 (h int PRIMARY KEY, " +
+        "f map<frozen<set<text>>, frozen<list<int>>>)");
+    session.execute("INSERT INTO test_frozen2 (h, f) values (1, " +
+        "{{'a','b'}:[66,77,88]})");
+    selectAndVerify("SELECT tojson(f) FROM test_frozen2",
+        "{\"[\\\"a\\\",\\\"b\\\"]\":[66,77,88]}");
+
+    // === TEST USER DEFINED TYPE. ===
+    // Test UDT.
+    session.execute("CREATE TYPE udt(v1 int, v2 int)");
+    session.execute("CREATE TABLE test_udt (h int PRIMARY KEY, u udt, su SET<FROZEN<udt>>)");
+    session.execute("INSERT INTO test_udt (h, u, su) values (1, {v1:11,v2:22}, {{v1:33,v2:44}})");
+    selectAndVerify("SELECT tojson(h) FROM test_udt", "1");
+    selectAndVerify("SELECT tojson(u) FROM test_udt", "{\"v1\":11,\"v2\":22}");
+    selectAndVerify("SELECT tojson(su) FROM test_udt", "[{\"v1\":33,\"v2\":44}]");
+
+    // Test FROZEN<UDT>.
+    session.execute("CREATE TABLE test_udt2 (h int PRIMARY KEY, u frozen<udt>)");
+    session.execute("INSERT INTO test_udt2 (h, u) values (1, {v1:33,v2:44})");
+    selectAndVerify("SELECT tojson(u) FROM test_udt2", "{\"v1\":33,\"v2\":44}");
+
+    // Test LIST<FROZEN<UDT>>.
+    session.execute("CREATE TABLE test_udt3 (h int PRIMARY KEY, u list<frozen<udt>>)");
+    session.execute("INSERT INTO test_udt3 (h, u) values (1, [{v1:44,v2:55}, {v1:66,v2:77}])");
+    selectAndVerify("SELECT tojson(u) FROM test_udt3",
+        "[{\"v1\":44,\"v2\":55},{\"v1\":66,\"v2\":77}]");
+
+    // Test MAP<FROZEN<UDT>:FROZEN<UDT>>.
+    session.execute("CREATE TABLE test_udt4 (h int PRIMARY KEY, " +
+        "u map<frozen<udt>, frozen<udt>>)");
+    session.execute("INSERT INTO test_udt4 (h, u) values (1, " +
+        "{{v1:44,v2:55}:{v1:66,v2:77}, {v1:88,v2:99}:{v1:11,v2:22}})");
+    selectAndVerify("SELECT tojson(u) FROM test_udt4",
+        "{\"{\\\"v1\\\":44,\\\"v2\\\":55}\":{\"v1\":66,\"v2\":77}," +
+        "\"{\\\"v1\\\":88,\\\"v2\\\":99}\":{\"v1\":11,\"v2\":22}}");
+
+    // Test MAP<FROZEN<LIST<FROZEN<UDT>>>:FROZEN<SET<FROZEN<UDT>>>>.
+    session.execute("CREATE TABLE test_udt5 (h int PRIMARY KEY, " +
+        "u map<frozen<list<frozen<udt>>>, frozen<set<frozen<udt>>>>)");
+    session.execute("INSERT INTO test_udt5 (h, u) values (1, " +
+        "{[{v1:44,v2:55}, {v1:66,v2:77}]:{{v1:88,v2:99},{v1:11,v2:22}}})");
+    selectAndVerify("SELECT tojson(u) FROM test_udt5",
+        "{\"[{\\\"v1\\\":44,\\\"v2\\\":55},{\\\"v1\\\":66,\\\"v2\\\":77}]\":" +
+        "[{\"v1\":11,\"v2\":22},{\"v1\":88,\"v2\":99}]}");
+
+    // Test MAP<FROZEN<MAP<FROZEN<UDT>:TEXT>>:FROZEN<SET<FROZEN<UDT>>>>.
+    session.execute("CREATE TABLE test_udt6 (h int PRIMARY KEY, " +
+        "u map<frozen<map<frozen<udt>, text>>, frozen<set<frozen<udt>>>>)");
+    session.execute("INSERT INTO test_udt6 (h, u) values (1, " +
+        "{{{v1:11,v2:22}:'text'}:{{v1:55,v2:66},{v1:77,v2:88}}})");
+    selectAndVerify("SELECT tojson(u) FROM test_udt6",
+        "{\"{\\\"{\\\\\\\"v1\\\\\\\":11,\\\\\\\"v2\\\\\\\":22}\\\":\\\"text\\\"}\":" +
+        "[{\"v1\":55,\"v2\":66},{\"v1\":77,\"v2\":88}]}");
+
+    // Test UDT with case-sensitive field names and names with spaces.
+    session.execute("CREATE TYPE udt7(v1 int, \"V2\" int, \"v  3\" int, \"V  4\" int)");
+    session.execute("CREATE TABLE test_udt7 (h int PRIMARY KEY, u udt7)");
+    session.execute("INSERT INTO test_udt7 (h, u) values (1, " +
+        "{v1:11,\"V2\":22,\"v  3\":33,\"V  4\":44})");
+    selectAndVerify("SELECT tojson(h) FROM test_udt7", "1");
+    // Verify that the column names in upper case are double quoted (see the case in Cassandra).
+    selectAndVerify("SELECT tojson(u) FROM test_udt7",
+        "{\"\\\"V  4\\\"\":44,\"\\\"V2\\\"\":22,\"v  3\":33,\"v1\":11}");
+
+    // Test UDT2<int, UDT>.
+    // Feature Not Supported: UDT field types cannot refer to other user-defined types.
+    // https://github.com/YugaByte/yugabyte-db/issues/1630
+    runInvalidQuery("CREATE TYPE udt8(i1 int, u1 udt)");
+    // Uncomment the following block if we support UDT2<UDT1,..> types.
+    //    session.execute("CREATE TABLE test_udt8 (h int PRIMARY KEY, u udt8)");
+    //    session.execute("INSERT INTO test_udt8 (h, u) values (1, {i1:33,u1:{v1:44,v2:55}})");
+    //    selectAndVerify("SELECT tojson(u) FROM test_udt8",
+    //        "{\"i1\":33,\"u1\":{\"v1\":44,\"v2\":55}}");
+
+    // Test TUPLE.
+    // Feature Not Supported
+    // https://github.com/YugaByte/yugabyte-db/issues/936
+    runInvalidQuery("CREATE TABLE test_tuple (h int PRIMARY KEY, t tuple<int>)");
+    // Uncomment the following block if we support TUPLE.
+    //    session.execute("CREATE TABLE test_tuple (h int PRIMARY KEY, t tuple<int, text>)");
+    //    session.execute("INSERT INTO test_tuple (h, t) values (1, (77, 'string'))");
+    //    selectAndVerify("SELECT tojson(u) FROM test_tuple", "[77,\"string\"]");
+
+    // Test SELECT JSON *.
+    // Feature Not Supported: Invalid SQL Statement. Syntax error.
+    runInvalidQuery("SELECT JSON * FROM test_tojson");
+
+    // Invalid test: FROZEN<int>.
+    // Error: Invalid Table Definition. Can only freeze collections or user defined types.
+    runInvalidQuery("CREATE TABLE invalid_frozen (h int PRIMARY KEY, u frozen<int>)");
+
+    // Select from system tables.
+    selectAndVerify("SELECT tojson(replication) from system_schema.keyspaces " +
+        "where keyspace_name='system_schema'",
+        "{\"class\":\"org.apache.cassandra.locator.SimpleStrategy\"," +
+        "\"replication_factor\":\"3\"}");
+
+    selectAndVerify("SELECT toJson(replication) as replication FROM system_schema.keyspaces " +
+        "where keyspace_name='system'",
+        "{\"class\":\"org.apache.cassandra.locator.SimpleStrategy\"," +
+        "\"replication_factor\":\"3\"}");
   }
 }

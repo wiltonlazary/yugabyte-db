@@ -23,6 +23,8 @@
 
 namespace yb {
 
+YB_STRONGLY_TYPED_BOOL(HadReadTime);
+
 // ConsistentReadPoint tracks a consistent read point to read across tablets. Note that this class
 // is not thread-safe except otherwise noted below.
 class ConsistentReadPoint {
@@ -36,10 +38,9 @@ class ConsistentReadPoint {
   void SetCurrentReadTime();
 
   // Set the read point to the specified read time with local limits.
-  void SetReadTime(ReadHybridTime&& read_time, HybridTimeMap&& local_limits);
+  void SetReadTime(const ReadHybridTime& read_time, HybridTimeMap&& local_limits);
 
-  // Get the read hybrid time of this read point.
-  HybridTime GetReadTime() const { return read_time_.read; }
+  const ReadHybridTime& GetReadTime() const { return read_time_; }
 
   // Get the read time of this read point for a tablet.
   ReadHybridTime GetReadTime(const TabletId& tablet) const;
@@ -53,6 +54,9 @@ class ConsistentReadPoint {
   // Restart read.
   void Restart();
 
+  // Defer read hybrid time to global limit.
+  void Defer();
+
   // Update the clock used by this consistent read point with the propagated time.
   void UpdateClock(HybridTime propagated_hybrid_time);
 
@@ -63,10 +67,14 @@ class ConsistentReadPoint {
   void PrepareChildTransactionData(ChildTransactionDataPB* data) const;
 
   // Finish a child transaction and populate the restart read times in the result.
-  void FinishChildTransactionResult(ChildTransactionResultPB* result) const;
+  void FinishChildTransactionResult(
+      HadReadTime had_read_time, ChildTransactionResultPB* result) const;
 
   // Apply restart read times from a child transaction result. This method is thread-safe.
   void ApplyChildTransactionResult(const ChildTransactionResultPB& result);
+
+  // Sets in transaction limit.
+  void SetInTxnLimit(HybridTime value);
 
   ConsistentReadPoint& operator=(ConsistentReadPoint&& other);
 

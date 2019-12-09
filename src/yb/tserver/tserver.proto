@@ -133,6 +133,12 @@ message TabletServerErrorPB {
 
     // This follower hasn't heard from the leader for a specified amount of time.
     STALE_FOLLOWER = 25;
+
+    // The operation is already in progress. Used for remote bootstrap requests for now.
+    ALREADY_IN_PROGRESS = 26;
+
+    // Tablet server has some tablets pending local bootstraps.
+    PENDING_LOCAL_BOOTSTRAPS = 27;
   }
 
   // The error code.
@@ -163,9 +169,6 @@ message WriteRequestPB {
   // A batch of Pgsql operations (Although batching is not yet supported).
   repeated PgsqlWriteRequestPB pgsql_write_batch = 13;
 
-  // Contains information about the cross shard transaction
-  optional TransactionMetadataPB transaction_meta = 11;
-
   // Whether data blocks will be cached when read from the files or discarded after use.
   // Disable this to lower cache churn when doing large scans.
   optional bool cache_blocks = 9 [default = true];
@@ -178,6 +181,15 @@ message WriteRequestPB {
   optional bool include_trace = 6 [ default = false ];
 
   optional ReadHybridTimePB read_time = 12;
+
+  // Use 2 int64 to represent UUID.
+  optional fixed64 client_id1 = 14;
+  optional fixed64 client_id2 = 15;
+  optional int64 request_id = 16;
+  optional int64 min_running_request_id = 17;
+  optional double rejection_score = 18;
+
+  optional fixed64 external_hybrid_time = 19;
 }
 
 message WriteResponsePB {
@@ -216,6 +228,9 @@ message WriteResponsePB {
 
   // Used to report restart whether this operation requires read restart.
   optional ReadHybridTimePB restart_read_time = 11;
+
+  // Used to report used read time when transaction asked for it.
+  optional ReadHybridTimePB used_read_time = 13;
 }
 
 // A list tablets request
@@ -270,17 +285,20 @@ message ReadRequestPB {
   optional ReadHybridTimePB read_time = 9;
 
   optional string proxy_uuid = 11;
+
+  optional bool DEPRECATED_may_have_metadata = 12;
+
+  optional double rejection_score = 13;
 }
 
 message ReadResponsePB {
+  reserved 2;
+
   repeated RedisResponsePB redis_batch = 1;
 
   repeated QLResponsePB ql_batch = 4;
 
   repeated PgsqlResponsePB pgsql_batch = 8;
-
-  // The hybrid_time chosen by the server for this read.
-  optional fixed64 hybrid_time = 2;
 
   optional TabletServerErrorPB error = 3;
 
@@ -290,6 +308,9 @@ message ReadResponsePB {
 
   // Used to report restart whether this operation requires read restart.
   optional ReadHybridTimePB restart_read_time = 7;
+
+  // Used to report used read time when transaction asked for it.
+  optional ReadHybridTimePB used_read_time = 9;
 }
 
 message TransactionStatePB {
@@ -300,6 +321,7 @@ message TransactionStatePB {
   // COMMITTED - list of involved tablets
   // APPLYING - single entry, status tablet of this transaction
   // APPLIED - single entry, tablet that applied this transaction
+  // Not used is other cases.
   repeated bytes tablets = 3;
 
   // Relevant only in APPLYING state.
@@ -335,4 +357,27 @@ message GetMasterAddressesRequestPB {
 message GetMasterAddressesResponsePB {
   optional TabletServerErrorPB error = 1;
   optional string master_addresses = 2;
+}
+
+message PublishRequestPB {
+  required bytes channel = 1;
+  required bytes message = 2;
+}
+
+message PublishResponsePB {
+  required int32 num_clients_forwarded_to = 1;
+}
+
+// Get this tserver's notion of being ready for handling IO requests across all
+// tablets that it owns.
+message IsTabletServerReadyRequestPB {
+}
+
+// When response has no errors, the tserver is deemed ready as per its tablet manager layer
+// when the number of not running tablets is 0. Or the client can choose to
+// timeout before that. Also returns total tablets under this tablet server.
+message IsTabletServerReadyResponsePB {
+  optional TabletServerErrorPB error = 1;
+  optional int32 num_tablets_not_running = 2;
+  optional int32 total_tablets = 3 [default = 0];
 }

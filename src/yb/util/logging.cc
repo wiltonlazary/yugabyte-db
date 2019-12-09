@@ -59,6 +59,7 @@
 
 #include "yb/gutil/callback.h"
 #include "yb/gutil/spinlock.h"
+#include "yb/gutil/ref_counted.h"
 
 #include "yb/util/debug-util.h"
 #include "yb/util/flag_tags.h"
@@ -74,6 +75,10 @@ DEFINE_string(fatal_details_path_prefix, "",
 DEFINE_string(minicluster_daemon_id, "",
               "A human-readable 'daemon id', e.g. 'm-1' or 'ts-2', used in tests.");
 
+DEFINE_string(ref_counted_debug_type_name_regex, "",
+              "Regex for type names for debugging RefCounted / scoped_refptr based classes. "
+              "An empty string disables RefCounted debug logging.");
+
 const char* kProjName = "yb";
 
 bool logging_initialized = false;
@@ -84,6 +89,10 @@ using namespace boost::uuids; // NOLINT(*)
 using base::SpinLockHolder;
 
 namespace yb {
+
+// We cannot initialize this inside a function that could be invoked for the first time in a signal
+// handler.
+const std::regex kStackTraceLineFormatRe(R"#(^\s*@\s+(0x[0-9a-f]+)\s+.*\n?$)#");
 
 // Sink which implements special handling for LOG(FATAL) and CHECK failures, such as disabling
 // core dumps and printing the failure stack trace into a separate file.
@@ -174,7 +183,6 @@ void CustomGlogFailureWriter(const char* data, int size) {
   if (size == 0) {
     return;
   }
-  static const std::regex kStackTraceLineFormatRe(R"#(^\s*@\s+(0x[0-9a-f]+)\s+.*\n?$)#");
 
   std::smatch match;
   string line = string(data, size);
@@ -193,10 +201,36 @@ void CustomGlogFailureWriter(const char* data, int size) {
   }
 }
 
+#ifndef NDEBUG
+void ReportRefCountedDebugEvent(
+    const char* type_name,
+    const void* this_ptr,
+    int32_t current_refcount,
+    int ref_delta) {
+  std::string demangled_type = DemangleName(type_name);
+  LOG(INFO) << demangled_type << "::" << (ref_delta == 1 ? "AddRef" : "Release")
+            << "(this=" << this_ptr << ", ref_count_=" << current_refcount << "):\n"
+            << GetStackTrace(StackTraceLineFormat::DEFAULT, 2);
+}
+#endif
+
+void ApplyFlagsInternal() {
+#ifndef NDEBUG
+  subtle::InitRefCountedDebugging(
+      FLAGS_ref_counted_debug_type_name_regex, ReportRefCountedDebugEvent);
+#endif
+}
+
 } // anonymous namespace
 
 void InitializeGoogleLogging(const char *arg) {
-  google::InstallFailureWriter(CustomGlogFailureWriter);
+  // TODO: re-enable this when we make stack trace symbolization async-safe, which means we have
+  // to get rid of memory allocations there. We also need to make sure that libbacktrace is
+  // async-safe.
+  static constexpr bool kUseCustomFailureWriter = false;
+  if (kUseCustomFailureWriter) {
+    google::InstallFailureWriter(CustomGlogFailureWriter);
+  }
   google::InitGoogleLogging(arg);
 
   google::InstallFailureFunction(DumpStackTraceAndExit);
@@ -259,6 +293,9 @@ void InitGoogleLoggingSafe(const char* arg) {
   // Stderr logging threshold: FLAGS_stderrthreshold.
   // Sink logging: off.
   initial_stderr_severity = FLAGS_stderrthreshold;
+
+  ApplyFlagsInternal();
+
   logging_initialized = true;
 }
 
@@ -275,6 +312,9 @@ void InitGoogleLoggingSafeBasic(const char* arg) {
   // Stderr logging threshold: INFO.
   // Sink logging: off.
   initial_stderr_severity = google::INFO;
+
+  ApplyFlagsInternal();
+
   logging_initialized = true;
 }
 
@@ -447,5 +487,33 @@ void LogFatalHandlerSink::send(
     cerr << output_str << endl;
   }
 }
+
+namespace logging_internal {
+
+bool LogRateThrottler::TooMany() {
+  const auto now = CoarseMonoClock::Now();
+  const auto drop_limit = now - duration_;
+  const auto queue_size = queue_.size();
+  std::lock_guard<std::mutex> lock(mutex_);
+  while (count_ > 0 && queue_[head_] < drop_limit) {
+    ++head_;
+    if (head_ >= queue_size) {
+      head_ = 0;
+    }
+    --count_;
+  }
+  if (count_ == queue_size) {
+    return true;
+  }
+  auto tail = head_ + count_;
+  if (tail >= queue_size) {
+    tail -= queue_size;
+  }
+  queue_[tail] = now;
+  ++count_;
+  return false;
+}
+
+} // namespace logging_internal
 
 } // namespace yb

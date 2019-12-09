@@ -21,9 +21,11 @@ namespace yb {
 namespace rpc {
 
 void RpcCall::Transferred(const Status& status, Connection* conn) {
-  CHECK(state_ == TransferState::PENDING) << "Aborted in invalid state: "
-                                          << yb::rpc::ToString(state_)
-                                          << ", status: " << status.ToString();
+  if (state_ != TransferState::PENDING) {
+    LOG(DFATAL) << "Transferred for " << ToString() << " executed twice, state: "
+                << yb::ToString(state_) << ", status: " << status;
+    return;
+  }
   state_ = status.ok() ? TransferState::FINISHED : TransferState::ABORTED;
   NotifyTransferred(status, conn);
 }

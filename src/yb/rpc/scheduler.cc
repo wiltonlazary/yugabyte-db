@@ -25,6 +25,7 @@
 
 #include <glog/logging.h>
 
+#include "yb/util/errno.h"
 #include "yb/util/status.h"
 
 using namespace std::placeholders;
@@ -42,6 +43,7 @@ class Scheduler::Impl {
 
   ~Impl() {
     Shutdown();
+    DCHECK_EQ(timer_counter_, 0);
     DCHECK(tasks_.empty());
   }
 
@@ -64,7 +66,8 @@ class Scheduler::Impl {
         timer_.cancel(ec);
         LOG_IF(ERROR, ec) << "Failed to cancel timer: " << ec.message();
 
-        auto status = STATUS(ServiceUnavailable, "Scheduler is shutting down", "", ESHUTDOWN);
+        auto status = STATUS(
+            ServiceUnavailable, "Scheduler is shutting down", "" /* msg2 */, Errno(ESHUTDOWN));
         // Abort all scheduled tasks. It is ok to run task earlier than it was scheduled because
         // we pass error status to it.
         for (auto task : tasks_) {
@@ -79,7 +82,7 @@ class Scheduler::Impl {
     strand_.dispatch([this, task] {
       if (closing_.load(std::memory_order_acquire)) {
         io_service_.post([task] {
-          task->Run(STATUS(Aborted, "Scheduler shutdown", "", ESHUTDOWN));
+          task->Run(STATUS(Aborted, "Scheduler shutdown", "" /* msg2 */, Errno(ESHUTDOWN)));
         });
         return;
       }
@@ -96,6 +99,10 @@ class Scheduler::Impl {
     return ++id_;
   }
 
+  IoService& io_service() {
+    return io_service_;
+  }
+
  private:
   void StartTimer() {
     DCHECK(strand_.running_in_this_thread());
@@ -104,11 +111,13 @@ class Scheduler::Impl {
     boost::system::error_code ec;
     timer_.expires_at((*tasks_.begin())->time(), ec);
     LOG_IF(ERROR, ec) << "Reschedule timer failed: " << ec.message();
+    ++timer_counter_;
     timer_.async_wait(strand_.wrap(std::bind(&Impl::HandleTimer, this, _1)));
   }
 
   void HandleTimer(const boost::system::error_code& ec) {
     DCHECK(strand_.running_in_this_thread());
+    --timer_counter_;
 
     if (ec) {
       LOG_IF(ERROR, ec != boost::asio::error::operation_aborted) << "Wait failed: " << ec.message();
@@ -150,6 +159,7 @@ class Scheduler::Impl {
   // Strand that protects tasks_ and timer_ fields.
   boost::asio::io_service::strand strand_;
   boost::asio::steady_timer timer_;
+  int timer_counter_ = 0;
   std::atomic<bool> closing_ = {false};
 };
 
@@ -170,6 +180,10 @@ void Scheduler::DoSchedule(std::shared_ptr<ScheduledTaskBase> task) {
 
 ScheduledTaskId Scheduler::NextId() {
   return impl_->NextId();
+}
+
+IoService& Scheduler::io_service() {
+  return impl_->io_service();
 }
 
 } // namespace rpc

@@ -71,6 +71,7 @@ class VersionEdit;
 class VersionSet;
 class Arena;
 class WriteCallback;
+class FileNumbersProvider;
 struct JobContext;
 struct ExternalSstFileInfo;
 
@@ -170,6 +171,9 @@ class DBImpl : public DB {
       ColumnFamilyHandle* column_family,
       const std::unordered_map<std::string, std::string>& options_map) override;
 
+  // Set whether DB should be flushed on shutdown.
+  void SetDisableFlushOnShutdown(bool disable_flush_on_shutdown) override;
+
   using DB::NumberLevels;
   virtual int NumberLevels(ColumnFamilyHandle* column_family) override;
   using DB::MaxMemCompactionLevel;
@@ -179,6 +183,7 @@ class DBImpl : public DB {
       ColumnFamilyHandle* column_family) override;
   virtual const std::string& GetName() const override;
   virtual Env* GetEnv() const override;
+  Env* GetCheckpointEnv() const override;
   using DB::GetOptions;
   virtual const Options& GetOptions(
       ColumnFamilyHandle* column_family) const override;
@@ -215,9 +220,13 @@ class DBImpl : public DB {
 
   UserFrontierPtr GetFlushedFrontier() override;
 
-  CHECKED_STATUS SetFlushedFrontier(UserFrontierPtr frontier) override;
+  CHECKED_STATUS ModifyFlushedFrontier(
+      UserFrontierPtr frontier,
+      FrontierModificationMode mode) override;
 
-  bool HasSomethingToFlush() override;
+  FlushAbility GetFlushAbility() override;
+
+  UserFrontierPtr GetMutableMemTableFrontier(UpdateUserValueType type) override;
 
   // Obtains the meta data of the specified column family of the DB.
   // STATUS(NotFound, "") will be returned if the current DB does not have
@@ -311,7 +320,6 @@ class DBImpl : public DB {
   InternalIterator* NewInternalIterator(
       Arena* arena, ColumnFamilyHandle* column_family = nullptr);
 
-#ifndef NDEBUG
   // Extra methods (for testing) that are not in the public DB interface
   // Implemented in db_impl_debug.cc
 
@@ -342,6 +350,12 @@ class DBImpl : public DB {
 
   int TEST_NumRunningLargeCompactions();
 
+  int TEST_NumTotalRunningCompactions();
+
+  int TEST_NumRunningFlushes();
+
+  int TEST_NumBackgroundCompactionsScheduled();
+
   void TEST_GetFilesMetaData(ColumnFamilyHandle* column_family,
                              std::vector<std::vector<FileMetaData>>* metadata);
 
@@ -371,8 +385,6 @@ class DBImpl : public DB {
   Cache* TEST_table_cache() { return table_cache_.get(); }
 
   WriteController& TEST_write_controler() { return write_controller_; }
-
-#endif  // NDEBUG
 
   // Return maximum background compaction alowed to be scheduled based on
   // compaction status.
@@ -459,11 +471,15 @@ class DBImpl : public DB {
   // And max seqno of imported database is less that active seqno of destination db.
   CHECKED_STATUS Import(const std::string& source_dir) override;
 
+  bool AreWritesStopped();
+  bool NeedsDelay() override;
+
   // Used in testing to make the old memtable immutable and start writing to a new one.
   void TEST_SwitchMemtable() override;
 
  protected:
   Env* const env_;
+  Env* const checkpoint_env_;
   const std::string dbname_;
   unique_ptr<VersionSet> versions_;
   const DBOptions db_options_;
@@ -516,7 +532,20 @@ class DBImpl : public DB {
 #endif
   struct CompactionState;
 
+  struct ManualCompaction;
+
   struct WriteContext;
+
+  class ThreadPoolTask;
+
+  class CompactionTask;
+  friend class CompactionTask;
+
+  class FlushTask;
+  friend class FlushTask;
+
+  class TaskPriorityUpdater;
+  friend class TaskPriorityUpdater;
 
   Status NewDB();
 
@@ -533,31 +562,11 @@ class DBImpl : public DB {
   // Delete any unneeded files and stale in-memory entries.
   void DeleteObsoleteFiles();
 
-  // Background process needs to call
-  //     auto x = CaptureCurrentFileNumberInPendingOutputs()
-  //     auto file_num = versions_->NewFileNumber();
-  //     <do something>
-  //     ReleaseFileNumberFromPendingOutputs(x)
-  // This will protect any file with number `file_num` or greater from being
-  // deleted while <do something> is running.
-  // -----------
-  // This function will capture current file number and append it to
-  // pending_outputs_. This will prevent any background process to delete any
-  // file created after this point.
-  std::list<uint64_t>::iterator CaptureCurrentFileNumberInPendingOutputs();
-  // This function should be called with the result of
-  // CaptureCurrentFileNumberInPendingOutputs(). It then marks that any file
-  // created between the calls CaptureCurrentFileNumberInPendingOutputs() and
-  // ReleaseFileNumberFromPendingOutputs() can now be deleted (if it's not live
-  // and blocked by any other pending_outputs_ calls)
-  void ReleaseFileNumberFromPendingOutputs(std::list<uint64_t>::iterator v);
-
   // Flush the in-memory write buffer to storage.  Switches to a new
   // log-file/memtable and writes a new descriptor iff successful.
-  Status FlushMemTableToOutputFile(ColumnFamilyData* cfd,
-                                   const MutableCFOptions& mutable_cf_options,
-                                   bool* madeProgress, JobContext* job_context,
-                                   LogBuffer* log_buffer);
+  Result<FileNumbersHolder> FlushMemTableToOutputFile(
+      ColumnFamilyData* cfd, const MutableCFOptions& mutable_cf_options,
+      bool* made_progress, JobContext* job_context, LogBuffer* log_buffer);
 
   // REQUIRES: log_numbers are sorted in ascending order
   Status RecoverLogFiles(const std::vector<uint64_t>& log_numbers,
@@ -604,22 +613,30 @@ class DBImpl : public DB {
   static void BGWorkCompaction(void* arg);
   static void BGWorkFlush(void* db);
   static void UnscheduleCallback(void* arg);
-  void BackgroundCallCompaction(void* arg);
-  void BackgroundCallFlush();
-  Status BackgroundCompaction(bool* madeProgress, JobContext* job_context,
-                              LogBuffer* log_buffer, void* m = 0);
-  Status BackgroundFlush(bool* madeProgress, JobContext* job_context,
-                         LogBuffer* log_buffer);
+  void WaitAfterBackgroundError(const Status& s, const char* job_name, LogBuffer* log_buffer);
+  void BackgroundCallCompaction(
+      ManualCompaction* manual_compaction, std::unique_ptr<Compaction> compaction = nullptr,
+      CompactionTask* compaction_task = nullptr);
+  void BackgroundCallFlush(ColumnFamilyData* cfd);
+  Result<FileNumbersHolder> BackgroundCompaction(
+      bool* made_progress, JobContext* job_context, LogBuffer* log_buffer,
+      ManualCompaction* manual_compaction = nullptr,
+      std::unique_ptr<Compaction> compaction = nullptr);
+  Result<FileNumbersHolder> BackgroundFlush(
+      bool* made_progress, JobContext* job_context, LogBuffer* log_buffer, ColumnFamilyData* cfd);
 
-  // Yugabyte: This updates the stats object to show
-  // total SST file size ticker.
-  // This is different from HandleTotalSSTFileSizes since the later
-  // looks into the version set and not necessarily computes
-  // all the live file sizes.
+  uint64_t GetCurrentVersionSstFilesSize() override;
 
-  uint64_t GetTotalSSTFileSize() override;
+  uint64_t GetCurrentVersionSstFilesUncompressedSize() override;
 
-  void SetTotalSSTFileSizeTicker();
+  uint64_t GetCurrentVersionDataSstFilesSize() override;
+
+  uint64_t GetCurrentVersionNumSSTFiles() override;
+
+  int GetCfdImmNumNotFlushed() override;
+
+  // Updates stats_ object with SST files size metrics.
+  void SetSSTFileTickers();
 
   void PrintStatistics();
 
@@ -638,11 +655,14 @@ class DBImpl : public DB {
 
   // helper functions for adding and removing from flush & compaction queues
   bool AddToCompactionQueue(ColumnFamilyData* cfd);
-  Compaction* PopFirstFromSmallCompactionQueue();
-  Compaction* PopFirstFromLargeCompactionQueue();
+  std::unique_ptr<Compaction> PopFirstFromSmallCompactionQueue();
+  std::unique_ptr<Compaction> PopFirstFromLargeCompactionQueue();
   bool IsEmptyCompactionQueue();
   void AddToFlushQueue(ColumnFamilyData* cfd);
   ColumnFamilyData* PopFirstFromFlushQueue();
+
+  // Compaction is marked as large based on options, so cannot be static or free function.
+  bool IsLargeCompaction(const Compaction& compaction);
 
   // helper function to call after some of the logs_ were synced
   void MarkLogsSynced(uint64_t up_to, bool synced_dir, const Status& status);
@@ -650,6 +670,20 @@ class DBImpl : public DB {
   const Snapshot* GetSnapshotImpl(bool is_write_conflict_boundary);
 
   CHECKED_STATUS ApplyVersionEdit(VersionEdit* edit);
+
+  void SubmitCompactionOrFlushTask(std::unique_ptr<ThreadPoolTask> task);
+
+  // Returns true if we have some background work.
+  // I.e. scheduled but not complete compaction or flush.
+  // prefix is used for logging.
+  bool CheckBackgroundWorkAndLog(const char* prefix) const;
+
+  struct TaskPriorityChange {
+    size_t task_serial_no;
+    int new_priority;
+  };
+
+  const std::string& LogPrefix() const;
 
   // table_cache_ provides its own synchronization
   std::shared_ptr<Cache> table_cache_;
@@ -665,15 +699,10 @@ class DBImpl : public DB {
   InstrumentedMutex mutex_;
 
   std::atomic<bool> shutting_down_;
-  // This condition variable is signaled on these conditions:
-  // * whenever bg_compaction_scheduled_ goes down to 0
-  // * if AnyManualCompaction, whenever a compaction finishes, even if it hasn't
-  // made any progress
-  // * whenever a compaction made any progress
-  // * whenever bg_flush_scheduled_ value decreases (i.e. whenever a flush is
-  // done, even if it didn't make any progress)
-  // * whenever there is an error in background flush or compaction
+
+  // This condition variable is signaled when state of having background work is changed.
   InstrumentedCondVar bg_cv_;
+
   uint64_t logfile_number_;
   std::deque<uint64_t>
       log_recycle_files;  // a list of log files that we can recycle
@@ -792,16 +821,24 @@ class DBImpl : public DB {
 
   SnapshotList snapshots_;
 
-  // For each background job, pending_outputs_ keeps the current file number at
-  // the time that background job started.
-  // FindObsoleteFiles()/PurgeObsoleteFiles() never deletes any file that has
-  // number bigger than any of the file number in pending_outputs_. Since file
-  // numbers grow monotonically, this also means that pending_outputs_ is always
-  // sorted. After a background job is done executing, its file number is
+  // For each background job, pending_outputs_ keeps the file number being written by that job.
+  // FindObsoleteFiles()/PurgeObsoleteFiles() never deletes any file that is present in
+  // pending_outputs_. After a background job is done executing, its file number is
   // deleted from pending_outputs_, which allows PurgeObsoleteFiles() to clean
   // it up.
-  // State is protected with db mutex.
-  std::list<uint64_t> pending_outputs_;
+  //
+  // Background job needs to call
+  //   {
+  //     auto file_num_holder = pending_outputs_->NewFileNumber();
+  //     auto file_num = *file_num_holder;
+  //     <do something>
+  //   }
+  // This will protect file with number `file_num` from being deleted while <do something> is
+  // running. NewFileNumber() will allocate new file number and append it to pending_outputs_.
+  // This will prevent any background process to delete this file. File number will be
+  // automatically removed from pending_outputs_ when file_num_holder is released on exit outside
+  // of the scope.
+  std::unique_ptr<FileNumbersProvider> pending_outputs_;
 
   // flush_queue_ and compaction_queue_ hold column families that we need to
   // flush and compact, respectively.
@@ -826,13 +863,18 @@ class DBImpl : public DB {
   std::deque<ColumnFamilyData*> flush_queue_;
   // invariant(column family present in compaction_queue_ <==>
   // ColumnFamilyData::pending_compaction_ == true)
-  std::deque<Compaction*> small_compaction_queue_;
-  std::deque<Compaction*> large_compaction_queue_;
+  std::deque<std::unique_ptr<Compaction>> small_compaction_queue_;
+  std::deque<std::unique_ptr<Compaction>> large_compaction_queue_;
   int unscheduled_flushes_;
   int unscheduled_compactions_;
 
   // count how many background compactions are running or have been scheduled
+  // This variable is left untouched when priority thread pool is used.
   int bg_compaction_scheduled_;
+
+  // Those tasks are managed by thread pool.
+  // And we remove them from this set, when they are processed/aborted by thread pool.
+  std::unordered_set<CompactionTask*> compaction_tasks_;
 
   // stores the total number of compactions that are currently running
   int num_total_running_compactions_;
@@ -863,7 +905,7 @@ class DBImpl : public DB {
     InternalKey* manual_end;      // how far we are compacting
     InternalKey tmp_storage;      // Used to keep track of compaction progress
     InternalKey tmp_storage1;     // Used to keep track of compaction progress
-    Compaction* compaction;
+    std::unique_ptr<Compaction> compaction;
   };
   std::deque<ManualCompaction*> manual_compaction_dequeue_;
 
@@ -925,6 +967,12 @@ class DBImpl : public DB {
 
   // Indicate DB was opened successfully
   bool opened_successfully_;
+
+  // Returns flush tick of the last flush of this DB.
+  int64_t last_flush_at_tick_ = 0;
+
+  // Whether DB should be flushed on shutdown.
+  bool disable_flush_on_shutdown_ = false;
 
   // No copying allowed
   DBImpl(const DBImpl&);

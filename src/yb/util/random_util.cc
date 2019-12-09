@@ -43,6 +43,13 @@
 
 namespace yb {
 
+namespace {
+
+const std::string kHumanReadableCharacters =
+    "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+}
+
 void RandomString(void* dest, size_t n, Random* rng) {
   size_t i = 0;
   uint32_t random = rng->Next();
@@ -62,6 +69,12 @@ uint32_t GetRandomSeed32() {
   return device();
 }
 
+std::vector<uint8_t> RandomBytes(size_t len, std::mt19937_64* rng) {
+  std::vector<uint8_t> data(len);
+  std::generate(data.begin(), data.end(), [=] { return RandomUniformInt(0, UCHAR_MAX, rng); });
+  return data;
+}
+
 std::string RandomHumanReadableString(int len, Random* rnd) {
   // TODO: https://yugabyte.atlassian.net/browse/ENG-1508: Avoid code duplication in yb::Random and
   // rocksdb::Random. Currently this does not allow to reuse the same function in both code bases.
@@ -73,12 +86,16 @@ std::string RandomHumanReadableString(int len, Random* rnd) {
   return ret;
 }
 
+std::string RandomHumanReadableString(size_t len, std::mt19937_64* rng) {
+  std::string ret(len, 0);
+  for (size_t i = 0; i != len; ++i) {
+    ret[i] = RandomElement(kHumanReadableCharacters, rng);
+  }
+  return ret;
+}
+
 namespace {
-#if __clang__ and __clang_major__ < 8
-boost::thread_specific_ptr<std::mt19937_64> thread_local_random_ptr;
-#else
 thread_local std::unique_ptr<std::mt19937_64> thread_local_random_ptr;
-#endif
 }
 
 std::mt19937_64& ThreadLocalRandom() {
@@ -89,6 +106,10 @@ std::mt19937_64& ThreadLocalRandom() {
   thread_local_random_ptr.reset(result = new std::mt19937_64);
   Seed(result);
   return *result;
+}
+
+bool RandomUniformBool(std::mt19937_64* rng) {
+  return RandomUniformInt(0, 1, rng) != 0;
 }
 
 } // namespace yb

@@ -66,11 +66,14 @@
 #include "yb/util/metrics.h"
 #include "yb/util/monotime.h"
 #include "yb/util/net/sockaddr.h"
+#include "yb/util/net/net_util.h"
+#include "yb/util/user.h"
 #include "yb/util/pb_util.h"
 #include "yb/util/rolling_log.h"
 #include "yb/util/spinlock_profiling.h"
 #include "yb/util/thread.h"
 #include "yb/util/version_info.h"
+#include "yb/gutil/sysinfo.h"
 
 DEFINE_int32(num_reactor_threads, -1,
              "Number of libev reactor threads to start. If -1, the value is automatically set.");
@@ -89,13 +92,17 @@ TAG_FLAG(generic_svc_queue_length, advanced);
 DEFINE_string(yb_test_name, "",
               "Specifies test name this daemon is running as part of.");
 
+DEFINE_bool(TEST_check_broadcast_address, true, "Break connectivity in test mini cluster to "
+            "check broadcast address.");
+
 using namespace std::literals;
+using namespace std::placeholders;
+
 using std::shared_ptr;
 using std::string;
 using std::stringstream;
 using std::vector;
 using strings::Substitute;
-using namespace std::placeholders;
 
 namespace yb {
 namespace server {
@@ -107,16 +114,27 @@ namespace {
 // Disambiguates between servers when in a minicluster.
 AtomicInt<int32_t> mem_tracker_id_counter(-1);
 
+std::string kServerMemTrackerName = "server";
+
+std::vector<MemTrackerPtr> common_mem_trackers;
+
 } // anonymous namespace
 
 std::shared_ptr<MemTracker> CreateMemTrackerForServer() {
   int32_t id = mem_tracker_id_counter.Increment();
-  string id_str = "server";
+  std::string id_str = kServerMemTrackerName;
   if (id != 0) {
     StrAppend(&id_str, " ", id);
   }
   return MemTracker::CreateTracker(id_str);
 }
+
+#if defined(TCMALLOC_ENABLED)
+void RegisterTCMallocTracker(const char* name, const char* prop) {
+  common_mem_trackers.push_back(MemTracker::CreateTracker(
+      -1, "TCMalloc "s + name, std::bind(&MemTracker::GetTCMallocProperty, prop)));
+}
+#endif
 
 RpcServerBase::RpcServerBase(string name, const ServerBaseOptions& options,
                              const string& metric_namespace,
@@ -130,6 +148,26 @@ RpcServerBase::RpcServerBase(string name, const ServerBaseOptions& options,
       options_(options),
       initialized_(false),
       stop_metrics_logging_latch_(1) {
+  mem_tracker_->SetMetricEntity(metric_entity_);
+
+#if defined(TCMALLOC_ENABLED)
+  // When mem tracker for first server is created we register mem trackers that report tc malloc
+  // status.
+  if (mem_tracker_->id() == kServerMemTrackerName) {
+    RegisterTCMallocTracker("Thread Cache", "tcmalloc.thread_cache_free_bytes");
+    RegisterTCMallocTracker("Central Cache", "tcmalloc.central_cache_free_bytes");
+    RegisterTCMallocTracker("Transfer Cache", "tcmalloc.transfer_cache_free_bytes");
+    RegisterTCMallocTracker("PageHeap Free", "tcmalloc.pageheap_free_bytes");
+
+    auto root = MemTracker::GetRootTracker();
+    root->SetPollChildrenConsumptionFunctors([]() {
+          for (auto& tracker : common_mem_trackers) {
+            tracker->UpdateConsumption();
+          }
+        });
+  }
+#endif
+
   if (FLAGS_use_hybrid_clock) {
     clock_ = new HybridClock();
   } else {
@@ -144,6 +182,8 @@ void RpcServerBase::SetConnectionContextFactory(
 
 RpcServerBase::~RpcServerBase() {
   Shutdown();
+  rpc_server_.reset();
+  messenger_.reset();
   if (mem_tracker_->parent()) {
     mem_tracker_->UnregisterFromParent();
   }
@@ -155,6 +195,29 @@ Endpoint RpcServerBase::first_rpc_address() const {
   return addrs[0];
 }
 
+const std::string RpcServerBase::get_hostname() const {
+  auto hostname = GetHostname();
+  if (hostname.ok()) {
+    YB_LOG_FIRST_N(INFO, 1) << "Running on host: " << *hostname;
+    return *hostname;
+  } else {
+    YB_LOG_FIRST_N(WARNING, 1) << "Failed to get current host name: " << hostname.status();
+    return "unknown_hostname";
+  }
+}
+
+const std::string RpcServerBase::get_current_user() const {
+  string user_name;
+  auto s = GetLoggedInUser(&user_name);
+  if (s.ok()) {
+    YB_LOG_FIRST_N(INFO, 1) << "Logged in user: " << user_name;
+    return user_name;
+  } else {
+    YB_LOG_FIRST_N(WARNING, 1) << "Failed to get current user";
+    return "unknown_user";
+  }
+}
+
 const NodeInstancePB& RpcServerBase::instance_pb() const {
   return *DCHECK_NOTNULL(instance_pb_.get());
 }
@@ -163,7 +226,7 @@ Status RpcServerBase::SetupMessengerBuilder(rpc::MessengerBuilder* builder) {
   if (FLAGS_num_reactor_threads == -1) {
     // Auto set the number of reactors based on the number of cores.
     FLAGS_num_reactor_threads =
-        std::min(16, static_cast<int>(std::thread::hardware_concurrency()));
+        std::min(16, static_cast<int>(base::NumCPUs()));
     LOG(INFO) << "Auto setting FLAGS_num_reactor_threads to " << FLAGS_num_reactor_threads;
   }
 
@@ -195,9 +258,9 @@ Status RpcServerBase::Init() {
   builder.UseDefaultConnectionContextFactory(mem_tracker());
   RETURN_NOT_OK(SetupMessengerBuilder(&builder));
   messenger_ = VERIFY_RESULT(builder.Build());
-  proxy_cache_.reset(new rpc::ProxyCache(messenger_));
+  proxy_cache_ = std::make_unique<rpc::ProxyCache>(messenger_.get());
 
-  RETURN_NOT_OK(rpc_server_->Init(messenger_));
+  RETURN_NOT_OK(rpc_server_->Init(messenger_.get()));
   RETURN_NOT_OK(rpc_server_->Bind());
   clock_->RegisterMetrics(metric_entity_);
 
@@ -207,7 +270,7 @@ Status RpcServerBase::Init() {
   return Status::OK();
 }
 
-std::string RpcServerBase::ToString() const {
+string RpcServerBase::ToString() const {
   return strings::Substitute("$0 : rpc=$1", name_, yb::ToString(first_rpc_address()));
 }
 
@@ -249,7 +312,7 @@ Status RpcServerBase::DumpServerInfo(const string& path,
 
 Status RpcServerBase::RegisterService(size_t queue_limit,
                                       rpc::ServiceIfPtr rpc_impl,
-                                      ServicePriority priority) {
+                                      rpc::ServicePriority priority) {
   return rpc_server_->RegisterService(queue_limit, std::move(rpc_impl), priority);
 }
 
@@ -331,14 +394,16 @@ void RpcServerBase::Shutdown() {
     stop_metrics_logging_latch_.CountDown();
     metrics_logging_thread_->Join();
   }
-  rpc_server_->Shutdown();
+  if (rpc_server_) {
+    rpc_server_->Shutdown();
+  }
   if (messenger_) {
     messenger_->Shutdown();
   }
 }
 
 RpcAndWebServerBase::RpcAndWebServerBase(
-    std::string name, const ServerBaseOptions& options,
+    string name, const ServerBaseOptions& options,
     const std::string& metric_namespace,
     MemTrackerPtr mem_tracker)
     : RpcServerBase(name, options, metric_namespace, std::move(mem_tracker)),
@@ -376,11 +441,11 @@ void RpcAndWebServerBase::GenerateInstanceID() {
 
 Status RpcAndWebServerBase::Init() {
   Status s = fs_manager_->Open();
-  if (s.IsNotFound()) {
+  if (s.IsNotFound() || (!s.ok() && fs_manager_->HasAnyLockFiles())) {
     LOG(INFO) << "Could not load existing FS layout: " << s.ToString();
     LOG(INFO) << "Creating new FS layout";
     is_first_run_ = true;
-    RETURN_NOT_OK_PREPEND(fs_manager_->CreateInitialFileSystemLayout(),
+    RETURN_NOT_OK_PREPEND(fs_manager_->CreateInitialFileSystemLayout(true),
                           "Could not create new FS layout");
     s = fs_manager_->Open();
   }
@@ -415,12 +480,11 @@ Status RpcAndWebServerBase::GetRegistration(ServerRegistrationPB* reg, RpcOnly r
     RETURN_NOT_OK_PREPEND(AddHostPortPBs(addrs, reg->mutable_private_rpc_addresses()),
                           "Failed to add RPC endpoints to registration");
   } else {
-    RETURN_NOT_OK_PREPEND(HostPortsToPBs(addrs, reg->mutable_private_rpc_addresses()),
-                          "Failed to add RPC addresses to registration");
+    HostPortsToPBs(addrs, reg->mutable_private_rpc_addresses());
     LOG(INFO) << "Using private ip address " << reg->private_rpc_addresses(0).host();
   }
 
-  RETURN_NOT_OK(HostPortsToPBs(options_.broadcast_addresses, reg->mutable_broadcast_addresses()));
+  HostPortsToPBs(options_.broadcast_addresses, reg->mutable_broadcast_addresses());
 
   if (!rpc_only) {
     std::vector<Endpoint> web_addrs;
@@ -438,8 +502,18 @@ Status RpcAndWebServerBase::GetRegistration(ServerRegistrationPB* reg, RpcOnly r
   return Status::OK();
 }
 
-std::string RpcAndWebServerBase::FooterHtml() const {
-  return Substitute("<pre>$0\nserver uuid $1</pre>",
+string RpcAndWebServerBase::GetEasterEggMessage() const {
+  return "Congratulations on installing YugaByte DB. "
+         "We'd like to welcome you to the community with a free t-shirt and pack of stickers! "
+         "Please claim your reward here: <a href='https://www.yugabyte.com/community-rewards/'>"
+         "https://www.yugabyte.com/community-rewards/</a>";
+
+}
+
+string RpcAndWebServerBase::FooterHtml() const {
+  return Substitute("<pre class='message'><i class=\"fa-lg fa fa-gift\" aria-hidden=\"true\"></i>"
+                    " $0</pre><pre>$1\nserver uuid $2</pre>",
+                    GetEasterEggMessage(),
                     VersionInfo::GetShortVersionString(),
                     instance_pb_->permanent_uuid());
 }
@@ -458,17 +532,7 @@ void RpcAndWebServerBase::DisplayIconTile(std::stringstream* output, const strin
           << "  </div> <!-- col-sm-4 col-md-4 -->\n";
 }
 
-void RpcAndWebServerBase::DisplayRpcIcons(std::stringstream* output) {
-  // RPCs in Progress.
-  DisplayIconTile(output, "fa-tasks", "Server RPCs", "/rpcz");
-}
-
-Status RpcAndWebServerBase::HandleDebugPage(const Webserver::WebRequest& req,
-                                            stringstream* output) {
-  *output << "<h1>Debug Utilities</h1>\n";
-
-  *output << "<div class='row debug-tiles'>\n";
-  *output << "<h2> General Info </h2>";
+void RpcAndWebServerBase::DisplayGeneralInfoIcons(std::stringstream* output) {
   // Logs.
   DisplayIconTile(output, "fa-files-o", "Logs", "/logs");
   // GFlags.
@@ -481,6 +545,21 @@ Status RpcAndWebServerBase::HandleDebugPage(const Webserver::WebRequest& req,
   DisplayIconTile(output, "fa-line-chart", "Metrics", "/metrics");
   // Threads.
   DisplayIconTile(output, "fa-list-ul", "Threads", "/threadz");
+}
+
+
+void RpcAndWebServerBase::DisplayRpcIcons(std::stringstream* output) {
+  // RPCs in Progress.
+  DisplayIconTile(output, "fa-tasks", "Server RPCs", "/rpcz");
+}
+
+Status RpcAndWebServerBase::HandleDebugPage(const Webserver::WebRequest& req,
+                                            stringstream* output) {
+  *output << "<h1>Debug Utilities</h1>\n";
+
+  *output << "<div class='row debug-tiles'>\n";
+  *output << "<h2> General Info </h2>";
+  DisplayGeneralInfoIcons(output);
   *output << "</div> <!-- row -->\n";
   *output << "<h2> RPCs In Progress </h2>";
   *output << "<div class='row debug-tiles'>\n";
@@ -493,7 +572,7 @@ Status RpcAndWebServerBase::Start() {
   GenerateInstanceID();
 
   AddDefaultPathHandlers(web_server_.get());
-  AddRpczPathHandlers(messenger_, web_server_.get());
+  AddRpczPathHandlers(messenger_.get(), web_server_.get());
   RegisterMetricsJsonHandler(web_server_.get(), metric_registry_.get());
   TracingPathHandlers::RegisterHandlers(web_server_.get());
   web_server_->RegisterPathHandler("/utilz", "Utilities",
@@ -513,23 +592,43 @@ void RpcAndWebServerBase::Shutdown() {
 }
 
 std::string TEST_RpcAddress(int index, Private priv) {
-  return Format("127.0.0.$0", index * 2 + (priv ? 0 : 1));
+  return Format("127.0.0.$0$1", index * 2 + (priv ? 0 : 1), priv ? "" : ".ip.yugabyte");
 }
 
-std::string TEST_RpcBindEndpoint(int index, uint16_t port) {
+string TEST_RpcBindEndpoint(int index, uint16_t port) {
   return Format("$0:$1", TEST_RpcAddress(index, Private::kTrue), port);
 }
 
-void TEST_BreakConnectivity(rpc::Messenger* messenger, int index) {
-  const int kMaxServers = 10;
+constexpr int kMaxServers = 20;
+
+void TEST_SetupConnectivity(rpc::Messenger* messenger, int index) {
+  if (!FLAGS_TEST_check_broadcast_address) {
+    return;
+  }
+
+  CHECK_GE(index, 1);
+  CHECK_LE(index, kMaxServers);
+
+  messenger->TEST_SetOutboundIpBase(
+      CHECK_RESULT(HostToAddress(TEST_RpcAddress(index, Private::kTrue))));
   for (int i = 1; i <= kMaxServers; ++i) {
     // We group servers by 2. When servers belongs to the same group, they should use
     // private ip for communication, otherwise public ip should be used.
     bool same_group = (i - 1) / 2 == (index - 1) / 2;
-    auto broken_address = boost::asio::ip::address::from_string(
-        TEST_RpcAddress(i, Private(!same_group)));
+    auto broken_address = CHECK_RESULT(HostToAddress(TEST_RpcAddress(i, Private(!same_group))));
     LOG(INFO) << "Break " << index << " => " << broken_address;
     messenger->BreakConnectivityWith(broken_address);
+    auto working_address = CHECK_RESULT(HostToAddress(TEST_RpcAddress(i, Private(same_group))));
+    messenger->RestoreConnectivityWith(working_address);
+  }
+}
+
+void TEST_Isolate(rpc::Messenger* messenger) {
+  for (int i = 1; i <= kMaxServers; ++i) {
+    messenger->BreakConnectivityWith(
+        CHECK_RESULT(HostToAddress(TEST_RpcAddress(i, Private::kFalse))));
+    messenger->BreakConnectivityWith(
+        CHECK_RESULT(HostToAddress(TEST_RpcAddress(i, Private::kTrue))));
   }
 }
 

@@ -40,12 +40,17 @@
 #include "yb/gutil/stl_util.h"
 #include "yb/gutil/strings/fastmem.h"
 #include "yb/gutil/strings/substitute.h"
+
+#include "yb/util/errno.h"
 #include "yb/util/faststring.h"
 #include "yb/util/logging.h"
 #include "yb/util/net/net_util.h"
 #include "yb/util/net/sockaddr.h"
 #include "yb/util/safe_math.h"
 #include "yb/util/slice.h"
+#include "yb/util/enums.h"
+
+#include "yb/yql/cql/ql/util/errcodes.h"
 
 using google::protobuf::RepeatedPtrField;
 using std::vector;
@@ -61,72 +66,76 @@ DEFINE_string(use_private_ip, "never",
 
 namespace yb {
 
+namespace {
+
+template <class Index, class Value>
+void SetAt(
+    Index index, const Value& value, const Value& default_value, std::vector<Value>* vector) {
+  size_t int_index = static_cast<size_t>(index);
+  size_t new_size = vector->size();
+  while (new_size <= int_index) {
+    new_size = std::max<size_t>(1, new_size * 2);
+  }
+  vector->resize(new_size, default_value);
+  (*vector)[int_index] = value;
+}
+
+std::vector<AppStatusPB::ErrorCode> CreateStatusToErrorCode() {
+  std::vector<AppStatusPB::ErrorCode> result;
+  const auto default_value = AppStatusPB::UNKNOWN_ERROR;
+#define YB_SET_STATUS_TO_ERROR_CODE(name, pb_name, value, message) \
+    SetAt(Status::BOOST_PP_CAT(k, name), AppStatusPB::pb_name, default_value, &result); \
+    static_assert( \
+        to_underlying(AppStatusPB::pb_name) == to_underlying(Status::BOOST_PP_CAT(k, name)), \
+        "The numeric value of AppStatusPB::" BOOST_PP_STRINGIZE(pb_name) " defined in" \
+            " wire_protocol.proto does not match the value of Status::k" BOOST_PP_STRINGIZE(name) \
+            " defined in status.h.");
+  BOOST_PP_SEQ_FOR_EACH(YB_STATUS_FORWARD_MACRO, YB_SET_STATUS_TO_ERROR_CODE, YB_STATUS_CODES);
+#undef YB_SET_STATUS_TO_ERROR_CODe
+  return result;
+}
+
+const std::vector<AppStatusPB::ErrorCode> kStatusToErrorCode = CreateStatusToErrorCode();
+
+std::vector<Status::Code> CreateErrorCodeToStatus() {
+  size_t max_index = 0;
+  for (const auto error_code : kStatusToErrorCode) {
+    if (error_code == AppStatusPB::UNKNOWN_ERROR) {
+      continue;
+    }
+    max_index = std::max(max_index, static_cast<size_t>(error_code));
+  }
+
+  std::vector<Status::Code> result(max_index + 1);
+  for (size_t int_code = 0; int_code != kStatusToErrorCode.size(); ++int_code) {
+    if (kStatusToErrorCode[int_code] == AppStatusPB::UNKNOWN_ERROR) {
+      continue;
+    }
+    result[static_cast<size_t>(kStatusToErrorCode[int_code])] = static_cast<Status::Code>(int_code);
+  }
+
+  return result;
+}
+
+const std::vector<Status::Code> kErrorCodeToStatus = CreateErrorCodeToStatus();
+
+} // namespace
+
 void StatusToPB(const Status& status, AppStatusPB* pb) {
   pb->Clear();
-  bool is_unknown = false;
+
   if (status.ok()) {
     pb->set_code(AppStatusPB::OK);
     // OK statuses don't have any message or posix code.
     return;
-  } else if (status.IsNotFound()) {
-    pb->set_code(AppStatusPB::NOT_FOUND);
-  } else if (status.IsCorruption()) {
-    pb->set_code(AppStatusPB::CORRUPTION);
-  } else if (status.IsNotSupported()) {
-    pb->set_code(AppStatusPB::NOT_SUPPORTED);
-  } else if (status.IsInvalidArgument()) {
-    pb->set_code(AppStatusPB::INVALID_ARGUMENT);
-  } else if (status.IsIOError()) {
-    pb->set_code(AppStatusPB::IO_ERROR);
-  } else if (status.IsAlreadyPresent()) {
-    pb->set_code(AppStatusPB::ALREADY_PRESENT);
-  } else if (status.IsRuntimeError()) {
-    pb->set_code(AppStatusPB::RUNTIME_ERROR);
-  } else if (status.IsNetworkError()) {
-    pb->set_code(AppStatusPB::NETWORK_ERROR);
-  } else if (status.IsIllegalState()) {
-    pb->set_code(AppStatusPB::ILLEGAL_STATE);
-  } else if (status.IsNotAuthorized()) {
-    pb->set_code(AppStatusPB::NOT_AUTHORIZED);
-  } else if (status.IsAborted()) {
-    pb->set_code(AppStatusPB::ABORTED);
-  } else if (status.IsRemoteError()) {
-    pb->set_code(AppStatusPB::REMOTE_ERROR);
-  } else if (status.IsServiceUnavailable()) {
-    pb->set_code(AppStatusPB::SERVICE_UNAVAILABLE);
-  } else if (status.IsTimedOut()) {
-    pb->set_code(AppStatusPB::TIMED_OUT);
-  } else if (status.IsUninitialized()) {
-    pb->set_code(AppStatusPB::UNINITIALIZED);
-  } else if (status.IsConfigurationError()) {
-    pb->set_code(AppStatusPB::CONFIGURATION_ERROR);
-  } else if (status.IsIncomplete()) {
-    pb->set_code(AppStatusPB::INCOMPLETE);
-  } else if (status.IsEndOfFile()) {
-    pb->set_code(AppStatusPB::END_OF_FILE);
-  } else if (status.IsInvalidCommand()) {
-    pb->set_code(AppStatusPB::INVALID_COMMAND);
-  } else if (status.IsQLError()) {
-    pb->set_code(AppStatusPB::SQL_ERROR);
-  } else if (status.IsInternalError()) {
-    pb->set_code(AppStatusPB::INTERNAL_ERROR);
-  } else if (status.IsExpired()) {
-    pb->set_code(AppStatusPB::EXPIRED);
-  } else if (status.IsLeaderHasNoLease()) {
-    pb->set_code(AppStatusPB::LEADER_HAS_NO_LEASE);
-  } else if (status.IsLeaderNotReadyToServe()) {
-    pb->set_code(AppStatusPB::LEADER_NOT_READY_TO_SERVE);
-  } else if (status.IsTryAgain()) {
-    pb->set_code(AppStatusPB::TRY_AGAIN_CODE);
-  } else if (status.IsBusy()) {
-    pb->set_code(AppStatusPB::BUSY);
-  } else {
-    LOG(WARNING) << "Unknown error code translation connect_from internal error "
-                 << status.ToString() << ": sending UNKNOWN_ERROR";
-    pb->set_code(AppStatusPB::UNKNOWN_ERROR);
-    is_unknown = true;
   }
-  if (is_unknown) {
+
+  auto code = static_cast<size_t>(status.code()) < kStatusToErrorCode.size()
+      ? kStatusToErrorCode[status.code()] : AppStatusPB::UNKNOWN_ERROR;
+  pb->set_code(code);
+  if (code == AppStatusPB::UNKNOWN_ERROR) {
+    LOG(WARNING) << "Unknown error code translation connect_from internal error "
+                 << status << ": sending UNKNOWN_ERROR";
     // For unknown status codes, include the original stringified error
     // code.
     pb->set_message(status.CodeAsString() + ": " + status.message().ToBuffer());
@@ -135,86 +144,103 @@ void StatusToPB(const Status& status, AppStatusPB* pb) {
     // will reconstruct the other parts of the ToString() response.
     pb->set_message(status.message().cdata(), status.message().size());
   }
-  if (status.IsQLError()) {
-    pb->set_ql_error_code(status.error_code());
-  } else if (status.error_code() != -1) {
-    pb->set_posix_code(status.error_code());
+
+  auto error_codes = status.ErrorCodesSlice();
+  pb->set_errors(error_codes.data(), error_codes.size());
+  // We always has 0 as terminating byte for error codes, so non empty error codes would have
+  // more than one bytes.
+  if (error_codes.size() > 1) {
+    // Set old protobuf fields for backward compatibility.
+    Errno err(status);
+    if (err != 0) {
+      pb->set_posix_code(err.value());
+    }
+    const auto* ql_error_data = status.ErrorData(ql::QLError::kCategory);
+    if (ql_error_data) {
+      pb->set_ql_error_code(static_cast<int64_t>(ql::QLErrorTag::Decode(ql_error_data)));
+    }
   }
+
+  pb->set_source_file(status.file_name());
+  pb->set_source_line(status.line_number());
+}
+
+struct WireProtocolTabletServerErrorTag {
+  static constexpr uint8_t kCategory = 5;
+
+  enum Value {};
+
+  static size_t EncodedSize(Value value) {
+    return sizeof(Value);
+  }
+
+  static uint8_t* Encode(Value value, uint8_t* out) {
+    Store<Value, LittleEndian>(out, value);
+    return out + sizeof(Value);
+  }
+};
+
+// Backward compatibility.
+Status StatusFromOldPB(const AppStatusPB& pb) {
+  auto code = kErrorCodeToStatus[pb.code()];
+
+  auto status_factory = [code, &pb](const Slice& errors) {
+    return Status(
+        code, pb.source_file().c_str(), pb.source_line(), pb.message(), errors, DupFileName::kTrue);
+  };
+
+  #define ENCODE_ERROR_AND_RETURN_STATUS(Tag, value) \
+    auto error_code = static_cast<Tag::Value>((value)); \
+    auto size = 2 + Tag::EncodedSize(error_code); \
+    uint8_t* buffer = static_cast<uint8_t*>(alloca(size)); \
+    buffer[0] = Tag::kCategory; \
+    Tag::Encode(error_code, buffer + 1); \
+    buffer[size - 1] = 0; \
+    return status_factory(Slice(buffer, size)); \
+    /**/
+
+  if (code == Status::kQLError) {
+    if (!pb.has_ql_error_code()) {
+      return STATUS(InternalError, "Query error code missing");
+    }
+
+    ENCODE_ERROR_AND_RETURN_STATUS(ql::QLErrorTag, pb.ql_error_code())
+  } else if (pb.has_posix_code()) {
+    if (code == Status::kIllegalState || code == Status::kLeaderNotReadyToServe ||
+        code == Status::kLeaderHasNoLease) {
+
+      ENCODE_ERROR_AND_RETURN_STATUS(WireProtocolTabletServerErrorTag, pb.posix_code())
+    } else {
+      ENCODE_ERROR_AND_RETURN_STATUS(ErrnoTag, pb.posix_code())
+    }
+  }
+
+  return Status(code, pb.source_file().c_str(), pb.source_line(), pb.message(), "",
+                nullptr /* error */, DupFileName::kTrue);
+  #undef ENCODE_ERROR_AND_RETURN_STATUS
 }
 
 Status StatusFromPB(const AppStatusPB& pb) {
-  int posix_code = pb.has_posix_code() ? pb.posix_code() : -1;
-
-  switch (pb.code()) {
-    case AppStatusPB::OK:
-      return Status::OK();
-    case AppStatusPB::NOT_FOUND:
-      return STATUS(NotFound, pb.message(), "", posix_code);
-    case AppStatusPB::CORRUPTION:
-      return STATUS(Corruption, pb.message(), "", posix_code);
-    case AppStatusPB::NOT_SUPPORTED:
-      return STATUS(NotSupported, pb.message(), "", posix_code);
-    case AppStatusPB::INVALID_ARGUMENT:
-      return STATUS(InvalidArgument, pb.message(), "", posix_code);
-    case AppStatusPB::IO_ERROR:
-      return STATUS(IOError, pb.message(), "", posix_code);
-    case AppStatusPB::ALREADY_PRESENT:
-      return STATUS(AlreadyPresent, pb.message(), "", posix_code);
-    case AppStatusPB::RUNTIME_ERROR:
-      return STATUS(RuntimeError, pb.message(), "", posix_code);
-    case AppStatusPB::NETWORK_ERROR:
-      return STATUS(NetworkError, pb.message(), "", posix_code);
-    case AppStatusPB::ILLEGAL_STATE:
-      return STATUS(IllegalState, pb.message(), "", posix_code);
-    case AppStatusPB::NOT_AUTHORIZED:
-      return STATUS(NotAuthorized, pb.message(), "", posix_code);
-    case AppStatusPB::ABORTED:
-      return STATUS(Aborted, pb.message(), "", posix_code);
-    case AppStatusPB::REMOTE_ERROR:
-      return STATUS(RemoteError, pb.message(), "", posix_code);
-    case AppStatusPB::SERVICE_UNAVAILABLE:
-      return STATUS(ServiceUnavailable, pb.message(), "", posix_code);
-    case AppStatusPB::TIMED_OUT:
-      return STATUS(TimedOut, pb.message(), "", posix_code);
-    case AppStatusPB::UNINITIALIZED:
-      return STATUS(Uninitialized, pb.message(), "", posix_code);
-    case AppStatusPB::CONFIGURATION_ERROR:
-      return STATUS(ConfigurationError, pb.message(), "", posix_code);
-    case AppStatusPB::INCOMPLETE:
-      return STATUS(Incomplete, pb.message(), "", posix_code);
-    case AppStatusPB::END_OF_FILE:
-      return STATUS(EndOfFile, pb.message(), "", posix_code);
-    case AppStatusPB::INVALID_COMMAND:
-      return STATUS(InvalidCommand, pb.message(), "", posix_code);
-    case AppStatusPB::SQL_ERROR:
-      if (!pb.has_ql_error_code()) {
-        return STATUS(InternalError, "SQL error code missing");
-      }
-      return STATUS(QLError, pb.message(), "", pb.ql_error_code());
-    case AppStatusPB::INTERNAL_ERROR:
-      return STATUS(InternalError, pb.message(), "", posix_code);
-    case AppStatusPB::EXPIRED:
-      return STATUS(Expired, pb.message(), "", posix_code);
-    case AppStatusPB::LEADER_HAS_NO_LEASE:
-      return STATUS(LeaderHasNoLease, pb.message(), "", posix_code);
-    case AppStatusPB::LEADER_NOT_READY_TO_SERVE:
-      return STATUS(LeaderNotReadyToServe, pb.message(), "", posix_code);
-    case AppStatusPB::TRY_AGAIN_CODE:
-      return STATUS(TryAgain, pb.message(), "", posix_code);
-    case AppStatusPB::BUSY:
-      return STATUS(Busy, pb.message(), "", posix_code);
-    case AppStatusPB::UNKNOWN_ERROR:
-    default:
-      LOG(WARNING) << "Unknown error code in status: " << pb.ShortDebugString();
-      return STATUS_FORMAT(
-          RuntimeError, "($0 unknown): $1, $2", pb.code(), pb.message(), posix_code);
+  if (pb.code() == AppStatusPB::OK) {
+    return Status::OK();
+  } else if (pb.code() == AppStatusPB::UNKNOWN_ERROR ||
+             static_cast<size_t>(pb.code()) >= kErrorCodeToStatus.size()) {
+    LOG(WARNING) << "Unknown error code in status: " << pb.ShortDebugString();
+    return STATUS_FORMAT(
+        RuntimeError, "($0 unknown): $1", pb.code(), pb.message());
   }
+
+  if (pb.has_errors()) {
+    return Status(kErrorCodeToStatus[pb.code()], pb.source_file().c_str(), pb.source_line(),
+                  pb.message(), pb.errors(), DupFileName::kTrue);
+  }
+
+  return StatusFromOldPB(pb);
 }
 
-Status HostPortToPB(const HostPort& host_port, HostPortPB* host_port_pb) {
+void HostPortToPB(const HostPort& host_port, HostPortPB* host_port_pb) {
   host_port_pb->set_host(host_port.host());
   host_port_pb->set_port(host_port.port());
-  return Status::OK();
 }
 
 HostPort HostPortFromPB(const HostPortPB& host_port_pb) {
@@ -239,12 +265,17 @@ Status EndpointFromHostPortPB(const HostPortPB& host_portpb, Endpoint* endpoint)
   return EndpointFromHostPort(host_port, endpoint);
 }
 
-Status HostPortsToPBs(const std::vector<HostPort>& addrs,
-                      RepeatedPtrField<HostPortPB>* pbs) {
+void HostPortsToPBs(const std::vector<HostPort>& addrs, RepeatedPtrField<HostPortPB>* pbs) {
   for (const auto& addr : addrs) {
-    RETURN_NOT_OK(HostPortToPB(addr, pbs->Add()));
+    HostPortToPB(addr, pbs->Add());
   }
-  return Status::OK();
+}
+
+void HostPortsFromPBs(const RepeatedPtrField<HostPortPB>& pbs, std::vector<HostPort>* addrs) {
+  addrs->reserve(pbs.size());
+  for (const auto& pb : pbs) {
+    addrs->push_back(HostPortFromPB(pb));
+  }
 }
 
 Status AddHostPortPBs(const std::vector<Endpoint>& addrs,
@@ -275,16 +306,15 @@ Status AddHostPortPBs(const std::vector<Endpoint>& addrs,
   return Status::OK();
 }
 
-Status SchemaToPB(const Schema& schema, SchemaPB *pb, int flags) {
+void SchemaToPB(const Schema& schema, SchemaPB *pb, int flags) {
   pb->Clear();
-  RETURN_NOT_OK(SchemaToColumnPBs(schema, pb->mutable_columns(), flags));
+  SchemaToColumnPBs(schema, pb->mutable_columns(), flags);
   schema.table_properties().ToTablePropertiesPB(pb->mutable_table_properties());
-  return Status::OK();
 }
 
-Status SchemaToPBWithoutIds(const Schema& schema, SchemaPB *pb) {
+void SchemaToPBWithoutIds(const Schema& schema, SchemaPB *pb) {
   pb->Clear();
-  return SchemaToColumnPBs(schema, pb->mutable_columns(), SCHEMA_PB_WITHOUT_IDS);
+  SchemaToColumnPBs(schema, pb->mutable_columns(), SCHEMA_PB_WITHOUT_IDS);
 }
 
 Status SchemaFromPB(const SchemaPB& pb, Schema *schema) {
@@ -317,6 +347,7 @@ void ColumnSchemaToPB(const ColumnSchema& col_schema, ColumnSchemaPB *pb, int fl
     pb->set_is_hash_key(true);
   }
 }
+
 
 ColumnSchema ColumnSchemaFromPB(const ColumnSchemaPB& pb) {
   // Only "is_hash_key" is used to construct ColumnSchema. The field "is_key" will be read when
@@ -365,9 +396,9 @@ Status ColumnPBsToSchema(const RepeatedPtrField<ColumnSchemaPB>& column_pbs,
   return schema->Reset(columns, column_ids, num_key_columns);
 }
 
-Status SchemaToColumnPBs(const Schema& schema,
-                         RepeatedPtrField<ColumnSchemaPB>* cols,
-                         int flags) {
+void SchemaToColumnPBs(const Schema& schema,
+                       RepeatedPtrField<ColumnSchemaPB>* cols,
+                       int flags) {
   cols->Clear();
   int idx = 0;
   for (const ColumnSchema& col : schema.columns()) {
@@ -381,7 +412,6 @@ Status SchemaToColumnPBs(const Schema& schema,
 
     idx++;
   }
-  return Status::OK();
 }
 
 Result<UsePrivateIpMode> GetPrivateIpMode() {
@@ -409,6 +439,9 @@ bool UsePublicIp(const CloudInfoPB& connect_to,
                  const CloudInfoPB& connect_from) {
   auto mode = GetMode();
 
+  if (mode == UsePrivateIpMode::never) {
+    return true;
+  }
   if (connect_to.placement_cloud() != connect_from.placement_cloud()) {
     return true;
   }

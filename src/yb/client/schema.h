@@ -52,14 +52,13 @@
 #include "yb/client/client_fwd.h"
 #include "yb/client/value.h"
 #include "yb/common/schema.h"
-#include "yb/common/ql_value.h"
 
 #include "yb/util/status.h"
 
 namespace yb {
 
 // the types used internally and sent over the wire to the tserver
-typedef QLValue::InternalType InternalType;
+typedef QLValuePB::ValueCase InternalType;
 
 class ColumnSchema;
 class YBPartialRow;
@@ -99,6 +98,10 @@ class YBColumnSchema {
         return InternalType::kInt32Value;
       case INT64:
         return InternalType::kInt64Value;
+      case UINT32:
+        return InternalType::kUint32Value;
+      case UINT64:
+        return InternalType::kUint64Value;
       case FLOAT:
         return InternalType::kFloatValue;
       case DOUBLE:
@@ -109,6 +112,10 @@ class YBColumnSchema {
         return InternalType::kStringValue;
       case TIMESTAMP:
         return InternalType::kTimestampValue;
+      case DATE:
+        return InternalType::kDateValue;
+      case TIME:
+        return InternalType::kTimeValue;
       case INET:
         return InternalType::kInetaddressValue;
       case JSONB:
@@ -139,12 +146,8 @@ class YBColumnSchema {
         return InternalType::VALUE_NOT_SET;
 
       case TYPEARGS: FALLTHROUGH_INTENDED;
-      case DATE: FALLTHROUGH_INTENDED;
-      case TIME: FALLTHROUGH_INTENDED;
       case UINT8: FALLTHROUGH_INTENDED;
-      case UINT16: FALLTHROUGH_INTENDED;
-      case UINT32: FALLTHROUGH_INTENDED;
-      case UINT64:
+      case UINT16:
         break;
     }
     LOG(FATAL) << "Internal error: unsupported type " << ql_type->ToString();
@@ -181,7 +184,7 @@ class YBColumnSchema {
   bool is_static() const;
   bool is_counter() const;
   int32_t order() const;
-  yb::ColumnSchema::SortingType sorting_type() const;
+  ColumnSchema::SortingType sorting_type() const;
 
  private:
   friend class YBColumnSpec;
@@ -204,6 +207,10 @@ class YBColumnSchema {
 // TODO(KUDU-861): this API will also be used for an improved AlterTable API.
 class YBColumnSpec {
  public:
+  explicit YBColumnSpec(const std::string& col_name);
+
+  ~YBColumnSpec();
+
   // Operations only relevant for Create Table
   // ------------------------------------------------------------
 
@@ -251,6 +258,10 @@ class YBColumnSpec {
   // Identify this column as counter.
   YBColumnSpec* Counter();
 
+  // Add JSON operation.
+  YBColumnSpec* JsonOp(JsonOperatorPB op, const std::string& str_value);
+  YBColumnSpec* JsonOp(JsonOperatorPB op, int32_t int_value);
+
   // Operations only relevant for Alter Table
   // ------------------------------------------------------------
 
@@ -262,13 +273,9 @@ class YBColumnSpec {
   friend class YBSchemaBuilder;
   friend class YBTableAlterer;
 
-  // This class should always be owned and deleted by one of its friends,
-  // not the user.
-  ~YBColumnSpec();
-
-  explicit YBColumnSpec(const std::string& col_name);
-
   CHECKED_STATUS ToColumnSchema(YBColumnSchema* col) const;
+
+  YBColumnSpec* JsonOp(JsonOperatorPB op, const QLValuePB& value);
 
   // Owned.
   Data* data_;
@@ -343,6 +350,8 @@ class YBSchema {
 
   bool Equals(const YBSchema& other) const;
 
+  Result<bool> Equals(const SchemaPB& pb_schema) const;
+
   const TableProperties& table_properties() const;
 
   YBColumnSchema Column(size_t idx) const;
@@ -382,9 +391,11 @@ class YBSchema {
 
   const std::vector<ColumnSchema>& columns() const;
 
-  int FindColumn(const StringPiece& name) const {
+  int FindColumn(const GStringPiece& name) const {
     return schema_->find_column(name);
   }
+
+  string ToString() const;
 
  private:
   friend YBSchema YBSchemaFromSchema(const Schema& schema);

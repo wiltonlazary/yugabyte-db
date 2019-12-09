@@ -50,6 +50,21 @@ TEST_F(QLTestParser, TestQLParser) {
   // Invalid statement: CREATE with unterminated double quoted column.
   PARSE_INVALID_STMT("CREATE TABLE human_resource(\"id# int primary key, name varchar)");
 
+  // Invalid statement: CREATE with tuple.
+  // Tuples are not supported until #936
+  PARSE_INVALID_STMT_ERR("CREATE TABLE human_resource(id int primary key, name tuple);",
+                         "expecting '<'");
+  PARSE_INVALID_STMT_ERR("CREATE TABLE human_resource(id int primary key, name tuple<>);",
+                         "expecting '<'");
+  PARSE_INVALID_STMT_ERR("CREATE TABLE human_resource(id int primary key, name tuple< >);",
+                         "unexpected '>'");
+  PARSE_INVALID_STMT_ERR("CREATE TABLE human_resource(id int primary key, name tuple<int>);",
+                         "Feature Not Supported");
+  PARSE_INVALID_STMT_ERR("CREATE TABLE human_resource(id int primary key, name tuple<int,int>);",
+                         "Feature Not Supported");
+  PARSE_INVALID_STMT_ERR("CREATE TABLE human_resource(id int primary key, name tuple<int,stuff>);",
+                         "Feature Not Supported");
+
   // Valid statement: INSERT.
   PARSE_VALID_STMT("INSERT INTO human_resource(id, name) VALUES(7, \"Scott Tiger\");");
 
@@ -235,6 +250,9 @@ TEST_F(QLTestParser, TestQLParser) {
                    "r2 = 'b' IF NOT EXISTS ELSE ERROR;");
   PARSE_VALID_STMT("UPDATE t SET v1 = 4, v2 = 'd' WHERE h1 = 1 AND h2 = 'a' AND r1 = 2 AND "
                    "r2 = 'b' IF NOT EXISTS OR v1 = 3 AND v2 = 'c' ELSE ERROR;");
+
+  // Test the issue: https://github.com/yugabyte/yugabyte-db/issues/2476
+  PARSE_INVALID_STMT("VALUES (1, 'Bob', 35, 'Ruby', '{\"name\": \"John\", 33, \"age\": 35}');");
 }
 
 TEST_F(QLTestParser, TestStaticColumn) {
@@ -269,8 +287,14 @@ TEST_F(QLTestParser, TestCreateIndex) {
   PARSE_VALID_STMT("CREATE INDEX IF NOT EXISTS i ON k.t ((c1, c2), c3, c4) "
                    "COVERING (c5, c6) WITH CLUSTERING ORDER BY (c3 DESC, c4 ASC);");
 
-  // Invalid statement: mandatory index name missing.
-  PARSE_INVALID_STMT("CREATE INDEX ON k.t (c1, c2, c3, c4);");
+  // Valid statement: CREATE INDEX i ON (<json_attribute>).
+  PARSE_VALID_STMT("CREATE INDEX i ON t (c2->>'a');");
+  PARSE_VALID_STMT("CREATE INDEX i ON t (c2->'a'->>'b');");
+  PARSE_VALID_STMT("CREATE INDEX i ON t (c2->'a'->'b'->>'c');");
+
+  // Default index name.
+  PARSE_VALID_STMT("CREATE INDEX ON k.t (c1, c2, c3, c4);");
+
   // Invalid statement: index name must be simple name without keyspace qualifier.
   PARSE_INVALID_STMT("CREATE INDEX k.i ON k.t (c1, c2, c3, c4);");
 }
@@ -284,6 +308,19 @@ TEST_F(QLTestParser, TestTruncate) {
   // Invalid statement: invalid target type.
   PARSE_INVALID_STMT("TRUNCATE KEYSPACE k;");
   PARSE_INVALID_STMT("TRUNCATE TYPE t;");
+}
+
+TEST_F(QLTestParser, TestExplain) {
+  // Valid statement: TRUNCATE [TABLE] [keyspace.]table.
+  PARSE_VALID_STMT("EXPLAIN SELECT * FROM t WHERE C1=:c1;");
+  PARSE_VALID_STMT("EXPLAIN INSERT INTO human_resource(id, name) VALUES(7, \"Scott Tiger\");");
+  PARSE_VALID_STMT("EXPLAIN UPDATE human_resource SET name = \"Joe Street\" WHERE id = 7;");
+  PARSE_VALID_STMT("EXPLAIN DELETE FROM t WHERE h1 = 1 AND h2 = 'a' AND r1 = 2 AND r2 = 'c' "
+                   "IF EXISTS ELSE ERROR;");
+  // Invalid statement: invalid target type.
+  PARSE_INVALID_STMT("EXPLAIN CREATE TABLE human_resource(id int, name varchar);");
+  PARSE_INVALID_STMT("EXPLAIN TRUNCATE TABLE T;");
+  PARSE_INVALID_STMT("EXPLAIN ANALYZE SELECT * FROM t WHERE C1=:c1;");
 }
 
 }  // namespace ql

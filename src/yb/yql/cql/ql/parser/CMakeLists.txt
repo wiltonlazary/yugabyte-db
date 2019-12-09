@@ -12,8 +12,10 @@
 #
 
 if (APPLE)
-  set(CMAKE_PREFIX_PATH "/usr/local/opt/flex" ${CMAKE_PREFIX_PATH})
-  set(CMAKE_PREFIX_PATH "/usr/local/opt/bison" ${CMAKE_PREFIX_PATH})
+  set(CMAKE_PREFIX_PATH "${HOMEBREW_OPT_DIR}/flex" ${CMAKE_PREFIX_PATH})
+  set(CMAKE_PREFIX_PATH "${HOMEBREW_OPT_DIR}/bison" ${CMAKE_PREFIX_PATH})
+  set(BISON_EXECUTABLE "${HOMEBREW_OPT_DIR}/bison/bin/bison")
+  set(FLEX_EXECUTABLE "${HOMEBREW_OPT_DIR}/flex/bin/flex")
 endif()
 
 find_package(BISON)
@@ -57,6 +59,10 @@ set(PARSER_CUSTOM_FLAGS
 
 set_source_files_properties(${SCANNER_LEX_L_CC} ${PARSER_GRAM_Y_CC_FINAL} PROPERTIES
                             COMPILE_FLAGS ${PARSER_CUSTOM_FLAGS})
+
+add_custom_target(
+    ql_parser_flex_bison_output
+    DEPENDS ${PARSER_GRAM_Y_CC_FINAL} ${PARSER_GRAM_Y_HH_FINAL} ${SCANNER_LEX_L_CC})
 
 add_library(ql_parser
             parser.cc

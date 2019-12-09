@@ -47,6 +47,7 @@
 #include "yb/common/key_encoder.h"
 #include "yb/common/hybrid_time.h"
 #include "yb/common/transaction.h"
+#include "yb/common/common.pb.h"
 #include "yb/gutil/stl_util.h"
 #include "yb/gutil/strings/strcat.h"
 #include "yb/gutil/strings/substitute.h"
@@ -182,8 +183,10 @@ class ColumnSchema {
  public:
   enum SortingType : uint8_t {
     kNotSpecified = 0,
-    kAscending,
-    kDescending
+    kAscending,          // ASC, NULLS FIRST
+    kDescending,         // DESC, NULLS FIRST
+    kAscendingNullsLast, // ASC, NULLS LAST
+    kDescendingNullsLast // DESC, NULLS LAST
   };
 
   // name: column name
@@ -277,6 +280,10 @@ class ColumnSchema {
         return "asc";
       case kDescending:
         return "desc";
+      case kAscendingNullsLast:
+        return "asc nulls last";
+      case kDescendingNullsLast:
+        return "desc nulls last";
     }
     LOG (FATAL) << "Invalid sorting type: " << sorting_type_;
   }
@@ -419,6 +426,26 @@ class TableProperties {
     copartition_table_id_ = copartition_table_id;
   }
 
+  void SetUseMangledColumnName(bool value) {
+    use_mangled_column_name_ = value;
+  }
+
+  bool use_mangled_column_name() const {
+    return use_mangled_column_name_;
+  }
+
+  void SetNumTablets(int num_tablets) {
+    num_tablets_ = num_tablets;
+  }
+
+  bool HasNumTablets() const {
+    return num_tablets_ > 0;
+  }
+
+  int num_tablets() const {
+    return num_tablets_;
+  }
+
   void ToTablePropertiesPB(TablePropertiesPB *pb) const;
 
   static TableProperties FromTablePropertiesPB(const TablePropertiesPB& pb);
@@ -434,6 +461,9 @@ class TableProperties {
   bool is_transactional_ = false;
   YBConsistencyLevel consistency_level_ = YBConsistencyLevel::STRONG;
   TableId copartition_table_id_ = kNoCopartitionTableId;
+  boost::optional<uint32_t> wal_retention_secs_;
+  bool use_mangled_column_name_ = false;
+  int num_tablets_ = 0;
 };
 
 // The schema for a set of rows.
@@ -460,7 +490,8 @@ class Schema {
                      NameToIndexMap::hasher(),
                      NameToIndexMap::key_equal(),
                      NameToIndexMapAllocator(&name_to_index_bytes_)),
-      has_nullables_(false) {
+      has_nullables_(false),
+      cotable_id_(boost::uuids::nil_uuid()) {
   }
 
   Schema(const Schema& other);
@@ -478,14 +509,15 @@ class Schema {
   // assertion will be fired!
   Schema(const vector<ColumnSchema>& cols,
          int key_columns,
-         const TableProperties& table_properties = TableProperties())
+         const TableProperties& table_properties = TableProperties(),
+         const Uuid& cotable_id = Uuid(boost::uuids::nil_uuid()))
     : name_to_index_bytes_(0),
       // TODO: C++11 provides a single-arg constructor
       name_to_index_(10,
                      NameToIndexMap::hasher(),
                      NameToIndexMap::key_equal(),
                      NameToIndexMapAllocator(&name_to_index_bytes_)) {
-    CHECK_OK(Reset(cols, key_columns, table_properties));
+    CHECK_OK(Reset(cols, key_columns, table_properties, cotable_id));
   }
 
   // Construct a schema with the given information.
@@ -497,23 +529,25 @@ class Schema {
   Schema(const vector<ColumnSchema>& cols,
          const vector<ColumnId>& ids,
          int key_columns,
-         const TableProperties& table_properties = TableProperties())
+         const TableProperties& table_properties = TableProperties(),
+         const Uuid& cotable_id = Uuid(boost::uuids::nil_uuid()))
     : name_to_index_bytes_(0),
       // TODO: C++11 provides a single-arg constructor
       name_to_index_(10,
                      NameToIndexMap::hasher(),
                      NameToIndexMap::key_equal(),
                      NameToIndexMapAllocator(&name_to_index_bytes_)) {
-    CHECK_OK(Reset(cols, ids, key_columns, table_properties));
+    CHECK_OK(Reset(cols, ids, key_columns, table_properties, cotable_id));
   }
 
   // Reset this Schema object to the given schema.
   // If this fails, the Schema object is left in an inconsistent
   // state and may not be used.
   CHECKED_STATUS Reset(const vector<ColumnSchema>& cols, int key_columns,
-                       const TableProperties& table_properties = TableProperties()) {
+                       const TableProperties& table_properties = TableProperties(),
+                       const Uuid& cotable_id = Uuid(boost::uuids::nil_uuid())) {
     std::vector<ColumnId> ids;
-    return Reset(cols, ids, key_columns, table_properties);
+    return Reset(cols, ids, key_columns, table_properties, cotable_id);
   }
 
   // Reset this Schema object to the given schema.
@@ -522,7 +556,8 @@ class Schema {
   CHECKED_STATUS Reset(const vector<ColumnSchema>& cols,
                        const vector<ColumnId>& ids,
                        int key_columns,
-                       const TableProperties& table_properties = TableProperties());
+                       const TableProperties& table_properties = TableProperties(),
+                       const Uuid& cotable_id = Uuid(boost::uuids::nil_uuid()));
 
   // Return the number of bytes needed to represent a single row of this schema.
   //
@@ -574,7 +609,7 @@ class Schema {
   inline Result<const ColumnSchema&> column_by_id(ColumnId id) const {
     int idx = find_column_by_id(id);
     if (idx < 0) {
-      return STATUS_FORMAT(InvalidArgument, "Column id $0 not found", idx);
+      return STATUS_FORMAT(InvalidArgument, "Column id $0 not found", id.ToString());
     }
     return cols_[idx];
   }
@@ -620,9 +655,13 @@ class Schema {
     table_properties_.SetCopartitionTableId(copartition_table_id);
   }
 
+  void SetTransactional(bool is_transactional) {
+    table_properties_.SetTransactional(is_transactional);
+  }
+
   // Return the column index corresponding to the given column,
   // or kColumnNotFound if the column is not in this schema.
-  int find_column(const StringPiece col_name) const {
+  int find_column(const GStringPiece col_name) const {
     auto iter = name_to_index_.find(col_name);
     if (PREDICT_FALSE(iter == name_to_index_.end())) {
       return kColumnNotFound;
@@ -652,7 +691,7 @@ class Schema {
   }
 
   // Returns true if the specified column (by name) is a key
-  bool is_key_column(const StringPiece col_name) const {
+  bool is_key_column(const GStringPiece col_name) const {
     return is_key_column(find_column(col_name));
   }
 
@@ -667,7 +706,7 @@ class Schema {
   }
 
   // Returns true if the specified column (by name) is a hash key
-  bool is_hash_key_column(const StringPiece col_name) const {
+  bool is_hash_key_column(const GStringPiece col_name) const {
     return is_hash_key_column(find_column(col_name));
   }
 
@@ -682,7 +721,7 @@ class Schema {
   }
 
   // Returns true if the specified column (by name) is a range column
-  bool is_range_column(const StringPiece col_name) const {
+  bool is_range_column(const GStringPiece col_name) const {
     return is_range_column(find_column(col_name));
   }
 
@@ -694,6 +733,14 @@ class Schema {
   // Returns the highest column id in this Schema.
   ColumnId max_col_id() const {
     return max_col_id_;
+  }
+
+  // Gets and sets the uuid of the non-primary table this schema belongs to co-located in a tablet.
+  const Uuid& cotable_id() const {
+    return cotable_id_;
+  }
+  void set_cotable_id(const Uuid& cotable_id) {
+    cotable_id_ = cotable_id;;
   }
 
   // Extract a given column from a row where the type is
@@ -805,7 +852,7 @@ class Schema {
   // Create a new schema containing only the selected columns.
   // The resulting schema will have no key columns defined.
   // If this schema has IDs, the resulting schema will as well.
-  CHECKED_STATUS CreateProjectionByNames(const std::vector<StringPiece>& col_names,
+  CHECKED_STATUS CreateProjectionByNames(const std::vector<GStringPiece>& col_names,
                                          Schema* out, size_t num_key_columns = 0) const;
 
   // Create a new schema containing only the selected column IDs.
@@ -989,20 +1036,20 @@ class Schema {
   vector<ColumnId> col_ids_;
   vector<size_t> col_offsets_;
 
-  // The keys of this map are StringPiece references to the actual name members of the
+  // The keys of this map are GStringPiece references to the actual name members of the
   // ColumnSchema objects inside cols_. This avoids an extra copy of those strings,
-  // and also allows us to do lookups on the map using StringPiece keys, sometimes
+  // and also allows us to do lookups on the map using GStringPiece keys, sometimes
   // avoiding copies.
   //
   // The map is instrumented with a counting allocator so that we can accurately
   // measure its memory footprint.
   int64_t name_to_index_bytes_;
-  typedef STLCountingAllocator<std::pair<const StringPiece, size_t> > NameToIndexMapAllocator;
+  typedef STLCountingAllocator<std::pair<const GStringPiece, size_t> > NameToIndexMapAllocator;
   typedef unordered_map<
-      StringPiece,
+      GStringPiece,
       size_t,
-      std::hash<StringPiece>,
-      std::equal_to<StringPiece>,
+      std::hash<GStringPiece>,
+      std::equal_to<GStringPiece>,
       NameToIndexMapAllocator> NameToIndexMap;
   NameToIndexMap name_to_index_;
 
@@ -1015,6 +1062,10 @@ class Schema {
   bool has_statics_ = false;
 
   TableProperties table_properties_;
+
+  // Uuid of the non-primary table this schema belongs to co-located in a tablet. Nil for the
+  // primary or single-tenant table.
+  Uuid cotable_id_;
 
   // NOTE: if you add more members, make sure to add the appropriate
   // code to swap() and CopyFrom() as well to prevent subtle bugs.

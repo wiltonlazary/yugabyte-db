@@ -35,6 +35,7 @@
 #include <string>
 #include <vector>
 
+#include "yb/gutil/gscoped_ptr.h"
 #include "yb/gutil/macros.h"
 #include "yb/gutil/port.h"
 #include "yb/util/env.h"
@@ -63,7 +64,7 @@ class MiniMaster {
   // Start a master running on the loopback interface and
   // an ephemeral port. To determine the address that the server
   // bound to, call MiniMaster::bound_addr()
-  CHECKED_STATUS Start();
+  CHECKED_STATUS Start(bool simulate_fs_create_failure = false);
 
   CHECKED_STATUS StartDistributedMaster(const std::vector<uint16_t>& peer_ports);
 
@@ -88,8 +89,6 @@ class MiniMaster {
 
   std::string bound_rpc_addr_str() const;
 
-  size_t NumSystemTables() const;
-
  private:
   CHECKED_STATUS StartDistributedMasterOnPorts(uint16_t rpc_port, uint16_t web_port,
                                        const std::vector<uint16_t>& peer_ports);
@@ -107,6 +106,7 @@ class MiniMaster {
 
   gscoped_ptr<Master> master_;
   int index_;
+  std::unique_ptr<Tunnel> tunnel_;
 };
 
 } // namespace master

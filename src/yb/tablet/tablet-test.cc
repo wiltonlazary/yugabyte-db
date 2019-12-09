@@ -34,6 +34,8 @@
 
 #include <glog/logging.h>
 
+#include "yb/client/table.h"
+
 #include "yb/common/row.h"
 #include "yb/common/ql_rowwise_iterator_interface.h"
 
@@ -55,8 +57,6 @@ using std::unordered_set;
 
 namespace yb {
 namespace tablet {
-
-using fs::ReadableBlock;
 
 DEFINE_int32(testiterator_num_inserts, 1000,
              "Number of rows inserted in TestRowIterator/TestInsert");

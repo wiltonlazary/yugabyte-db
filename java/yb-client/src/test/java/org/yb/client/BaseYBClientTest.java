@@ -32,7 +32,6 @@
 package org.yb.client;
 
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.Lists;
 import com.google.common.net.HostAndPort;
 import com.stumbleupon.async.Callback;
 import com.stumbleupon.async.Deferred;
@@ -45,12 +44,10 @@ import org.yb.Type;
 import org.yb.minicluster.BaseMiniClusterTest;
 
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 
-import static org.junit.Assert.fail;
+import static org.yb.AssertionWrappers.fail;
 
 /**
  * A base class for tests using the the Java YB client.
@@ -78,7 +75,9 @@ public class BaseYBClientTest extends BaseMiniClusterTest {
         .defaultAdminOperationTimeoutMs(DEFAULT_SLEEP)
         .defaultOperationTimeoutMs(DEFAULT_SLEEP)
         .defaultSocketReadTimeoutMs(DEFAULT_SLEEP)
+        .sslCertFile(certFile)
         .build();
+
     syncClient = new YBClient(client);
     syncClient.createKeyspace(DEFAULT_KEYSPACE_NAME);
   }

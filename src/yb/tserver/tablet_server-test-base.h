@@ -37,6 +37,7 @@
 #include "yb/common/schema.h"
 
 #include "yb/rpc/rpc_fwd.h"
+#include "yb/rpc/messenger.h"
 
 #include "yb/util/metrics.h"
 #include "yb/util/test_util.h"
@@ -77,6 +78,7 @@ class TabletServerTestBase : public YBTest {
 
   // Starts the tablet server, override to start it later.
   void SetUp() override;
+  void TearDown() override;
 
   virtual void StartTabletServer();
 
@@ -128,7 +130,7 @@ class TabletServerTestBase : public YBTest {
   Schema key_schema_;
   TableType table_type_;
 
-  std::shared_ptr<rpc::Messenger> client_messenger_;
+  std::unique_ptr<rpc::Messenger> client_messenger_;
   std::unique_ptr<rpc::ProxyCache> proxy_cache_;
 
   std::unique_ptr<MiniTabletServer> mini_server_;

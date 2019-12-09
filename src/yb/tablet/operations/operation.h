@@ -40,7 +40,9 @@
 
 #include "yb/common/hybrid_time.h"
 #include "yb/common/wire_protocol.h"
-#include "yb/consensus/consensus.h"
+#include "yb/consensus/consensus_fwd.h"
+#include "yb/consensus/consensus.pb.h"
+#include "yb/consensus/opid_util.h"
 #include "yb/util/auto_release_pool.h"
 #include "yb/util/locks.h"
 #include "yb/util/status.h"
@@ -55,7 +57,7 @@ class OperationCompletionCallback;
 class OperationState;
 
 YB_DEFINE_ENUM(OperationType,
-               (kWrite)(kAlterSchema)(kUpdateTransaction)(kSnapshot)(kTruncate)(kEmpty));
+               (kWrite)(kChangeMetadata)(kUpdateTransaction)(kSnapshot)(kTruncate)(kEmpty));
 
 // Base class for transactions.  There are different implementations for different types (Write,
 // AlterSchema, etc.) OperationDriver implementations use Operations along with Consensus to execute
@@ -67,21 +69,12 @@ class Operation {
     TRACE_TXNS = 1
   };
 
-  enum OperationResult {
-    COMMITTED,
-    ABORTED
-  };
-
   Operation(std::unique_ptr<OperationState> state,
-            consensus::DriverType type,
             OperationType operation_type);
 
   // Returns the OperationState for this transaction.
   virtual OperationState* state() { return state_.get(); }
   virtual const OperationState* state() const { return state_.get(); }
-
-  // Returns whether this transaction is being executed on the leader or on a replica.
-  consensus::DriverType type() const { return type_; }
 
   // Returns this transaction's type.
   OperationType operation_type() const { return operation_type_; }
@@ -103,34 +96,35 @@ class Operation {
   // The OpId is provided for debuggability purposes.
   void Start();
 
-  // Executes the Apply() phase of the transaction, the actual actions of this phase depend on the
-  // transaction type, but usually this is the method where data-structures are changed.
-  virtual CHECKED_STATUS Apply() = 0;
+  // Applies replicated operation, the actual actions of this phase depend on the
+  // operation type, but usually this is the method where data-structures are changed.
+  // Also it should notify callback if necessary.
+  CHECKED_STATUS Replicated(int64_t leader_term);
 
-  // Executed after Apply() but before the commit is submitted to consensus.  Some transactions use
-  // this to perform pre-commit actions (e.g. write transactions perform early lock release on this
-  // hook).  Default implementation does nothing.
-  virtual void PreCommit() {}
-
-  // Executed after the transaction has been applied and the commit message has been appended to the
-  // log (though it might not be durable yet), or if the transaction was aborted.  Implementations
-  // are expected to perform cleanup on this method, the driver will reply to the client after this
-  // method call returns.  'result' will be either COMMITTED or ABORTED, letting implementations
-  // know what was the final status of the transaction.
-  virtual void Finish(OperationResult result) {}
+  // Abort operation. Release resources and notify callbacks.
+  void Aborted(const Status& status);
 
   // Each implementation should have its own ToString() method.
   virtual std::string ToString() const = 0;
 
+  std::string LogPrefix() const;
+
   virtual ~Operation() {}
 
  private:
+  // Actual implementation of Replicated.
+  // complete_status could be used to change completion status, i.e. callback will be invoked
+  // with this status.
+  virtual CHECKED_STATUS DoReplicated(int64_t leader_term, Status* complete_status) = 0;
+
+  // Actual implementation of Aborted, should return status that should be passed to callback.
+  virtual CHECKED_STATUS DoAborted(const Status& status) = 0;
+
   virtual void DoStart() = 0;
 
   // A private version of this transaction's transaction state so that we can use base
   // OperationState methods on destructors.
   std::unique_ptr<OperationState> state_;
-  const consensus::DriverType type_;
   const OperationType operation_type_;
 };
 
@@ -145,11 +139,7 @@ class OperationState {
 
   // Sets the ConsensusRound for this transaction, if this transaction is being executed through the
   // consensus system.
-  void set_consensus_round(const scoped_refptr<consensus::ConsensusRound>& consensus_round) {
-    consensus_round_ = consensus_round;
-    op_id_ = consensus_round_->id();
-    UpdateRequestFromConsensusRound();
-  }
+  void set_consensus_round(const scoped_refptr<consensus::ConsensusRound>& consensus_round);
 
   // Each subclass should provide a way to update the internal reference to the Message* request, so
   // we can avoid copying the request object all the time.
@@ -169,11 +159,6 @@ class OperationState {
     completion_clbk_ = std::move(completion_clbk);
   }
 
-  // Returns the completion callback.
-  OperationCompletionCallback* completion_callback() {
-    return DCHECK_NOTNULL(completion_clbk_.get());
-  }
-
   // Sets a heap object to be managed by this transaction's AutoReleasePool.
   template<class T>
   T* AddToAutoReleasePool(T* t) {
@@ -191,6 +176,8 @@ class OperationState {
 
   // Each implementation should have its own ToString() method.
   virtual std::string ToString() const = 0;
+
+  std::string LogPrefix() const;
 
   // Sets the hybrid_time for the transaction
   void set_hybrid_time(const HybridTime& hybrid_time);
@@ -222,6 +209,13 @@ class OperationState {
     return op_id_;
   }
 
+  bool has_completion_callback() const {
+    return completion_clbk_ != nullptr;
+  }
+
+  void CompleteWithStatus(const Status& status) const;
+  void SetError(const Status& status, tserver::TabletServerErrorPB::Code code) const;
+
   virtual ~OperationState();
 
  protected:
@@ -239,7 +233,7 @@ class OperationState {
   HybridTime hybrid_time_;
 
   // The clock error when hybrid_time_ was read.
-  uint64_t hybrid_time_error_;
+  uint64_t hybrid_time_error_ = 0;
 
   boost::optional<Arena> arena_;
 
@@ -278,7 +272,7 @@ class OperationCompletionCallback {
   const tserver::TabletServerErrorPB::Code error_code() const;
 
   // Subclasses should override this.
-  virtual void OperationCompleted();
+  virtual void OperationCompleted() = 0;
 
   void CompleteWithStatus(const Status& status) {
     set_error(status);
@@ -315,6 +309,19 @@ class LatchOperationCompletionCallback : public OperationCompletionCallback {
  private:
   CountDownLatch* latch_;
   ResponsePB* response_;
+};
+
+class SynchronizerOperationCompletionCallback : public OperationCompletionCallback {
+ public:
+  explicit SynchronizerOperationCompletionCallback(Synchronizer* synchronizer)
+    : synchronizer_(DCHECK_NOTNULL(synchronizer)) {}
+
+  void OperationCompleted() override {
+    synchronizer_->StatusCB(status());
+  }
+
+ private:
+  Synchronizer* synchronizer_;
 };
 
 }  // namespace tablet

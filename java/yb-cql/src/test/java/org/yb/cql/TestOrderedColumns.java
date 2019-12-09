@@ -17,10 +17,10 @@ import com.datastax.driver.core.Row;
 
 import org.junit.Test;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertTrue;
+import static org.yb.AssertionWrappers.assertEquals;
+import static org.yb.AssertionWrappers.assertFalse;
+import static org.yb.AssertionWrappers.assertNull;
+import static org.yb.AssertionWrappers.assertTrue;
 import org.apache.commons.lang3.ArrayUtils;
 
 import java.net.InetAddress;
@@ -36,6 +36,11 @@ import java.util.Random;
 import java.util.stream.*;
 import java.util.TreeSet;
 
+import org.yb.YBTestRunner;
+
+import org.junit.runner.RunWith;
+
+@RunWith(value=YBTestRunner.class)
 public class TestOrderedColumns extends BaseCQLTest {
 
   @Override
@@ -422,4 +427,30 @@ public class TestOrderedColumns extends BaseCQLTest {
 
     dropTable();
   }
+
+  @Test
+  public void testOrderingWithStaticColumns() throws Exception {
+    session.execute("CREATE TABLE test_static (h int, s int static, r1 int, r2 int, v int, " +
+        "primary key((h), r1, r2)) WITH CLUSTERING ORDER BY(r1 DESC, r2 ASC);");
+
+    session.execute("INSERT INTO test_static (h, s, r1, r2, v) VALUES (1, 2, 1, 1, 1);");
+    session.execute("INSERT INTO test_static (h, s, r1, r2, v) VALUES (1, 2, 1, 2, 1);");
+    session.execute("INSERT INTO test_static (h, s, r1, r2, v) VALUES (1, 2, 2, 1, 1);");
+    session.execute("INSERT INTO test_static (h, s, r1, r2, v) VALUES (1, 2, 2, 2, 1);");
+
+    String selectTemplate = "SELECT h, s, r1, r2, v FROM test_static WHERE h = 1";
+
+    assertQueryRowsOrdered(selectTemplate,
+        "Row[1, 2, 2, 1, 1]",
+        "Row[1, 2, 2, 2, 1]",
+        "Row[1, 2, 1, 1, 1]",
+        "Row[1, 2, 1, 2, 1]");
+
+    assertQueryRowsOrdered(selectTemplate + " ORDER BY r1 ASC, r2 DESC",
+        "Row[1, 2, 1, 2, 1]",
+        "Row[1, 2, 1, 1, 1]",
+        "Row[1, 2, 2, 2, 1]",
+        "Row[1, 2, 2, 1, 1]");
+  }
+
 }

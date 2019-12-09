@@ -16,6 +16,7 @@
 #include <glog/logging.h>
 
 #include "yb/common/wire_protocol.h"
+#include "yb/consensus/consensus.h"
 #include "yb/rpc/rpc_context.h"
 #include "yb/server/hybrid_clock.h"
 #include "yb/tablet/tablet.h"
@@ -31,12 +32,16 @@ using consensus::TRUNCATE_OP;
 using consensus::DriverType;
 using strings::Substitute;
 
+void TruncateOperationState::UpdateRequestFromConsensusRound() {
+  request_ = consensus_round()->replicate_msg()->mutable_truncate_request();
+}
+
 string TruncateOperationState::ToString() const {
   return Format("TruncateOperationState [hybrid_time=$0]", hybrid_time_even_if_unset());
 }
 
-TruncateOperation::TruncateOperation(std::unique_ptr<TruncateOperationState> state, DriverType type)
-    : Operation(std::move(state), type, OperationType::kTruncate) {
+TruncateOperation::TruncateOperation(std::unique_ptr<TruncateOperationState> state)
+    : Operation(std::move(state), OperationType::kTruncate) {
 }
 
 consensus::ReplicateMsgPtr TruncateOperation::NewReplicateMsg() {
@@ -53,12 +58,17 @@ void TruncateOperation::DoStart() {
         server::HybridClock::GetPhysicalValueMicros(state()->hybrid_time()));
 }
 
-Status TruncateOperation::Apply() {
+Status TruncateOperation::DoAborted(const Status& status) {
+  return status;
+}
+
+Status TruncateOperation::DoReplicated(int64_t leader_term, Status* complete_status) {
   TRACE("APPLY TRUNCATE: started");
 
   RETURN_NOT_OK(state()->tablet()->Truncate(state()));
 
   TRACE("APPLY TRUNCATE: finished");
+
   return Status::OK();
 }
 

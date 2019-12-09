@@ -40,14 +40,19 @@ class PTName : public TreeNode {
                   const MCSharedPtr<MCString>& name = nullptr);
   virtual ~PTName();
 
+  // Node type.
+  virtual TreeNodeOpcode opcode() const override {
+    return TreeNodeOpcode::kPTName;
+  }
+
   template<typename... TypeArgs>
   inline static PTName::SharedPtr MakeShared(MemoryContext *memctx, TypeArgs&&... args) {
     return MCMakeShared<PTName>(memctx, std::forward<TypeArgs>(args)...);
   }
 
-  CHECKED_STATUS SetupPrimaryKey(SemContext *sem_context);
-  CHECKED_STATUS SetupHashAndPrimaryKey(SemContext *sem_context);
-  CHECKED_STATUS SetupCoveringIndexColumn(SemContext *sem_context);
+  virtual CHECKED_STATUS Analyze(SemContext *sem_context) override {
+    return Status::OK();
+  }
 
   const MCString& name() const {
     return *name_;
@@ -61,7 +66,7 @@ class PTName : public TreeNode {
     return name_->c_str();
   }
 
- private:
+ protected:
   MCSharedPtr<MCString> name_;
 };
 
@@ -135,6 +140,11 @@ class PTQualifiedName : public PTName {
     return ptnames_.size() == 1;
   }
 
+  // Column name should be the last name.
+  const MCSharedPtr<MCString>& column_name() {
+    return ptnames_.back()->name_ptr();
+  }
+
   // Construct bind variable name from this name.
   const MCSharedPtr<MCString>& bindvar_name() {
     return ptnames_.back()->name_ptr();
@@ -144,7 +154,7 @@ class PTQualifiedName : public PTName {
   CHECKED_STATUS AnalyzeName(SemContext *sem_context, ObjectType object_type);
 
   client::YBTableName ToTableName() const {
-    return client::YBTableName(first_name().c_str(), last_name().c_str());
+    return client::YBTableName(YQL_DATABASE_CQL, first_name().c_str(), last_name().c_str());
   }
 
   virtual string QLName() const override {

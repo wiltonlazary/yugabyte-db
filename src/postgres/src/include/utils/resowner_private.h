@@ -6,7 +6,7 @@
  * See utils/resowner/README for more info.
  *
  *
- * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/resowner_private.h
@@ -24,6 +24,7 @@
 #include "utils/resowner.h"
 #include "utils/snapshot.h"
 
+#include "yb/yql/pggate/ybc_pg_typedefs.h"
 
 /* support for buffer refcount management */
 extern void ResourceOwnerEnlargeBuffers(ResourceOwner owner);
@@ -87,5 +88,21 @@ extern void ResourceOwnerRememberDSM(ResourceOwner owner,
 						 dsm_segment *);
 extern void ResourceOwnerForgetDSM(ResourceOwner owner,
 					   dsm_segment *);
+
+/* support for JITContext management */
+extern void ResourceOwnerEnlargeJIT(ResourceOwner owner);
+extern void ResourceOwnerRememberJIT(ResourceOwner owner,
+						 Datum handle);
+extern void ResourceOwnerForgetJIT(ResourceOwner owner,
+					   Datum handle);
+
+/* support for YugaByte statement refcount management */
+extern void ResourceOwnerEnlargeYugaByteStmts(ResourceOwner owner);
+extern void ResourceOwnerRememberYugaByteStmt(
+	ResourceOwner owner,
+	YBCPgStatement yb_stmt);
+extern void ResourceOwnerForgetYugaByteStmt(
+	ResourceOwner owner,
+	YBCPgStatement yb_stmt);
 
 #endif							/* RESOWNER_PRIVATE_H */

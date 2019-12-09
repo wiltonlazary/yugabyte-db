@@ -52,7 +52,13 @@ namespace yb {
 // setup routines useful for integration tests.
 class ExternalMiniClusterITestBase : public YBTest {
  public:
+  virtual void SetUpCluster(ExternalMiniClusterOptions* opts) {
+    // Fsync causes flakiness on EC2.
+    CHECK_NOTNULL(opts)->extra_tserver_flags.push_back("--never_fsync");
+  }
+
   virtual void TearDown() override {
+    client_.reset();
     if (cluster_) {
       if (HasFatalFailure()) {
         LOG(INFO) << "Found fatal failure";
@@ -77,30 +83,36 @@ class ExternalMiniClusterITestBase : public YBTest {
  protected:
   void StartCluster(const std::vector<std::string>& extra_ts_flags = std::vector<std::string>(),
                     const std::vector<std::string>& extra_master_flags = std::vector<std::string>(),
-                    int num_tablet_servers = 3);
+                    int num_tablet_servers = 3,
+                    int num_masters = 1);
 
   gscoped_ptr<ExternalMiniCluster> cluster_;
   gscoped_ptr<itest::ExternalMiniClusterFsInspector> inspect_;
-  std::shared_ptr<client::YBClient> client_;
+  std::unique_ptr<client::YBClient> client_;
   itest::TabletServerMap ts_map_;
 };
 
 void ExternalMiniClusterITestBase::StartCluster(const std::vector<std::string>& extra_ts_flags,
                                                 const std::vector<std::string>& extra_master_flags,
-                                                int num_tablet_servers) {
+                                                int num_tablet_servers,
+                                                int num_masters) {
   ExternalMiniClusterOptions opts;
+  opts.num_masters = num_masters;
   opts.num_tablet_servers = num_tablet_servers;
   opts.extra_master_flags = extra_master_flags;
   opts.extra_tserver_flags = extra_ts_flags;
-  opts.extra_tserver_flags.push_back("--never_fsync"); // fsync causes flakiness on EC2.
+  SetUpCluster(&opts);
+
   cluster_.reset(new ExternalMiniCluster(opts));
   ASSERT_OK(cluster_->Start());
   inspect_.reset(new itest::ExternalMiniClusterFsInspector(cluster_.get()));
-  ASSERT_OK(itest::CreateTabletServerMap(cluster_->master_proxy().get(),
+  int master_leader = 0;
+  ASSERT_OK(cluster_->GetLeaderMasterIndex(&master_leader));
+
+  ASSERT_OK(itest::CreateTabletServerMap(cluster_->master_proxy(master_leader).get(),
                                          &cluster_->proxy_cache(),
                                          &ts_map_));
-  client::YBClientBuilder builder;
-  ASSERT_OK(cluster_->CreateClient(&builder, &client_));
+  client_ = ASSERT_RESULT(cluster_->CreateClient());
 }
 
 }  // namespace yb

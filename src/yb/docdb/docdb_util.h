@@ -17,7 +17,6 @@
 #define YB_DOCDB_DOCDB_UTIL_H
 
 #include "yb/common/schema.h"
-#include "yb/common/ql_value.h"
 #include "yb/docdb/docdb.h"
 #include "yb/docdb/doc_write_batch.h"
 #include "yb/docdb/docdb_compaction_filter.h"
@@ -25,22 +24,8 @@
 
 namespace yb {
 namespace docdb {
-
-// Add primary key column values to the component group. Verify that they are in the same order
-// as in the table schema.
-CHECKED_STATUS QLKeyColumnValuesToPrimitiveValues(
-    const google::protobuf::RepeatedPtrField<QLExpressionPB> &column_values,
-    const Schema &schema, size_t column_idx, const size_t column_count,
-    vector<PrimitiveValue> *components);
-
-CHECKED_STATUS InitKeyColumnPrimitiveValues(
-    const google::protobuf::RepeatedPtrField<PgsqlExpressionPB> &column_values,
-    const Schema &schema,
-    size_t start_idx,
-    vector<PrimitiveValue> *components);
-
 // A wrapper around a RocksDB instance and provides utility functions on top of it, such as
-// compacting the history until a certain point. This is used in the builk load tool. This is also
+// compacting the history until a certain point. This is used in the bulk load tool. This is also
 // convenient base class for GTest test classes, because it exposes member functions such as
 // rocksdb() and write_options().
 class DocDBRocksDBUtil {
@@ -64,7 +49,7 @@ class DocDBRocksDBUtil {
 
   rocksdb::DB* rocksdb();
   rocksdb::DB* intents_db();
-  DocDB doc_db() { return {rocksdb(), intents_db()}; }
+  DocDB doc_db() { return { rocksdb(), intents_db(), &KeyBounds::kNoBounds }; }
 
   CHECKED_STATUS InitCommonRocksDBOptions();
 
@@ -73,6 +58,7 @@ class DocDBRocksDBUtil {
   const rocksdb::Options& options() const { return rocksdb_options_; }
 
   CHECKED_STATUS OpenRocksDB();
+
   CHECKED_STATUS ReopenRocksDB();
   CHECKED_STATUS DestroyRocksDB();
   void ResetMonotonicCounter();
@@ -84,11 +70,16 @@ class DocDBRocksDBUtil {
       rocksdb::WriteBatch *rocksdb_write_batch,
       HybridTime hybrid_time = HybridTime::kInvalid,
       bool decode_dockey = true,
-      bool increment_write_id = true) const;
+      bool increment_write_id = true,
+      PartialRangeKeyIntents partial_range_key_intents = PartialRangeKeyIntents::kTrue) const;
 
   // Writes the given DocWriteBatch to RocksDB. We substitue the hybrid time, if provided.
-  CHECKED_STATUS WriteToRocksDB(const DocWriteBatch& write_batch, const HybridTime& hybrid_time,
-                                bool decode_dockey = true, bool increment_write_id = true);
+  CHECKED_STATUS WriteToRocksDB(
+      const DocWriteBatch& write_batch,
+      const HybridTime& hybrid_time,
+      bool decode_dockey = true,
+      bool increment_write_id = true,
+      PartialRangeKeyIntents partial_range_key_intents = PartialRangeKeyIntents::kTrue);
 
   // The same as WriteToRocksDB but also clears the write batch afterwards.
   CHECKED_STATUS WriteToRocksDBAndClear(DocWriteBatch* dwb, const HybridTime& hybrid_time,
@@ -106,45 +97,50 @@ class DocDBRocksDBUtil {
   CHECKED_STATUS SetPrimitive(
       const DocPath& doc_path,
       const Value& value,
-      HybridTime hybrid_time);
+      HybridTime hybrid_time,
+      const ReadHybridTime& read_ht = ReadHybridTime::Max());
 
   CHECKED_STATUS SetPrimitive(
       const DocPath& doc_path,
       const PrimitiveValue& value,
-      HybridTime hybrid_time);
+      HybridTime hybrid_time,
+      const ReadHybridTime& read_ht = ReadHybridTime::Max());
 
   CHECKED_STATUS InsertSubDocument(
       const DocPath& doc_path,
       const SubDocument& value,
       HybridTime hybrid_time,
-      MonoDelta ttl = Value::kMaxTtl);
+      MonoDelta ttl = Value::kMaxTtl,
+      const ReadHybridTime& read_ht = ReadHybridTime::Max());
 
   CHECKED_STATUS ExtendSubDocument(
       const DocPath& doc_path,
       const SubDocument& value,
       HybridTime hybrid_time,
-      MonoDelta ttl = Value::kMaxTtl);
+      MonoDelta ttl = Value::kMaxTtl,
+      const ReadHybridTime& read_ht = ReadHybridTime::Max());
 
   CHECKED_STATUS ExtendList(
       const DocPath& doc_path,
       const SubDocument& value,
-      const ListExtendOrder extend_order,
-      HybridTime hybrid_time);
+      HybridTime hybrid_time,
+      const ReadHybridTime& read_ht = ReadHybridTime::Max());
 
   CHECKED_STATUS ReplaceInList(
       const DocPath &doc_path,
       const std::vector<int>& indexes,
       const std::vector<SubDocument>& values,
-      const HybridTime& current_time, // Used for reading.
+      const ReadHybridTime& read_ht,
       const HybridTime& hybrid_time,
       const rocksdb::QueryId query_id,
-      MonoDelta table_ttl = Value::kMaxTtl,
+      MonoDelta default_ttl = Value::kMaxTtl,
       MonoDelta ttl = Value::kMaxTtl,
       UserTimeMicros user_timestamp = Value::kInvalidUserTimestamp);
 
   CHECKED_STATUS DeleteSubDoc(
       const DocPath& doc_path,
-      HybridTime hybrid_time);
+      HybridTime hybrid_time,
+      const ReadHybridTime& read_ht = ReadHybridTime::Max());
 
   void DocDBDebugDumpToConsole();
 
@@ -188,14 +184,13 @@ class DocDBRocksDBUtil {
   rocksdb::Options rocksdb_options_;
   std::string rocksdb_dir_;
 
-
   // This is used for auto-assigning op ids to RocksDB write batches to emulate what a tablet would
   // do in production.
   rocksdb::OpId op_id_;
 
   std::shared_ptr<rocksdb::Cache> block_cache_;
-  std::shared_ptr<FixedHybridTimeRetentionPolicy> retention_policy_ {
-      std::make_shared<FixedHybridTimeRetentionPolicy>(HybridTime::kMin, MonoDelta::kMax) };
+  std::shared_ptr<ManualHistoryRetentionPolicy> retention_policy_ {
+      std::make_shared<ManualHistoryRetentionPolicy>() };
 
   rocksdb::WriteOptions write_options_;
   Schema schema_;

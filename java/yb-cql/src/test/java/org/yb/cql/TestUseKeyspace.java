@@ -13,9 +13,14 @@
 package org.yb.cql;
 
 import org.junit.Test;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.fail;
+import static org.yb.AssertionWrappers.assertEquals;
+import static org.yb.AssertionWrappers.fail;
 
+import org.yb.YBTestRunner;
+
+import org.junit.runner.RunWith;
+
+@RunWith(value=YBTestRunner.class)
 public class TestUseKeyspace extends BaseCQLTest {
 
   private void testCreateExistingKeyspace(String keyspace) throws Exception {

@@ -31,12 +31,17 @@
 //
 package org.yb.client;
 
-import static org.junit.Assert.assertEquals;
+import static org.yb.AssertionWrappers.assertEquals;
 
 import org.junit.Test;
 
 import java.math.BigInteger;
 
+import org.yb.YBTestRunner;
+
+import org.junit.runner.RunWith;
+
+@RunWith(value=YBTestRunner.class)
 public class TestBytes {
 
   @Test

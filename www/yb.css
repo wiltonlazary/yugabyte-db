@@ -67,7 +67,8 @@ body {
 
 .nav-logo {
     display: inline-block;
-    height: 39px;
+    height: 42px;
+    width: auto;
     margin: 10px auto;
     padding-left: 5px;
 }
@@ -113,20 +114,25 @@ body {
 
 .footer {
   width: 100%;
-  /* Set the fixed height of the footer here */
-  height: 60px;
   background-color: #f5f5f5;
-  /* Pin the footer to the bottom */
-  position: absolute;
   bottom: 0;
   margin-left: -35px;
 }
 .footer pre {
   border: none;
+  /* To prevent horizontal scrolling */
+  white-space:pre-wrap;
 }
-
+.footer pre.message {
+  /* To prevent word break in the easter egg message */
+  word-break: inherit;
+}
 .yb-footer {
   margin-left: 180px;
+}
+
+.yb-bottom-spacer {
+  height: 60px;
 }
 
 .sidebar-wrapper {
@@ -193,4 +199,26 @@ body {
 
 .dbg-caption>h3 {
   margin-top: 0px;
+}
+
+.level0 td:first-child {
+    padding-left: 15px;
+}
+.level1 td:first-child {
+    padding-left: 30px;
+}
+.level2 td:first-child {
+    padding-left: 45px;
+}
+.level3 td:first-child {
+    padding-left: 60px;
+}
+.level4 td:first-child {
+    padding-left: 75px;
+}
+.level5 td:first-child {
+    padding-left: 90px;
+}
+.level6 td:first-child {
+    padding-left: 105px;
 }

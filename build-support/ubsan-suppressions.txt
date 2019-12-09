@@ -6,7 +6,7 @@
 # Here is a copy-and-paste for convenience:
 # https://gist.githubusercontent.com/mbautin/fb08c1864783cfa410c16caf7c1b4833/raw
 
-# It looks like in the suppression files we should use the last argument out of the three  arguments
+# It looks like in the suppression files we should use the last argument out of the three arguments
 # to the UBSAN_CHECK macro. Here is a list for convenience.
 #
 # alignment
@@ -34,6 +34,8 @@
 # vla-bound
 # vptr
 
+# Also keep in mind that some of these warnings can only be suppressed if the code is compiled with
+# the appropriate -fsanitize-recover=... option (e.g. -fsanitize-recover=shift-base).
 # -------------------------------------------------------------------------------------------------
 # UBSAN issues in the AWS C++ SDK.
 # -------------------------------------------------------------------------------------------------
@@ -59,11 +61,39 @@ enum:Aws::Utils::Outcome*operator=
 alignment:crcutil::Crc32cSSE4::Crc32c
 
 # snappy works with unaligned data
-alignment:snappy::internal::CompressFragment
-alignment:snappy::EmitLiteral
-alignment:snappy::EmitCopyLessThan64
-alignment:snappy::internal::CompressFragment
-alignment:snappy::SnappyDecompressor::DecompressAllTags
+alignment:snappy::
 
 # https://goo.gl/AaE3P5
 pointer-overflow:google::*::DumpStackFrameInfo*
+
+# src/postgres/src/port/erand48.c
+signed-integer-overflow:_dorand48
+signed-integer-overflow:pg_erand48
+signed-integer-overflow:erand48.c
+
+# https://gist.githubusercontent.com/mbautin/8939d2a6e22156fbf61daaeb986f169e/raw
+shift-base:pglz_compress
+shift-base:pglz_find_match
+
+# We might need these too:
+shift-exponent:pglz_compress
+shift-exponent:pglz_find_match
+
+# https://gist.githubusercontent.com/mbautin/c65046247ff1e48dc03ae7ac2d711c27/raw
+shift-base:LocalExecuteInvalidationMessage
+
+# https://gist.githubusercontent.com/mbautin/aa04a0504e729db687a9520c4b13fbcc/raw
+shift-exponent:postmaster.c
+signed-integer-overflow:int.c
+signed-integer-overflow:int8.c
+
+# C++ Cassandra driver uses the following hack: type B is inherited from A and object of type A
+# is downcasted to B. It works since B does not have any extra fields etc. UBSAN correctly
+# detects this failure, but it is widely used across driver so we have to suppress it.
+vptr:libcassandra.so
+
+# UBSAN finds UndefinedBehaviorSanitizer error in case of 'float' value to 'double' type casting
+# with overflow. The result is 'Inf' and that's correct. Let's suppress the error because there
+# are such castings with overflow in a few tests. (For example: QLTestSelectedExpr.TestCastDecimal)
+# (See https://github.com/YugaByte/yugabyte-db/issues/1241 for details.)
+float-cast-overflow:yb::bfql::SetNumericResult

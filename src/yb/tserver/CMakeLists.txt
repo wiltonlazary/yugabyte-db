@@ -139,12 +139,14 @@ ADD_YB_LIBRARY(tserver_service_proto
 #########################################
 
 set(TSERVER_UTIL_SRCS
-  tserver_flags.cc)
+  tserver_flags.cc
+  tserver_error.cc)
 set(TSERVER_UTIL_LIBS
   yb_util)
 ADD_YB_LIBRARY(tserver_util
   SRCS ${TSERVER_UTIL_SRCS}
   DEPS ${TSERVER_UTIL_LIBS})
+add_dependencies(tserver_util gen_proto)
 
 #########################################
 # tserver
@@ -152,10 +154,12 @@ ADD_YB_LIBRARY(tserver_util
 
 set(TSERVER_SRCS
   heartbeater.cc
+  metrics_snapshotter.cc
   mini_tablet_server.cc
   remote_bootstrap_client.cc
   remote_bootstrap_service.cc
   remote_bootstrap_session.cc
+  service_util.cc
   tablet_server.cc
   tablet_server_options.cc
   tablet_service.cc
@@ -181,7 +185,9 @@ target_link_libraries(tserver
   server_common
   server_process
   tablet
-  yb_client)
+  yb_client
+  yb_pggate_flags
+  ${TSERVER_LIB_EXTENSIONS})
 
 #########################################
 # yb-tserver
@@ -192,7 +198,7 @@ target_link_libraries(yb-tserver
   tserver
   yb-cql
   yb-redis
-  yb-pgsql
+  yb_pgwrapper
   master
   ${YB_BASE_LIBS})
 
@@ -208,6 +214,7 @@ target_link_libraries(tserver_test_util tablet_test_util tserver yb_test_util)
 #########################################
 
 set(YB_TEST_LINK_LIBS
+  rpc_test_util
   tserver
   tserver_test_util
   yb_client # yb::client::YBTableName
@@ -228,3 +235,6 @@ if(YB_ENT_CURRENT_SOURCE_DIR)
     ADD_YB_TEST(${test})
   endforeach()
 endif()
+
+# Tablet server starts PostgreSQL as a child process
+adD_dependencies(tserver postgres)

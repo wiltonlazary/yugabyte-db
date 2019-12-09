@@ -204,7 +204,7 @@ class MethodSubstitutions : public Substituter {
   // namespaces for method arguments.
   static std::string StripNamespaceIfPossible(const std::string& service_full_name,
                                               const std::string& arg_full_name) {
-    StringPiece service_package(service_full_name);
+    GStringPiece service_package(service_full_name);
     if (!service_package.contains(".")) {
       return arg_full_name;
     }
@@ -213,7 +213,7 @@ class MethodSubstitutions : public Substituter {
     service_package.remove_suffix(service_package.length() -
                                   service_package.find_last_of(".") - 1);
 
-    StringPiece argfqn(arg_full_name);
+    GStringPiece argfqn(arg_full_name);
     if (argfqn.starts_with(service_package)) {
       argfqn.remove_prefix(argfqn.find_last_of(".") + 1);
     }
@@ -348,7 +348,6 @@ class CodeGenerator : public ::google::protobuf::compiler::CodeGenerator {
       "#include \"yb/rpc/rpc_fwd.h\"\n"
       "#include \"yb/rpc/rpc_header.pb.h\"\n"
       "#include \"yb/rpc/service_if.h\"\n"
-      "#include \"yb/rpc/yb_rpc.h\"\n"
       "\n"
       "namespace yb {\n"
       "class MetricEntity;\n"
@@ -428,7 +427,6 @@ class CodeGenerator : public ::google::protobuf::compiler::CodeGenerator {
         "  void InitMetrics(const scoped_refptr<MetricEntity>& ent);\n"
         "\n"
         "  ::yb::rpc::RpcMethodMetrics metrics_[kMethodCount];\n"
-        "\n"
         "};\n"
       );
 
@@ -453,6 +451,7 @@ class CodeGenerator : public ::google::protobuf::compiler::CodeGenerator {
       "#include <glog/logging.h>\n"
       "\n"
       "#include \"yb/rpc/inbound_call.h\"\n"
+      "#include \"yb/rpc/local_call.h\"\n"
       "#include \"yb/rpc/remote_method.h\"\n"
       "#include \"yb/rpc/rpc_context.h\"\n"
       "#include \"yb/rpc/service_if.h\"\n"

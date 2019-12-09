@@ -31,7 +31,7 @@
 //
 package org.yb.client;
 
-import static org.junit.Assert.*;
+import static org.yb.AssertionWrappers.*;
 
 import com.google.common.base.Stopwatch;
 import com.google.common.base.Ticker;
@@ -39,6 +39,11 @@ import org.junit.Test;
 
 import java.util.concurrent.atomic.AtomicLong;
 
+import org.yb.YBTestRunner;
+
+import org.junit.runner.RunWith;
+
+@RunWith(value=YBTestRunner.class)
 public class TestDeadlineTracker {
 
   @Test

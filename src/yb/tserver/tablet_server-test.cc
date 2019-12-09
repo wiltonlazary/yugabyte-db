@@ -32,12 +32,16 @@
 
 #include "yb/consensus/log-test-base.h"
 
+#include "yb/common/ql_value.h"
+
 #include "yb/gutil/strings/escaping.h"
 #include "yb/gutil/strings/substitute.h"
 
 #include "yb/master/master.pb.h"
 
 #include "yb/rpc/messenger.h"
+#include "yb/rpc/rpc_test_util.h"
+#include "yb/rpc/yb_rpc.h"
 
 #include "yb/server/hybrid_clock.h"
 #include "yb/server/server_base.pb.h"
@@ -47,6 +51,7 @@
 #include "yb/tserver/tablet_server.h"
 #include "yb/tserver/tablet_server-test-base.h"
 #include "yb/tserver/tablet_server_test_util.h"
+#include "yb/tserver/ts_tablet_manager.h"
 #include "yb/tserver/tserver_admin.proxy.h"
 
 #include "yb/util/crc.h"
@@ -190,7 +195,6 @@ TEST_F(TabletServerTest, TestSetFlagsAndCheckWebPages) {
   ASSERT_OK(c.FetchURL(Substitute("http://$0/tablets", addr),
                        &buf));
   ASSERT_STR_CONTAINS(buf.ToString(), kTabletId);
-  ASSERT_STR_CONTAINS(buf.ToString(), "<td>hash_split: [&lt;start&gt;, &lt;end&gt;)</td>");
 
   // Tablet page should include the schema.
   ASSERT_OK(c.FetchURL(Substitute("http://$0/tablet?id=$1", addr, kTabletId),
@@ -213,7 +217,6 @@ TEST_F(TabletServerTest, TestSetFlagsAndCheckWebPages) {
     // Check that the tablet entry shows up.
     ASSERT_STR_CONTAINS(buf.ToString(), "\"type\": \"tablet\"");
     ASSERT_STR_CONTAINS(buf.ToString(), "\"id\": \"test-tablet\"");
-    ASSERT_STR_CONTAINS(buf.ToString(), "\"partition\": \"hash_split: [<start>, <end>)\"");
 
     // Check entity attributes.
     ASSERT_STR_CONTAINS(buf.ToString(), "\"table_name\": \"test-table\"");
@@ -517,10 +520,11 @@ TEST_F(TabletServerTest, TestClientGetsErrorBackWhenRecoveryFailed) {
 
   // Save the log path before shutting down the tablet (and destroying
   // the tablet peer).
-  string log_path = tablet_peer_->log()->ActiveSegmentPathForTests();
-  ShutdownTablet();
+  string log_path = tablet_peer_->log()->ActiveSegmentForTests()->path();
+  auto idx = tablet_peer_->log()->ActiveSegmentForTests()->first_entry_offset() + 300;
 
-  ASSERT_OK(log::CorruptLogFile(env_.get(), log_path, log::FLIP_BYTE, 300));
+  ShutdownTablet();
+  ASSERT_OK(log::CorruptLogFile(env_.get(), log_path, log::FLIP_BYTE, idx));
 
   ASSERT_FALSE(ShutdownAndRebuildTablet().ok());
 
@@ -553,7 +557,7 @@ TEST_F(TabletServerTest, TestCreateTablet_TabletExists) {
   req.mutable_config()->CopyFrom(mini_server_->CreateLocalConfig());
 
   Schema schema = SchemaBuilder(schema_).Build();
-  ASSERT_OK(SchemaToPB(schema, req.mutable_schema()));
+  SchemaToPB(schema, req.mutable_schema());
 
   // Send the call
   {
@@ -726,12 +730,13 @@ TEST_F(TabletServerTest, TestRpcServerCreateDestroy) {
         "server1", opts, rpc::CreateConnectionContextFactory<rpc::YBInboundConnectionContext>());
   }
   {
-    server::RpcServer server2(
-        "server2", opts, rpc::CreateConnectionContextFactory<rpc::YBInboundConnectionContext>());
     MessengerBuilder mb("foo");
-    auto messenger = mb.Build();
-    ASSERT_OK(messenger);
-    ASSERT_OK(server2.Init(*messenger));
+    auto messenger = rpc::CreateAutoShutdownMessengerHolder(ASSERT_RESULT(mb.Build()));
+    {
+      server::RpcServer server2(
+          "server2", opts, rpc::CreateConnectionContextFactory<rpc::YBInboundConnectionContext>());
+      ASSERT_OK(server2.Init(messenger.get()));
+    }
   }
 }
 
@@ -742,29 +747,28 @@ TEST_F(TabletServerTest, TestRpcServerRPCFlag) {
   ServerRegistrationPB reg;
   auto tbo = ASSERT_RESULT(TabletServerOptions::CreateTabletServerOptions());
   MessengerBuilder mb("foo");
-  auto messenger = mb.Build();
-  ASSERT_OK(messenger);
+  auto messenger = CreateAutoShutdownMessengerHolder(ASSERT_RESULT(mb.Build()));
 
   server::RpcServer server1(
       "server1", opts, rpc::CreateConnectionContextFactory<rpc::YBInboundConnectionContext>());
-  ASSERT_OK(server1.Init(*messenger));
+  ASSERT_OK(server1.Init(messenger.get()));
 
   FLAGS_rpc_bind_addresses = "0.0.0.0:2000,0.0.0.1:2001";
   server::RpcServerOptions opts2;
   server::RpcServer server2(
       "server2", opts2, rpc::CreateConnectionContextFactory<rpc::YBInboundConnectionContext>());
-  ASSERT_OK(server2.Init(*messenger));
+  ASSERT_OK(server2.Init(messenger.get()));
 
   FLAGS_rpc_bind_addresses = "10.20.30.40:2017";
   server::RpcServerOptions opts3;
   server::RpcServer server3(
       "server3", opts3, rpc::CreateConnectionContextFactory<rpc::YBInboundConnectionContext>());
-  ASSERT_OK(server3.Init(*messenger));
+  ASSERT_OK(server3.Init(messenger.get()));
 
   reg.Clear();
-  tbo.fs_opts.data_paths = { "/tmp" };
+  tbo.fs_opts.data_paths = { GetTestPath("fake-ts") };
   tbo.rpc_opts = opts3;
-  YB_EDITION_NS_PREFIX TabletServer server(tbo);
+  enterprise::TabletServer server(tbo);
 
   ASSERT_NO_FATALS(WARN_NOT_OK(server.Init(), "Ignore"));
   // This call will fail for http binding, but this test is for rpc.
@@ -777,7 +781,7 @@ TEST_F(TabletServerTest, TestRpcServerRPCFlag) {
   FLAGS_rpc_bind_addresses = "10.20.30.40:2017,20.30.40.50:2018";
   server::RpcServerOptions opts4;
   tbo.rpc_opts = opts4;
-  YB_EDITION_NS_PREFIX TabletServer tserver2(tbo);
+  enterprise::TabletServer tserver2(tbo);
   ASSERT_NO_FATALS(WARN_NOT_OK(tserver2.Init(), "Ignore"));
   // This call will fail for http binding, but this test is for rpc.
   ASSERT_NO_FATALS(WARN_NOT_OK(tserver2.GetRegistration(&reg), "Ignore"));
@@ -890,27 +894,6 @@ TEST_F(TabletServerTest, TestChecksumScan) {
   ASSERT_NE(total_crc, resp.checksum());
   ASSERT_EQ(first_crc, resp.checksum());
 }
-
-class DelayFsyncLogHook : public log::Log::LogFaultHooks {
- public:
-  DelayFsyncLogHook() : log_latch1_(1), test_latch1_(1) {}
-
-  Status PostAppend() override {
-    test_latch1_.CountDown();
-    log_latch1_.Wait();
-    log_latch1_.Reset(1);
-    return Status::OK();
-  }
-
-  void Continue() {
-    test_latch1_.Wait();
-    log_latch1_.CountDown();
-  }
-
- private:
-  CountDownLatch log_latch1_;
-  CountDownLatch test_latch1_;
-};
 
 } // namespace tserver
 } // namespace yb

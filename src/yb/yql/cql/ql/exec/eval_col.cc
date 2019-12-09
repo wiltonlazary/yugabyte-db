@@ -13,6 +13,8 @@
 //
 //--------------------------------------------------------------------------------------------------
 
+#include "yb/common/ql_value.h"
+
 #include "yb/yql/cql/ql/exec/executor.h"
 
 namespace yb {
@@ -47,18 +49,9 @@ CHECKED_STATUS Executor::ColumnArgsToPB(const PTDmlStmt *tnode, QLWriteRequestPB
     }
 
     const ColumnDesc *col_desc = col.desc();
-    QLExpressionPB *expr_pb;
-
     VLOG(3) << "WRITE request, column id = " << col_desc->id();
-    if (col_desc->is_hash()) {
-      expr_pb = req->add_hashed_column_values();
-    } else if (col_desc->is_primary()) {
-      expr_pb = req->add_range_column_values();
-    } else {
-      QLColumnValuePB* col_pb = req->add_column_values();
-      col_pb->set_column_id(col_desc->id());
-      expr_pb = col_pb->mutable_expr();
-    }
+
+    QLExpressionPB *expr_pb = CreateQLExpression(req, *col_desc);
 
     RETURN_NOT_OK(PTExprToPB(col.expr(), expr_pb));
     if (col_desc->is_primary()) {
@@ -68,7 +61,7 @@ CHECKED_STATUS Executor::ColumnArgsToPB(const PTDmlStmt *tnode, QLWriteRequestPB
     // Null values not allowed for primary key: checking here catches nulls introduced by bind.
     if (col_desc->is_primary() && expr_pb->has_value() && IsNull(expr_pb->value())) {
       LOG(INFO) << "Unexpected null value. Current request: " << req->DebugString();
-      return exec_context().Error(tnode, ErrorCode::NULL_ARGUMENT_FOR_PRIMARY_KEY);
+      return exec_context_->Error(tnode, ErrorCode::NULL_ARGUMENT_FOR_PRIMARY_KEY);
     }
   }
 

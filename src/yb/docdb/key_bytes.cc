@@ -37,7 +37,7 @@ Status KeyBytes::ReplaceLastHybridTimeForSeek(HybridTime hybrid_time) {
 Status KeyBytes::OnlyLacksHybridTimeFrom(const rocksdb::Slice& other_slice, bool* result) const {
   *result = false;
 
-  DOCDB_DEBUG_LOG("other_slice=$0", FormatRocksDBSliceAsStr(other_slice));
+  DOCDB_DEBUG_LOG("other_slice=$0", FormatSliceAsStr(other_slice));
 
   if (other_slice.empty()) {
     return STATUS(Corruption, "Empty key not expected");
@@ -52,11 +52,6 @@ Status KeyBytes::OnlyLacksHybridTimeFrom(const rocksdb::Slice& other_slice, bool
   *result = prefix_size + other_encoded_ht_size + 1 == other_encoded_key_size &&
             other_slice.starts_with(AsSlice());
   return Status::OK();
-}
-
-void AppendIntentType(IntentType intent_type, KeyBytes* key) {
-  key->AppendValueType(ValueType::kIntentType);
-  key->mutable_data()->push_back(static_cast<char>(intent_type));
 }
 
 void AppendDocHybridTime(const DocHybridTime& doc_ht, KeyBytes* key) {

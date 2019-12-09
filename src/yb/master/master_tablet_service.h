@@ -27,18 +27,11 @@ namespace master {
 // A subset of the TabletService supported by the Master to query specific tables.
 class MasterTabletServiceImpl : public yb::tserver::TabletServiceImpl {
  public:
-
   MasterTabletServiceImpl(MasterTabletServer* server, Master* master);
-  void Read(const tserver::ReadRequestPB* req, tserver::ReadResponsePB* resp,
-                    rpc::RpcContext context) override;
 
   void Write(const tserver::WriteRequestPB* req,
              tserver::WriteResponsePB* resp,
              rpc::RpcContext context) override;
-
-  void NoOp(const tserver::NoOpRequestPB* req,
-            tserver::NoOpResponsePB* resp,
-            rpc::RpcContext context) override;
 
   void ListTablets(const tserver::ListTabletsRequestPB* req,
                    tserver::ListTabletsResponsePB* resp,
@@ -56,12 +49,17 @@ class MasterTabletServiceImpl : public yb::tserver::TabletServiceImpl {
                 tserver::ChecksumResponsePB* resp,
                 rpc::RpcContext context) override;
 
+  void IsTabletServerReady(const tserver::IsTabletServerReadyRequestPB* req,
+                           tserver::IsTabletServerReadyResponsePB* resp,
+                           rpc::RpcContext context) override;
+
  private:
   bool GetTabletOrRespond(
       const tserver::ReadRequestPB* req,
       tserver::ReadResponsePB* resp,
       rpc::RpcContext* context,
-      std::shared_ptr<tablet::AbstractTablet>* tablet) override;
+      std::shared_ptr<tablet::AbstractTablet>* tablet,
+      tablet::TabletPeerPtr looked_up_tablet_peer) override;
 
   Master *const master_;
   DISALLOW_COPY_AND_ASSIGN(MasterTabletServiceImpl);

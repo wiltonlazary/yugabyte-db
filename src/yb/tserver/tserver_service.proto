@@ -61,7 +61,14 @@ service TabletServerService {
   rpc AbortTransaction(AbortTransactionRequestPB) returns (AbortTransactionResponsePB);
   rpc Truncate(TruncateRequestPB) returns (TruncateResponsePB);
   rpc GetTabletStatus(GetTabletStatusRequestPB) returns (GetTabletStatusResponsePB);
-  rpc GetMasterAddresses (GetMasterAddressesRequestPB) returns (GetMasterAddressesResponsePB);
+  rpc GetMasterAddresses(GetMasterAddressesRequestPB) returns (GetMasterAddressesResponsePB);
+
+  rpc Publish(PublishRequestPB) returns (PublishResponsePB);
+
+  rpc IsTabletServerReady(IsTabletServerReadyRequestPB) returns (IsTabletServerReadyResponsePB);
+
+  // Takes precreated transaction from this tserver.
+  rpc TakeTransaction(TakeTransactionRequestPB) returns (TakeTransactionResponsePB);
 }
 
 message GetLogLocationRequestPB {
@@ -98,7 +105,11 @@ message ListTabletsForTabletServerResponsePB {
     optional string table_name = 1;
     optional bytes tablet_id = 2;
     optional bool is_leader = 3;
-    optional tablet.TabletStatePB state = 4;
+    optional tablet.RaftGroupStatePB state = 4;
+    optional uint64 num_sst_files = 5;
+    optional uint64 num_log_segments = 6;
+    optional uint64 num_memtables_intents = 7;
+    optional uint64 num_memtables_regular = 8;
   }
 
   repeated Entry entries = 1;
@@ -130,7 +141,7 @@ message UpdateTransactionResponsePB {
 
 message GetTransactionStatusRequestPB {
   optional bytes tablet_id = 1;
-  optional bytes transaction_id = 2;
+  repeated bytes transaction_id = 2;
   optional fixed64 propagated_hybrid_time = 3;
 }
 
@@ -138,9 +149,9 @@ message GetTransactionStatusResponsePB {
   // Error message, if any.
   optional TabletServerErrorPB error = 1;
 
-  optional TransactionStatus status = 2;
+  repeated TransactionStatus status = 2;
   // For description of status_hybrid_time see comment in TransactionStatusResult.
-  optional fixed64 status_hybrid_time = 3;
+  repeated fixed64 status_hybrid_time = 3;
 
   optional fixed64 propagated_hybrid_time = 4;
 }
@@ -160,4 +171,11 @@ message AbortTransactionResponsePB {
   optional fixed64 status_hybrid_time = 3;
 
   optional fixed64 propagated_hybrid_time = 4;
+}
+
+message TakeTransactionRequestPB {
+}
+
+message TakeTransactionResponsePB {
+  optional TransactionMetadataPB metadata = 1;
 }

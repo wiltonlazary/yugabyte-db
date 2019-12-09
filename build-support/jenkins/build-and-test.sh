@@ -67,6 +67,7 @@
 #   Default: 0
 #     Try to auto-detect the set of C++ tests to run for the current set of changes relative to
 #     origin/master.
+
 #
 # Portions Copyright (c) YugaByte, Inc.
 
@@ -75,6 +76,11 @@ set -euo pipefail
 echo "Build script $BASH_SOURCE is running"
 
 . "${BASH_SOURCE%/*}/../common-test-env.sh"
+
+readonly COMMON_YB_BUILD_ARGS_FOR_CPP_BUILD=(
+  --no-rebuild-thirdparty
+  --skip-java
+)
 
 # -------------------------------------------------------------------------------------------------
 # Functions
@@ -90,7 +96,7 @@ build_cpp_code() {
 
   heading "Building C++ code in $YB_SRC_ROOT."
   remote_opt=""
-  if [[ ${YB_REMOTE_BUILD:-} == "1" ]]; then
+  if [[ ${YB_REMOTE_COMPILATION:-} == "1" ]]; then
     # This helps with our background script resizing the build cluster, because it looks at all
     # running build processes with the "--remote" option as of 08/2017.
     remote_opt="--remote"
@@ -102,8 +108,7 @@ build_cpp_code() {
   # dependencies (or downloaded them, or picked an existing third-party directory) above.
 
   local yb_build_args=(
-    --no-rebuild-thirdparty
-    --skip-java
+    "${COMMON_YB_BUILD_ARGS_FOR_CPP_BUILD[@]}"
     "$BUILD_TYPE"
   )
 
@@ -111,13 +116,15 @@ build_cpp_code() {
     # TODO: remove this code when it becomes clear why CMake sometimes gets re-run.
     log "Building a dummy target to check if Ninja re-runs CMake (it should not)."
     # The "-d explain" option will make Ninja explain why it is building a particular target.
-    time run_centralized_build_cmd "$YB_SRC_ROOT/yb_build.sh" $remote_opt \
-      --make-ninja-extra-args "-d explain" \
-      --target dummy_target \
-      "${yb_build_args[@]}"
+    (
+      time "$YB_SRC_ROOT/yb_build.sh" $remote_opt \
+        --make-ninja-extra-args "-d explain" \
+        --target dummy_target \
+        "${yb_build_args[@]}"
+    )
   fi
 
-  time run_centralized_build_cmd "$YB_SRC_ROOT/yb_build.sh" $remote_opt \
+  time "$YB_SRC_ROOT/yb_build.sh" $remote_opt \
     "${yb_build_args[@]}" 2>&1 | \
     filter_boring_cpp_build_output
 
@@ -142,6 +149,14 @@ cleanup() {
 
 cd "$YB_SRC_ROOT"
 
+log "Removing old JSON-based test report files"
+(
+  set -x
+  find . -name "*_test_report.json" -exec rm -f '{}' \;
+  rm -f test_results.json test_failures.json
+)
+
+export YB_RUN_JAVA_TEST_METHODS_SEPARATELY=1
 log "Running with Bash version $BASH_VERSION"
 if ! "$YB_BUILD_SUPPORT_DIR/common-build-env-test.sh"; then
   fatal "Test of the common build environment failed, cannot proceed."
@@ -166,6 +181,7 @@ readonly build_type
 
 BUILD_TYPE=$build_type
 readonly BUILD_TYPE
+export BUILD_TYPE
 
 export YB_USE_NINJA=1
 log "YB_USE_NINJA=$YB_USE_NINJA"
@@ -176,6 +192,7 @@ log "YB_NINJA_PATH=${YB_NINJA_PATH:-undefined}"
 set_build_root --no-readonly
 
 set_common_test_paths
+set_java_home
 
 export YB_DISABLE_LATEST_SYMLINK=1
 remove_latest_symlink
@@ -199,12 +216,16 @@ log "Running Python tests"
 time run_python_tests
 log "Finished running Python tests (see timing information above)"
 
+log "Running a light-weight lint script on our Java code"
+time lint_java_code
+log "Finished running a light-weight lint script on the Java code"
+
 # TODO: deduplicate this with similar logic in yb-jenkins-build.sh.
 YB_BUILD_JAVA=${YB_BUILD_JAVA:-1}
 YB_BUILD_CPP=${YB_BUILD_CPP:-1}
 
 if [[ -z ${YB_RUN_AFFECTED_TESTS_ONLY:-} ]] && is_jenkins_phabricator_build; then
-  log "YB_RUN_AFFECTED_TESTS_ONLY is not set, and this is a Jenkins phabricator test." \
+  log "YB_RUN_AFFECTED_TESTS_ONLY is not set, and this is a Jenkins Phabricator test." \
       "Setting YB_RUN_AFFECTED_TESTS_ONLY=1 automatically."
   export YB_RUN_AFFECTED_TESTS_ONLY=1
 fi
@@ -269,9 +290,7 @@ if is_jenkins; then
   fi
 fi
 
-if [[ ! -d $BUILD_ROOT ]]; then
-  create_dir_on_ephemeral_drive "$BUILD_ROOT" "build/${BUILD_ROOT##*/}"
-fi
+mkdir_safe "$BUILD_ROOT"
 
 if [[ -h $BUILD_ROOT ]]; then
   # If we ended up creating BUILD_ROOT as a symlink to an ephemeral drive, now make BUILD_ROOT
@@ -290,23 +309,26 @@ if is_jenkins; then
   trap cleanup EXIT
 fi
 
-configure_remote_build
+configure_remote_compilation
 
-if "$using_default_thirdparty_dir"; then
+log "YB_THIRDPARTY_DIR=$YB_THIRDPARTY_DIR"
+if using_default_thirdparty_dir; then
+  log "Found that YB_THIRDPARTY_DIR is the default location"
   find_thirdparty_dir
   if ! "$found_shared_thirdparty_dir"; then
     if [[ ${NO_REBUILD_THIRDPARTY:-} == "1" ]]; then
       log "Skiping third-party build because NO_REBUILD_THIRDPARTY is set."
     else
       log "Starting third-party dependency build"
-      time thirdparty/build_thirdparty.py
+      time thirdparty/build_thirdparty.sh
       log "Third-party dependency build finished (see timing information above)"
     fi
   fi
 else
-  log "YB_THIRDPARTY_DIR is explicitly specified as '$YB_THIRDPARTY_DIR', not looking for a" \
-      "shared third-party directory."
+  log "YB_THIRDPARTY_DIR is explicitly specified as a non-default location '$YB_THIRDPARTY_DIR'," \
+      "not looking for a shared third-party directory."
 fi
+validate_thirdparty_dir
 
 export NO_REBUILD_THIRDPARTY=1
 
@@ -332,13 +354,33 @@ if [[ $YB_RUN_AFFECTED_TESTS_ONLY == "1" ]]; then
   )
 fi
 
+if [[ ${YB_ENABLE_STATIC_ANALYZER:-auto} == "auto" ]]; then
+  if is_clang &&
+     is_linux &&
+     [[ $build_type =~ ^(debug|release)$ ]] &&
+     is_jenkins_master_build
+  then
+    if true; then
+      log "Not enabling Clang static analyzer. Will enable in clang/Linux builds in the future."
+    else
+      # TODO: re-enable this when we have time to sift through analyzer warnings.
+      export YB_ENABLE_STATIC_ANALYZER=1
+      log "Enabling Clang static analyzer (this is a clang Linux $build_type build)"
+    fi
+  else
+    log "Not enabling Clang static analyzer (this is not a clang Linux debug/release build):" \
+        "OSTYPE=$OSTYPE, YB_COMPILER_TYPE=$YB_COMPILER_TYPE, build_type=$build_type"
+  fi
+else
+  log "YB_ENABLE_STATIC_ANALYZER is already set to $YB_ENABLE_STATIC_ANALYZER," \
+      "not setting automatically"
+fi
+
 # We have a retry loop around CMake because it sometimes fails due to NFS unavailability.
 declare -i -r MAX_CMAKE_RETRIES=3
 declare -i cmake_attempt_index=1
 while true; do
-  # We run CMake on the "central build master" in case of a distributed build.
-  if run_centralized_build_cmd "$YB_SRC_ROOT/yb_build.sh" "$BUILD_TYPE" --cmake-only --no-remote
-  then
+  if "$YB_SRC_ROOT/yb_build.sh" "$BUILD_TYPE" --cmake-only --no-remote; then
     log "CMake succeeded after attempt $cmake_attempt_index"
     break
   fi
@@ -379,12 +421,15 @@ if [[ $YB_BUILD_CPP == "1" ]] && ! which ctest >/dev/null; then
   fatal "ctest not found, won't be able to run C++ tests"
 fi
 
+export YB_SKIP_INITIAL_SYS_CATALOG_SNAPSHOT=1
+
 # -------------------------------------------------------------------------------------------------
 # Build C++ code regardless of YB_BUILD_CPP, because we'll also need it for Java tests.
 
 heading "Building C++ code"
 
-if [[ ${YB_TRACK_REGRESSIONS:-} == "1" ]]; then
+YB_TRACK_REGRESSIONS=${YB_TRACK_REGRESSIONS:-0}
+if [[ $YB_TRACK_REGRESSIONS == "1" ]]; then
 
   cd "$YB_SRC_ROOT"
   if ! git diff-index --quiet HEAD --; then
@@ -404,7 +449,7 @@ if [[ ${YB_TRACK_REGRESSIONS:-} == "1" ]]; then
 
   if [[ -e $YB_SRC_ROOT_REGR ]]; then
     log "Removing the existing contents of '$YB_SRC_ROOT_REGR'"
-    time run_centralized_build_cmd rm -rf "$YB_SRC_ROOT_REGR"
+    time rm -rf "$YB_SRC_ROOT_REGR"
     if [[ -e $YB_SRC_ROOT_REGR ]]; then
       log "Failed to remove '$YB_SRC_ROOT_REGR' right away"
       sleep 0.5
@@ -415,7 +460,7 @@ if [[ ${YB_TRACK_REGRESSIONS:-} == "1" ]]; then
   fi
 
   log "Cloning '$YB_SRC_ROOT' to '$YB_SRC_ROOT_REGR'"
-  time run_centralized_build_cmd git clone "$YB_SRC_ROOT" "$YB_SRC_ROOT_REGR"
+  time git clone "$YB_SRC_ROOT" "$YB_SRC_ROOT_REGR"
   if [[ ! -d $YB_SRC_ROOT_REGR ]]; then
     log "Directory $YB_SRC_ROOT_REGR did not appear right away"
     sleep 0.5
@@ -445,7 +490,7 @@ fi
 
 build_cpp_code "$YB_SRC_ROOT"
 
-if [[ ${YB_TRACK_REGRESSIONS:-} == "1" ]]; then
+if [[ $YB_TRACK_REGRESSIONS == "1" ]]; then
   log "Waiting for building C++ code one commit behind (at $git_commit_after_rollback)" \
       "in $YB_SRC_ROOT_REGR"
   wait "$build_cpp_code_regr_pid"
@@ -454,15 +499,56 @@ fi
 log "Disk usage after C++ build:"
 show_disk_usage
 
+# We can grep for this line in the log to determine the stage of the build job.
+log "ALL OF YUGABYTE C++ BUILD FINISHED"
+
 # End of the C++ code build.
 # -------------------------------------------------------------------------------------------------
 
+# -------------------------------------------------------------------------------------------------
+# Running initdb
+# -------------------------------------------------------------------------------------------------
+
+export YB_SKIP_INITIAL_SYS_CATALOG_SNAPSHOT=0
+
+if [[ $BUILD_TYPE != "tsan" ]]; then
+  declare -i initdb_attempt_index=1
+  declare -i -r MAX_INITDB_ATTEMPTS=3
+
+  while [[ $initdb_attempt_index -le $MAX_INITDB_ATTEMPTS ]]; do
+    log "Creating initial system catalog snapshot (attempt $initdb_attempt_index)"
+    if ! time "$YB_SRC_ROOT/yb_build.sh" "$BUILD_TYPE" initdb --skip-java; then
+      initdb_err_msg="Failed to create initial sys catalog snapshot at "
+      initdb_err_msg+="attempt $initdb_attempt_index"
+      log "$initdb_err_msg. PostgreSQL tests may take longer."
+      FAILURES+="$initdb_err_msg"$'\n'
+      EXIT_STATUS=1
+    else
+      log "Successfully created initial system catalog snapshot at attempt $initdb_attempt_index"
+      break
+    fi
+    let initdb_attempt_index+=1
+  done
+  if [[ $initdb_attempt_index -gt $MAX_INITDB_ATTEMPTS ]]; then
+    log "Failed to run create initial sys catalog snapshot after $MAX_INITDB_ATTEMPTS attempts."
+    log "We will still run the tests. They will take longer because they will have to run initdb."
+  fi
+fi
+
+# -------------------------------------------------------------------------------------------------
+# Dependency graph analysis allowing to determine what tests to run.
+# -------------------------------------------------------------------------------------------------
+
 if [[ $YB_RUN_AFFECTED_TESTS_ONLY == "1" ]]; then
-  (
-    set -x
-    "$YB_SRC_ROOT/python/yb/dependency_graph.py" \
-      --build-root "$BUILD_ROOT" self-test --rebuild-graph
-  )
+  if ! ( set -x
+         "$YB_SRC_ROOT/python/yb/dependency_graph.py" \
+           --build-root "$BUILD_ROOT" self-test --rebuild-graph ); then
+    # Trying to diagnose this error:
+    # https://gist.githubusercontent.com/mbautin/c5c6f14714f7655c10620d8e658e1f5b/raw
+    log "dependency_graph.py failed, listing all pb.{h,cc} files in the build directory"
+    ( set -x; find "$BUILD_ROOT" -name "*.pb.h" -or -name "*.pb.cc" )
+    fatal "Dependency graph construction failed"
+  fi
 fi
 
 # Save the current HEAD commit in case we build Java below and add a new commit. This is used for
@@ -474,58 +560,72 @@ fi
 #   pom.xml changes we've just made, forcing us to always run Java tests.
 current_git_commit=$(git rev-parse HEAD)
 
+random_build_id=$( date +%Y%m%dT%H%M%S )_$RANDOM$RANDOM$RANDOM
+
 # -------------------------------------------------------------------------------------------------
 # Java build
 
+java_build_failed=false
 if [[ $YB_BUILD_JAVA == "1" && $YB_SKIP_BUILD != "1" ]]; then
   # This sets the proper NFS-shared directory for Maven's local repository on Jenkins.
+  # Use a unique version to avoid a race with other concurrent jobs on jar files that we install
+  # into ~/.m2/repository.
+  export YB_TMP_GROUP_ID=org.ybtmpgroupid$random_build_id
   set_mvn_parameters
 
   heading "Building Java code..."
   if [[ -n ${JAVA_HOME:-} ]]; then
     export PATH=$JAVA_HOME/bin:$PATH
   fi
-  pushd "$YB_SRC_ROOT/java"
 
-  # build_yb_java_code will provide some common options for Maven. This includes local Maven
-  # repository location and the local Maven settings file.
-  build_yb_java_code clean
+  build_yb_java_code_in_all_dirs clean
 
-  if is_jenkins; then
-    # Use a unique version to avoid a race with other concurrent jobs on jar files that we install
-    # into ~/.m2/repository.
-    random_id=$( date +%Y%m%dT%H%M%S )_$RANDOM$RANDOM$RANDOM
-    yb_java_project_version=yugabyte-jenkins-$random_id
+  heading "Java 'clean' build is complete, will now actually build Java code"
 
-    yb_new_group_id=org.yb$random_id
-    find . -name "pom.xml" \
-           -exec sed -i "s#<groupId>org[.]yb</groupId>#<groupId>$yb_new_group_id</groupId>#g" {} \;
 
-    # Tell gen_version_info.py to store the Git SHA1 of the commit really present in the code
-    # being built, not our temporary commit to update pom.xml files.
-    get_current_git_sha1
-    export YB_VERSION_INFO_GIT_SHA1=$current_git_sha1
+  for java_project_dir in "${yb_java_project_dirs[@]}"; do
+    pushd "$java_project_dir"
+    heading \
+      "Changing groupId from 'org.yb' to '$YB_TMP_GROUP_ID' in directory '$java_project_dir'"
+    find "$java_project_dir" -name "pom.xml" | \
+      while read pom_file_path; do
+        sed_i "s#<groupId>org[.]yb</groupId>#<groupId>$YB_TMP_GROUP_ID</groupId>#g" \
+              "$pom_file_path"
+      done
+    heading "Building Java code in directory '$java_project_dir'"
+    if ! build_yb_java_code_with_retries -DskipTests clean install; then
+      EXIT_STATUS=1
+      FAILURES+="Java build failed in directory '$java_project_dir'"$'\n'
+      java_build_failed=true
+    else
+      log "Java code build in directory '$java_project_dir' SUCCEEDED"
+    fi
+    popd
+  done
 
-    commit_msg="Updating version to $yb_java_project_version and groupId to $yb_new_group_id "
-    commit_msg+="during testing"
-
-    build_yb_java_code versions:set -DnewVersion="$yb_java_project_version"
-    (
-      set -x
-      git add -A .
-      git commit -m "$commit_msg"
-    )
-    unset commit_msg
+  if "$java_build_failed"; then
+    fatal "Java build failed, stopping here."
   fi
 
-  java_build_cmd_line=( --fail-never -DbinDir="$BUILD_ROOT"/bin )
-  if ! time build_yb_java_code_with_retries "${java_build_cmd_line[@]}" \
-                                            -DskipTests clean install 2>&1; then
-    EXIT_STATUS=1
-    FAILURES+=$'Java build failed\n'
-  fi
+  # Tell gen_version_info.py to store the Git SHA1 of the commit really present in the code
+  # being built, not our temporary commit to update pom.xml files.
+  get_current_git_sha1
+  export YB_VERSION_INFO_GIT_SHA1=$current_git_sha1
+
+  heading "Committing local changes (groupId update)"
+  commit_msg="Updating groupId to $YB_TMP_GROUP_ID during testing"
+
+  (
+    set -x
+    cd "$YB_SRC_ROOT"
+    git add -A .
+    git commit -m "$commit_msg"
+  )
+  unset commit_msg
+
+  collect_java_tests
+
   log "Finished building Java code (see timing information above)"
-  popd
 fi
 
 # -------------------------------------------------------------------------------------------------
@@ -555,6 +655,7 @@ if [[ ${YB_SKIP_CREATING_RELEASE_PACKAGE:-} != "1" &&
       --build_args="--skip-build" \
       --save_release_path_to_file "$package_path_file" \
       --commit "$current_git_commit" \
+      --yw \
       --force
   )
 
@@ -566,10 +667,8 @@ if [[ ${YB_SKIP_CREATING_RELEASE_PACKAGE:-} != "1" &&
     fatal "Package path stored in '$package_path_file' does not exist: $YB_PACKAGE_PATH"
   fi
 
-  # Upload the package, if we have the enterprise-only code in this tree (even if the current build
-  # is a community edition build). Therefore we are not checking the $YB_EDITION env variable here.
-  # We also don't attempt to upload any packages for Phabricator (pre-commit) builds.
-  if [[ -d $YB_SRC_ROOT/ent ]] && ! is_jenkins_phabricator_build; then
+  # Upload the package.
+  if ! is_jenkins_phabricator_build; then
     . "$YB_SRC_ROOT/ent/build-support/upload_package.sh"
     if ! "$package_uploaded" && ! "$package_upload_skipped"; then
       FAILURES+=$'Package upload failed\n'
@@ -586,6 +685,12 @@ fi
 # If YB_COMPILE_ONLY is set to 1, we skip running all tests (Java and C++).
 
 set_sanitizer_runtime_options
+
+# To reduce Jenkins archive size, let's gzip Java logs and delete per-test-method logs in case
+# of no test failures.
+export YB_GZIP_PER_TEST_METHOD_LOGS=1
+export YB_GZIP_TEST_LOGS=1
+export YB_DELETE_SUCCESSFUL_PER_TEST_METHOD_LOGS=1
 
 if [[ $YB_COMPILE_ONLY != "1" ]]; then
   if spark_available; then
@@ -645,22 +750,30 @@ if [[ $YB_COMPILE_ONLY != "1" ]]; then
     fi
 
     if [[ $YB_BUILD_JAVA == "1" ]]; then
-      pushd "$YB_SRC_ROOT/java"
       set_test_invocation_id
       log "Running Java tests in a non-distributed way"
-      if ! time build_yb_java_code_with_retries "${java_build_cmd_line[@]}" verify 2>&1; then
+      if ! time run_all_java_test_methods_separately; then
         EXIT_STATUS=1
         FAILURES+=$'Java tests failed\n'
       fi
       log "Finished running Java tests (see timing information above)"
       kill_stuck_processes
-      popd
     fi
   fi
 fi
 
 # Finished running tests.
 remove_latest_symlink
+
+log "Aggregating test reports"
+cd "$YB_SRC_ROOT"  # even though we should already be in this directory
+find . -type f -name "*_test_report.json" | \
+    "$YB_SRC_ROOT/python/yb/aggregate_test_reports.py" \
+      --yb-src-root "$YB_SRC_ROOT" \
+      --output-dir "$YB_SRC_ROOT" \
+      --build-type "$build_type" \
+      --compiler-type "$YB_COMPILER_TYPE" \
+      --build-root "$BUILD_ROOT"
 
 if [[ -n $FAILURES ]]; then
   heading "Failure summary"

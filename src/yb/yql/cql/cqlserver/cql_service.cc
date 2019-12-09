@@ -16,6 +16,9 @@
 #include <mutex>
 #include <thread>
 
+#include "yb/client/meta_data_cache.h"
+#include "yb/client/transaction_pool.h"
+
 #include "yb/gutil/strings/join.h"
 
 #include "yb/yql/cql/cqlserver/cql_processor.h"
@@ -30,8 +33,11 @@
 #include "yb/util/mem_tracker.h"
 
 using namespace std::placeholders;
+using namespace yb::size_literals;
 
-DEFINE_int64(cql_service_max_prepared_statement_size_bytes, 0,
+DECLARE_bool(use_cassandra_authentication);
+
+DEFINE_int64(cql_service_max_prepared_statement_size_bytes, 128_MB,
              "The maximum amount of memory the CQL proxy should use to maintain prepared "
              "statements. 0 or negative means unlimited.");
 DEFINE_int32(cql_ybclient_reactor_threads, 24,
@@ -55,7 +61,7 @@ using yb::client::YBMetaDataCache;
 using yb::rpc::InboundCall;
 
 CQLServiceImpl::CQLServiceImpl(CQLServer* server, const CQLServerOptions& opts,
-                               client::LocalTabletFilter local_tablet_filter)
+                               ql::TransactionPoolProvider transaction_pool_provider)
     : CQLServerServiceIf(server->metric_entity()),
       server_(server),
       async_client_init_(
@@ -65,9 +71,7 @@ CQLServiceImpl::CQLServiceImpl(CQLServer* server, const CQLServerOptions& opts,
           server->tserver() ? server->tserver()->messenger() : nullptr),
       next_available_processor_(processors_.end()),
       messenger_(server->messenger()),
-      cql_rpcserver_env_(new CQLRpcServerEnv(server->first_rpc_address().address().to_string(),
-                                             opts.broadcast_rpc_address)),
-      local_tablet_filter_(std::move(local_tablet_filter)) {
+      transaction_pool_provider_(std::move(transaction_pool_provider)) {
   // TODO(ENG-446): Handle metrics for all the methods individually.
   cql_metrics_ = std::make_shared<CQLMetrics>(server->metric_entity());
 
@@ -76,26 +80,32 @@ CQLServiceImpl::CQLServiceImpl(CQLServer* server, const CQLServerOptions& opts,
   prepared_stmts_mem_tracker_ = MemTracker::CreateTracker(
       FLAGS_cql_service_max_prepared_statement_size_bytes > 0 ?
       FLAGS_cql_service_max_prepared_statement_size_bytes : -1,
-      "CQL prepared statements' memory usage", server->mem_tracker());
+      "CQL prepared statements", server->mem_tracker());
 
   auth_prepared_stmt_ = std::make_shared<ql::Statement>(
       "",
       Substitute("SELECT $0, $1 FROM system_auth.roles WHERE role = ?",
                  kRoleColumnNameSaltedHash, kRoleColumnNameCanLogin));
+
+  async_client_init_.Start();
 }
 
-const std::shared_ptr<client::YBClient>& CQLServiceImpl::client() const {
-  auto& client = async_client_init_.client();
+CQLServiceImpl::~CQLServiceImpl() {
+}
+
+client::YBClient* CQLServiceImpl::client() const {
+  auto client = async_client_init_.client();
   if (!is_metadata_initialized_.load(std::memory_order_acquire)) {
     std::lock_guard<std::mutex> l(metadata_init_mutex_);
     if (!is_metadata_initialized_.load(std::memory_order_acquire)) {
-      // Add proxy to call local tserver if available.
+      // Add local tserver if available.
       if (server_->tserver() != nullptr && server_->tserver()->proxy() != nullptr) {
-        client->AddTabletServerProxy(
-            server_->tserver()->permanent_uuid(), server_->tserver()->proxy());
+        client->SetLocalTabletServer(
+            server_->tserver()->permanent_uuid(), server_->tserver()->proxy(), server_->tserver());
       }
       // Create and save the metadata cache object.
-      metadata_cache_ = std::make_shared<YBMetaDataCache>(client);
+      metadata_cache_ = std::make_shared<YBMetaDataCache>(client,
+                                                          FLAGS_use_cassandra_authentication);
       is_metadata_initialized_.store(true, std::memory_order_release);
     }
   }
@@ -120,11 +130,6 @@ void CQLServiceImpl::Handle(yb::rpc::InboundCallPtr inbound_call) {
   TRACE("Handling the CQL call");
   // Collect the call.
   CQLInboundCall* cql_call = down_cast<CQLInboundCall*>(CHECK_NOTNULL(inbound_call.get()));
-  if (cql_call->TryResume()) {
-    // This is a continuation/callback from a previous request.
-    // Call the call back, and we are done.
-    return;
-  }
   DVLOG(4) << "Handling " << cql_call->ToString();
 
   // Process the call.
@@ -264,21 +269,6 @@ void CQLServiceImpl::CollectGarbage(size_t required) {
   VLOG(1) << "DeleteLruPreparedStatement: CQL prepared statement cache count = "
           << prepared_stmts_map_.size() << "/" << prepared_stmts_list_.size()
           << ", memory usage = " << prepared_stmts_mem_tracker_->consumption();
-}
-
-client::TransactionManager* CQLServiceImpl::GetTransactionManager() {
-  auto result = transaction_manager_.load(std::memory_order_acquire);
-  if (result) {
-    return result;
-  }
-  std::lock_guard<decltype(transaction_manager_mutex_)> lock(transaction_manager_mutex_);
-  if (transaction_manager_holder_) {
-    return transaction_manager_holder_.get();
-  }
-  transaction_manager_holder_ = std::make_unique<client::TransactionManager>(
-      client(), server_->clock(), local_tablet_filter_);
-  transaction_manager_.store(transaction_manager_holder_.get(), std::memory_order_release);
-  return transaction_manager_holder_.get();
 }
 
 server::Clock* CQLServiceImpl::clock() {

@@ -15,6 +15,8 @@ package org.yb.ybcli.commands;
 
 import java.util.List;
 
+import com.google.common.net.HostAndPort;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.shell.core.CommandMarker;
@@ -31,6 +33,7 @@ import org.yb.client.GetLoadMovePercentResponse;
 import org.yb.client.GetMasterClusterConfigResponse;
 import org.yb.client.GetTableSchemaResponse;
 import org.yb.client.IsLoadBalancedResponse;
+import org.yb.client.IsServerReadyResponse;
 import org.yb.client.LeaderStepDownResponse;
 import org.yb.client.ListMastersResponse;
 import org.yb.client.ListTablesResponse;
@@ -66,7 +69,7 @@ public class YBCliCommands implements CommandMarker {
   @CliAvailabilityIndicator({"list tablet-servers", "list tablets", "list tables", "list masters",
                              "change_config", "change_blacklist", "leader_step_down",
                              "get_universe_config", "get_load_move_completion",
-                             "is_load_balanced"})
+                             "is_load_balanced", "is_tserver_ready"})
   public boolean isDatabaseOperationAvailable() {
     // We can perform operations on the database once we are connected to one.
     if (connectedToDatabase) {
@@ -392,10 +395,38 @@ public class YBCliCommands implements CommandMarker {
         return "Failed: " + resp.errorMessage();
       }
 
-      return "Percent completed = " + resp.getPercentCompleted();
+      return "Percent completed = " + resp.getPercentCompleted() +
+        " : Remaining = " + resp.getRemaining() + " out of Total = " + resp.getTotal();
     } catch (Exception e) {
       LOG.error("Caught exception ", e);
       return "Failed: " + e.toString() + "\n";
+    }
+  }
+
+  @CliCommand(value = "is_server_ready",
+              help = "Check if server is ready to serve IO requests.")
+  public String getIsTserverReady(
+      @CliOption(key = {"host", "h"},
+                 mandatory = true,
+                 help = "Hostname or IP of the server. ") final String host,
+      @CliOption(key = {"port", "p"},
+                 mandatory = true,
+                 help = "RPC port number of the server.") final int port,
+      @CliOption(key = {"isTserver", "t"},
+                 mandatory = true,
+                 help = "True imples the tserver, else master.") final boolean isTserver) {
+    try {
+      HostAndPort hp = HostAndPort.fromParts(host, port);
+      IsServerReadyResponse resp = ybClient.isServerReady(hp, isTserver);
+
+      if (resp.hasError()) {
+        return "Failed: server response error : " + resp.errorMessage();
+      }
+
+      return "Server is ready.";
+    } catch (Exception e) {
+      LOG.error("Caught exception ", e);
+      return "Failed: " + e.toString();
     }
   }
 

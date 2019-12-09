@@ -31,8 +31,8 @@
 //
 package org.yb.client;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertTrue;
+import static org.yb.AssertionWrappers.assertEquals;
+import static org.yb.AssertionWrappers.assertTrue;
 
 import com.google.common.base.Charsets;
 import com.google.common.collect.ImmutableList;
@@ -50,6 +50,11 @@ import org.yb.client.PartitionSchema.RangeSchema;
 import java.util.ArrayList;
 import java.util.List;
 
+import org.yb.YBTestRunner;
+
+import org.junit.runner.RunWith;
+
+@RunWith(value=YBTestRunner.class)
 public class TestKeyEncoding {
 
   private static Schema buildSchema(ColumnSchemaBuilder... columns) {

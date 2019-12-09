@@ -57,6 +57,7 @@ class YBTableTestBase : public YBTest {
   YBTableTestBase();
   virtual void SetUp() override;
   virtual void TearDown() override;
+  virtual void BeforeCreateTable();
 
   virtual bool use_external_mini_cluster();
   virtual int session_timeout_ms();
@@ -67,7 +68,7 @@ class YBTableTestBase : public YBTest {
   virtual client::YBTableName table_name();
   virtual bool need_redis_table();
 
-  void CreateRedisTable(shared_ptr<yb::client::YBClient> client, client::YBTableName table_name);
+  void CreateRedisTable(const client::YBTableName& table_name);
   virtual void CreateTable();
   void OpenTable();
   void DeleteTable();
@@ -78,7 +79,7 @@ class YBTableTestBase : public YBTest {
   void FetchTSMetricsPage();
 
   client::TableHandle table_;
-  std::shared_ptr<yb::client::YBClient> client_;
+  std::unique_ptr<client::YBClient> client_;
   bool table_exists_ = false;
 
   yb::MiniCluster* mini_cluster() {
@@ -120,7 +121,7 @@ class YBTableTestBase : public YBTest {
   // Calls CreateYBClient and assigns it to local class field
   void CreateClient();
   // Creates a ClientYB client without assigning it to the class field.
-  std::shared_ptr<yb::client::YBClient> CreateYBClient();
+  std::unique_ptr<yb::client::YBClient> CreateYBClient();
 
   std::shared_ptr<yb::client::YBSession> NewSession();
 

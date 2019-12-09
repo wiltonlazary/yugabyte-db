@@ -12,6 +12,7 @@
 //
 
 #include "yb/client/client.h"
+#include "yb/client/meta_data_cache.h"
 #include "yb/integration-tests/external_mini_cluster.h"
 #include "yb/yql/cql/ql/ql_processor.h"
 #include "yb/yql/cql/ql/util/statement_params.h"
@@ -54,6 +55,9 @@ class SystemTableFaultTolerance : public YBTest {
     opts.num_masters = 1;
     opts.num_tablet_servers = 1;
     opts.extra_master_flags = extra_master_flags;
+    // Master failovers should not be happening concurrently with us trying to load an initial sys
+    // catalog snapshot. At least this is not supported as of 05/27/2019.
+    opts.enable_ysql = false;
     cluster_.reset(new ExternalMiniCluster(opts));
   }
 };
@@ -74,15 +78,14 @@ TEST_F(SystemTableFaultTolerance, TestFaultTolerance) {
   builder.add_master_server_addr(cluster_->GetLeaderMaster()->bound_rpc_hostport().ToString());
   builder.default_rpc_timeout(MonoDelta::FromSeconds(10))
     .default_admin_operation_timeout(MonoDelta::FromSeconds(10));
-  std::shared_ptr<client::YBClient> client;
-  ASSERT_OK(builder.Build(&client));
+  auto client = ASSERT_RESULT(builder.Build());
 
-  auto metadata_cache = std::make_shared<client::YBMetaDataCache>(client);
-  std::weak_ptr<rpc::Messenger> messenger;
+  auto metadata_cache = std::make_shared<client::YBMetaDataCache>(client.get(),
+      false /* Update roles' permissions cache */);
   server::ClockPtr clock(new server::HybridClock());
   ASSERT_OK(clock->Init());
-  auto processor = std::make_unique<ql::QLProcessor>(
-      messenger, client, metadata_cache, nullptr, clock, ql::TransactionManagerProvider());
+  auto processor = std::make_unique<ql::QLProcessor>(client.get(), metadata_cache, nullptr, clock,
+                                                     ql::TransactionPoolProvider());
   Synchronizer s;
   ql::StatementParameters statement_parameters;
   processor->RunAsync("SELECT * from system.peers", statement_parameters,

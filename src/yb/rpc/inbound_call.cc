@@ -39,6 +39,7 @@
 #include "yb/rpc/connection.h"
 #include "yb/rpc/connection_context.h"
 #include "yb/rpc/rpc_introspection.pb.h"
+#include "yb/rpc/rpc_metrics.h"
 #include "yb/rpc/serialization.h"
 #include "yb/rpc/service_pool.h"
 
@@ -79,18 +80,22 @@ TAG_FLAG(rpc_slow_query_threshold_ms, runtime);
 namespace yb {
 namespace rpc {
 
-InboundCall::InboundCall(ConnectionPtr conn, CallProcessedListener call_processed_listener)
+InboundCall::InboundCall(ConnectionPtr conn, RpcMetrics* rpc_metrics,
+                         CallProcessedListener call_processed_listener)
     : trace_(new Trace),
       conn_(std::move(conn)),
+      rpc_metrics_(rpc_metrics ? rpc_metrics : &conn_->rpc_metrics()),
       call_processed_listener_(std::move(call_processed_listener)) {
   TRACE_TO(trace_, "Created InboundCall");
-  RecordCallReceived();
+  IncrementCounter(rpc_metrics_->inbound_calls_created);
+  IncrementGauge(rpc_metrics_->inbound_calls_alive);
 }
 
 InboundCall::~InboundCall() {
   TRACE_TO(trace_, "Destroying InboundCall");
   YB_LOG_IF_EVERY_N(INFO, FLAGS_print_trace_every > 0, FLAGS_print_trace_every)
       << "Tracing op: \n " << trace_->DumpToString(true);
+  DecrementGauge(rpc_metrics_->inbound_calls_alive);
 }
 
 void InboundCall::NotifyTransferred(const Status& status, Connection* conn) {
@@ -129,16 +134,18 @@ Trace* InboundCall::trace() {
 
 void InboundCall::RecordCallReceived() {
   TRACE_EVENT_ASYNC_BEGIN0("rpc", "InboundCall", this);
-  DCHECK(!timing_.time_received.Initialized());  // Protect against multiple calls.
-  VLOG(4) << "Received call " << ToString();
+  // Protect against multiple calls.
+  LOG_IF_WITH_PREFIX(DFATAL, timing_.time_received.Initialized()) << "Already marked as received";
+  VLOG_WITH_PREFIX(4) << "Received";
   timing_.time_received = MonoTime::Now();
 }
 
 void InboundCall::RecordHandlingStarted(scoped_refptr<Histogram> incoming_queue_time) {
   DCHECK(incoming_queue_time != nullptr);
-  DCHECK(!timing_.time_handled.Initialized());  // Protect against multiple calls.
+  // Protect against multiple calls.
+  LOG_IF_WITH_PREFIX(DFATAL, timing_.time_handled.Initialized()) << "Already marked as started";
   timing_.time_handled = MonoTime::Now();
-  VLOG(4) << "Handling call " << ToString();
+  VLOG_WITH_PREFIX(4) << "Handling";
   incoming_queue_time->Increment(
       timing_.time_handled.GetDeltaSince(timing_.time_received).ToMicroseconds());
 }
@@ -148,9 +155,10 @@ MonoDelta InboundCall::GetTimeInQueue() const {
 }
 
 void InboundCall::RecordHandlingCompleted(scoped_refptr<Histogram> handler_run_time) {
-  DCHECK(!timing_.time_completed.Initialized());  // Protect against multiple calls.
+  // Protect against multiple calls.
+  LOG_IF_WITH_PREFIX(DFATAL, timing_.time_completed.Initialized()) << "Already marked as completed";
   timing_.time_completed = MonoTime::Now();
-  VLOG(4) << "Completed handling call " << ToString();
+  VLOG_WITH_PREFIX(4) << "Completed handling";
   if (handler_run_time) {
     handler_run_time->Increment((timing_.time_completed - timing_.time_handled).ToMicroseconds());
   }
@@ -158,22 +166,53 @@ void InboundCall::RecordHandlingCompleted(scoped_refptr<Histogram> handler_run_t
 
 bool InboundCall::ClientTimedOut() const {
   auto deadline = GetClientDeadline();
-  if (deadline.Equals(MonoTime::Max())) {
+  if (deadline == CoarseTimePoint::max()) {
     return false;
   }
 
-  MonoTime now = MonoTime::Now();
-  return deadline.ComesBefore(now);
+  return deadline < CoarseMonoClock::now();
 }
 
 void InboundCall::QueueResponse(bool is_success) {
   TRACE_TO(trace_, is_success ? "Queueing success response" : "Queueing failure response");
   LogTrace();
-  connection()->context().QueueResponse(connection(), shared_from(this));
+  bool expected = false;
+  if (responded_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+    connection()->context().QueueResponse(connection(), shared_from(this));
+  } else {
+    LOG_WITH_PREFIX(DFATAL) << "Response already queued";
+  }
 }
 
 std::string InboundCall::LogPrefix() const {
-  return Format("{ InboundCall@$0 } ", this);
+  return Format("$0: ", this);
+}
+
+bool InboundCall::RespondTimedOutIfPending(const char* message) {
+  if (!TryStartProcessing()) {
+    return false;
+  }
+
+  RespondFailure(ErrorStatusPB::ERROR_SERVER_TOO_BUSY, STATUS(TimedOut, message));
+  Clear();
+
+  return true;
+}
+
+void InboundCall::Clear() {
+  request_data_.Reset();
+}
+
+void InboundCall::InboundCallTask::Run() {
+  handler_->Handle(call_);
+}
+
+void InboundCall::InboundCallTask::Done(const Status& status) {
+  // We should reset call_ after this function. So it is easiest way to do it.
+  auto call = std::move(call_);
+  if (!status.ok()) {
+    handler_->Failure(call, status);
+  }
 }
 
 }  // namespace rpc

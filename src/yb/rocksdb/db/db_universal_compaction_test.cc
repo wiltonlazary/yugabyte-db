@@ -48,9 +48,9 @@ class DBTestUniversalCompactionBase
   bool exclusive_manual_compaction_;
 };
 
-class DBTestUniversalCompaction : public DBTestUniversalCompactionBase {
+class DBTestUniversalCompactionWithParam : public DBTestUniversalCompactionBase {
  public:
-  DBTestUniversalCompaction() :
+  DBTestUniversalCompactionWithParam() :
       DBTestUniversalCompactionBase("/db_universal_compaction_test") {}
 };
 
@@ -70,10 +70,9 @@ void VerifyCompactionResult(
 
 class KeepFilter : public CompactionFilter {
  public:
-  virtual bool Filter(int level, const Slice& key, const Slice& value,
-                      std::string* new_value, bool* value_changed) const
-      override {
-    return false;
+  FilterDecision Filter(int level, const Slice& key, const Slice& value,
+                      std::string* new_value, bool* value_changed) override {
+    return FilterDecision::kKeep;
   }
 
   const char* Name() const override { return "KeepFilter"; }
@@ -102,11 +101,11 @@ class KeepFilterFactory : public CompactionFilterFactory {
 class DelayFilter : public CompactionFilter {
  public:
   explicit DelayFilter(DBTestBase* d) : db_test(d) {}
-  virtual bool Filter(int level, const Slice& key, const Slice& value,
-                      std::string* new_value,
-                      bool* value_changed) const override {
+  FilterDecision Filter(int level, const Slice& key, const Slice& value,
+                        std::string* new_value,
+                        bool* value_changed) override {
     db_test->env_->addon_time_.fetch_add(1000);
-    return true;
+    return FilterDecision::kDiscard;
   }
 
   const char* Name() const override { return "DelayFilter"; }
@@ -132,7 +131,7 @@ class DelayFilterFactory : public CompactionFilterFactory {
 
 // Make sure we don't trigger a problem if the trigger conditon is given
 // to be 0, which is invalid.
-TEST_P(DBTestUniversalCompaction, UniversalCompactionSingleSortedRun) {
+TEST_P(DBTestUniversalCompactionWithParam, UniversalCompactionSingleSortedRun) {
   Options options;
   options = CurrentOptions(options);
 
@@ -168,7 +167,7 @@ TEST_P(DBTestUniversalCompaction, UniversalCompactionSingleSortedRun) {
   }
 }
 
-TEST_P(DBTestUniversalCompaction, OptimizeFiltersForHits) {
+TEST_P(DBTestUniversalCompactionWithParam, OptimizeFiltersForHits) {
   Options options;
   options = CurrentOptions(options);
   options.compaction_style = kCompactionStyleUniversal;
@@ -238,7 +237,7 @@ TEST_P(DBTestUniversalCompaction, OptimizeFiltersForHits) {
 //  1. A lot of magic numbers ("11" or "12").
 //  2. Made assumption on the memtable flush conditions, which may change from
 //     time to time.
-TEST_P(DBTestUniversalCompaction, UniversalCompactionTrigger) {
+TEST_P(DBTestUniversalCompactionWithParam, UniversalCompactionTrigger) {
   Options options;
   options.compaction_style = kCompactionStyleUniversal;
   options.compaction_options_universal.size_ratio = 5;
@@ -345,7 +344,7 @@ TEST_P(DBTestUniversalCompaction, UniversalCompactionTrigger) {
   rocksdb::SyncPoint::GetInstance()->DisableProcessing();
 }
 
-TEST_P(DBTestUniversalCompaction, UniversalCompactionSizeAmplification) {
+TEST_P(DBTestUniversalCompactionWithParam, UniversalCompactionSizeAmplification) {
   Options options;
   options.compaction_style = kCompactionStyleUniversal;
   options.num_levels = num_levels_;
@@ -388,7 +387,7 @@ TEST_P(DBTestUniversalCompaction, UniversalCompactionSizeAmplification) {
   ASSERT_EQ(NumSortedRuns(1), 1);
 }
 
-TEST_P(DBTestUniversalCompaction, CompactFilesOnUniversalCompaction) {
+TEST_P(DBTestUniversalCompactionWithParam, CompactFilesOnUniversalCompaction) {
   const int kTestKeySize = 16;
   const int kTestValueSize = 984;
   const int kEntrySize = kTestKeySize + kTestValueSize;
@@ -459,7 +458,7 @@ TEST_P(DBTestUniversalCompaction, CompactFilesOnUniversalCompaction) {
   ASSERT_EQ(cf_meta.levels[0].files.size(), 1U);
 }
 
-TEST_P(DBTestUniversalCompaction, UniversalCompactionTargetLevel) {
+TEST_P(DBTestUniversalCompactionWithParam, UniversalCompactionTargetLevel) {
   Options options;
   options.compaction_style = kCompactionStyleUniversal;
   options.write_buffer_size = 100 << 10;     // 100KB
@@ -660,7 +659,7 @@ INSTANTIATE_TEST_CASE_P(DBTestUniversalCompactionParallel,
                         ::testing::Combine(::testing::Values(1, 10),
                                            ::testing::Bool()));
 
-TEST_P(DBTestUniversalCompaction, UniversalCompactionOptions) {
+TEST_P(DBTestUniversalCompactionWithParam, UniversalCompactionOptions) {
   Options options;
   options.compaction_style = kCompactionStyleUniversal;
   options.write_buffer_size = 105 << 10;    // 105KB
@@ -693,7 +692,7 @@ TEST_P(DBTestUniversalCompaction, UniversalCompactionOptions) {
   ASSERT_EQ(NumSortedRuns(1), 1);
 }
 
-TEST_P(DBTestUniversalCompaction, UniversalCompactionStopStyleSimilarSize) {
+TEST_P(DBTestUniversalCompactionWithParam, UniversalCompactionStopStyleSimilarSize) {
   Options options = CurrentOptions();
   options.compaction_style = kCompactionStyleUniversal;
   options.write_buffer_size = 105 << 10;    // 105KB
@@ -777,7 +776,7 @@ TEST_P(DBTestUniversalCompaction, UniversalCompactionStopStyleSimilarSize) {
   ASSERT_EQ(NumSortedRuns(), 4);
 }
 
-TEST_P(DBTestUniversalCompaction, UniversalCompactionCompressRatio1) {
+TEST_P(DBTestUniversalCompactionWithParam, UniversalCompactionCompressRatio1) {
   if (!Snappy_Supported()) {
     return;
   }
@@ -846,7 +845,7 @@ TEST_P(DBTestUniversalCompaction, UniversalCompactionCompressRatio1) {
   ASSERT_GT(TotalSize(), 110000 * 11 * 0.8 + 110000 * 2);
 }
 
-TEST_P(DBTestUniversalCompaction, UniversalCompactionCompressRatio2) {
+TEST_P(DBTestUniversalCompactionWithParam, UniversalCompactionCompressRatio2) {
   if (!Snappy_Supported()) {
     return;
   }
@@ -878,7 +877,7 @@ TEST_P(DBTestUniversalCompaction, UniversalCompactionCompressRatio2) {
 }
 
 // Test that checks trivial move in universal compaction
-TEST_P(DBTestUniversalCompaction, UniversalCompactionTrivialMoveTest1) {
+TEST_P(DBTestUniversalCompactionWithParam, UniversalCompactionTrivialMoveTest1) {
   int32_t trivial_move = 0;
   int32_t non_trivial_move = 0;
   rocksdb::SyncPoint::GetInstance()->SetCallBack(
@@ -926,7 +925,7 @@ TEST_P(DBTestUniversalCompaction, UniversalCompactionTrivialMoveTest1) {
   rocksdb::SyncPoint::GetInstance()->DisableProcessing();
 }
 // Test that checks trivial move in universal compaction
-TEST_P(DBTestUniversalCompaction, UniversalCompactionTrivialMoveTest2) {
+TEST_P(DBTestUniversalCompactionWithParam, UniversalCompactionTrivialMoveTest2) {
   int32_t trivial_move = 0;
   int32_t non_trivial_move = 0;
   rocksdb::SyncPoint::GetInstance()->SetCallBack(
@@ -971,7 +970,7 @@ TEST_P(DBTestUniversalCompaction, UniversalCompactionTrivialMoveTest2) {
   rocksdb::SyncPoint::GetInstance()->DisableProcessing();
 }
 
-TEST_P(DBTestUniversalCompaction, UniversalCompactionFourPaths) {
+TEST_P(DBTestUniversalCompactionWithParam, UniversalCompactionFourPaths) {
   Options options;
   options.db_paths.emplace_back(dbname_, 300 * 1024);
   options.db_paths.emplace_back(dbname_ + "_2", 300 * 1024);
@@ -1074,7 +1073,7 @@ TEST_P(DBTestUniversalCompaction, UniversalCompactionFourPaths) {
   Destroy(options);
 }
 
-TEST_P(DBTestUniversalCompaction, IncreaseUniversalCompactionNumLevels) {
+TEST_P(DBTestUniversalCompactionWithParam, IncreaseUniversalCompactionNumLevels) {
   std::function<void(int)> verify_func = [&](int num_keys_in_db) {
     std::string keys_in_db;
     Iterator* iter = dbfull()->NewIterator(ReadOptions(), handles_[1]);
@@ -1168,7 +1167,7 @@ TEST_P(DBTestUniversalCompaction, IncreaseUniversalCompactionNumLevels) {
 }
 
 
-TEST_P(DBTestUniversalCompaction, UniversalCompactionSecondPathRatio) {
+TEST_P(DBTestUniversalCompactionWithParam, UniversalCompactionSecondPathRatio) {
   if (!Snappy_Supported()) {
     return;
   }
@@ -1270,7 +1269,7 @@ TEST_P(DBTestUniversalCompaction, UniversalCompactionSecondPathRatio) {
   Destroy(options);
 }
 
-INSTANTIATE_TEST_CASE_P(UniversalCompactionNumLevels, DBTestUniversalCompaction,
+INSTANTIATE_TEST_CASE_P(UniversalCompactionNumLevels, DBTestUniversalCompactionWithParam,
                         ::testing::Combine(::testing::Values(1, 3, 5),
                                            ::testing::Bool()));
 
@@ -1344,6 +1343,136 @@ INSTANTIATE_TEST_CASE_P(DBTestUniversalManualCompactionOutputPathId,
                         DBTestUniversalManualCompactionOutputPathId,
                         ::testing::Combine(::testing::Values(1, 8),
                                            ::testing::Bool()));
+
+class DBTestUniversalCompaction : public DBTestBase {
+ public:
+  DBTestUniversalCompaction() : DBTestBase("/db_universal_compaction_test") {}
+  void GenerateFilesAndCheckCompactionResult(
+      const Options& options, const std::vector<size_t>& keys_per_file, int value_size,
+      int num_output_files);
+};
+
+void DBTestUniversalCompaction::GenerateFilesAndCheckCompactionResult(
+    const Options& options, const std::vector<size_t>& keys_per_file, int value_size,
+    int num_output_files) {
+  DestroyAndReopen(options);
+
+  ASSERT_OK(dbfull()->SetOptions({{"disable_auto_compactions", "true"}}));
+
+  LOG(INFO) << "Generating files with keys counts: " << yb::ToString(keys_per_file);
+
+  Random rnd(301);
+  int key_idx = 0;
+
+  for (size_t num = 0; num < keys_per_file.size(); num++) {
+    for (size_t i = 0; i < keys_per_file[num]; i++) {
+      ASSERT_OK(Put(Key(key_idx), RandomString(&rnd, value_size)));
+      key_idx++;
+    }
+    ASSERT_OK(Flush());
+    dbfull()->TEST_WaitForFlushMemTable();
+    ASSERT_EQ(NumSortedRuns(0), num + 1);
+  }
+
+  ASSERT_OK(dbfull()->EnableAutoCompaction({dbfull()->DefaultColumnFamily()}));
+
+  dbfull()->TEST_WaitForCompact();
+
+  ASSERT_EQ(NumSortedRuns(0), num_output_files);
+}
+
+TEST_F(DBTestUniversalCompaction, DontDeleteOutput) {
+  Options options;
+  options.env = env_;
+  options.create_if_missing = true;
+  DestroyAndReopen(options);
+
+  std::atomic<bool> stop_requested(false);
+
+  auto purge_thread = std::thread([this, &stop_requested] {
+      while (!stop_requested) {
+        JobContext job_context(0);
+        dbfull()->TEST_LockMutex();
+        dbfull()->FindObsoleteFiles(&job_context, true /*force*/);
+        dbfull()->TEST_UnlockMutex();
+        dbfull()->PurgeObsoleteFiles(job_context);
+        job_context.Clean();
+      }
+    });
+
+  for (int iter = 0; iter < 300; ++iter) {
+    for (int i = 0; i < 2; ++i) {
+      ASSERT_OK(Put("a", "begin"));
+      ASSERT_OK(Put("z", "end"));
+      ASSERT_OK(Flush());
+    }
+
+    // If locking output files , PurgeObsoleteFiles() will delete the file that Flush/Compaction
+    // just created causing error like:
+    // /tmp/rocksdbtest-1552237650/db_test/000009.sst: No such file or directory
+    Compact("a", "b");
+  }
+
+  stop_requested = true;
+  purge_thread.join();
+}
+
+TEST_F(DBTestUniversalCompaction, IncludeFilesSmallerThanThreshold) {
+  const auto value_size = 10_KB;
+  Options options;
+  options.compaction_style = kCompactionStyleUniversal;
+  options.num_levels = 1;
+  // Make write_buffer_size high to avoid auto flush.
+  options.write_buffer_size = 10000 * value_size;
+  options.level0_file_num_compaction_trigger = 5;
+  // Set high percentage to avoid triggering compactions based on size amplification for this test.
+  options.compaction_options_universal.max_size_amplification_percent = 10000;
+  options.compaction_options_universal.stop_style = kCompactionStopStyleTotalSize;
+  options.compaction_options_universal.size_ratio = 20;
+  options.compaction_options_universal.always_include_size_threshold = 10 * value_size;
+  options.compaction_options_universal.min_merge_width = 4;
+  options = CurrentOptions(options);
+
+  // Sequence of SST files matches read amplification compaction rule if each earlier file is less
+  // than <sum of newer files sizes> * (100 + size_ratio) / 100 or less than
+  // always_include_size_threshold. See UniversalCompactionPicker::PickCompactionUniversalReadAmp.
+
+  // Should be compacted into 2 files since 150 > 1.2 * (10+11+25+55) = 121.
+  GenerateFilesAndCheckCompactionResult(options, {150, 55, 25, 11, 10}, value_size, 2);
+
+  // Should be compacted into 1 file since the whole files sequence matches size_ratio
+  // (each earlier file is less than 1.2 * <sum of newer files>).
+  GenerateFilesAndCheckCompactionResult(options, {120, 55, 25, 11, 10}, value_size, 1);
+
+  // No compaction should happen since 60 > 1.2*(10+11+25) = 55.2.
+  GenerateFilesAndCheckCompactionResult(options, {120, 60, 25, 11, 10}, value_size, 5);
+
+  options.compaction_options_universal.always_include_size_threshold = 35 * value_size;
+
+  // No compaction should happen even with higher threshold.
+  GenerateFilesAndCheckCompactionResult(options, {120, 60, 25, 11, 10}, value_size, 5);
+
+  // No compaction should happen since each earlier file is more than 1.2 * <sum of newer files>
+  // and only 3 files are smaller than threshold.
+  GenerateFilesAndCheckCompactionResult(options, {100, 40, 16, 8, 4}, value_size, 5);
+
+  // Should be compacted into 1 file since all files are smaller than threshold.
+  GenerateFilesAndCheckCompactionResult(options, {25, 10, 4, 2, 1}, value_size, 1);
+
+  // Should be compacted into 1 file since {180, 80, 40} matches size_ratio and {25, 10} are smaller
+  // than threshold.
+  GenerateFilesAndCheckCompactionResult(options, {180, 80, 40, 25, 10}, value_size, 1);
+
+  // Should be compacted into 2 files since {80, 40} matches matches size_ratio and {25, 10} are
+  // smaller than threshold while 200 > 1.2*(10+25+40+80)=186 and shouldn't be compacted.
+  GenerateFilesAndCheckCompactionResult(options, {200, 80, 40, 25, 10}, value_size, 2);
+
+  // Should be compacted into 1 file since all files are smaller than threshold.
+  const std::vector<size_t> file_sizes = {350, 150, 60, 25, 10, 4, 2, 1};
+  options.compaction_options_universal.always_include_size_threshold =
+      *std::max_element(file_sizes.begin(), file_sizes.end()) * value_size * 1.2;
+  GenerateFilesAndCheckCompactionResult(options, file_sizes, value_size, 1);
+}
 
 }  // namespace rocksdb
 

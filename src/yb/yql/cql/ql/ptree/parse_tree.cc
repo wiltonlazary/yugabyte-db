@@ -29,7 +29,8 @@ using std::string;
 // Parse Tree
 //--------------------------------------------------------------------------------------------------
 
-ParseTree::ParseTree(const string& stmt, const bool reparsed, const MemTrackerPtr& mem_tracker)
+ParseTree::ParseTree(const string& stmt, const bool reparsed, const MemTrackerPtr& mem_tracker,
+                     const bool internal)
     : stmt_(stmt),
       reparsed_(reparsed),
       buffer_allocator_(mem_tracker ?
@@ -37,7 +38,8 @@ ParseTree::ParseTree(const string& stmt, const bool reparsed, const MemTrackerPt
                                                                         mem_tracker) :
                         nullptr),
       ptree_mem_(buffer_allocator_ ? buffer_allocator_.get() : HeapBufferAllocator::Get()),
-      psem_mem_(buffer_allocator_ ? buffer_allocator_.get() : HeapBufferAllocator::Get()) {
+      psem_mem_(buffer_allocator_ ? buffer_allocator_.get() : HeapBufferAllocator::Get()),
+      internal_(internal) {
 }
 
 ParseTree::~ParseTree() {
@@ -59,16 +61,12 @@ CHECKED_STATUS ParseTree::Analyze(SemContext *sem_context) {
                                 ErrorCode::SQL_STATEMENT_INVALID);
     case 1: {
       const TreeNode::SharedPtr tnode = lnode->node_list().front();
-      RETURN_NOT_OK(tnode->Analyze(sem_context));
-      // If the statement is a DML and requires a transaction, wrap it around with START TRANSACTION
-      // and COMMIT.
-      if (tnode->IsDml() && std::static_pointer_cast<PTDmlStmt>(tnode)->RequiresTransaction()) {
-        lnode->Prepend(PTStartTransaction::MakeShared(sem_context->PTreeMem(), tnode->loc_ptr()));
-        lnode->Append(PTCommit::MakeShared(sem_context->PTreeMem(), tnode->loc_ptr()));
-      } else {
-        // Hoist the statement to the root node.
-        root_ = tnode;
+      if (internal_) {
+        tnode->set_internal();
       }
+      RETURN_NOT_OK(tnode->Analyze(sem_context));
+      // Hoist the statement to the root node.
+      root_ = tnode;
       return Status::OK();
     }
     default:

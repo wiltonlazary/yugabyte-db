@@ -35,6 +35,7 @@
 #include <gtest/gtest.h>
 
 #include "yb/client/client.h"
+#include "yb/client/table_creator.h"
 #include "yb/consensus/consensus.proxy.h"
 #include "yb/consensus/metadata.pb.h"
 #include "yb/consensus/quorum_util.h"
@@ -83,7 +84,7 @@ using tablet::TabletPeer;
 using tserver::MiniTabletServer;
 using tserver::TSTabletManager;
 
-static const YBTableName kTableName("my_keyspace", "test-table");
+static const YBTableName kTableName(YQL_DATABASE_CQL, "my_keyspace", "test-table");
 static const int kNumReplicas = 3;
 
 class TsTabletManagerITest : public YBTest {
@@ -98,8 +99,8 @@ class TsTabletManagerITest : public YBTest {
   const YBSchema schema_;
 
   gscoped_ptr<MiniCluster> cluster_;
-  std::shared_ptr<YBClient> client_;
-  std::shared_ptr<Messenger> client_messenger_;
+  std::unique_ptr<Messenger> client_messenger_;
+  std::unique_ptr<YBClient> client_;
 };
 
 void TsTabletManagerITest::SetUp() {
@@ -107,15 +108,18 @@ void TsTabletManagerITest::SetUp() {
 
   MessengerBuilder bld("client");
   client_messenger_ = ASSERT_RESULT(bld.Build());
+  client_messenger_->TEST_SetOutboundIpBase(ASSERT_RESULT(HostToAddress("127.0.0.1")));
 
   MiniClusterOptions opts;
   opts.num_tablet_servers = kNumReplicas;
   cluster_.reset(new MiniCluster(env_.get(), opts));
   ASSERT_OK(cluster_->Start());
-  ASSERT_OK(cluster_->CreateClient(&client_));
+  client_ = ASSERT_RESULT(cluster_->CreateClient(client_messenger_.get()));
 }
 
 void TsTabletManagerITest::TearDown() {
+  client_.reset();
+  client_messenger_->Shutdown();
   cluster_->Shutdown();
   YBTest::TearDown();
 }
@@ -131,17 +135,19 @@ TEST_F(TsTabletManagerITest, TestReportNewLeaderOnLeaderChange) {
   // Run a few more iters in slow-test mode.
   OverrideFlagForSlowTests("num_election_test_loops", "10");
 
-  ASSERT_OK(client_->CreateNamespaceIfNotExists(kTableName.namespace_name()));
+  ASSERT_OK(client_->CreateNamespaceIfNotExists(kTableName.namespace_name(),
+                                                kTableName.namespace_type()));
   // Create the table.
   std::shared_ptr<YBTable> table;
   gscoped_ptr<YBTableCreator> table_creator(client_->NewTableCreator());
   ASSERT_OK(table_creator->table_name(kTableName)
             .schema(&schema_)
+            .hash_schema(YBHashSchema::kMultiColumnHash)
             .num_tablets(1)
             .Create());
   ASSERT_OK(client_->OpenTable(kTableName, &table));
 
-  rpc::ProxyCache proxy_cache(client_messenger_);
+  rpc::ProxyCache proxy_cache(client_messenger_.get());
 
   // Build a TServerDetails map so we can check for convergence.
   MasterServiceProxy master_proxy(&proxy_cache, cluster_->mini_master()->bound_rpc_addr());

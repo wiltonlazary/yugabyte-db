@@ -11,12 +11,12 @@
 // under the License.
 //
 
-#include <rapidjson/document.h>
 #include <rapidjson/error/en.h>
-#include <rapidjson/stringbuffer.h>
-#include <rapidjson/writer.h>
 
 #include "yb/common/jsonb.h"
+#include "yb/common/json_util.h"
+#include "yb/common/ql_value.h"
+
 #include "yb/util/kv_util.h"
 #include "yb/util/stol_utils.h"
 #include "yb/util/varint.h"
@@ -70,6 +70,18 @@ Status Jsonb::FromString(const std::string& json) {
 
 Status Jsonb::FromRapidJson(const rapidjson::Document& document) {
   return ToJsonbInternal(document, &serialized_jsonb_);
+}
+
+Status Jsonb::FromRapidJson(const rapidjson::Value& value) {
+  rapidjson::Document document;
+  document.CopyFrom(value, document.GetAllocator());
+  return FromRapidJson(document);
+}
+
+Status Jsonb::FromQLValuePB(const QLValuePB& value_pb) {
+  rapidjson::Document document;
+  RETURN_NOT_OK(ConvertQLValuePBToRapidJson(value_pb, &document));
+  return FromRapidJson(document);
 }
 
 std::pair<size_t, size_t> Jsonb::ComputeOffsetsAndJsonbHeader(size_t num_entries,
@@ -628,10 +640,7 @@ Status Jsonb::ToJsonString(std::string* json) const {
 Status Jsonb::ToJsonStringInternal(const Slice& jsonb, std::string* json) {
   rapidjson::Document document;
   RETURN_NOT_OK(FromJsonbInternal(jsonb, &document));
-  rapidjson::StringBuffer buffer;
-  rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
-  document.Accept(writer);
-  *json = buffer.GetString();
+  *DCHECK_NOTNULL(json) = WriteRapidJsonToString(document);
   return Status::OK();
 }
 
@@ -648,8 +657,7 @@ Status Jsonb::ApplyJsonbOperatorToArray(const Slice& jsonb, const QLJsonOperatio
   // Retrieve the array index and verify.
   util::VarInt varint;
   RETURN_NOT_OK(varint.DecodeFromComparable(json_op.operand().value().varint_value()));
-  int64_t array_index;
-  RETURN_NOT_OK(varint.ToInt64(&array_index));
+  int64_t array_index = VERIFY_RESULT(varint.ToInt64());
 
   if (array_index < 0 || array_index >= num_array_entries) {
     return STATUS_SUBSTITUTE(NotFound, "Array index: $0 out of bounds [0, $1)",

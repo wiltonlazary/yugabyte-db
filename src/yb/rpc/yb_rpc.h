@@ -17,58 +17,88 @@
 #define YB_RPC_YB_RPC_H
 
 #include "yb/rpc/binary_call_parser.h"
+#include "yb/rpc/circular_read_buffer.h"
 #include "yb/rpc/connection_context.h"
 #include "yb/rpc/rpc_with_call_id.h"
+
+#include "yb/util/ev_util.h"
 
 namespace yb {
 namespace rpc {
 
 class YBConnectionContext : public ConnectionContextWithCallId, public BinaryCallParserListener {
  public:
-  YBConnectionContext(GrowableBufferAllocator* allocator, const MemTrackerPtr& call_tracker);
+  YBConnectionContext(
+      size_t receive_buffer_size, const MemTrackerPtr& buffer_tracker,
+      const MemTrackerPtr& call_tracker);
   ~YBConnectionContext();
 
   const MemTrackerPtr& call_tracker() const { return call_tracker_; }
 
+  void SetEventLoop(ev::loop_ref* loop) override;
+
+  void Shutdown(const Status& status) override;
+
  protected:
   BinaryCallParser& parser() { return parser_; }
+
+  ev::loop_ref* loop_ = nullptr;
+
+  EvTimerHolder timer_;
 
  private:
   uint64_t ExtractCallId(InboundCall* call) override;
 
-  size_t BufferLimit() override;
+  StreamReadBuffer& ReadBuffer() override {
+    return read_buffer_;
+  }
 
   BinaryCallParser parser_;
+
+  CircularReadBuffer read_buffer_;
 
   const MemTrackerPtr call_tracker_;
 };
 
 class YBInboundConnectionContext : public YBConnectionContext {
  public:
-  YBInboundConnectionContext(GrowableBufferAllocator* allocator, const MemTrackerPtr& call_tracker)
-      : YBConnectionContext(allocator, call_tracker) {}
+  YBInboundConnectionContext(
+      size_t receive_buffer_size, const MemTrackerPtr& buffer_tracker,
+      const MemTrackerPtr& call_tracker)
+      : YBConnectionContext(receive_buffer_size, buffer_tracker, call_tracker) {}
 
   static std::string Name() { return "Inbound RPC"; }
  private:
   // Takes ownership of call_data content.
-  CHECKED_STATUS HandleCall(const ConnectionPtr& connection, std::vector<char>* call_data) override;
+  CHECKED_STATUS HandleCall(const ConnectionPtr& connection, CallData* call_data) override;
   void Connected(const ConnectionPtr& connection) override;
-  Result<size_t> ProcessCalls(const ConnectionPtr& connection,
-                              const IoVecs& data,
-                              ReadBufferFull read_buffer_full) override;
+  Result<ProcessDataResult> ProcessCalls(const ConnectionPtr& connection,
+                                          const IoVecs& data,
+                                          ReadBufferFull read_buffer_full) override;
 
   // Takes ownership of call_data content.
   CHECKED_STATUS HandleInboundCall(const ConnectionPtr& connection, std::vector<char>* call_data);
 
+  void HandleTimeout(ev::timer& watcher, int revents); // NOLINT
+
   RpcConnectionPB::StateType State() override { return state_; }
 
   RpcConnectionPB::StateType state_ = RpcConnectionPB::UNKNOWN;
+
+  void UpdateLastWrite(const ConnectionPtr& connection) override;
+
+  std::weak_ptr<Connection> connection_;
+
+  // Last time data was sent to network layer below application.
+  CoarseTimePoint last_write_time_;
+  // Last time we queued heartbeat for sending.
+  CoarseTimePoint last_heartbeat_sending_time_;
 };
 
 class YBInboundCall : public InboundCall {
  public:
   YBInboundCall(ConnectionPtr conn, CallProcessedListener call_processed_listener);
-  explicit YBInboundCall(const RemoteMethod& remote_method);
+  explicit YBInboundCall(RpcMetrics* rpc_metrics, const RemoteMethod& remote_method);
   virtual ~YBInboundCall();
 
   // Is this a local call?
@@ -82,7 +112,7 @@ class YBInboundCall : public InboundCall {
   // from the reactor thread.
   //
   // Takes ownership of call_data content.
-  CHECKED_STATUS ParseFrom(const MemTrackerPtr& mem_tracker, std::vector<char>* call_data);
+  CHECKED_STATUS ParseFrom(const MemTrackerPtr& mem_tracker, CallData* call_data);
 
   int32_t call_id() const {
     return header_.call_id();
@@ -94,6 +124,10 @@ class YBInboundCall : public InboundCall {
 
   // See RpcContext::AddRpcSidecar()
   CHECKED_STATUS AddRpcSidecar(RefCntBuffer car, int* idx);
+
+  int RpcSidecarsSize() const;
+
+  const RefCntBuffer& RpcSidecar(int idx);
 
   // See RpcContext::ResetRpcSidecars()
   void ResetRpcSidecars();
@@ -126,13 +160,13 @@ class YBInboundCall : public InboundCall {
 
   // Serialize the response packet for the finished call.
   // The resulting slices refer to memory in this object.
-  void Serialize(std::deque<RefCntBuffer>* output) const override;
+  void Serialize(boost::container::small_vector_base<RefCntBuffer>* output) override;
 
   void LogTrace() const override;
   std::string ToString() const override;
   bool DumpPB(const DumpRunningRpcsRequestPB& req, RpcCallInProgressPB* resp) override;
 
-  MonoTime GetClientDeadline() const override;
+  CoarseTimePoint GetClientDeadline() const override;
 
   const std::string& method_name() const override {
     return remote_method_.method_name();
@@ -149,7 +183,7 @@ class YBInboundCall : public InboundCall {
  protected:
   // Vector of additional sidecars that are tacked on to the call's response
   // after serialization of the protobuf. See rpc/rpc_sidecar.h for more info.
-  std::vector<RefCntBuffer> sidecars_;
+  boost::container::small_vector<RefCntBuffer, kMinBufferForSidecarSlices> sidecars_;
 
   // Serialize and queue the response.
   virtual void Respond(const google::protobuf::MessageLite& response, bool is_success);
@@ -176,8 +210,10 @@ class YBInboundCall : public InboundCall {
 
 class YBOutboundConnectionContext : public YBConnectionContext {
  public:
-  YBOutboundConnectionContext(GrowableBufferAllocator* allocator, const MemTrackerPtr& call_tracker)
-      : YBConnectionContext(allocator, call_tracker) {}
+  YBOutboundConnectionContext(
+      size_t receive_buffer_size, const MemTrackerPtr& buffer_tracker,
+      const MemTrackerPtr& call_tracker)
+      : YBConnectionContext(receive_buffer_size, buffer_tracker, call_tracker) {}
 
   static std::string Name() { return "Outbound RPC"; }
 
@@ -187,12 +223,20 @@ class YBOutboundConnectionContext : public YBConnectionContext {
   }
 
   // Takes ownership of call_data content.
-  CHECKED_STATUS HandleCall(const ConnectionPtr& connection, std::vector<char>* call_data) override;
+  CHECKED_STATUS HandleCall(const ConnectionPtr& connection, CallData* call_data) override;
   void Connected(const ConnectionPtr& connection) override;
   void AssignConnection(const ConnectionPtr& connection) override;
-  Result<size_t> ProcessCalls(const ConnectionPtr& connection,
+  Result<ProcessDataResult> ProcessCalls(const ConnectionPtr& connection,
                               const IoVecs& data,
                               ReadBufferFull read_buffer_full) override;
+
+  void UpdateLastRead(const ConnectionPtr& connection) override;
+
+  void HandleTimeout(ev::timer& watcher, int revents); // NOLINT
+
+  std::weak_ptr<Connection> connection_;
+
+  CoarseTimePoint last_read_time_;
 };
 
 } // namespace rpc

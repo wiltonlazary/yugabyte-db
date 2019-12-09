@@ -41,6 +41,7 @@
 #include "yb/util/cast.h"
 #include "yb/util/status.h"
 #include "yb/util/net/net_fwd.h"
+#include "yb/util/strongly_typed_uuid.h"
 
 namespace yb {
 
@@ -60,7 +61,7 @@ void StatusToPB(const Status& status, AppStatusPB* pb);
 Status StatusFromPB(const AppStatusPB& pb);
 
 // Convert the specified HostPort to protobuf.
-Status HostPortToPB(const HostPort& host_port, HostPortPB* host_port_pb);
+void HostPortToPB(const HostPort& host_port, HostPortPB* host_port_pb);
 
 // Returns the HostPort created from the specified protobuf.
 HostPort HostPortFromPB(const HostPortPB& host_port_pb);
@@ -77,8 +78,12 @@ CHECKED_STATUS AddHostPortPBs(const std::vector<Endpoint>& addrs,
                               google::protobuf::RepeatedPtrField<HostPortPB>* pbs);
 
 // Simply convert the list of host ports into a repeated list of corresponding PB's.
-CHECKED_STATUS HostPortsToPBs(const std::vector<HostPort>& addrs,
-                              google::protobuf::RepeatedPtrField<HostPortPB>* pbs);
+void HostPortsToPBs(const std::vector<HostPort>& addrs,
+                    google::protobuf::RepeatedPtrField<HostPortPB>* pbs);
+
+// Convert list of HostPortPBs into host ports.
+void HostPortsFromPBs(const google::protobuf::RepeatedPtrField<HostPortPB>& pbs,
+                      std::vector<HostPort>* addrs);
 
 enum SchemaPBConversionFlags {
   SCHEMA_PB_WITHOUT_IDS = 1 << 0,
@@ -86,10 +91,10 @@ enum SchemaPBConversionFlags {
 
 // Convert the specified schema to protobuf.
 // 'flags' is a bitfield of SchemaPBConversionFlags values.
-Status SchemaToPB(const Schema& schema, SchemaPB* pb, int flags = 0);
+void SchemaToPB(const Schema& schema, SchemaPB* pb, int flags = 0);
 
 // Convert the specified schema to protobuf without column IDs.
-Status SchemaToPBWithoutIds(const Schema& schema, SchemaPB *pb);
+void SchemaToPBWithoutIds(const Schema& schema, SchemaPB *pb);
 
 // Returns the Schema created from the specified protobuf.
 // If the schema is invalid, return a non-OK status.
@@ -119,7 +124,7 @@ CHECKED_STATUS ColumnPBsToColumnTuple(
 //
 // The 'cols' list is replaced by this method.
 // 'flags' is a bitfield of SchemaPBConversionFlags values.
-Status SchemaToColumnPBs(
+void SchemaToColumnPBs(
   const Schema& schema,
   google::protobuf::RepeatedPtrField<ColumnSchemaPB>* cols,
   int flags = 0);
@@ -153,7 +158,8 @@ static inline void CQLEncodeLength(const int32_t length, faststring* buffer) {
   buffer->append(&byte_value, sizeof(byte_value));
 }
 
-// Encode a 32-bit length into the buffer. Caller should ensure the buffer size is at least 4 bytes.
+// Encode a 32-bit length into the buffer without extending the buffer. Caller should ensure the
+// buffer size is at least 4 bytes.
 static inline void CQLEncodeLength(const int32_t length, void* buffer) {
   NetworkByteOrder::Store32(buffer, static_cast<uint32_t>(length));
 }
@@ -224,13 +230,26 @@ static inline void CQLFinishCollection(int32_t start_pos, faststring* buffer) {
     }                                                       \
   } while (0)
 
+static inline Result<int32_t> CQLDecodeLength(Slice* data) {
+  RETURN_NOT_ENOUGH(data, sizeof(int32_t));
+  const auto len = static_cast<int32_t>(NetworkByteOrder::Load32(data->data()));
+  data->remove_prefix(sizeof(int32_t));
+  return len;
+}
+
+// Decode a 32-bit length from the buffer without consuming the buffer. Caller should ensure the
+// buffer size is at least 4 bytes.
+static inline int32_t CQLDecodeLength(const void* buffer) {
+  return static_cast<int32_t>(NetworkByteOrder::Load32(buffer));
+}
+
 // Decode a CQL number (8, 16, 32 and 64-bit integer). <num_type> is the parsed integer type.
 // <converter> converts the number from network byte-order to machine order and <data_type>
 // is the coverter's return type. The converter's return type <data_type> is unsigned while
 // <num_type> may be signed or unsigned.
 template<typename num_type, typename data_type>
 static inline CHECKED_STATUS CQLDecodeNum(
-    size_t len, data_type (*converter)(const void*), Slice* data, num_type* val) {
+    const size_t len, data_type (*converter)(const void*), Slice* data, num_type* val) {
 
   static_assert(sizeof(data_type) == sizeof(num_type), "inconsistent num type size");
   if (len != sizeof(num_type)) {
@@ -250,7 +269,7 @@ static inline CHECKED_STATUS CQLDecodeNum(
 // is the coverter's return type. The converter's return type <data_type> is an integer type.
 template<typename float_type, typename data_type>
 static inline CHECKED_STATUS CQLDecodeFloat(
-    size_t len, data_type (*converter)(const void*), Slice* data, float_type* val) {
+    const size_t len, data_type (*converter)(const void*), Slice* data, float_type* val) {
   // Make sure float and double are exactly sizeof uint32_t and uint64_t.
   static_assert(sizeof(float_type) == sizeof(data_type), "inconsistent floating point type size");
   data_type bval = 0;
@@ -272,5 +291,9 @@ static inline uint8_t Load8(const void* p) {
 
 #undef RETURN_NOT_ENOUGH
 
+YB_STRONGLY_TYPED_UUID(ClientId);
+typedef int64_t RetryableRequestId;
+
 } // namespace yb
+
 #endif  // YB_COMMON_WIRE_PROTOCOL_H
