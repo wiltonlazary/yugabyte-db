@@ -38,6 +38,7 @@
 #include "yb/client/table.h"
 
 #include "yb/common/row.h"
+#include "yb/common/row_mark.h"
 #include "yb/common/wire_protocol.pb.h"
 #include "yb/common/wire_protocol.h"
 #include "yb/common/redis_protocol.pb.h"
@@ -84,6 +85,10 @@ void YBOperation::ResetTable(std::shared_ptr<YBTable> new_table) {
 
 bool YBOperation::IsTransactional() const {
   return table_->schema().table_properties().is_transactional();
+}
+
+bool YBOperation::IsYsqlCatalogOp() const {
+  return table_->schema().table_properties().is_ysql_catalog_table();
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -748,6 +753,11 @@ Status YBNoOp::Execute(const YBPartialRow& key) {
   }
 
   return Status::OK();
+}
+
+bool YBPgsqlReadOp::wrote_data(IsolationLevel isolation_level) {
+  return isolation_level == IsolationLevel::SERIALIZABLE_ISOLATION ||
+         IsValidRowMarkType(GetRowMarkTypeFromPB(*read_request_));
 }
 
 }  // namespace client

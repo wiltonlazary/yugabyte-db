@@ -72,6 +72,7 @@
 #include "yb/tablet/tablet.h"
 #include "yb/tablet/tablet.pb.h"
 #include "yb/tablet/tablet_bootstrap_if.h"
+#include "yb/tablet/tablet_fwd.h"
 #include "yb/tablet/tablet_metadata.h"
 #include "yb/tablet/tablet_peer.h"
 #include "yb/tablet/tablet_options.h"
@@ -641,7 +642,8 @@ Status TSTabletManager::CreateNewTablet(
     const PartitionSchema &partition_schema,
     const boost::optional<IndexInfo>& index_info,
     RaftConfigPB config,
-    TabletPeerPtr *tablet_peer) {
+    TabletPeerPtr *tablet_peer,
+    const bool colocated) {
   if (state() != MANAGER_RUNNING) {
     return STATUS_FORMAT(IllegalState, "Manager is not running: $0", state());
   }
@@ -677,8 +679,10 @@ Status TSTabletManager::CreateNewTablet(
   RaftGroupMetadataPtr meta;
   string data_root_dir;
   string wal_root_dir;
-  GetAndRegisterDataAndWalDir(fs_manager_, table_id, tablet_id, table_type,
-                              &data_root_dir, &wal_root_dir);
+  if (!colocated) {
+    GetAndRegisterDataAndWalDir(fs_manager_, table_id, tablet_id, table_type,
+                                &data_root_dir, &wal_root_dir);
+  }
   Status create_status = RaftGroupMetadata::CreateNew(fs_manager_,
                                                    table_id,
                                                    tablet_id,
@@ -693,8 +697,9 @@ Status TSTabletManager::CreateNewTablet(
                                                    TABLET_DATA_READY,
                                                    &meta,
                                                    data_root_dir,
-                                                   wal_root_dir);
-  if (!create_status.ok()) {
+                                                   wal_root_dir,
+                                                   colocated);
+  if (!create_status.ok() && !colocated) {
     UnregisterDataWalDir(table_id, tablet_id, table_type, data_root_dir, wal_root_dir);
   }
   RETURN_NOT_OK_PREPEND(create_status, "Couldn't create tablet metadata")
@@ -1103,21 +1108,25 @@ void TSTabletManager::OpenTablet(const RaftGroupMetadataPtr& meta,
     }
 
     tablet::BootstrapTabletData data = {
-        meta,
-        async_client_init_->get_client_future(),
-        scoped_refptr<server::Clock>(server_->clock()),
-        MemTracker::FindOrCreateTracker("Tablets", server_->mem_tracker()),
-        block_based_table_mem_tracker_,
-        metric_registry_,
-        tablet_peer->status_listener(),
-        tablet_peer->log_anchor_registry(),
-        tablet_options_,
-        " P " + tablet_peer->permanent_uuid(),
-        tablet_peer.get(),
-        std::bind(&TSTabletManager::PreserveLocalLeadersOnly, this, _1),
-        tablet_peer.get(),
-        append_pool(),
-        &retryable_requests};
+        .meta = meta,
+        .client_future = async_client_init_->get_client_future(),
+        .clock = scoped_refptr<server::Clock>(server_->clock()),
+        .mem_tracker = MemTracker::FindOrCreateTracker("Tablets", server_->mem_tracker()),
+        .block_based_table_mem_tracker = block_based_table_mem_tracker_,
+        .metric_registry = metric_registry_,
+        .listener = tablet_peer->status_listener(),
+        .log_anchor_registry = tablet_peer->log_anchor_registry(),
+        .tablet_options = tablet_options_,
+        .log_prefix_suffix = " P " + tablet_peer->permanent_uuid(),
+        .transaction_participant_context = tablet_peer.get(),
+        .local_tablet_filter = std::bind(&TSTabletManager::PreserveLocalLeadersOnly, this, _1),
+        .transaction_coordinator_context = tablet_peer.get(),
+        .append_pool = append_pool(),
+        .retryable_requests = &retryable_requests,
+        .txns_enabled = tablet::TransactionsEnabled::kTrue,
+        // We are assuming we're never dealing with the system catalog tablet in TSTabletManager.
+        .is_sys_catalog = tablet::IsSysCatalogTablet::kFalse
+    };
     s = BootstrapTablet(data, &tablet, &log, &bootstrap_info);
     if (!s.ok()) {
       LOG(ERROR) << kLogPrefix << "Tablet failed to bootstrap: " << s;

@@ -81,15 +81,15 @@ ColumnSortingOptions(SortByDir dir, SortByNulls nulls, bool* is_desc, bool* is_n
 /*  Database Functions. */
 
 void
-YBCCreateDatabase(Oid dboid, const char *dbname, Oid src_dboid, Oid next_oid)
+YBCCreateDatabase(Oid dboid, const char *dbname, Oid src_dboid, Oid next_oid, bool colocated)
 {
 	YBCPgStatement handle;
 
-	HandleYBStatus(YBCPgNewCreateDatabase(ybc_pg_session,
-										  dbname,
+	HandleYBStatus(YBCPgNewCreateDatabase(dbname,
 										  dboid,
 										  src_dboid,
 										  next_oid,
+										  colocated,
 										  &handle));
 	HandleYBStmtStatus(YBCPgExecCreateDatabase(handle), handle);
 	HandleYBStatus(YBCPgDeleteStatement(handle));
@@ -100,9 +100,8 @@ YBCDropDatabase(Oid dboid, const char *dbname)
 {
 	YBCPgStatement handle;
 
-	HandleYBStatus(YBCPgNewDropDatabase(ybc_pg_session,
-										dbname,
-																			dboid,
+	HandleYBStatus(YBCPgNewDropDatabase(dbname,
+										dboid,
 										&handle));
 	HandleYBStmtStatus(YBCPgExecDropDatabase(handle), handle);
 	HandleYBStatus(YBCPgDeleteStatement(handle));
@@ -111,8 +110,7 @@ YBCDropDatabase(Oid dboid, const char *dbname)
 void
 YBCReserveOids(Oid dboid, Oid next_oid, uint32 count, Oid *begin_oid, Oid *end_oid)
 {
-	HandleYBStatus(YBCPgReserveOids(ybc_pg_session,
-									dboid,
+	HandleYBStatus(YBCPgReserveOids(dboid,
 									next_oid,
 									count,
 									begin_oid,
@@ -485,8 +483,22 @@ YBCCreateTable(CreateStmt *stmt, char relkind, TupleDesc desc, Oid relationId, O
 		}
 	}
 
-	HandleYBStatus(YBCPgNewCreateTable(ybc_pg_session,
-									   db_name,
+	ListCell	*opt_cell;
+	// Set the default option to true so that tables created in a colocated database will be
+	// colocated by default. For regular database, this argument will be ignored.
+	bool		colocated = true;
+	/* Scan list to see if colocated was included */
+	foreach(opt_cell, stmt->options)
+	{
+		DefElem *def = (DefElem *) lfirst(opt_cell);
+
+		if (strcmp(def->defname, "colocated") == 0)
+		{
+			colocated = defGetBoolean(def);
+		}
+	}
+
+	HandleYBStatus(YBCPgNewCreateTable(db_name,
 									   schema_name,
 									   stmt->relation->relname,
 									   MyDatabaseId,
@@ -497,6 +509,7 @@ YBCCreateTable(CreateStmt *stmt, char relkind, TupleDesc desc, Oid relationId, O
 									   &handle));
 
 	CreateTableAddColumns(handle, desc, primary_key);
+	HandleYBStmtStatus(YBCPgCreateTableSetColocated(handle, colocated), handle);
 
 	/* Handle SPLIT statement, if present */
 	OptSplit *split_options = stmt->split_options;
@@ -522,8 +535,7 @@ YBCDropTable(Oid relationId)
 {
 	YBCPgStatement handle;
 
-	HandleYBStatus(YBCPgNewDropTable(ybc_pg_session,
-									 MyDatabaseId,
+	HandleYBStatus(YBCPgNewDropTable(MyDatabaseId,
 									 relationId,
 									 false,    /* if_exists */
 									 &handle));
@@ -537,7 +549,7 @@ YBCTruncateTable(Relation rel) {
 	Oid relationId = RelationGetRelid(rel);
 
 	/* Truncate the base table */
-	HandleYBStatus(YBCPgNewTruncateTable(ybc_pg_session, MyDatabaseId, relationId, &handle));
+	HandleYBStatus(YBCPgNewTruncateTable(MyDatabaseId, relationId, &handle));
 	HandleYBStmtStatus(YBCPgExecTruncateTable(handle), handle);
 	HandleYBStatus(YBCPgDeleteStatement(handle));
 
@@ -555,7 +567,7 @@ YBCTruncateTable(Relation rel) {
 		if (indexId == rel->rd_pkindex)
 			continue;
 
-		HandleYBStatus(YBCPgNewTruncateTable(ybc_pg_session, MyDatabaseId, indexId, &handle));
+		HandleYBStatus(YBCPgNewTruncateTable(MyDatabaseId, indexId, &handle));
 		HandleYBStmtStatus(YBCPgExecTruncateTable(handle), handle);
 		HandleYBStatus(YBCPgDeleteStatement(handle));
 	}
@@ -569,7 +581,8 @@ YBCCreateIndex(const char *indexName,
 			   TupleDesc indexTupleDesc,
 			   int16 *coloptions,
 			   Oid indexId,
-			   Relation rel)
+			   Relation rel,
+			   List *index_options)
 {
 	char *db_name	  = get_database_name(MyDatabaseId);
 	char *schema_name = get_namespace_name(RelationGetNamespace(rel));
@@ -580,10 +593,24 @@ YBCCreateIndex(const char *indexName,
 					 schema_name,
 					 indexName);
 
+	ListCell	*opt_cell;
+	// Set the default option to true so that tables created in a colocated database will be
+	// colocated by default. For regular database, this argument will be ignored.
+	bool		colocated = true;
+	/* Scan list to see if colocated was included */
+	foreach(opt_cell, index_options)
+	{
+		DefElem *def = (DefElem *) lfirst(opt_cell);
+
+		if (strcmp(def->defname, "colocated") == 0)
+		{
+			colocated = defGetBoolean(def);
+		}
+	}
+
 	YBCPgStatement handle = NULL;
 
-	HandleYBStatus(YBCPgNewCreateIndex(ybc_pg_session,
-									   db_name,
+	HandleYBStatus(YBCPgNewCreateIndex(db_name,
 									   schema_name,
 									   indexName,
 									   MyDatabaseId,
@@ -592,6 +619,7 @@ YBCCreateIndex(const char *indexName,
 									   rel->rd_rel->relisshared,
 									   indexInfo->ii_Unique,
 									   false, /* if_not_exists */
+									   colocated,
 									   &handle));
 
 	for (int i = 0; i < indexTupleDesc->natts; i++)
@@ -636,8 +664,7 @@ YBCPgStatement
 YBCPrepareAlterTable(AlterTableStmt *stmt, Relation rel, Oid relationId)
 {
 	YBCPgStatement handle = NULL;
-	HandleYBStatus(YBCPgNewAlterTable(ybc_pg_session,
-									  MyDatabaseId,
+	HandleYBStatus(YBCPgNewAlterTable(MyDatabaseId,
 									  relationId,
 									  &handle));
 
@@ -772,8 +799,7 @@ YBCRename(RenameStmt *stmt, Oid relationId)
 	switch (stmt->renameType)
 	{
 		case OBJECT_TABLE:
-			HandleYBStatus(YBCPgNewAlterTable(ybc_pg_session,
-											  MyDatabaseId,
+			HandleYBStatus(YBCPgNewAlterTable(MyDatabaseId,
 											  relationId,
 											  &handle));
 			HandleYBStmtStatus(YBCPgAlterTableRenameTable(handle, db_name, stmt->newname), handle);
@@ -782,8 +808,7 @@ YBCRename(RenameStmt *stmt, Oid relationId)
 		case OBJECT_COLUMN:
 		case OBJECT_ATTRIBUTE:
 
-			HandleYBStatus(YBCPgNewAlterTable(ybc_pg_session,
-											  MyDatabaseId,
+			HandleYBStatus(YBCPgNewAlterTable(MyDatabaseId,
 											  relationId,
 											  &handle));
 
@@ -807,8 +832,7 @@ YBCDropIndex(Oid relationId)
 {
 	YBCPgStatement handle;
 
-	HandleYBStatus(YBCPgNewDropIndex(ybc_pg_session,
-									 MyDatabaseId,
+	HandleYBStatus(YBCPgNewDropIndex(MyDatabaseId,
 									 relationId,
 									 false,	   /* if_exists */
 									 &handle));

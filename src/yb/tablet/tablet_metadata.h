@@ -157,12 +157,6 @@ struct KvStoreInfo {
   std::vector<std::unique_ptr<TableInfo>> old_tables;
 };
 
-// Manages the "blocks tracking" for the specified Raft group.
-//
-// RaftGroupMetadata is owned by the Raft group. As new blocks are written to store
-// the Raft group's data, the Tablet calls Flush() to persist the block list
-// on disk.
-//
 // At startup, the TSTabletManager will load a RaftGroupMetadata for each
 // super block found in the tablets/ directory, and then instantiate
 // Raft groups from this data.
@@ -188,7 +182,8 @@ class RaftGroupMetadata : public RefCountedThreadSafe<RaftGroupMetadata> {
                                   const TabletDataState& initial_tablet_data_state,
                                   RaftGroupMetadataPtr* metadata,
                                   const std::string& data_root_dir = std::string(),
-                                  const std::string& wal_root_dir = std::string());
+                                  const std::string& wal_root_dir = std::string(),
+                                  const bool colocated = false);
 
   // Load existing metadata from disk.
   static CHECKED_STATUS Load(FsManager* fs_manager,
@@ -417,7 +412,8 @@ class RaftGroupMetadata : public RefCountedThreadSafe<RaftGroupMetadata> {
                     Partition partition,
                     const boost::optional<IndexInfo>& index_info,
                     const uint32_t schema_version,
-                    const TabletDataState& tablet_data_state);
+                    const TabletDataState& tablet_data_state,
+                    const bool colocated = false);
 
   // Constructor for loading an existing Raft group.
   RaftGroupMetadata(FsManager* fs_manager, RaftGroupId raft_group_id);
@@ -490,6 +486,9 @@ class RaftGroupMetadata : public RefCountedThreadSafe<RaftGroupMetadata> {
   // Record of the last opid logged by the tablet before it was last tombstoned. Has no meaning for
   // non-tombstoned tablets.
   yb::OpId tombstone_last_logged_opid_;
+
+  // True if the raft group is for a colocated tablet.
+  bool colocated_;
 
   DISALLOW_COPY_AND_ASSIGN(RaftGroupMetadata);
 };

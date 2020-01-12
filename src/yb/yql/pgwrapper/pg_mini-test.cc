@@ -14,11 +14,17 @@
 #include "yb/integration-tests/mini_cluster.h"
 #include "yb/integration-tests/yb_mini_cluster_test_base.h"
 
-#include "yb/master/initial_sys_catalog_snapshot.h"
+#include "yb/master/catalog_entity_info.h"
+#include "yb/master/catalog_manager.h"
+#include "yb/master/mini_master.h"
+#include "yb/master/sys_catalog_constants.h"
+#include "yb/master/sys_catalog_initialization.h"
 
 #include "yb/tserver/mini_tablet_server.h"
 #include "yb/tserver/tablet_server.h"
 
+#include "yb/util/logging.h"
+#include "yb/yql/pggate/pggate_flags.h"
 #include "yb/yql/pgwrapper/libpq_utils.h"
 #include "yb/yql/pgwrapper/pg_wrapper.h"
 
@@ -40,12 +46,17 @@ DECLARE_int32(ysql_num_shards_per_tserver);
 DECLARE_int64(retryable_rpc_single_call_timeout_ms);
 DECLARE_uint64(max_clock_skew_usec);
 DECLARE_int64(db_write_buffer_size);
+DECLARE_bool(ysql_enable_manual_sys_table_txn_ctl);
 
 namespace yb {
 namespace pgwrapper {
 
 class PgMiniTest : public YBMiniClusterTestBase<MiniCluster> {
  protected:
+  // This allows modifying flags before we start the postgres process in SetUp.
+  virtual void BeforePgProcessStart() {
+  }
+
   void SetUp() override {
     constexpr int kNumTabletServers = 3;
     constexpr int kNumMasters = 1;
@@ -75,11 +86,13 @@ class PgMiniTest : public YBMiniClusterTestBase<MiniCluster> {
         pg_ts->options()->fs_opts.data_paths.front() + "/pg_data",
         pg_ts->server()->GetSharedMemoryFd()));
     pg_process_conf.master_addresses = pg_ts->options()->master_addresses_flag;
+    pg_process_conf.force_disable_log_file = true;
 
     LOG(INFO) << "Starting PostgreSQL server listening on "
               << pg_process_conf.listen_addresses << ":" << pg_process_conf.pg_port << ", data: "
               << pg_process_conf.data_dir;
 
+    BeforePgProcessStart();
     pg_supervisor_ = std::make_unique<PgSupervisor>(pg_process_conf);
     ASSERT_OK(pg_supervisor_->Start());
 
@@ -95,6 +108,10 @@ class PgMiniTest : public YBMiniClusterTestBase<MiniCluster> {
 
   Result<PGConn> Connect() {
     return PGConn::Connect(pg_host_port_);
+  }
+
+  Result<PGConn> ConnectToDB(const std::string &dbname) {
+    return PGConn::Connect(pg_host_port_, dbname);
   }
 
   // Have several threads doing updates and several threads doing large scans in parallel.  If
@@ -119,6 +136,8 @@ class PgMiniTest : public YBMiniClusterTestBase<MiniCluster> {
   // * 2 isolation levels
   // This totals 4 x 4 x 2 = 32 situations.
   void TestRowLockConflictMatrix();
+
+  void TestForeignKey(IsolationLevel isolation);
 
  private:
   std::unique_ptr<PgSupervisor> pg_supervisor_;
@@ -458,14 +477,12 @@ void PgMiniTest::TestRowLockConflictMatrix() {
         Status status_commit = conn_a.Execute("COMMIT");
         ASSERT_OK(conn_b.Execute("COMMIT"));
         if (AreConflictingRowMarkTypes(row_mark_type_a, row_mark_type_b)) {
-          // There should be a conflict.
           if (result_select.ok()) {
             // Should conflict on COMMIT only.
             ASSERT_NOK(status_commit);
             ASSERT_TRUE(status_commit.IsNetworkError()) << status_commit;
             ASSERT_EQ(PgsqlError(status_commit), YBPgErrorCode::YB_PG_T_R_SERIALIZATION_FAILURE)
                 << status_commit;
-            ASSERT_STR_CONTAINS(status_commit.ToString(), "Transaction expired: 25P02");
           } else {
             // Should conflict on SELECT only.
             ASSERT_OK(status_commit);
@@ -477,7 +494,6 @@ void PgMiniTest::TestRowLockConflictMatrix() {
                                 "Conflicts with higher priority transaction");
           }
         } else {
-          // There should not be a conflict.
           ASSERT_OK(result_select);
           ASSERT_OK(status_commit);
         }
@@ -550,7 +566,6 @@ TEST_F(PgMiniTest, YB_DISABLE_TEST_IN_SANITIZERS(SerializableReadOnly)) {
     ASSERT_NOK(status);
     ASSERT_TRUE(status.IsNetworkError()) << status;
     ASSERT_EQ(PgsqlError(status), YBPgErrorCode::YB_PG_T_R_SERIALIZATION_FAILURE) << status;
-    ASSERT_STR_CONTAINS(status.ToString(), "Transaction expired: 25P02");
   } else {
     ASSERT_TRUE(result.status().IsNetworkError()) << result.status();
     ASSERT_EQ(PgsqlError(result.status()), YBPgErrorCode::YB_PG_T_R_SERIALIZATION_FAILURE)
@@ -607,12 +622,11 @@ TEST_F_EX(PgMiniTest, YB_DISABLE_TEST_IN_TSAN(BulkCopyWithRestart), PgMiniSmallW
   TestThreadHolder thread_holder;
   constexpr int kTotalBatches = RegularBuildVsSanitizers(50, 5);
   constexpr int kBatchSize = 1000;
+  constexpr int kValueSize = 128;
 
   std::atomic<int> key(0);
 
   thread_holder.AddThreadFunctor([this, &kTableName, &stop = thread_holder.stop_flag(), &key] {
-    constexpr int kValueSize = 128;
-
     SetFlagOnExit set_flag(&stop);
     auto conn = ASSERT_RESULT(Connect());
 
@@ -641,12 +655,287 @@ TEST_F_EX(PgMiniTest, YB_DISABLE_TEST_IN_TSAN(BulkCopyWithRestart), PgMiniSmallW
   LOG(INFO) << "Restarting cluster";
   ASSERT_OK(cluster_->RestartSync());
 
-  ASSERT_OK(WaitFor([this] {
+  ASSERT_OK(WaitFor([this, &conn, &key, &kTableName] {
     auto intents_count = CountIntents(cluster_.get());
     LOG(INFO) << "Intents count: " << intents_count;
 
-    return intents_count <= 5000;
-  }, 5s, "Intents cleanup"));
+    if (intents_count <= 5000) {
+      return true;
+    }
+
+    // We cleanup only transactions that were completely aborted/applied before last replication
+    // happens.
+    // So we could get into situation when intents of the last transactions are not cleaned.
+    // To avoid such scenario in this test we write one more row to allow cleanup.
+    EXPECT_OK(conn.ExecuteFormat(
+        "INSERT INTO $0 VALUES ($1, '$2')", kTableName, ++key,
+        RandomHumanReadableString(kValueSize)));
+
+    return false;
+  }, 5s, "Intents cleanup", 200ms));
+}
+
+void PgMiniTest::TestForeignKey(IsolationLevel isolation_level) {
+  const std::string kDataTable = "data";
+  const std::string kReferenceTable = "reference";
+  constexpr int kRows = 10;
+  auto conn = ASSERT_RESULT(Connect());
+
+  ASSERT_OK(conn.ExecuteFormat(
+      "CREATE TABLE $0 (id int NOT NULL, name VARCHAR, PRIMARY KEY (id))",
+      kReferenceTable));
+  ASSERT_OK(conn.ExecuteFormat(
+      "CREATE TABLE $0 (ref_id INTEGER, data_id INTEGER, name VARCHAR, "
+          "PRIMARY KEY (ref_id, data_id))",
+      kDataTable));
+  ASSERT_OK(conn.ExecuteFormat(
+      "ALTER TABLE $0 ADD CONSTRAINT fk FOREIGN KEY(ref_id) REFERENCES $1(id) "
+          "ON DELETE CASCADE",
+      kDataTable, kReferenceTable));
+
+  ASSERT_OK(conn.ExecuteFormat(
+      "INSERT INTO $0 VALUES ($1, 'reference_$1')", kReferenceTable, 1));
+
+  for (int i = 1; i <= kRows; ++i) {
+    ASSERT_OK(conn.StartTransaction(isolation_level));
+    ASSERT_OK(conn.ExecuteFormat(
+        "INSERT INTO $0 VALUES ($1, $2, 'data_$2')", kDataTable, 1, i));
+    ASSERT_OK(conn.CommitTransaction());
+  }
+
+  ASSERT_OK(WaitFor([this] {
+    return CountIntents(cluster_.get()) == 0;
+  }, 15s, "Intents cleanup"));
+}
+
+TEST_F(PgMiniTest, YB_DISABLE_TEST_IN_TSAN(ForeignKeySerializable)) {
+  TestForeignKey(IsolationLevel::SERIALIZABLE_ISOLATION);
+}
+
+TEST_F(PgMiniTest, YB_DISABLE_TEST_IN_TSAN(ForeignKeySnapshot)) {
+  TestForeignKey(IsolationLevel::SNAPSHOT_ISOLATION);
+}
+
+// ------------------------------------------------------------------------------------------------
+// A test performing manual transaction control on system tables.
+// ------------------------------------------------------------------------------------------------
+
+class PgMiniTestManualSysTableTxn : public PgMiniTest {
+  virtual void BeforePgProcessStart() {
+    // Enable manual transaction control for operations on system tables. Otherwise, they would
+    // execute non-transactionally.
+    FLAGS_ysql_enable_manual_sys_table_txn_ctl = true;
+  }
+};
+
+TEST_F_EX(PgMiniTest, YB_DISABLE_TEST_IN_TSAN(SystemTableTxnTest), PgMiniTestManualSysTableTxn) {
+
+  // Resolving conflicts between transactions on a system table.
+  //
+  // postgres=# \d pg_ts_dict;
+  //
+  //              Table "pg_catalog.pg_ts_dict"
+  //      Column     | Type | Collation | Nullable | Default
+  // ----------------+------+-----------+----------+---------
+  //  dictname       | name |           | not null |
+  //  dictnamespace  | oid  |           | not null |
+  //  dictowner      | oid  |           | not null |
+  //  dicttemplate   | oid  |           | not null |
+  //  dictinitoption | text |           |          |
+  // Indexes:
+  //     "pg_ts_dict_oid_index" PRIMARY KEY, lsm (oid)
+  //     "pg_ts_dict_dictname_index" UNIQUE, lsm (dictname, dictnamespace)
+
+  auto conn1 = ASSERT_RESULT(Connect());
+  auto conn2 = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn1.Execute("SET yb_debug_mode = true"));
+  ASSERT_OK(conn2.Execute("SET yb_debug_mode = true"));
+
+  size_t commit1_fail_count = 0;
+  size_t commit2_fail_count = 0;
+  size_t insert2_fail_count = 0;
+
+  const auto kStartTxnStatementStr = "START TRANSACTION ISOLATION LEVEL REPEATABLE READ";
+  for (int i = 1; i <= 100; ++i) {
+    std::string dictname = Format("contendedkey$0", i);
+    const int dictnamespace = i;
+    ASSERT_OK(conn1.Execute(kStartTxnStatementStr));
+    ASSERT_OK(conn2.Execute(kStartTxnStatementStr));
+
+    // Insert a row in each transaction. The first insert should always succeed.
+    ASSERT_OK(conn1.Execute(
+        Format("INSERT INTO pg_ts_dict VALUES ('$0', $1, 1, 2, 'b')", dictname, dictnamespace)));
+    Status insert_status2 = conn2.Execute(
+        Format("INSERT INTO pg_ts_dict VALUES ('$0', $1, 3, 4, 'c')", dictname, dictnamespace));
+    if (!insert_status2.ok()) {
+      LOG(INFO) << "MUST BE A CONFLICT: Insert failed: " << insert_status2;
+      insert2_fail_count++;
+    }
+
+    Status commit_status1;
+    Status commit_status2;
+    if (RandomUniformBool()) {
+      commit_status1 = conn1.Execute("COMMIT");
+      commit_status2 = conn2.Execute("COMMIT");
+    } else {
+      commit_status2 = conn2.Execute("COMMIT");
+      commit_status1 = conn1.Execute("COMMIT");
+    }
+    if (!commit_status1.ok()) {
+      commit1_fail_count++;
+    }
+    if (!commit_status2.ok()) {
+      commit2_fail_count++;
+    }
+
+    auto get_commit_statuses_str = [&commit_status1, &commit_status2]() {
+      return Format("commit_status1=$0, commit_status2=$1", commit_status1, commit_status2);
+    };
+
+    bool succeeded1 = commit_status1.ok();
+    bool succeeded2 = insert_status2.ok() && commit_status2.ok();
+
+    ASSERT_TRUE(!succeeded1 || !succeeded2)
+        << "Both transactions can't commit. " << get_commit_statuses_str();
+    ASSERT_TRUE(succeeded1 || succeeded2)
+        << "We expect one of the two transactions to succeed. " << get_commit_statuses_str();
+    if (!commit_status1.ok()) {
+      ASSERT_OK(conn1.Execute("ROLLBACK"));
+    }
+    if (!commit_status2.ok()) {
+      ASSERT_OK(conn2.Execute("ROLLBACK"));
+    }
+
+    if (RandomUniformBool()) {
+      std::swap(conn1, conn2);
+    }
+  }
+  LOG(INFO) << "Test stats: "
+            << EXPR_VALUE_FOR_LOG(commit1_fail_count) << ", "
+            << EXPR_VALUE_FOR_LOG(insert2_fail_count) << ", "
+            << EXPR_VALUE_FOR_LOG(commit2_fail_count);
+  ASSERT_GE(commit1_fail_count, 25);
+  ASSERT_GE(insert2_fail_count, 25);
+  ASSERT_EQ(commit2_fail_count, 0);
+}
+
+TEST_F(PgMiniTest, YB_DISABLE_TEST_IN_TSAN(DropDBUpdateSysTablet)) {
+  const std::string kDatabaseName = "testdb";
+  master::CatalogManager *catalog_manager =
+      cluster_->leader_mini_master()->master()->catalog_manager();
+  PGConn conn = ASSERT_RESULT(Connect());
+  scoped_refptr<master::TabletInfo> sys_tablet;
+  std::array<int, 4> num_tables;
+
+  {
+    auto catalog_lock(catalog_manager->lock_);
+    sys_tablet = catalog_manager->tablet_map_->find(master::kSysCatalogTabletId)->second;
+  }
+  {
+    auto tablet_lock = sys_tablet->LockForWrite();
+    num_tables[0] = tablet_lock->data().pb.table_ids_size();
+  }
+  ASSERT_OK(conn.ExecuteFormat("CREATE DATABASE $0", kDatabaseName));
+  {
+    auto tablet_lock = sys_tablet->LockForWrite();
+    num_tables[1] = tablet_lock->data().pb.table_ids_size();
+  }
+  ASSERT_OK(conn.ExecuteFormat("DROP DATABASE $0", kDatabaseName));
+  {
+    auto tablet_lock = sys_tablet->LockForWrite();
+    num_tables[2] = tablet_lock->data().pb.table_ids_size();
+  }
+  // Make sure that the system catalog tablet table_ids is persisted.
+  ASSERT_OK(cluster_->RestartSync());
+  {
+    // Refresh stale local variables after RestartSync.
+    catalog_manager = cluster_->leader_mini_master()->master()->catalog_manager();
+    auto catalog_lock(catalog_manager->lock_);
+    sys_tablet = catalog_manager->tablet_map_->find(master::kSysCatalogTabletId)->second;
+  }
+  {
+    auto tablet_lock = sys_tablet->LockForWrite();
+    num_tables[3] = tablet_lock->data().pb.table_ids_size();
+  }
+  ASSERT_LT(num_tables[0], num_tables[1]);
+  ASSERT_EQ(num_tables[0], num_tables[2]);
+  ASSERT_EQ(num_tables[0], num_tables[3]);
+}
+
+TEST_F(PgMiniTest, YB_DISABLE_TEST_IN_TSAN(DropDBMarkDeleted)) {
+  const std::string kDatabaseName = "testdb";
+  constexpr auto kSleepTime = 500ms;
+  constexpr int kMaxNumSleeps = 20;
+  master::CatalogManager *catalog_manager =
+      cluster_->leader_mini_master()->master()->catalog_manager();
+  PGConn conn = ASSERT_RESULT(Connect());
+
+  ASSERT_FALSE(catalog_manager->AreTablesDeleting());
+  ASSERT_OK(conn.ExecuteFormat("CREATE DATABASE $0", kDatabaseName));
+  ASSERT_OK(conn.ExecuteFormat("DROP DATABASE $0", kDatabaseName));
+  // System tables should be deleting then deleted.
+  int num_sleeps = 0;
+  while (catalog_manager->AreTablesDeleting() && (num_sleeps++ != kMaxNumSleeps)) {
+    LOG(INFO) << "Tables are deleting...";
+    std::this_thread::sleep_for(kSleepTime);
+  }
+  ASSERT_FALSE(catalog_manager->AreTablesDeleting()) << "Tables should have finished deleting";
+  // Make sure that the table deletions are persisted.
+  ASSERT_OK(cluster_->RestartSync());
+  // Refresh stale local variable after RestartSync.
+  catalog_manager = cluster_->leader_mini_master()->master()->catalog_manager();
+  ASSERT_FALSE(catalog_manager->AreTablesDeleting());
+}
+
+TEST_F(PgMiniTest, YB_DISABLE_TEST_IN_TSAN(DropDBWithTables)) {
+  const std::string kDatabaseName = "testdb";
+  const std::string kTablePrefix = "testt";
+  constexpr auto kSleepTime = 500ms;
+  constexpr int kMaxNumSleeps = 20;
+  int num_tables_before, num_tables_after;
+  master::CatalogManager *catalog_manager =
+      cluster_->leader_mini_master()->master()->catalog_manager();
+  PGConn conn = ASSERT_RESULT(Connect());
+  scoped_refptr<master::TabletInfo> sys_tablet;
+
+  {
+    auto catalog_lock(catalog_manager->lock_);
+    sys_tablet = catalog_manager->tablet_map_->find(master::kSysCatalogTabletId)->second;
+  }
+  {
+    auto tablet_lock = sys_tablet->LockForWrite();
+    num_tables_before = tablet_lock->data().pb.table_ids_size();
+  }
+  ASSERT_OK(conn.ExecuteFormat("CREATE DATABASE $0", kDatabaseName));
+  {
+    PGConn conn_new = ASSERT_RESULT(ConnectToDB(kDatabaseName));
+    for (int i = 0; i < 10; ++i) {
+      ASSERT_OK(conn_new.ExecuteFormat("CREATE TABLE $0$1 (i int)", kTablePrefix, i));
+    }
+    ASSERT_OK(conn_new.ExecuteFormat("INSERT INTO $0$1 (i) VALUES (1), (2), (3)", kTablePrefix, 5));
+  }
+  ASSERT_OK(conn.ExecuteFormat("DROP DATABASE $0", kDatabaseName));
+  // User and system tables should be deleting then deleted.
+  int num_sleeps = 0;
+  while (catalog_manager->AreTablesDeleting() && (num_sleeps++ != kMaxNumSleeps)) {
+    LOG(INFO) << "Tables are deleting...";
+    std::this_thread::sleep_for(kSleepTime);
+  }
+  ASSERT_FALSE(catalog_manager->AreTablesDeleting()) << "Tables should have finished deleting";
+  // Make sure that the table deletions are persisted.
+  ASSERT_OK(cluster_->RestartSync());
+  {
+    // Refresh stale local variables after RestartSync.
+    catalog_manager = cluster_->leader_mini_master()->master()->catalog_manager();
+    auto catalog_lock(catalog_manager->lock_);
+    sys_tablet = catalog_manager->tablet_map_->find(master::kSysCatalogTabletId)->second;
+  }
+  ASSERT_FALSE(catalog_manager->AreTablesDeleting());
+  {
+    auto tablet_lock = sys_tablet->LockForWrite();
+    num_tables_after = tablet_lock->data().pb.table_ids_size();
+  }
+  ASSERT_EQ(num_tables_before, num_tables_after);
 }
 
 } // namespace pgwrapper

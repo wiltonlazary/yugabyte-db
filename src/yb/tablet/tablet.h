@@ -83,6 +83,7 @@
 #include "yb/gutil/thread_annotations.h"
 
 #include "yb/tablet/operations/snapshot_operation.h"
+#include "yb/util/strongly_typed_bool.h"
 
 namespace rocksdb {
 class DB;
@@ -189,7 +190,9 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
       std::string log_prefix_suffix,
       TransactionParticipantContext* transaction_participant_context,
       client::LocalTabletFilter local_tablet_filter,
-      TransactionCoordinatorContext* transaction_coordinator_context);
+      TransactionCoordinatorContext* transaction_coordinator_context,
+      IsSysCatalogTablet is_sys_catalog,
+      TransactionsEnabled txns_enabled = TransactionsEnabled::kTrue);
 
   ~Tablet();
 
@@ -220,8 +223,6 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
 
   CHECKED_STATUS RemoveIntents(
       const RemoveIntentsData& data, const TransactionIdSet& transactions) override;
-
-  HybridTime ApplierSafeTime(HybridTime min_allowed, CoarseTimePoint deadline) override;
 
   // Finish the Prepare phase of a write transaction.
   //
@@ -545,6 +546,11 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
   // Flushed intents db if necessary.
   void FlushIntentsDbIfNecessary(const yb::OpId& lastest_log_entry_op_id);
 
+  bool is_sys_catalog() const { return is_sys_catalog_; }
+  bool IsTransactionalRequest(bool is_ysql_request) const override;
+
+  void SetCleanupPool(ThreadPool* thread_pool);
+
   // ==============================================================================================
  protected:
 
@@ -571,10 +577,12 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
       rocksdb::WriteBatch* rocksdb_write_batch);
 
   Result<TransactionOperationContextOpt> CreateTransactionOperationContext(
-      const TransactionMetadataPB& transaction_metadata) const;
+      const TransactionMetadataPB& transaction_metadata,
+      bool is_ysql_catalog_table) const;
 
   TransactionOperationContextOpt CreateTransactionOperationContext(
-      const boost::optional<TransactionId>& transaction_id) const;
+      const boost::optional<TransactionId>& transaction_id,
+      bool is_ysql_catalog_table) const;
 
   // Pause any new read/write operations and wait for all pending read/write operations to finish.
   util::ScopedPendingOperationPause PauseReadWriteOperations();
@@ -729,11 +737,26 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
   template <class Ids>
   CHECKED_STATUS RemoveIntentsImpl(const RemoveIntentsData& data, const Ids& ids);
 
+  // Tries to find intent .SST files that could be deleted and remove them.
+  void CleanupIntentFiles();
+  void DoCleanupIntentFiles();
+
+  HybridTime ApplierSafeTime(HybridTime min_allowed, CoarseTimePoint deadline) override;
+
+  void MinRunningHybridTimeSatisfied() override {
+    CleanupIntentFiles();
+  }
+
   std::function<rocksdb::MemTableFilter()> mem_table_flush_filter_factory_;
 
   client::LocalTabletFilter local_tablet_filter_;
 
   std::string log_prefix_suffix_;
+
+  IsSysCatalogTablet is_sys_catalog_;
+  TransactionsEnabled txns_enabled_;
+
+  std::unique_ptr<ThreadPoolToken> cleanup_intent_files_token_;
 
   DISALLOW_COPY_AND_ASSIGN(Tablet);
 };

@@ -100,6 +100,7 @@ class TwoDCTest : public YBTest, public testing::WithParamInterface<int> {
       SetUpWithParams(std::vector<uint32_t> num_consumer_tablets,
                       std::vector<uint32_t> num_producer_tablets,
                       uint32_t replication_factor) {
+    FLAGS_enable_ysql = false;
     // Allow for one-off network instability by ensuring a single CDC RPC timeout << test timeout.
     FLAGS_cdc_read_rpc_timeout_ms = (kRpcTimeout / 6) * 1000;
     FLAGS_cdc_write_rpc_timeout_ms = (kRpcTimeout / 6) * 1000;
@@ -821,7 +822,8 @@ TEST_P(TwoDCTest, TestDeleteUniverse) {
 TEST_P(TwoDCTest, TestWalRetentionSet) {
   FLAGS_cdc_wal_retention_time_secs = 8 * 3600;
 
-  auto tables = ASSERT_RESULT(SetUpWithParams({8, 4, 4, 12}, {8, 4, 12, 8}, 3));
+  uint32_t replication_factor = NonTsanVsTsan(3, 1);
+  auto tables = ASSERT_RESULT(SetUpWithParams({8, 4, 4, 12}, {8, 4, 12, 8}, replication_factor));
 
   std::vector<std::shared_ptr<client::YBTable>> producer_tables;
   // tables contains both producer and consumer universe tables (alternately).

@@ -60,7 +60,7 @@ export default class MarkerClusterLayer extends MapLayer {
   createLeafletElement(props) {
     // Needed to react-leaflet^1.1.1 when extending Base Map Classes
   }
-  componentWillMount() {
+  UNSAFE_componentWillMount() {
     super.componentWillMount();
     this.leafletElement = Leaflet.markerClusterGroup({
       zoomToBoundsOnClick: false,
@@ -85,7 +85,7 @@ export default class MarkerClusterLayer extends MapLayer {
     });
   }
 
-  componentWillReceiveProps(nextProps) {
+  UNSAFE_componentWillReceiveProps(nextProps) {
     const self = this;
     this.leafletElement.clearLayers();
     const {newMarkerData} = nextProps;

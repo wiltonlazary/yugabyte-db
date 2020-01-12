@@ -85,6 +85,11 @@ YBTableCreator& YBTableCreator::num_tablets(int32_t count) {
   return *this;
 }
 
+YBTableCreator& YBTableCreator::colocated(const bool colocated) {
+  colocated_ = colocated;
+  return *this;
+}
+
 YBTableCreator& YBTableCreator::schema(const YBSchema* schema) {
   schema_ = schema;
   return *this;
@@ -183,6 +188,7 @@ Status YBTableCreator::Create() {
   req.set_name(table_name_.table_name());
   table_name_.SetIntoNamespaceIdentifierPB(req.mutable_namespace_());
   req.set_table_type(table_type_);
+  req.set_colocated(colocated_);
 
   if (!creator_role_name_.empty()) {
     req.set_creator_role_name(creator_role_name_);
@@ -209,18 +215,21 @@ Status YBTableCreator::Create() {
   SchemaToPB(internal::GetSchema(*schema_), req.mutable_schema());
 
   // Setup the number splits (i.e. number of splits).
-  if (num_tablets_ <= 0) {
+  if (num_tablets_ > 0) {
+    VLOG(1) << "num_tablets: number of tablets explicitly specified: " << num_tablets_;
+  } else if (schema_->table_properties().num_tablets() > 0) {
+    num_tablets_ = schema_->table_properties().num_tablets();
+  } else {
     if (table_name_.is_system()) {
       num_tablets_ = 1;
       VLOG(1) << "num_tablets=1: using one tablet for a system table";
     } else {
       num_tablets_ = VERIFY_RESULT(client_->NumTabletsForUserTable(table_type_));
     }
-  } else {
-    VLOG(1) << "num_tablets: number of tablets explicitly specified: " << num_tablets_;
   }
-
+  req.mutable_schema()->mutable_table_properties()->set_num_tablets(num_tablets_);
   req.set_num_tablets(num_tablets_);
+
   req.mutable_partition_schema()->CopyFrom(partition_schema_);
 
   // Index mapping with data-table being indexed.

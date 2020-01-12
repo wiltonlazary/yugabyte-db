@@ -49,6 +49,7 @@ DECLARE_int32(update_min_cdc_indices_interval_secs);
 DECLARE_double(leader_failure_max_missed_heartbeat_periods);
 DECLARE_bool(enable_load_balancing);
 DECLARE_int32(follower_unavailable_considered_failed_sec);
+DECLARE_bool(enable_ysql);
 
 METRIC_DECLARE_entity(cdc);
 METRIC_DECLARE_gauge_int64(last_read_opid_index);
@@ -77,6 +78,7 @@ class CDCServiceTest : public YBMiniClusterTestBase<MiniCluster> {
     YBMiniClusterTestBase::SetUp();
 
     MiniClusterOptions opts;
+    SetAtomicFlag(false, &FLAGS_enable_ysql);
     opts.num_tablet_servers = server_count();
     opts.num_masters = 1;
     cluster_.reset(new MiniCluster(env_.get(), opts));
@@ -157,7 +159,7 @@ void VerifyCdcState(client::YBClient* client) {
   ASSERT_OK(table.Open(cdc_state_table, client));
   ASSERT_EQ(1, boost::size(client::TableRange(table)));
   const auto& row = client::TableRange(table).begin();
-  string checkpoint = row->column(2).string_value();
+  string checkpoint = row->column(master::kCdcCheckpointIdx).string_value();
   size_t split = checkpoint.find(".");
   auto index = boost::lexical_cast<int>(checkpoint.substr(split + 1, string::npos));
   // Verify that op id index has been advanced and is not 0.
@@ -901,7 +903,7 @@ class CDCServiceTestMinSpace : public CDCServiceTest {
     FLAGS_TEST_record_segments_violate_min_space_policy = true;
 
     // This will rollover log segments a lot faster.
-    FLAGS_log_segment_size_bytes = 100;
+    FLAGS_log_segment_size_bytes = 500;
     CDCServiceTest::SetUp();
   }
 };
@@ -949,6 +951,13 @@ TEST_F_EX(CDCServiceTest, TestLogRetentionByOpId_MinSpace, CDCServiceTestMinSpac
               (*tablet_peer->log()->reader_->segments_violate_min_space_policy_)[i]->path());
     LOG(INFO) << "Segment " << segment_sequence[i]->path() << " to be GCed";
   }
+
+  int32_t num_gced(0);
+  ASSERT_OK(tablet_peer->log()->GC(std::numeric_limits<int64_t>::max(), &num_gced));
+  ASSERT_EQ(num_gced, segment_sequence.size());
+
+  // Read from 0.0.  This should start reading from the beginning of the logs.
+  GetChanges(tablet_id, stream_id, /* term */ 0, /* index */ 0);
 }
 
 TEST_F(CDCServiceTest, TestLogCdcIndex) {
@@ -1181,7 +1190,7 @@ TEST_F_EX(CDCServiceTest, TestNewLeaderUpdatesLogCDCAppliedIndex, CDCServiceTest
   // Wait until GetChanges doesn't return any errors. This means that we are able to write to
   // the cdc_state table.
   ASSERT_OK(WaitFor([&](){
-    bool has_error;
+    bool has_error = false;
     GetChanges(tablet_id, stream_id, /* term */ 0, /* index */ 5, &has_error);
     return !has_error;
   }, MonoDelta::FromSeconds(180), "Wait until cdc state table can take writes."));

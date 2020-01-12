@@ -11,6 +11,10 @@ import static com.yugabyte.yw.common.PlacementInfoUtil.UNIVERSE_ALIVE_METRIC;
 import static com.yugabyte.yw.common.PlacementInfoUtil.getAzUuidToNumNodes;
 import static com.yugabyte.yw.common.PlacementInfoUtil.updateUniverseDefinition;
 import static com.yugabyte.yw.common.ModelFactory.createUniverse;
+
+import com.google.common.collect.ImmutableList;
+import com.yugabyte.yw.common.ShellProcessHandler;
+import com.yugabyte.yw.forms.RunInShellFormData;
 import com.yugabyte.yw.forms.UniverseTaskParams.EncryptionAtRestConfig;
 import static com.yugabyte.yw.forms.UniverseDefinitionTaskParams.ClusterOperationType.CREATE;
 import static org.hamcrest.CoreMatchers.allOf;
@@ -23,14 +27,15 @@ import static org.junit.Assert.assertThat;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.assertFalse;
 import static org.mockito.Matchers.any;
+import static org.mockito.Matchers.anyBoolean;
 import static org.mockito.Matchers.eq;
 import static org.mockito.Matchers.anyList;
 import static org.mockito.Matchers.anyMap;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
-import static org.mockito.Matchers.anyMap;
 import static play.inject.Bindings.bind;
 import static play.test.Helpers.contentAsString;
 import static play.mvc.Http.Status.FORBIDDEN;
@@ -39,7 +44,6 @@ import java.io.File;
 import java.io.IOException;
 import java.util.*;
 
-import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.net.HostAndPort;
 import com.yugabyte.yw.common.ApiHelper;
@@ -59,6 +63,7 @@ import com.yugabyte.yw.models.NodeInstance;
 import com.yugabyte.yw.models.Provider;
 import com.yugabyte.yw.models.Region;
 import com.yugabyte.yw.models.Universe;
+import com.yugabyte.yw.models.Users;
 import com.yugabyte.yw.models.helpers.DeviceInfo;
 import com.yugabyte.yw.models.helpers.NodeDetails;
 import com.yugabyte.yw.models.helpers.NodeDetails.NodeState;
@@ -70,7 +75,6 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
-import org.junit.Ignore;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Matchers;
 
@@ -80,7 +84,6 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.yugabyte.yw.common.kms.services.SmartKeyEARService;
 import com.yugabyte.yw.common.kms.services.AwsEARService;
 import com.yugabyte.yw.common.kms.EncryptionAtRestManager;
-import com.yugabyte.yw.common.kms.util.KeyProvider;
 import com.yugabyte.yw.commissioner.CallHome;
 import com.yugabyte.yw.commissioner.Commissioner;
 import com.yugabyte.yw.commissioner.HealthChecker;
@@ -93,10 +96,11 @@ import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UserIntent;
 import com.yugabyte.yw.forms.UniverseTaskParams;
 
 import org.mockito.Mock;
+import org.mockito.Mockito;
 import org.mockito.runners.MockitoJUnitRunner;
 import org.yb.client.YBClient;
 import play.Application;
-import play.Configuration;
+import play.api.Play;
 import play.inject.guice.GuiceApplicationBuilder;
 import play.libs.Json;
 import play.mvc.Result;
@@ -112,16 +116,18 @@ public class UniverseControllerTest extends WithApplication {
 
   @Mock
   play.Configuration mockAppConfig;
+
   private Customer customer;
+  private Users user;
   private KmsConfig kmsConfig;
   private String authToken;
   private YBClientService mockService;
   private YBClient mockClient;
   private ApiHelper mockApiHelper;
   private CallHome mockCallHome;
-  private HealthChecker mockHealthChecker;
   private EncryptionAtRestManager mockEARManager;
   private QueryExecutor mockQueryExecutor;
+  private ShellProcessHandler mockShellProcessHandler;
 
   @Override
   protected Application provideApplication() {
@@ -133,15 +139,16 @@ public class UniverseControllerTest extends WithApplication {
     mockCallHome = mock(CallHome.class);
     mockEARManager = mock(EncryptionAtRestManager.class);
     mockQueryExecutor = mock(QueryExecutor.class);
+    mockShellProcessHandler = mock(ShellProcessHandler.class);
     return new GuiceApplicationBuilder()
         .configure((Map) Helpers.inMemoryDatabase())
         .overrides(bind(Commissioner.class).toInstance(mockCommissioner))
         .overrides(bind(MetricQueryHelper.class).toInstance(mockMetricQueryHelper))
         .overrides(bind(ApiHelper.class).toInstance(mockApiHelper))
         .overrides(bind(CallHome.class).toInstance(mockCallHome))
-        .overrides(bind(HealthChecker.class).toInstance(mockHealthChecker))
         .overrides(bind(EncryptionAtRestManager.class).toInstance(mockEARManager))
         .overrides(bind(QueryExecutor.class).toInstance(mockQueryExecutor))
+        .overrides(bind(ShellProcessHandler.class).toInstance(mockShellProcessHandler))
         .build();
   }
 
@@ -201,12 +208,13 @@ public class UniverseControllerTest extends WithApplication {
   @Before
   public void setUp() {
     customer = ModelFactory.testCustomer();
+    user = ModelFactory.testUser(customer);
     ObjectNode kmsConfigReq = Json.newObject()
             .put("name", "some config name")
             .put("base_url", "some_base_url")
             .put("api_key", "some_api_token");
     kmsConfig = ModelFactory.createKMSConfig(customer.uuid, "SMARTKEY", kmsConfigReq);
-    authToken = customer.createAuthToken();
+    authToken = user.createAuthToken();
     when(mockEARManager.getServiceInstance("SMARTKEY")).thenReturn(new SmartKeyEARService());
     when(mockEARManager.getServiceInstance("AWS")).thenReturn(new AwsEARService());
   }
@@ -248,7 +256,7 @@ public class UniverseControllerTest extends WithApplication {
 
     String resultString = contentAsString(result);
     assertThat(resultString, allOf(notNullValue(),
-        equalTo("Unable To Authenticate Customer")));
+        equalTo("Unable To Authenticate User")));
   }
 
   @Test
@@ -284,7 +292,7 @@ public class UniverseControllerTest extends WithApplication {
 
     String resultString = contentAsString(result);
     assertThat(resultString, allOf(notNullValue(),
-        equalTo("Unable To Authenticate Customer")));
+        equalTo("Unable To Authenticate User")));
   }
 
   @Test
@@ -292,7 +300,10 @@ public class UniverseControllerTest extends WithApplication {
     UUID invalidUUID = UUID.randomUUID();
     String url = "/api/customers/" + customer.uuid + "/universes/" + invalidUUID;
     Result result = doRequestWithAuthToken("GET", url, authToken);
-    assertBadRequest(result, "Invalid Universe UUID: " + invalidUUID);
+    String expectedResult = String.format("Universe UUID: %s doesn't belong " +
+                                          "to Customer UUID: %s", invalidUUID,
+                                          customer.uuid);
+    assertBadRequest(result, expectedResult);
   }
 
   @Test
@@ -1639,7 +1650,7 @@ public class UniverseControllerTest extends WithApplication {
   }
 
   @Test
-  public void testCreateUniverseEncryptionAtRestWithEncryptionAtRestKMSConfigExists() {
+  public void testCreateUniverseEncryptionAtRestWithKMSConfigExists() {
     UUID fakeTaskUUID = UUID.randomUUID();
     when(mockCommissioner.submit(Matchers.any(TaskType.class),
             Matchers.any(UniverseDefinitionTaskParams.class)))
@@ -1693,12 +1704,6 @@ public class UniverseControllerTest extends WithApplication {
     JsonNode userIntent = json.get("universeDetails").get("clusters").get(0).get("userIntent");
     assertValue(json, "taskUUID", fakeTaskUUID.toString());
     verify(mockCommissioner).submit(eq(TaskType.CreateUniverse), argCaptor.capture());
-    // Verify that the KMS provider service started to run for the correct provider
-    verify(mockEARManager, times(1)).generateUniverseKey(
-            eq(kmsConfig.configUUID),
-            any(UUID.class),
-            any(EncryptionAtRestConfig.class)
-    );
   }
 
   @Test
@@ -1780,16 +1785,11 @@ public class UniverseControllerTest extends WithApplication {
     ArgumentCaptor<UniverseTaskParams> argCaptor = ArgumentCaptor
             .forClass(UniverseTaskParams.class);
     verify(mockCommissioner).submit(eq(TaskType.SetUniverseKey), argCaptor.capture());
-    verify(mockEARManager, times(1)).generateUniverseKey(
-            eq(kmsConfig.configUUID),
-            eq(UUID.fromString(testUniUUID)),
-            any(EncryptionAtRestConfig.class)
-    );
   }
 
   @Test
   public void testRunQueryWithInvalidUniverse() {
-    Customer c2 = ModelFactory.testCustomer("tc2", "tc2@demo.com");
+    Customer c2 = ModelFactory.testCustomer("tc2", "Test Customer 2");
     Universe u = createUniverse(c2.getCustomerId());
     ObjectNode bodyJson = Json.newObject();
     String url = "/api/customers/" + customer.uuid + "/universes/" + u.universeUUID +
@@ -1835,5 +1835,130 @@ public class UniverseControllerTest extends WithApplication {
     JsonNode json = Json.parse(contentAsString(result));
     assertOk(result);
     assertEquals("bar", json.get("foo").asText());
+  }
+
+
+  @Test
+  public void testRunInShellWithInvalidUniverse() {
+    Customer c2 = ModelFactory.testCustomer("tc2", "Test Customer 2");
+    Universe u = createUniverse(c2.getCustomerId());
+    ObjectNode bodyJson = Json.newObject();
+    String url = "/api/customers/" + customer.uuid + "/universes/" + u.universeUUID +
+        "/run_in_shell";
+    Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson);
+    assertBadRequest(result, String.format("Universe UUID: %s doesn't belong to Customer UUID: %s",
+        u.universeUUID, customer.uuid));
+  }
+
+  @Test
+  public void testRunInShellWithoutInsecureMode() {
+    Universe u = createUniverse(customer.getCustomerId());
+    customer.addUniverseUUID(u.universeUUID);
+    customer.save();
+    ObjectNode bodyJson = Json.newObject()
+        .put("query", "select * from product limit 1")
+        .put("db_name", "demo");
+    String url = "/api/customers/" + customer.uuid + "/universes/" + u.universeUUID +
+        "/run_in_shell";
+    Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson);
+    assertBadRequest(result, "run_in_shell not supported for this application");
+  }
+
+  private void mockAndAssertRunInShell(Universe u,
+                                       RunInShellFormData.ShellType shellType,
+                                       String scriptLocation,
+                                       String commandFile) {
+    String url = "/api/customers/" + customer.uuid + "/universes/" + u.universeUUID +
+        "/run_in_shell";
+
+    ObjectNode bodyJson = Json.newObject()
+        .put("db_name", "demo")
+        .put("shell_type", shellType.name());
+
+    if (commandFile != null) {
+      bodyJson.put("command_file", commandFile);
+    } else {
+      bodyJson.put("command", "select * from product limit 1");
+    }
+
+    if (scriptLocation != null) {
+      bodyJson.put("shell_location", scriptLocation);
+    } else {
+      Application application = Play.current().injector().instanceOf(Application.class);
+      scriptLocation = application.path().getAbsolutePath() + "/../bin";
+    }
+
+    ShellProcessHandler.ShellResponse response = new ShellProcessHandler.ShellResponse();
+    response.message = "Some Response";
+    when(mockShellProcessHandler.run(anyList(), anyMap(), anyBoolean())).thenReturn(response);
+    Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson);
+    ArgumentCaptor<ArrayList> command = ArgumentCaptor.forClass(ArrayList.class);
+    ArgumentCaptor<HashMap> config = ArgumentCaptor.forClass(HashMap.class);
+    ArgumentCaptor<Boolean> logOutput = ArgumentCaptor.forClass(Boolean.class);
+    Mockito.verify(mockShellProcessHandler, times(1))
+        .run(command.capture(), (Map<String, String>) config.capture(), logOutput.capture());
+    List<String> shellCommand = new ArrayList<>();
+    if (shellType.equals(RunInShellFormData.ShellType.YSQLSH)) {
+      shellCommand.addAll(ImmutableList.of(scriptLocation + "/ysqlsh", "-h", "host-n1",
+          "-p", "5433", "-d", "demo"));
+      if (bodyJson.has("command_file")) {
+        shellCommand.addAll(ImmutableList.of("-f",
+            scriptLocation + "/" + bodyJson.get("command_file").asText()));
+      } else {
+        shellCommand.addAll(ImmutableList.of("-c", bodyJson.get("command").asText()));
+      }
+    } else if (shellType.equals(RunInShellFormData.ShellType.YCQLSH)) {
+      shellCommand.addAll(ImmutableList.of(scriptLocation + "/cqlsh", "host-n1",
+          "9042", "-k", "demo"));
+      if (bodyJson.has("command_file")) {
+        shellCommand.addAll(ImmutableList.of("-f",
+            scriptLocation + "/" + bodyJson.get("command_file").asText()));
+      } else {
+        shellCommand.addAll(ImmutableList.of("-e", bodyJson.get("command").asText()));
+      }
+    }
+    assertEquals(shellCommand, command.getValue());
+    assertFalse(logOutput.getValue());
+    assertTrue(config.getValue().isEmpty());
+    assertOk(result);
+    assertEquals("\"Some Response\"", contentAsString(result));
+  }
+
+  @Test
+  public void testRunInShellWithInsecureMode() {
+    Universe u = createUniverse(customer.getCustomerId());
+    customer.addUniverseUUID(u.universeUUID);
+    customer.save();
+    u = Universe.saveDetails(u.universeUUID, ApiUtils.mockUniverseUpdaterWithYSQLNodes(true));
+
+    ConfigHelper configHelper = new ConfigHelper();
+    configHelper.loadConfigToDB(ConfigHelper.ConfigType.Security,
+        ImmutableMap.of("level", "insecure"));
+
+    for(RunInShellFormData.ShellType shellType: RunInShellFormData.ShellType.values()) {
+      mockAndAssertRunInShell(u, shellType, null, "/share/myscript.sql");
+      reset(mockShellProcessHandler);
+      mockAndAssertRunInShell(u, shellType, null, null);
+      reset(mockShellProcessHandler);
+    }
+  }
+
+  @Test
+  public void testRunInShellWithInsecureModeAndScriptLocation() {
+    Universe u = createUniverse(customer.getCustomerId());
+    customer.addUniverseUUID(u.universeUUID);
+    customer.save();
+    u = Universe.saveDetails(u.universeUUID, ApiUtils.mockUniverseUpdaterWithYSQLNodes(true));
+
+    ConfigHelper configHelper = new ConfigHelper();
+    configHelper.loadConfigToDB(ConfigHelper.ConfigType.Security,
+        ImmutableMap.of("level", "insecure"));
+
+    for(RunInShellFormData.ShellType shellType: RunInShellFormData.ShellType.values()) {
+      mockAndAssertRunInShell(u, shellType, "/tmp/bin", "../share/myscript.sql");
+      reset(mockShellProcessHandler);
+      mockAndAssertRunInShell(u, shellType, "/tmp/bin", null);
+      reset(mockShellProcessHandler);
+    }
   }
 }

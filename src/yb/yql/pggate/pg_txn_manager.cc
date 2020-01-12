@@ -12,7 +12,8 @@
 //
 
 #include "yb/yql/pggate/pggate.h"
-#include "yb/util/status.h"
+#include "yb/yql/pggate/pggate_flags.h"
+#include "yb/yql/pggate/pg_txn_manager.h"
 
 #include "yb/client/session.h"
 #include "yb/client/transaction.h"
@@ -22,8 +23,43 @@
 #include "yb/tserver/tserver_shared_mem.h"
 #include "yb/tserver/tserver_service.proxy.h"
 
+#include "yb/util/random_util.h"
+#include "yb/util/status.h"
+
+namespace {
+
+uint64_t txn_priority_lower_bound = 0;
+uint64_t txn_priority_upper_bound = std::numeric_limits<uint64_t>::max();
+
+// Converts double value in range 0..1 to uint64_t value in range
+// 0..std::numeric_limits<uint64_t>::max()
+uint64_t ConvertBound(double value) {
+  if (value <= 0.0) {
+    return 0;
+  }
+  if (value >= 1.0) {
+    return std::numeric_limits<uint64_t>::max();
+  }
+  return value * std::numeric_limits<uint64_t>::max();
+}
+
+} // namespace
+
+extern "C" {
+
+void YBCAssignTransactionPriorityLowerBound(double newval, void* extra) {
+  txn_priority_lower_bound = ConvertBound(newval);
+}
+
+void YBCAssignTransactionPriorityUpperBound(double newval, void* extra) {
+  txn_priority_upper_bound = ConvertBound(newval);
+}
+
+}
+
 using namespace std::literals;
 using namespace std::placeholders;
+
 
 namespace yb {
 namespace pggate {
@@ -86,8 +122,12 @@ void PgTxnManager::StartNewSession() {
 }
 
 Status PgTxnManager::BeginWriteTransactionIfNecessary(bool read_only_op) {
+  if (ddl_txn_) {
+    return Status::OK();
+  }
+
   VLOG(2) << "BeginWriteTransactionIfNecessary: txn_in_progress_="
-          << txn_in_progress_;
+          << txn_in_progress_ << ", txn_=" << txn_.get();
 
   // Using Postgres isolation_level_, read_only_, and deferrable_, determine the internal isolation
   // level and defer effect.
@@ -125,6 +165,9 @@ Status PgTxnManager::BeginWriteTransactionIfNecessary(bool read_only_op) {
     } else {
       txn_ = std::make_shared<YBTransaction>(GetOrCreateTransactionManager());
     }
+    auto priority = RandomUniformInt(
+        txn_priority_lower_bound, std::max(txn_priority_lower_bound, txn_priority_upper_bound));
+    txn_->SetPriority(priority);
     if (isolation == IsolationLevel::SNAPSHOT_ISOLATION) {
       txn_->InitWithReadPoint(isolation, std::move(*session_->read_point()));
     } else {
@@ -157,14 +200,18 @@ Status PgTxnManager::RestartTransaction() {
 
 Status PgTxnManager::CommitTransaction() {
   if (!txn_in_progress_) {
+    VLOG(2) << "No transaction in progress, nothing to commit.";
     return Status::OK();
   }
+
   if (!txn_) {
-    // This was a read-only transaction, nothing to commit.
+    VLOG(2) << "This was a read-only transaction, nothing to commit.";
     ResetTxnAndSession();
     return Status::OK();
   }
+  VLOG(2) << "Committing transaction.";
   Status status = txn_->CommitFuture().get();
+  VLOG(2) << "Transaction commit status: " << status;
   ResetTxnAndSession();
   return status;
 }
@@ -204,9 +251,14 @@ TransactionManager* PgTxnManager::GetOrCreateTransactionManager() {
 }
 
 Result<client::YBSession*> PgTxnManager::GetTransactionalSession() {
+  if (ddl_session_) {
+    VLOG(2) << "Using the DDL session: " << ddl_session_.get();
+    return ddl_session_.get();
+  }
   if (!txn_in_progress_) {
     RETURN_NOT_OK(BeginTransaction());
   }
+  VLOG(2) << "Using the non-DDL transactional session: " << session_.get();
   return session_.get();
 }
 
@@ -215,6 +267,36 @@ void PgTxnManager::ResetTxnAndSession() {
   session_ = nullptr;
   txn_ = nullptr;
   can_restart_.store(true, std::memory_order_release);
+}
+
+Status PgTxnManager::EnterSeparateDdlTxnMode() {
+  DSCHECK(!ddl_txn_,
+          IllegalState, "EnterSeparateDdlTxnMode called when already in a DDL transaction");
+  VLOG(2) << __PRETTY_FUNCTION__;
+
+  ddl_session_ = std::make_shared<YBSession>(async_client_init_->client(), clock_);
+  ddl_session_->SetForceConsistentRead(client::ForceConsistentRead::kTrue);
+  ddl_txn_ = std::make_shared<YBTransaction>(GetOrCreateTransactionManager());
+  ddl_session_->SetTransaction(ddl_txn_);
+  RETURN_NOT_OK(ddl_txn_->Init(
+      FLAGS_ysql_serializable_isolation_for_ddl_txn ? IsolationLevel::SERIALIZABLE_ISOLATION
+                                                    : IsolationLevel::SNAPSHOT_ISOLATION));
+  VLOG(2) << __PRETTY_FUNCTION__ << ": ddl_txn_=" << ddl_txn_.get();
+  return Status::OK();
+}
+
+Status PgTxnManager::ExitSeparateDdlTxnMode(bool is_success) {
+  VLOG(2) << __PRETTY_FUNCTION__ << ": ddl_txn_=" << ddl_txn_.get();
+  DSCHECK(!!ddl_txn_,
+          IllegalState, "ExitSeparateDdlTxnMode called when not in a DDL transaction");
+  if (is_success) {
+    RETURN_NOT_OK(ddl_txn_->CommitFuture().get());
+  } else {
+    ddl_txn_->Abort();
+  }
+  ddl_txn_.reset();
+  ddl_session_.reset();
+  return Status::OK();
 }
 
 }  // namespace pggate

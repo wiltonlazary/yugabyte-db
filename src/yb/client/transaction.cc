@@ -22,6 +22,7 @@
 #include "yb/client/in_flight_op.h"
 #include "yb/client/meta_cache.h"
 #include "yb/client/tablet_rpc.h"
+#include "yb/client/transaction_cleanup.h"
 #include "yb/client/transaction_manager.h"
 #include "yb/client/transaction_rpc.h"
 #include "yb/client/yb_op.h"
@@ -121,6 +122,10 @@ class YBTransaction::Impl final {
     LOG_IF_WITH_PREFIX(DFATAL, !waiters_.empty()) << "Non empty waiters";
   }
 
+  void SetPriority(uint64_t priority) {
+    metadata_.priority = priority;
+  }
+
   YBTransactionPtr CreateSimilarTransaction() {
     return std::make_shared<YBTransaction>(manager_);
   }
@@ -134,19 +139,13 @@ class YBTransaction::Impl final {
     if (read_time.read.is_valid()) {
       read_point_.SetReadTime(read_time, ConsistentReadPoint::HybridTimeMap());
     }
-    metadata_.isolation = isolation;
-    if (read_point_.GetReadTime()) {
-      metadata_.DEPRECATED_start_time = read_point_.GetReadTime().read;
-    } else {
-      metadata_.DEPRECATED_start_time = read_point_.Now();
-    }
-
+    CompleteInit(isolation);
     return Status::OK();
   }
 
   void InitWithReadPoint(IsolationLevel isolation, ConsistentReadPoint&& read_point) {
-    metadata_.isolation = isolation;
     read_point_ = std::move(read_point);
+    CompleteInit(isolation);
   }
 
   const IsolationLevel isolation() const {
@@ -174,9 +173,9 @@ class YBTransaction::Impl final {
       other->read_point_.Restart();
       other->metadata_.isolation = metadata_.isolation;
       if (metadata_.isolation == IsolationLevel::SNAPSHOT_ISOLATION) {
-        other->metadata_.DEPRECATED_start_time = other->read_point_.GetReadTime().read;
+        other->metadata_.start_time = other->read_point_.GetReadTime().read;
       } else {
-        other->metadata_.DEPRECATED_start_time = other->read_point_.Now();
+        other->metadata_.start_time = other->read_point_.Now();
       }
       state_.store(TransactionState::kAborted, std::memory_order_release);
     }
@@ -257,14 +256,25 @@ class YBTransaction::Impl final {
 
     if (status.ok()) {
       if (used_read_time && metadata_.isolation == IsolationLevel::SNAPSHOT_ISOLATION) {
-        LOG_IF_WITH_PREFIX(DFATAL, read_point_.GetReadTime())
+        const bool read_point_already_set = static_cast<bool>(read_point_.GetReadTime());
+#ifndef NDEBUG
+        if (read_point_already_set) {
+          // Display details of operations before crashing in debug mode.
+          int op_idx = 1;
+          for (const auto& op : ops) {
+            LOG(ERROR) << "Operation " << op_idx << ": " << op->ToString();
+            op_idx++;
+          }
+        }
+#endif
+        LOG_IF_WITH_PREFIX(DFATAL, read_point_already_set)
             << "Read time already picked (" << read_point_.GetReadTime()
             << ", but server replied with used read time: " << used_read_time;
         read_point_.SetReadTime(used_read_time, ConsistentReadPoint::HybridTimeMap());
       }
       const std::string* prev_tablet_id = nullptr;
       for (const auto& op : ops) {
-        if (op->yb_op->wrote_data(metadata_.isolation)) {
+        if (op->yb_op->succeeded() && op->yb_op->wrote_data(metadata_.isolation)) {
           const std::string& tablet_id = op->tablet->tablet_id();
           if (prev_tablet_id == nullptr || tablet_id != *prev_tablet_id) {
             prev_tablet_id = &tablet_id;
@@ -291,6 +301,16 @@ class YBTransaction::Impl final {
       state_.store(TransactionState::kCommitted, std::memory_order_release);
       commit_callback_ = std::move(callback);
       if (!ready_) {
+        // If we have not written any intents and do not even have a transaction status tablet,
+        // just report the transaction as committed.
+        //
+        // See https://github.com/yugabyte/yugabyte-db/issues/3105 for details -- we might be able
+        // to remove this special case if it turns out there is a bug elsewhere.
+        if (tablets_with_metadata_.empty()) {
+          commit_callback_(Status::OK());
+          return;
+        }
+
         waiters_.emplace_back(std::bind(&Impl::DoCommit, this, deadline, _1, transaction));
         lock.unlock();
         RequestStatusTablet(deadline);
@@ -468,6 +488,15 @@ class YBTransaction::Impl final {
     abort_handle_ = manager_->rpcs().InvalidHandle();
   }
 
+  void CompleteInit(IsolationLevel isolation) {
+    metadata_.isolation = isolation;
+    if (read_point_.GetReadTime()) {
+      metadata_.start_time = read_point_.GetReadTime().read;
+    } else {
+      metadata_.start_time = read_point_.Now();
+    }
+  }
+
   void SetReadTimeIfNeeded(bool do_it) {
     if (!read_point_.GetReadTime() && do_it &&
         metadata_.isolation == IsolationLevel::SNAPSHOT_ISOLATION) {
@@ -568,60 +597,9 @@ class YBTransaction::Impl final {
       tablet_ids.assign(tablets_with_metadata_.begin(), tablets_with_metadata_.end());
     }
 
-    for (const auto& tablet_id : tablet_ids) {
-      manager_->client()->LookupTabletById(
-          tablet_id,
-          TransactionRpcDeadline(),
-          std::bind(&Impl::LookupTabletForCleanupDone, this, _1, transaction),
-          client::UseCache::kTrue);
-    }
-  }
-
-  void LookupTabletForCleanupDone(const Result<internal::RemoteTabletPtr>& remote_tablet,
-                                  const YBTransactionPtr& transaction) {
-    if (!remote_tablet.ok()) {
-      // Intents will be cleaned up later in this case.
-      LOG(WARNING) << "Tablet lookup failed: " << remote_tablet.status();
-      return;
-    }
-    VLOG_WITH_PREFIX(1) << "Lookup tablet for cleanup done: " << yb::ToString(*remote_tablet);
-    auto remote_tablet_servers = (**remote_tablet).GetRemoteTabletServers(
-        internal::IncludeFailedReplicas::kTrue);
-
-    constexpr auto kCallTimeout = 15s;
-    auto now = manager_->Now().ToUint64();
-
-    {
-      std::unique_lock<std::mutex> lock(mutex_);
-      abort_requests_.reserve(abort_requests_.size() + remote_tablet_servers.size());
-      for (auto* server : remote_tablet_servers) {
-        VLOG_WITH_PREFIX(2) << "Sending cleanup to: " << yb::ToString(*server);
-        auto status = server->InitProxy(manager_->client());
-        if (!status.ok()) {
-          LOG(WARNING) << "Failed to init proxy to " << server->ToString() << ": " << status;
-          continue;
-        }
-        abort_requests_.emplace_back();
-        auto& abort_request = abort_requests_.back();
-
-        auto& request = abort_request.request;
-        request.set_tablet_id((**remote_tablet).tablet_id());
-        request.set_propagated_hybrid_time(now);
-        auto& state = *request.mutable_state();
-        state.set_transaction_id(metadata_.transaction_id.begin(), metadata_.transaction_id.size());
-        state.set_status(TransactionStatus::CLEANUP);
-
-        abort_request.controller.set_timeout(kCallTimeout);
-
-        server->proxy()->UpdateTransactionAsync(
-            request, &abort_request.response, &abort_request.controller,
-            std::bind(&Impl::ProcessResponse, this, transaction));
-      }
-    }
-  }
-
-  void ProcessResponse(const YBTransactionPtr& transaction) {
-    VLOG_WITH_PREFIX(3) << "Cleanup intents for Abort done";
+    CleanupTransaction(
+        manager_->client(), manager_->clock(), metadata_.transaction_id, Sealed::kFalse,
+        tablet_ids);
   }
 
   void CommitDone(const Status& status,
@@ -888,15 +866,6 @@ class YBTransaction::Impl final {
   rpc::Rpcs::Handle commit_handle_;
   rpc::Rpcs::Handle abort_handle_;
 
-  // RPC data for abort requests.
-  struct AbortRequest {
-    tserver::UpdateTransactionRequestPB request;
-    tserver::UpdateTransactionResponsePB response;
-    rpc::RpcController controller;
-  };
-
-  boost::container::stable_vector<AbortRequest> abort_requests_;
-
   typedef std::unordered_set<TabletId> TabletIds;
 
   std::mutex mutex_;
@@ -928,6 +897,10 @@ YBTransaction::YBTransaction(TransactionManager* manager, ChildTransactionData d
 }
 
 YBTransaction::~YBTransaction() {
+}
+
+void YBTransaction::SetPriority(uint64_t priority) {
+  impl_->SetPriority(priority);
 }
 
 Status YBTransaction::Init(IsolationLevel isolation, const ReadHybridTime& read_time) {

@@ -193,6 +193,10 @@ class RetryingTSRpcTask : public MonitoredTask {
 
   std::atomic<rpc::ScheduledTaskId> reactor_task_id_{rpc::kInvalidTaskId};
 
+  // Mutex protecting calls to UnregisterAsyncTask to avoid races between Run and user triggered
+  // Aborts.
+  std::mutex unregister_mutex_;
+
  private:
   // Returns true if we should impose a limit in the number of retries for this task type.
   bool RetryLimitTaskType() {
@@ -516,6 +520,33 @@ class AsyncTryStepDown : public CommonInfoForRaftTask {
   const std::string new_leader_uuid_;
   consensus::LeaderStepDownRequestPB stepdown_req_;
   consensus::LeaderStepDownResponsePB stepdown_resp_;
+};
+
+// Task to add a table to a tablet. Catalog Manager uses this task to send the request to the
+// tserver admin service.
+class AsyncAddTableToTablet : public RetryingTSRpcTask {
+ public:
+  AsyncAddTableToTablet(
+      Master* master, ThreadPool* callback_pool, const scoped_refptr<TabletInfo>& tablet,
+      const scoped_refptr<TableInfo>& table);
+
+  Type type() const override { return ASYNC_ADD_TABLE_TO_TABLET; }
+
+  std::string type_name() const override { return "Add Table to Tablet"; }
+
+  std::string description() const override;
+
+ private:
+  TabletId tablet_id() const override { return tablet_id_; }
+
+  void HandleResponse(int attempt) override;
+  bool SendRequest(int attempt) override;
+
+  scoped_refptr<TabletInfo> tablet_;
+  scoped_refptr<TableInfo> table_;
+  const TabletId tablet_id_;
+  tserver::AddTableToTabletRequestPB req_;
+  tserver::AddTableToTabletResponsePB resp_;
 };
 
 } // namespace master

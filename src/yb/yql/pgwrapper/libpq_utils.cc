@@ -11,12 +11,16 @@
 // under the License.
 //
 
+#include <boost/preprocessor/seq/for_each.hpp>
+
 #include "yb/yql/pgwrapper/libpq_utils.h"
 
 #include "yb/common/pgsql_error.h"
 
 #include "yb/gutil/endian.h"
 
+#include "yb/util/enums.h"
+#include "yb/util/logging.h"
 #include "yb/util/monotime.h"
 
 using namespace std::literals;
@@ -26,15 +30,48 @@ namespace pgwrapper {
 
 namespace {
 
+// Converts the given element of the ExecStatusType enum to a string.
+std::string ExecStatusTypeToStr(ExecStatusType exec_status_type) {
+#define EXEC_STATUS_SWITCH_CASE(r, data, item) case item: return #item;
+#define EXEC_STATUS_TYPE_ENUM_ELEMENTS \
+    (PGRES_EMPTY_QUERY) \
+    (PGRES_COMMAND_OK) \
+    (PGRES_TUPLES_OK) \
+    (PGRES_COPY_OUT) \
+    (PGRES_COPY_IN) \
+    (PGRES_BAD_RESPONSE) \
+    (PGRES_NONFATAL_ERROR) \
+    (PGRES_FATAL_ERROR) \
+    (PGRES_COPY_BOTH) \
+    (PGRES_SINGLE_TUPLE)
+  switch (exec_status_type) {
+    BOOST_PP_SEQ_FOR_EACH(EXEC_STATUS_SWITCH_CASE, ~, EXEC_STATUS_TYPE_ENUM_ELEMENTS)
+  }
+#undef EXEC_STATUS_SWITCH_CASE
+#undef EXEC_STATUS_TYPE_ENUM_ELEMENTS
+  return Format("Unknown ExecStatusType ($0)", exec_status_type);
+}
+
 YBPgErrorCode GetSqlState(PGresult* result) {
-  auto status = PQresultStatus(result);
-  if (status == ExecStatusType::PGRES_COMMAND_OK) {
+  auto exec_status_type = PQresultStatus(result);
+  if (exec_status_type == ExecStatusType::PGRES_COMMAND_OK ||
+      exec_status_type == ExecStatusType::PGRES_TUPLES_OK) {
     return YBPgErrorCode::YB_PG_SUCCESSFUL_COMPLETION;
   }
 
   const char* sqlstate_str = PQresultErrorField(result, PG_DIAG_SQLSTATE);
-  CHECK_NOTNULL(sqlstate_str);
-  CHECK_EQ(5, strlen(sqlstate_str));
+  if (sqlstate_str == nullptr) {
+    auto err_msg = PQresultErrorMessage(result);
+    YB_LOG_EVERY_N_SECS(WARNING, 5)
+        << "SQLSTATE is not defined for result with "
+        << "error message: " << (err_msg ? err_msg : "N/A") << ", "
+        << "PQresultStatus: " << ExecStatusTypeToStr(exec_status_type);
+    return YBPgErrorCode::YB_PG_INTERNAL_ERROR;
+  }
+
+  CHECK_EQ(5, strlen(sqlstate_str))
+      << "sqlstate_str: " << sqlstate_str
+      << ", PQresultStatus: " << ExecStatusTypeToStr(exec_status_type);
 
   uint32_t sqlstate = 0;
 
@@ -175,6 +212,27 @@ Result<PGResultPtr> PGConn::FetchMatrix(const std::string& command, int rows, in
   return res;
 }
 
+CHECKED_STATUS PGConn::StartTransaction(IsolationLevel isolation_level) {
+  switch (isolation_level) {
+    case IsolationLevel::NON_TRANSACTIONAL:
+      return Status::OK();
+    case IsolationLevel::SNAPSHOT_ISOLATION:
+      return Execute("START TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+    case IsolationLevel::SERIALIZABLE_ISOLATION:
+      return Execute("START TRANSACTION ISOLATION LEVEL SERIALIZABLE");
+  }
+
+  FATAL_INVALID_ENUM_VALUE(IsolationLevel, isolation_level);
+}
+
+CHECKED_STATUS PGConn::CommitTransaction() {
+  return Execute("COMMIT");
+}
+
+CHECKED_STATUS PGConn::RollbackTransaction() {
+  return Execute("ROLLBACK");
+}
+
 Status PGConn::CopyBegin(const std::string& command) {
   auto result = VERIFY_RESULT(CheckResult(
       PGResultPtr(
@@ -302,6 +360,12 @@ Result<int64_t> GetInt64(PGresult* result, int row, int column) {
   return BigEndian::Load64(VERIFY_RESULT(GetValueWithLength(result, row, column, sizeof(int64_t))));
 }
 
+Result<double> GetDouble(PGresult* result, int row, int column) {
+  auto temp =
+      BigEndian::Load64(VERIFY_RESULT(GetValueWithLength(result, row, column, sizeof(int64_t))));
+  return *reinterpret_cast<double*>(&temp);
+}
+
 Result<std::string> GetString(PGresult* result, int row, int column) {
   auto len = PQgetlength(result, row, column);
   auto value = PQgetvalue(result, row, column);
@@ -312,6 +376,7 @@ Result<std::string> AsString(PGresult* result, int row, int column) {
   constexpr Oid INT8OID = 20;
   constexpr Oid INT4OID = 23;
   constexpr Oid TEXTOID = 25;
+  constexpr Oid FLOAT8OID = 701;
   constexpr Oid BPCHAROID = 1042;
   constexpr Oid VARCHAROID = 1043;
 
@@ -321,6 +386,8 @@ Result<std::string> AsString(PGresult* result, int row, int column) {
       return std::to_string(VERIFY_RESULT(GetInt64(result, row, column)));
     case INT4OID:
       return std::to_string(VERIFY_RESULT(GetInt32(result, row, column)));
+    case FLOAT8OID:
+      return std::to_string(VERIFY_RESULT(GetDouble(result, row, column)));
     case TEXTOID: FALLTHROUGH_INTENDED;
     case BPCHAROID: FALLTHROUGH_INTENDED;
     case VARCHAROID:

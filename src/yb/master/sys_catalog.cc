@@ -61,6 +61,7 @@
 #include "yb/rpc/rpc_context.h"
 #include "yb/tablet/tablet_bootstrap_if.h"
 #include "yb/tablet/tablet.h"
+#include "yb/tablet/tablet_fwd.h"
 #include "yb/tablet/tablet_options.h"
 #include "yb/tablet/operations/write_operation.h"
 
@@ -84,7 +85,6 @@ using yb::consensus::RaftConfigPB;
 using yb::consensus::RaftPeerPB;
 using yb::log::Log;
 using yb::log::LogAnchorRegistry;
-using yb::tablet::LatchOperationCompletionCallback;
 using yb::tablet::TabletClass;
 using yb::tserver::WriteRequestPB;
 using yb::tserver::WriteResponsePB;
@@ -485,36 +485,48 @@ Status SysCatalogTable::OpenTablet(const scoped_refptr<tablet::RaftGroupMetadata
   RETURN_NOT_OK(tablet_peer()->SetBootstrapping());
   tablet::TabletOptions tablet_options;
   tablet::BootstrapTabletData data = {
-      metadata,
-      std::shared_future<client::YBClient*>(),
-      scoped_refptr<server::Clock>(master_->clock()),
-      master_->mem_tracker(),
-      MemTracker::FindOrCreateTracker("BlockBasedTable", master_->mem_tracker()),
-      metric_registry_,
-      tablet_peer()->status_listener(),
-      tablet_peer()->log_anchor_registry(),
-      tablet_options,
-      " P " + tablet_peer()->permanent_uuid(),
-      nullptr, // transaction_participant_context
-      client::LocalTabletFilter(),
-      nullptr, // transaction_coordinator_context
-      append_pool()};
+      .meta = metadata,
+      .client_future = master_->async_client_initializer().get_client_future(),
+      .clock = scoped_refptr<server::Clock>(master_->clock()),
+      .mem_tracker = master_->mem_tracker(),
+      .block_based_table_mem_tracker =
+          MemTracker::FindOrCreateTracker("BlockBasedTable", master_->mem_tracker()),
+      .metric_registry = metric_registry_,
+      .listener = tablet_peer()->status_listener(),
+      .log_anchor_registry = tablet_peer()->log_anchor_registry(),
+      .tablet_options = tablet_options,
+      .log_prefix_suffix = " P " + tablet_peer()->permanent_uuid(),
+      .transaction_participant_context = tablet_peer().get(),
+      .local_tablet_filter = client::LocalTabletFilter(),
+      // This is only required if the sys catalog tablet is also acting as a transaction status
+      // tablet, which it does not as of 12/06/2019. This could have been a nullptr, but putting
+      // the TabletPeer here in case we need this for rolling master upgrades when we do enable
+      // storing transaction status records in the sys catalog tablet.
+      .transaction_coordinator_context = tablet_peer().get(),
+      .append_pool = append_pool(),
+      .retryable_requests = nullptr,
+      // Disable transactions if we are creating the initial sys catalog snapshot.
+      // initdb is much faster with transactions disabled.
+      .txns_enabled = tablet::TransactionsEnabled(!FLAGS_create_initial_sys_catalog_snapshot),
+      .is_sys_catalog = tablet::IsSysCatalogTablet::kTrue
+  };
   RETURN_NOT_OK(BootstrapTablet(data, &tablet, &log, &consensus_info));
 
   // TODO: Do we have a setSplittable(false) or something from the outside is
   // handling split in the TS?
 
-  RETURN_NOT_OK_PREPEND(tablet_peer()->InitTabletPeer(tablet,
-                                                     std::shared_future<client::YBClient*>(),
-                                                     master_->mem_tracker(),
-                                                     master_->messenger(),
-                                                     &master_->proxy_cache(),
-                                                     log,
-                                                     tablet->GetMetricEntity(),
-                                                     raft_pool(),
-                                                     tablet_prepare_pool(),
-                                                     nullptr /* retryable_requests */),
-                        "Failed to Init() TabletPeer");
+  RETURN_NOT_OK_PREPEND(tablet_peer()->InitTabletPeer(
+          tablet,
+          master_->async_client_initializer().get_client_future(),
+          master_->mem_tracker(),
+          master_->messenger(),
+          &master_->proxy_cache(),
+          log,
+          tablet->GetMetricEntity(),
+          raft_pool(),
+          tablet_prepare_pool(),
+          nullptr /* retryable_requests */),
+      "Failed to Init() TabletPeer");
 
   RETURN_NOT_OK_PREPEND(tablet_peer()->Start(consensus_info),
                         "Failed to Start() TabletPeer");
@@ -556,7 +568,7 @@ Status SysCatalogTable::WaitUntilRunning() {
 }
 
 CHECKED_STATUS SysCatalogTable::SyncWrite(SysCatalogWriter* writer) {
-  tserver::WriteResponsePB resp;
+  auto resp = std::make_shared<tserver::WriteResponsePB>();
   // If this is a PG write, them the pgsql write batch is not empty.
   //
   // If this is a QL write, then it is a normal sys_catalog write, so ignore writes that might
@@ -566,21 +578,20 @@ CHECKED_STATUS SysCatalogTable::SyncWrite(SysCatalogWriter* writer) {
     return Status::OK();
   }
 
-  CountDownLatch latch(1);
-  auto txn_callback = std::make_unique<LatchOperationCompletionCallback<WriteResponsePB>>(
-      &latch, &resp);
+  auto latch = std::make_shared<CountDownLatch>(1);
   auto operation_state = std::make_unique<tablet::WriteOperationState>(
-      tablet_peer()->tablet(), &writer->req(), &resp);
-  operation_state->set_completion_callback(std::move(txn_callback));
+      tablet_peer()->tablet(), &writer->req(), resp.get());
+  operation_state->set_completion_callback(
+      tablet::MakeLatchOperationCompletionCallback(latch, resp));
 
   tablet_peer()->WriteAsync(
       std::move(operation_state), writer->leader_term(), CoarseTimePoint::max() /* deadline */);
 
   {
     int num_iterations = 0;
-    static constexpr auto kWarningInterval = 10s;
-    static constexpr int kMaxNumIterations = 6;
-    while (!latch.WaitFor(kWarningInterval)) {
+    static constexpr auto kWarningInterval = 5s;
+    static constexpr int kMaxNumIterations = 12;
+    while (!latch->WaitFor(kWarningInterval)) {
       ++num_iterations;
       const auto waited_so_far = num_iterations * kWarningInterval;
       LOG(WARNING) << "Waited for "
@@ -594,11 +605,11 @@ CHECKED_STATUS SysCatalogTable::SyncWrite(SysCatalogWriter* writer) {
     }
   }
 
-  if (resp.has_error()) {
-    return StatusFromPB(resp.error().status());
+  if (resp->has_error()) {
+    return StatusFromPB(resp->error().status());
   }
-  if (resp.per_row_errors_size() > 0) {
-    for (const WriteResponsePB::PerRowErrorPB& error : resp.per_row_errors()) {
+  if (resp->per_row_errors_size() > 0) {
+    for (const WriteResponsePB::PerRowErrorPB& error : resp->per_row_errors()) {
       LOG(WARNING) << "row " << error.row_index() << ": " << StatusFromPB(error.error()).ToString();
     }
     return STATUS(Corruption, "One or more rows failed to write");

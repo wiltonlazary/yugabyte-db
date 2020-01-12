@@ -44,6 +44,11 @@ class PgTxnManager;
 // Convenience typedefs.
 typedef std::vector<std::shared_ptr<client::YBPgsqlOp>> PgsqlOpBuffer;
 
+struct PgApplyOutcome {
+  OpBuffered buffered;
+  client::YBSessionPtr yb_session;
+};
+
 // This class is not thread-safe as it is mostly used by a single-threaded PostgreSQL backend
 // process.
 class PgSession : public RefCountedThreadSafe<PgSession> {
@@ -75,7 +80,8 @@ class PgSession : public RefCountedThreadSafe<PgSession> {
   CHECKED_STATUS CreateDatabase(const std::string& database_name,
                                 PgOid database_oid,
                                 PgOid source_database_oid,
-                                PgOid nexte_oid);
+                                PgOid next_oid,
+                                const bool colocated);
   CHECKED_STATUS DropDatabase(const std::string& database_name, PgOid database_oid);
   client::YBNamespaceAlterer *NewNamespaceAlterer(const std::string& namespace_name,
                                                   PgOid database_oid);
@@ -138,12 +144,10 @@ class PgSession : public RefCountedThreadSafe<PgSession> {
   // Apply the given operation to read and write database content. If the operation is a write
   // op, return true if the operation is buffered and should not be flushed except in bulk
   // by FlushBufferedWriteOperations(). False otherwise.
-  Result<OpBuffered> PgApplyAsync(const std::shared_ptr<client::YBPgsqlOp>& op,
-                                  uint64_t* read_time);
+  Result<PgApplyOutcome> PgApplyAsync(const std::shared_ptr<client::YBPgsqlOp>& op,
+                                      uint64_t* read_time);
 
-  CHECKED_STATUS PgFlushAsync(StatusFunctor callback);
-  CHECKED_STATUS RestartTransaction();
-  bool HasAppliedOperations() const;
+  CHECKED_STATUS PgFlushAsync(StatusFunctor callback, const client::YBSessionPtr& yb_session);
 
   // Return the number of errors which are pending.
   int CountPendingErrors() const;
@@ -189,13 +193,11 @@ class PgSession : public RefCountedThreadSafe<PgSession> {
   }
 
   // Check if initdb has already been run before. Needed to make initdb idempotent.
-  CHECKED_STATUS IsInitDbDone(bool* initdb_done);
+  Result<bool> IsInitDbDone();
 
   // Returns the local tserver's catalog version stored in shared memory, or an error if
   // the shared memory has not been initialized (e.g. in initdb).
   Result<uint64_t> GetSharedCatalogVersion();
-
-  PgTxnManager* pg_txn_manager() { return pg_txn_manager_.get(); }
 
  private:
   // Returns the appropriate session to use, in most cases the one used by the current transaction.
@@ -203,7 +205,10 @@ class PgSession : public RefCountedThreadSafe<PgSession> {
   //                non-read-only operations we make sure to start a YB transaction.
   // We are returning a raw pointer here because the returned session is owned either by the
   // PgTxnManager or by this object.
-  Result<client::YBSession*> GetSession(bool transactional, bool read_only_op);
+  Result<client::YBSession*> GetSession(
+      bool transactional,
+      bool read_only_op,
+      bool is_ysql_catalog_op);
 
   // Get the appropriate YBSession to apply the given operation to, based on whether or not this
   // is an operation on a transactional table, as well as read-only vs. non-read-only operation.
@@ -219,6 +224,9 @@ class PgSession : public RefCountedThreadSafe<PgSession> {
 
   // Flush buffered write operations from the given buffer.
   Status FlushBufferedWriteOperations(PgsqlOpBuffer* write_ops, bool transactional);
+
+  // Whether we should buffer and execute the given operation transactionally.
+  bool ShouldBufferTransactionally(client::YBPgsqlOp* op);
 
   // YBClient, an API that SQL engine uses to communicate with all servers.
   client::YBClient* const client_;
@@ -247,9 +255,6 @@ class PgSession : public RefCountedThreadSafe<PgSession> {
   uint buffer_write_ops_ = 0;
   PgsqlOpBuffer buffered_write_ops_;
   PgsqlOpBuffer buffered_txn_write_ops_;
-
-  bool has_txn_ops_ = false;
-  bool has_non_txn_ops_ = false;
 
   // True if the read request has a row mark.
   bool has_row_mark_ = false;

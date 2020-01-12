@@ -137,7 +137,7 @@ class MetadataCowWrapper {
 };
 
 // The data related to a tablet which is persisted on disk.
-// This portion of TableInfo is managed via CowObject.
+// This portion of TabletInfo is managed via CowObject.
 // It wraps the underlying protobuf to add useful accessors.
 struct PersistentTabletInfo : public Persistent<SysTabletsEntryPB, SysRowEntry::TABLET> {
   bool is_running() const {
@@ -147,6 +147,10 @@ struct PersistentTabletInfo : public Persistent<SysTabletsEntryPB, SysRowEntry::
   bool is_deleted() const {
     return pb.state() == SysTabletsEntryPB::REPLACED ||
            pb.state() == SysTabletsEntryPB::DELETED;
+  }
+
+  bool is_colocated() const {
+    return pb.colocated();
   }
 
   // Helper to set the state of the tablet with a custom message.
@@ -204,6 +208,8 @@ class TabletInfo : public RefCountedThreadSafe<TabletInfo>,
   // Accessors for the last reported schema version.
   bool set_reported_schema_version(uint32_t version);
   uint32_t reported_schema_version() const;
+
+  bool colocated() const;
 
   // No synchronization needed.
   std::string ToString() const override;
@@ -267,6 +273,10 @@ struct PersistentTableInfo : public Persistent<SysTablesEntryPB, SysRowEntry::TA
     return pb.state() == SysTablesEntryPB::DELETED;
   }
 
+  bool is_deleting() const {
+    return pb.state() == SysTablesEntryPB::DELETING;
+  }
+
   bool is_running() const {
     return pb.state() == SysTablesEntryPB::RUNNING ||
            pb.state() == SysTablesEntryPB::ALTERING;
@@ -287,6 +297,10 @@ struct PersistentTableInfo : public Persistent<SysTablesEntryPB, SysRowEntry::TA
 
   const SchemaPB& schema() const {
     return pb.schema();
+  }
+
+  SchemaPB* mutable_schema() {
+    return pb.mutable_schema();
   }
 
   // Helper to set the state of the tablet with a custom message.
@@ -314,6 +328,8 @@ class TableInfo : public RefCountedThreadSafe<TableInfo>,
   const NamespaceId namespace_id() const;
 
   const CHECKED_STATUS GetSchema(Schema* schema) const;
+
+  bool colocated() const;
 
   // Return the table's ID. Does not require synchronization.
   virtual const std::string& id() const override { return table_id_; }
@@ -449,6 +465,10 @@ struct PersistentNamespaceInfo : public Persistent<SysNamespaceEntryPB, SysRowEn
   YQLDatabase database_type() const {
     return pb.database_type();
   }
+
+  bool colocated() const {
+    return pb.colocated();
+  }
 };
 
 // The information about a namespace.
@@ -465,6 +485,8 @@ class NamespaceInfo : public RefCountedThreadSafe<NamespaceInfo>,
   const NamespaceName& name() const;
 
   YQLDatabase database_type() const;
+
+  bool colocated() const;
 
   std::string ToString() const override;
 
@@ -619,6 +641,18 @@ class SysConfigInfo : public RefCountedThreadSafe<SysConfigInfo>,
 
   DISALLOW_COPY_AND_ASSIGN(SysConfigInfo);
 };
+
+// Convenience typedefs.
+typedef std::unordered_map<TabletId, scoped_refptr<TabletInfo>> TabletInfoMap;
+typedef std::unordered_map<TableId, scoped_refptr<TableInfo>> TableInfoMap;
+typedef std::pair<NamespaceId, TableName> TableNameKey;
+typedef std::unordered_map<
+    TableNameKey, scoped_refptr<TableInfo>, boost::hash<TableNameKey>> TableInfoByNameMap;
+
+typedef std::unordered_map<UDTypeId, scoped_refptr<UDTypeInfo>> UDTypeInfoMap;
+typedef std::pair<NamespaceId, UDTypeName> UDTypeNameKey;
+typedef std::unordered_map<
+    UDTypeNameKey, scoped_refptr<UDTypeInfo>, boost::hash<UDTypeNameKey>> UDTypeInfoByNameMap;
 
 }  // namespace master
 }  // namespace yb

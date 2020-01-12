@@ -137,18 +137,19 @@ class UniverseForm extends Component {
     this.props.submitEditUniverseReadReplica(this.getFormPayload(), universeUUID);
   }
 
-  componentWillMount() {
-    this.props.resetConfig();
-    this.setState({editNotAllowed: true});
+  componentDidMount() {
+    if (this.props.type === "Create") {
+      this.props.resetConfig();
+    }
   }
 
   componentWillUnmount() {
     this.props.resetConfig();
   }
 
-  componentWillUpdate(newProps) {
-    if (newProps.universe.formSubmitSuccess) {
-      this.props.reset();
+  componentDidUpdate(prevProps) {
+    if (this.props.universe.formSubmitSuccess) {
+      prevProps.reset();
     }
   }
 

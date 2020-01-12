@@ -149,6 +149,9 @@ Status MiniCluster::Start(const std::vector<tserver::TabletServerOptions>& extra
     RETURN_NOT_OK(env_->CreateDir(fs_root_));
   }
 
+  // TODO: properly handle setting these variables in case of multiple MiniClusters in the same
+  // process.
+
   // Use conservative number of threads for the mini cluster for unit test env
   // where several unit tests tend to run in parallel.
   // To get default number of threads - try to find SERVICE_POOL_OPTIONS macro usage.
@@ -166,11 +169,7 @@ Status MiniCluster::Start(const std::vector<tserver::TabletServerOptions>& extra
   FLAGS_use_private_ip = "cloud";
 
   // This dictates the RF of newly created tables.
-  if (num_ts_initial_ >= 3) {
-    FLAGS_replication_factor = 3;
-  } else {
-    FLAGS_replication_factor = 1;
-  }
+  SetAtomicFlag(num_ts_initial_ >= 3 ? 3 : 1, &FLAGS_replication_factor);
   FLAGS_memstore_size_mb = 16;
 
   // start the masters
@@ -695,14 +694,20 @@ Status WaitAllReplicasHaveIndex(MiniCluster* cluster, int64_t index, MonoDelta t
   }, timeout, "Wait for all replicas to have a specific Raft index");
 }
 
-std::vector<rocksdb::DB*> GetAllRocksDbs(MiniCluster* cluster) {
+template <class Collection>
+void PushBackIfNotNull(const typename Collection::value_type& value, Collection* collection) {
+  if (value != nullptr) {
+    collection->push_back(value);
+  }
+}
+
+std::vector<rocksdb::DB*> GetAllRocksDbs(MiniCluster* cluster, bool include_intents) {
   std::vector<rocksdb::DB*> dbs;
   for (auto& peer : ListTabletPeers(cluster, ListPeersFilter::kAll)) {
     const auto* tablet = peer->tablet();
-    for (auto* db : {tablet->TEST_db(), tablet->TEST_intents_db()}) {
-      if (db) {
-        dbs.push_back(db);
-      }
+    PushBackIfNotNull(tablet->TEST_db(), &dbs);
+    if (include_intents) {
+      PushBackIfNotNull(tablet->TEST_intents_db(), &dbs);
     }
   }
   return dbs;

@@ -52,6 +52,7 @@ import com.yugabyte.yw.forms.TableDefinitionTaskParams;
 import com.yugabyte.yw.models.Backup;
 import com.yugabyte.yw.models.CustomerConfig;
 import com.yugabyte.yw.models.CustomerTask;
+import com.yugabyte.yw.models.Users;
 import com.yugabyte.yw.models.helpers.ColumnDetails;
 import com.yugabyte.yw.models.helpers.TaskType;
 import org.junit.Before;
@@ -74,6 +75,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.yugabyte.yw.common.services.YBClientService;
 import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.Universe;
+import com.yugabyte.yw.models.Schedule;
 
 import play.Application;
 import play.inject.guice.GuiceApplicationBuilder;
@@ -150,6 +152,7 @@ public class TablesControllerTest extends WithApplication {
     when(mockListTablesResponse.getTableInfoList()).thenReturn(tableInfoList);
     when(mockClient.getTablesList()).thenReturn(mockListTablesResponse);
     Customer customer = ModelFactory.testCustomer();
+    Users user = ModelFactory.testUser(customer);
     Universe u1 = createUniverse(customer.getCustomerId());
     u1 = Universe.saveDetails(u1.universeUUID, ApiUtils.mockUniverseUpdater());
     customer.addUniverseUUID(u1.universeUUID);
@@ -193,6 +196,7 @@ public class TablesControllerTest extends WithApplication {
   @Test
   public void testUniverseListMastersNotQueryable() {
     Customer customer = ModelFactory.testCustomer();
+    Users user = ModelFactory.testUser(customer);
     Universe u1 = createUniverse("Universe-1", customer.getCustomerId());
     customer.addUniverseUUID(u1.universeUUID);
     customer.save();
@@ -205,7 +209,8 @@ public class TablesControllerTest extends WithApplication {
   @Test
   public void testCreateCassandraTableWithInvalidUUID() {
     Customer customer = ModelFactory.testCustomer();
-    String authToken = customer.createAuthToken();
+    Users user = ModelFactory.testUser(customer);
+    String authToken = user.createAuthToken();
     customer.save();
 
     UUID badUUID = UUID.randomUUID();
@@ -222,7 +227,8 @@ public class TablesControllerTest extends WithApplication {
   @Test
   public void testCreateCassandraTableWithInvalidParams() {
     Customer customer = ModelFactory.testCustomer();
-    String authToken = customer.createAuthToken();
+    Users user = ModelFactory.testUser(customer);
+    String authToken = user.createAuthToken();
     Universe universe = createUniverse(customer.getCustomerId());
     universe = Universe.saveDetails(universe.universeUUID, ApiUtils.mockUniverseUpdater());
     customer.addUniverseUUID(universe.universeUUID);
@@ -245,7 +251,8 @@ public class TablesControllerTest extends WithApplication {
     when(mockCommissioner.submit(Matchers.any(TaskType.class),
         Matchers.any(TableDefinitionTaskParams.class))).thenReturn(fakeTaskUUID);
     Customer customer = ModelFactory.testCustomer();
-    String authToken = customer.createAuthToken();
+    Users user = ModelFactory.testUser(customer);
+    String authToken = user.createAuthToken();
     Universe universe = createUniverse(customer.getCustomerId());
     universe = Universe.saveDetails(universe.universeUUID, ApiUtils.mockUniverseUpdater());
     customer.addUniverseUUID(universe.universeUUID);
@@ -327,6 +334,7 @@ public class TablesControllerTest extends WithApplication {
 
     // Creating fake authentication
     Customer customer = ModelFactory.testCustomer();
+    Users user = ModelFactory.testUser(customer);
     Universe universe = createUniverse(customer.getCustomerId());
     universe = Universe.saveDetails(universe.universeUUID, ApiUtils.mockUniverseUpdater());
     customer.addUniverseUUID(universe.universeUUID);
@@ -353,6 +361,7 @@ public class TablesControllerTest extends WithApplication {
 
     // Creating fake authentication
     Customer customer = ModelFactory.testCustomer();
+    Users user = ModelFactory.testUser(customer);
     Universe universe = createUniverse(customer.getCustomerId());
     universe = Universe.saveDetails(universe.universeUUID, ApiUtils.mockUniverseUpdater());
     customer.addUniverseUUID(universe.universeUUID);
@@ -404,8 +413,9 @@ public class TablesControllerTest extends WithApplication {
         Matchers.any(BulkImportParams.class))).thenReturn(fakeTaskUUID);
 
     Customer customer = ModelFactory.testCustomer();
+    Users user = ModelFactory.testUser(customer);
     ModelFactory.awsProvider(customer);
-    String authToken = customer.createAuthToken();
+    String authToken = user.createAuthToken();
     Universe universe = createUniverse(customer.getCustomerId());
     universe = Universe.saveDetails(universe.universeUUID, ApiUtils.mockUniverseUpdater(aws));
     customer.addUniverseUUID(universe.universeUUID);
@@ -429,8 +439,9 @@ public class TablesControllerTest extends WithApplication {
     when(mockCommissioner.submit(Matchers.any(TaskType.class),
         Matchers.any(BulkImportParams.class))).thenReturn(fakeTaskUUID);
     Customer customer = ModelFactory.testCustomer();
+    Users user = ModelFactory.testUser(customer);
     ModelFactory.awsProvider(customer);
-    String authToken = customer.createAuthToken();
+    String authToken = user.createAuthToken();
     Universe universe = createUniverse(customer.getCustomerId());
     universe = Universe.saveDetails(universe.universeUUID, ApiUtils.mockUniverseUpdater(aws));
     customer.addUniverseUUID(universe.universeUUID);
@@ -452,12 +463,14 @@ public class TablesControllerTest extends WithApplication {
   @Test
   public void testCreateBackupWithInvalidParams() {
     Customer customer = ModelFactory.testCustomer();
+    Users user = ModelFactory.testUser(customer);
     Universe universe = ModelFactory.createUniverse(customer.getCustomerId());
     String url = "/api/customers/" + customer.uuid + "/universes/" + universe.universeUUID +
         "/tables/" + UUID.randomUUID() + "/create_backup";
     ObjectNode bodyJson = Json.newObject();
 
-    Result result = FakeApiHelper.doRequestWithAuthTokenAndBody("PUT", url, customer.createAuthToken(), bodyJson);
+    Result result = FakeApiHelper.doRequestWithAuthTokenAndBody("PUT", url,
+        user.createAuthToken(), bodyJson);
     JsonNode resultJson = Json.parse(contentAsString(result));
     assertEquals(BAD_REQUEST, result.status());
     assertErrorNodeValue(resultJson, "storageConfigUUID", "This field is required");
@@ -468,6 +481,7 @@ public class TablesControllerTest extends WithApplication {
   @Test
   public void testCreateBackupWithInvalidStorageConfig() {
     Customer customer = ModelFactory.testCustomer();
+    Users user = ModelFactory.testUser(customer);
     Universe universe = ModelFactory.createUniverse(customer.getCustomerId());
     String url = "/api/customers/" + customer.uuid + "/universes/" + universe.universeUUID +
         "/tables/" + UUID.randomUUID() + "/create_backup";
@@ -478,13 +492,15 @@ public class TablesControllerTest extends WithApplication {
     bodyJson.put("actionType", "CREATE");
     bodyJson.put("storageConfigUUID", randomUUID.toString());
 
-    Result result = FakeApiHelper.doRequestWithAuthTokenAndBody("PUT", url, customer.createAuthToken(), bodyJson);
+    Result result = FakeApiHelper.doRequestWithAuthTokenAndBody("PUT", url,
+        user.createAuthToken(), bodyJson);
     assertBadRequest(result, "Invalid StorageConfig UUID: " + randomUUID);
   }
 
   @Test
   public void testCreateBackupWithValidParams() {
     Customer customer = ModelFactory.testCustomer();
+    Users user = ModelFactory.testUser(customer);
     Universe universe = ModelFactory.createUniverse(customer.getCustomerId());
     UUID tableUUID = UUID.randomUUID();
     String url = "/api/customers/" + customer.uuid + "/universes/" + universe.universeUUID +
@@ -500,7 +516,8 @@ public class TablesControllerTest extends WithApplication {
     ArgumentCaptor<BackupTableParams> taskParams =  ArgumentCaptor.forClass(BackupTableParams.class);;
     UUID fakeTaskUUID = UUID.randomUUID();
     when(mockCommissioner.submit(any(), any())).thenReturn(fakeTaskUUID);
-    Result result = FakeApiHelper.doRequestWithAuthTokenAndBody("PUT", url, customer.createAuthToken(), bodyJson);
+    Result result = FakeApiHelper.doRequestWithAuthTokenAndBody("PUT", url,
+        user.createAuthToken(), bodyJson);
     verify(mockCommissioner, times(1)).submit(taskType.capture(), taskParams.capture());
     assertEquals(TaskType.BackupUniverse, taskType.getValue());
     String storageRegex = "s3://foo/univ-" + universe.universeUUID + "/backup-\\d{4}-[0-1]\\d-[0-3]\\dT[0-2]\\d:[0-5]\\d:[0-5]\\d\\-\\d+/table-foo.bar-[a-zA-Z0-9]*";
@@ -516,8 +533,34 @@ public class TablesControllerTest extends WithApplication {
   }
 
   @Test
+  public void testCreateBackupCronExpression() {
+    Customer customer = ModelFactory.testCustomer();
+    Users user = ModelFactory.testUser(customer);
+    Universe universe = ModelFactory.createUniverse(customer.getCustomerId());
+    UUID tableUUID = UUID.randomUUID();
+    String url = "/api/customers/" + customer.uuid + "/universes/" + universe.universeUUID +
+        "/tables/" + tableUUID + "/create_backup";
+    ObjectNode bodyJson = Json.newObject();
+    CustomerConfig customerConfig = ModelFactory.createS3StorageConfig(customer);
+    bodyJson.put("keyspace", "foo");
+    bodyJson.put("tableName", "bar");
+    bodyJson.put("actionType", "CREATE");
+    bodyJson.put("storageConfigUUID", customerConfig.configUUID.toString());
+    bodyJson.put("cronExpression", "5 * * * *");
+    Result result = FakeApiHelper.doRequestWithAuthTokenAndBody("PUT", url,
+        user.createAuthToken(), bodyJson);
+    assertOk(result);
+    JsonNode resultJson = Json.parse(contentAsString(result));
+    UUID scheduleUUID = UUID.fromString(resultJson.path("scheduleUUID").asText());
+    Schedule schedule = Schedule.get(scheduleUUID);
+    assertNotNull(schedule);
+    assertEquals(schedule.getCronExpression(), "5 * * * *");
+  }
+
+  @Test
   public void testCreateMultiBackup() {
     Customer customer = ModelFactory.testCustomer();
+    Users user = ModelFactory.testUser(customer);
     Universe universe = ModelFactory.createUniverse(customer.getCustomerId());
     UUID tableUUID = UUID.randomUUID();
     String url = "/api/customers/" + customer.uuid + "/universes/" + universe.universeUUID +
@@ -532,7 +575,7 @@ public class TablesControllerTest extends WithApplication {
     UUID fakeTaskUUID = UUID.randomUUID();
     when(mockCommissioner.submit(any(), any())).thenReturn(fakeTaskUUID);
     Result result = FakeApiHelper.doRequestWithAuthTokenAndBody("PUT", url,
-        customer.createAuthToken(), bodyJson);
+        user.createAuthToken(), bodyJson);
     verify(mockCommissioner, times(1)).submit(taskType.capture(), taskParams.capture());
     assertEquals(TaskType.MultiTableBackup, taskType.getValue());
     assertOk(result);
@@ -540,6 +583,52 @@ public class TablesControllerTest extends WithApplication {
     assertValue(resultJson, "taskUUID", fakeTaskUUID.toString());
     CustomerTask ct = CustomerTask.findByTaskUUID(fakeTaskUUID);
     assertNotNull(ct);
+  }
+
+  @Test
+  public void testCreateMultiBackupScheduleCron() {
+    Customer customer = ModelFactory.testCustomer();
+    Users user = ModelFactory.testUser(customer);
+    Universe universe = ModelFactory.createUniverse(customer.getCustomerId());
+    UUID tableUUID = UUID.randomUUID();
+    String url = "/api/customers/" + customer.uuid + "/universes/" + universe.universeUUID +
+        "/multi_table_backup";
+    ObjectNode bodyJson = Json.newObject();
+    CustomerConfig customerConfig = ModelFactory.createS3StorageConfig(customer);
+    bodyJson.put("storageConfigUUID", customerConfig.configUUID.toString());
+    bodyJson.put("cronExpression", "5 * * * *");
+
+    Result result = FakeApiHelper.doRequestWithAuthTokenAndBody("PUT", url,
+        user.createAuthToken(), bodyJson);
+    assertOk(result);
+    JsonNode resultJson = Json.parse(contentAsString(result));
+    UUID scheduleUUID = UUID.fromString(resultJson.path("scheduleUUID").asText());
+    Schedule schedule = Schedule.get(scheduleUUID);
+    assertNotNull(schedule);
+    assertEquals(schedule.getCronExpression(), "5 * * * *");
+  }
+
+  @Test
+  public void testCreateMultiBackupScheduleFrequency() {
+    Customer customer = ModelFactory.testCustomer();
+    Users user = ModelFactory.testUser(customer);
+    Universe universe = ModelFactory.createUniverse(customer.getCustomerId());
+    UUID tableUUID = UUID.randomUUID();
+    String url = "/api/customers/" + customer.uuid + "/universes/" + universe.universeUUID +
+        "/multi_table_backup";
+    ObjectNode bodyJson = Json.newObject();
+    CustomerConfig customerConfig = ModelFactory.createS3StorageConfig(customer);
+    bodyJson.put("storageConfigUUID", customerConfig.configUUID.toString());
+    bodyJson.put("schedulingFrequency", "6000");
+
+    Result result = FakeApiHelper.doRequestWithAuthTokenAndBody("PUT", url,
+        user.createAuthToken(), bodyJson);
+    assertOk(result);
+    JsonNode resultJson = Json.parse(contentAsString(result));
+    UUID scheduleUUID = UUID.fromString(resultJson.path("scheduleUUID").asText());
+    Schedule schedule = Schedule.get(scheduleUUID);
+    assertNotNull(schedule);
+    assertEquals(schedule.getFrequency(), 6000);
   }
 
   @Test
@@ -561,6 +650,7 @@ public class TablesControllerTest extends WithApplication {
 
     // Creating fake authentication
     Customer customer = ModelFactory.testCustomer();
+    Users user = ModelFactory.testUser(customer);
     Universe universe = createUniverse(customer.getCustomerId());
     universe = Universe.saveDetails(universe.universeUUID, ApiUtils.mockUniverseUpdater());
     customer.addUniverseUUID(universe.universeUUID);
@@ -573,6 +663,7 @@ public class TablesControllerTest extends WithApplication {
   @Test
   public void testDeleteTableWithInvalidparams() {
     Customer customer = ModelFactory.testCustomer();
+    Users user = ModelFactory.testUser(customer);
     Universe universe = createUniverse(customer.getCustomerId());
     universe = Universe.saveDetails(universe.universeUUID, ApiUtils.mockUniverseUpdater());
     customer.addUniverseUUID(universe.universeUUID);

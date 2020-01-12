@@ -56,6 +56,7 @@
 #include "yb/gutil/stl_util.h"
 #include "yb/gutil/stringprintf.h"
 #include "yb/gutil/strings/escaping.h"
+#include "yb/master/sys_catalog_constants.h"
 #include "yb/server/hybrid_clock.h"
 
 #include "yb/tablet/tablet_bootstrap_if.h"
@@ -266,6 +267,16 @@ bool RejectWrite(tablet::TabletPeer* tablet_peer, const std::string& message, do
                        TabletServerErrorPB::UNKNOWN_ERROR,
                        context);
   return false;
+}
+
+void AdjustYsqlOperationTransactionality(
+    size_t ysql_batch_size,
+    const TabletPeer* tablet_peer,
+    tablet::WriteOperationState* operation_state) {
+  // Operations on YSQL system catalog tables are always considered transactional.
+  if (ysql_batch_size > 0 && tablet_peer->tablet()->is_sys_catalog()) {
+    operation_state->set_force_txn_path();
+  }
 }
 
 } // namespace
@@ -687,7 +698,7 @@ void TabletServiceAdminImpl::CreateTablet(const CreateTabletRequestPB* req,
   s = server_->tablet_manager()->CreateNewTablet(req->table_id(), req->tablet_id(), partition,
       req->table_name(), req->table_type(), schema, partition_schema,
       req->has_index_info() ? boost::optional<IndexInfo>(req->index_info()) : boost::none,
-      req->config(), /* tablet_peer */ nullptr);
+      req->config(), /* tablet_peer */ nullptr, req->colocated());
   if (PREDICT_FALSE(!s.ok())) {
     TabletServerErrorPB::Code code;
     if (s.IsAlreadyPresent()) {
@@ -822,6 +833,28 @@ void TabletServiceAdminImpl::CountIntents(
   context.RespondSuccess();
 }
 
+void TabletServiceAdminImpl::AddTableToTablet(
+    const AddTableToTabletRequestPB* req, AddTableToTabletResponsePB* resp,
+    rpc::RpcContext context) {
+  auto tablet_id = req->tablet_id();
+
+  const auto tablet =
+      LookupLeaderTabletOrRespond(server_->tablet_peer_lookup(), tablet_id, resp, &context);
+  if (!tablet) {
+    return;
+  }
+
+  tserver::ChangeMetadataRequestPB change_req;
+  *change_req.mutable_add_table() = req->add_table();
+  change_req.set_tablet_id(tablet_id);
+  Status s = tablet::SyncReplicateChangeMetadataOperation(
+      &change_req, tablet.peer.get(), tablet.leader_term);
+  if (PREDICT_FALSE(!s.ok())) {
+    SetupErrorAndRespond(resp->mutable_error(), s, &context);
+  }
+  context.RespondSuccess();
+}
+
 void TabletServiceImpl::Write(const WriteRequestPB* req,
                               WriteResponsePB* resp,
                               rpc::RpcContext context) {
@@ -924,6 +957,10 @@ void TabletServiceImpl::Write(const WriteRequestPB* req,
             tablet.peer, context_ptr, resp, operation_state.get(), server_->Clock(),
             req->include_trace()));
   }
+
+  AdjustYsqlOperationTransactionality(
+      req->pgsql_write_batch_size(), tablet.peer.get(), operation_state.get());
+
   tablet.peer->WriteAsync(
       std::move(operation_state), tablet.leader_term, context_ptr->GetClientDeadline());
 }
@@ -1076,7 +1113,7 @@ struct ReadContext {
   RequestScope request_scope;
 
   bool transactional() const {
-    return tablet->SchemaRef().table_properties().is_transactional();
+    return tablet->IsTransactionalRequest(req->pgsql_batch_size() > 0);
   }
 
   // Picks read based for specified read context.
@@ -1299,7 +1336,7 @@ void TabletServiceImpl::Read(const ReadRequestPB* req,
   // TODO: should check all the tables referenced by the requests to decide if it is transactional.
   const bool transactional = read_context.transactional();
   // Should not pick read time for serializable isolation, since it is picked after read intents
-  // added. Also conflict resolution for serializable isolation should be done w/o read time
+  // are added. Also conflict resolution for serializable isolation should be done without read time
   // specified. So we use max hybrid time for conflict resolution in such case.
   // It was implemented as part of #655.
   if (!serializable_isolation) {
@@ -1312,7 +1349,7 @@ void TabletServiceImpl::Read(const ReadRequestPB* req,
   }
 
   if (transactional) {
-    // Serial number is used for check whether this operation was initiated before
+    // Serial number is used to check whether this operation was initiated before
     // transaction status request. So we should initialize it as soon as possible.
     read_context.request_scope = RequestScope(
         down_cast<Tablet*>(read_context.tablet.get())->transaction_participant());
@@ -1348,6 +1385,9 @@ void TabletServiceImpl::Read(const ReadRequestPB* req,
     auto operation_state = std::make_unique<WriteOperationState>(
         leader_peer.peer->tablet(), &write_req, nullptr /* response */,
         docdb::OperationKind::kRead);
+
+    AdjustYsqlOperationTransactionality(
+        req->pgsql_batch_size(), leader_peer.peer.get(), operation_state.get());
 
     auto context_ptr = std::make_shared<RpcContext>(std::move(context));
     read_context.context = context_ptr.get();

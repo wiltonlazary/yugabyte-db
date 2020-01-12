@@ -513,7 +513,7 @@ if (NOT "$ENV{YB_DISABLE_LATEST_SYMLINK}" STREQUAL "1")
 endif()
 
 add_custom_target(dummy_target ALL
-  cat /dev/null
+  COMMAND cat /dev/null
   COMMENT "Dummy target for dependency resolution testing")
 
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/cmake_modules")
@@ -708,16 +708,6 @@ elseif(NOT "${USING_SANITIZERS}")
 else()
   message("Not specifying linker flags to not allow any undefined symbols: this is ASAN/TSAN")
 endif()
-
-# Explicitly disable the new gcc5 ABI. Until clang supports abi tags [1], any
-# generated code (which always uses clang) must be built against the old ABI.
-# (Note: we are not using any LLVM codegen in YugaByte as of 08/2016).
-# There's no recourse for using both ABIs in the same process; gcc's advice [2]
-# is to build everything against the old ABI.
-#
-# 1. https://llvm.org/bugs/show_bug.cgi?id=23529
-# 2. https://gcc.gnu.org/onlinedocs/libstdc++/manual/using_dual_abi.html
-ADD_CXX_FLAGS(-D_GLIBCXX_USE_CXX11_ABI=0)
 
 # We don't want to use any stubs; that's exclusively for builds using our
 # exported client headers).
@@ -1765,6 +1755,10 @@ endif()
 
 message("Linker flags: ${CMAKE_EXE_LINKER_FLAGS}")
 
+# -------------------------------------------------------------------------------------------------
+# Subdirectories
+# -------------------------------------------------------------------------------------------------
+
 add_subdirectory(src/yb/rocksdb)
 add_subdirectory(src/yb/gutil)
 add_subdirectory(src/yb/util)
@@ -1791,6 +1785,10 @@ add_subdirectory(src/yb/cdc)
 add_subdirectory(src/postgres)
 
 include("${YB_SRC_ROOT}/ent/CMakeLists.txt")
+
+# ------------------------------------------------------------------------------------------------
+# Utilities for collecting the dependency graph
+# ------------------------------------------------------------------------------------------------
 
 # We could not accumulate multiple lines in YB_ALL_DEPS due to a CMake bug with cache variables,
 # but we can write multiple lines in the output file.

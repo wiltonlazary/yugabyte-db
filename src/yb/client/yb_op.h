@@ -101,8 +101,7 @@ class YBOperation {
   virtual bool returns_sidecar() = 0;
 
   virtual bool wrote_data(IsolationLevel isolation_level) {
-    return succeeded() &&
-           (!read_only() || isolation_level == IsolationLevel::SERIALIZABLE_ISOLATION);
+    return !read_only() || isolation_level == IsolationLevel::SERIALIZABLE_ISOLATION;
   }
 
   virtual void SetHashCode(uint16_t hash_code) = 0;
@@ -119,6 +118,9 @@ class YBOperation {
   // Returns whether this operation is being performed on a table where distributed transactions
   // are enabled.
   virtual bool IsTransactional() const;
+
+  // Whether this is an operation on one of the YSQL system catalog tables.
+  bool IsYsqlCatalogOp() const;
 
  protected:
   explicit YBOperation(const std::shared_ptr<YBTable>& table);
@@ -494,6 +496,8 @@ class YBPgsqlReadOp : public YBPgsqlOp {
 
   static std::vector<ColumnSchema> MakeColumnSchemasFromColDesc(
       const google::protobuf::RepeatedPtrField<PgsqlRSColDescPB>& rscol_descs);
+
+  bool wrote_data(IsolationLevel isolation_level) override;
 
  protected:
   virtual Type type() const override {

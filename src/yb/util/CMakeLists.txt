@@ -307,6 +307,7 @@ add_dependencies(yb_util gen_version_info)
 #######################################
 
 add_library(yb_test_util
+  logging_test_util.cc
   test_util.cc)
 target_link_libraries(yb_test_util
   gflags
@@ -361,12 +362,12 @@ ADD_YB_TEST(hdr_histogram-test)
 ADD_YB_TEST(inline_slice-test)
 ADD_YB_TEST(jsonreader-test)
 ADD_YB_TEST(lockfree-test)
-ADD_YB_TEST(logging-test)
 ADD_YB_TEST(map-util-test)
 ADD_YB_TEST(memcmpable_varint-test LABELS no_tsan)
 ADD_YB_TEST(memenv/memenv-test)
 ADD_YB_TEST(memory/arena-test)
 ADD_YB_TEST(memory/mc_types-test)
+ADD_YB_TEST(memory/memory_usage-test)
 ADD_YB_TEST(mem_tracker-test)
 ADD_YB_TEST(metrics-test)
 ADD_YB_TEST(monotime-test)

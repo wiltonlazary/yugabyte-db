@@ -45,12 +45,14 @@ PgCreateDatabase::PgCreateDatabase(PgSession::ScopedRefPtr pg_session,
                                    const char *database_name,
                                    const PgOid database_oid,
                                    const PgOid source_database_oid,
-                                   const PgOid next_oid)
+                                   const PgOid next_oid,
+                                   const bool colocated)
     : PgDdl(std::move(pg_session)),
       database_name_(database_name),
       database_oid_(database_oid),
       source_database_oid_(source_database_oid),
-      next_oid_(next_oid) {
+      next_oid_(next_oid),
+      colocated_(colocated) {
 }
 
 PgCreateDatabase::~PgCreateDatabase() {
@@ -58,7 +60,7 @@ PgCreateDatabase::~PgCreateDatabase() {
 
 Status PgCreateDatabase::Exec() {
   return pg_session_->CreateDatabase(database_name_, database_oid_, source_database_oid_,
-                                     next_oid_);
+                                     next_oid_, colocated_);
 }
 
 PgDropDatabase::PgDropDatabase(PgSession::ScopedRefPtr pg_session,
@@ -124,7 +126,7 @@ PgCreateTable::PgCreateTable(PgSession::ScopedRefPtr pg_session,
     // For regular user table, ybrowid should be a hash key because ybrowid is a random uuid.
     // For sys catalog table, it should be a range key because sys catalog table is an
     // unpartitioned table in a single tablet.
-    bool is_hash = is_pg_catalog_table_ ? false : true;
+    bool is_hash = !is_pg_catalog_table_;
     CHECK_OK(AddColumn("ybrowid", static_cast<int32_t>(PgSystemAttrNum::kYBRowId),
                        YB_YQL_DATA_TYPE_BINARY, is_hash, true /* is_range */));
   }
@@ -166,22 +168,26 @@ Status PgCreateTable::SetNumTablets(int32_t num_tablets) {
   return Status::OK();
 }
 
+void PgCreateTable::SetColocated(bool colocated) {
+  colocated_ = colocated;
+}
+
 Status PgCreateTable::Exec() {
   // Construct schema.
   client::YBSchema schema;
-  if (!is_pg_catalog_table_) {
-    TableProperties table_properties;
-    const char* pg_txn_enabled_env_var = getenv("YB_PG_TRANSACTIONS_ENABLED");
-    const bool transactional =
-        !pg_txn_enabled_env_var || strcmp(pg_txn_enabled_env_var, "1") == 0;
-    LOG(INFO) << Format(
-        "PgCreateTable: creating a $0 table: $1",
-        transactional ? "transactional" : "non-transactional", table_name_.ToString());
-    if (transactional) {
-      table_properties.SetTransactional(true);
-      schema_builder_.SetTableProperties(table_properties);
-    }
+
+  TableProperties table_properties;
+  const char* pg_txn_enabled_env_var = getenv("YB_PG_TRANSACTIONS_ENABLED");
+  const bool transactional =
+      !pg_txn_enabled_env_var || strcmp(pg_txn_enabled_env_var, "1") == 0;
+  LOG(INFO) << Format(
+      "PgCreateTable: creating a $0 table: $1",
+      transactional ? "transactional" : "non-transactional", table_name_.ToString());
+  if (transactional) {
+    table_properties.SetTransactional(true);
+    schema_builder_.SetTableProperties(table_properties);
   }
+
   RETURN_NOT_OK(schema_builder_.Build(&schema));
 
   // Create table.
@@ -189,7 +195,8 @@ Status PgCreateTable::Exec() {
   table_creator->table_name(table_name_).table_type(client::YBTableType::PGSQL_TABLE_TYPE)
                 .table_id(table_id_.GetYBTableId())
                 .num_tablets(num_tablets_)
-                .schema(&schema);
+                .schema(&schema)
+                .colocated(colocated_);
   if (is_pg_catalog_table_) {
     table_creator->is_pg_catalog_table();
   }
@@ -221,7 +228,9 @@ Status PgCreateTable::Exec() {
     if (s.IsNotFound()) {
       return STATUS(InvalidArgument, "Database not found", table_name_.namespace_name());
     }
-    return STATUS_FORMAT(InvalidArgument, "Invalid table definition: $0", s.ToString());
+    return STATUS_FORMAT(
+        InvalidArgument, "Invalid table definition: $0",
+        s.ToString(false /* include_file_and_line */, false /* include_code */));
   }
 
   return Status::OK();
@@ -279,11 +288,13 @@ PgCreateIndex::PgCreateIndex(PgSession::ScopedRefPtr pg_session,
                              const PgObjectId& base_table_id,
                              bool is_shared_index,
                              bool is_unique_index,
-                             bool if_not_exist)
+                             bool if_not_exist,
+                             bool colocated)
     : PgCreateTable(pg_session, database_name, schema_name, index_name, index_id,
                     is_shared_index, if_not_exist, false /* add_primary_key */),
       base_table_id_(base_table_id),
       is_unique_index_(is_unique_index) {
+  SetColocated(colocated);
 }
 
 PgCreateIndex::~PgCreateIndex() {

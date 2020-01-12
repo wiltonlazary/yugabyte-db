@@ -13,6 +13,7 @@
 //--------------------------------------------------------------------------------------------------
 
 #include "yb/yql/pggate/pg_doc_op.h"
+#include "yb/yql/pggate/pg_txn_manager.h"
 
 #include <boost/algorithm/string.hpp>
 
@@ -26,6 +27,7 @@
 #include "yb/common/pgsql_error.h"
 #include "yb/common/transaction_error.h"
 #include "yb/util/yb_pg_errcodes.h"
+#include "yb/yql/pggate/ybc_pggate.h"
 
 namespace yb {
 namespace pggate {
@@ -38,9 +40,12 @@ PgDocOp::PgDocOp(PgSession::ScopedRefPtr pg_session)
 }
 
 PgDocOp::~PgDocOp() {
-  std::unique_lock<std::mutex> lock(mtx_);
+}
+
+void PgDocOp::AbortAndWait() {
   // Hold on to this object just in case there are requests in the queue while PostgreSQL client
   // cancels the operation.
+  std::unique_lock<std::mutex> lock(mtx_);
   is_canceled_ = true;
   cv_.notify_all();
 
@@ -177,7 +182,8 @@ void PgDocOp::HandleResponseStatus(client::YBPgsqlOp* op) {
   exec_status_ = exec_status_.CloneAndAddErrorCode(TransactionError(txn_error_code));
 }
 
-//--------------------------------------------------------------------------------------------------
+// End of PgDocOp base class.
+//-------------------------------------------------------------------------------------------------
 
 PgDocReadOp::PgDocReadOp(
     PgSession::ScopedRefPtr pg_session,
@@ -232,13 +238,15 @@ Status PgDocReadOp::SendRequestUnlocked() {
 
   SetRequestPrefetchLimit();
   SetRowMark();
-  SCHECK_EQ(VERIFY_RESULT(pg_session_->PgApplyAsync(read_op_, &read_time_)), OpBuffered::kFalse,
+
+  auto apply_outcome = VERIFY_RESULT(pg_session_->PgApplyAsync(read_op_, &read_time_));
+  SCHECK_EQ(apply_outcome.buffered, OpBuffered::kFalse,
             IllegalState, "YSQL read operation should not be buffered");
 
   waiting_for_response_ = true;
-  Status s = pg_session_->PgFlushAsync([this](const Status& s) {
-                                         PgDocReadOp::ReceiveResponse(s);
-                                       });
+  Status s = pg_session_->PgFlushAsync([self = shared_from(this)](const Status& s) {
+                                         self->ReceiveResponse(s);
+                                       }, apply_outcome.yb_session);
   if (!s.ok()) {
     waiting_for_response_ = false;
     return s;
@@ -307,14 +315,15 @@ Status PgDocWriteOp::SendRequestUnlocked() {
   CHECK(!waiting_for_response_);
 
   // If the op is buffered, we should not flush now. Just return.
-  if (VERIFY_RESULT(pg_session_->PgApplyAsync(write_op_, &read_time_)) == OpBuffered::kTrue) {
+  auto apply_outcome = VERIFY_RESULT(pg_session_->PgApplyAsync(write_op_, &read_time_));
+  if (apply_outcome.buffered == OpBuffered::kTrue) {
     return Status::OK();
   }
 
   waiting_for_response_ = true;
-  Status s = pg_session_->PgFlushAsync([this](const Status& s) {
-                                         PgDocWriteOp::ReceiveResponse(s);
-                                       });
+  Status s = pg_session_->PgFlushAsync([self = shared_from(this)](const Status& s) {
+                                         self->ReceiveResponse(s);
+                                       }, apply_outcome.yb_session);
   if (!s.ok()) {
     waiting_for_response_ = false;
     return s;

@@ -16,6 +16,7 @@
 #include "yb/client/table.h"
 #include "yb/client/yb_op.h"
 #include "yb/docdb/doc_key.h"
+#include "yb/util/debug-util.h"
 #include "yb/yql/pggate/pg_dml.h"
 #include "yb/yql/pggate/util/pg_doc_data.h"
 
@@ -38,6 +39,7 @@ PgDml::PgDml(PgSession::ScopedRefPtr pg_session, const PgObjectId& table_id)
 }
 
 PgDml::~PgDml() {
+  doc_op_->AbortAndWait();
 }
 
 Status PgDml::LoadTable() {

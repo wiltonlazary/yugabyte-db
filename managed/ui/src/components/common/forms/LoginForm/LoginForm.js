@@ -16,14 +16,17 @@ class LoginForm extends Component {
     loginCustomer(formValues);
   };
 
-  componentWillReceiveProps(nextProps) {
-    const {customer: { authToken, error }} =  nextProps;
-    const currentAuth = this.props.customer.authToken;
+  componentDidUpdate(prevProps) {
+    const { customer: { authToken, error }} = this.props;
+    const currentAuth = prevProps.customer.authToken;
     if (getPromiseState(authToken).isSuccess() && !_.isEqual(authToken, currentAuth)) {
       if (error === 'Invalid') {
         this.props.resetCustomerError();
         browserHistory.goBack();
       } else {
+        if (localStorage.getItem('__yb_intro_dialog__') !== 'hidden') {
+          localStorage.setItem('__yb_intro_dialog__', 'new');
+        }
         browserHistory.push('/');
       }
     }

@@ -99,6 +99,7 @@
 #include "yb/server/hybrid_clock.h"
 
 #include "yb/tablet/maintenance_manager.h"
+#include "yb/tablet/tablet_fwd.h"
 #include "yb/tablet/tablet_metrics.h"
 #include "yb/tablet/tablet_retention_policy.h"
 #include "yb/tablet/transaction_coordinator.h"
@@ -159,6 +160,9 @@ DEFINE_int32(num_raft_ops_to_force_idle_intents_db_to_flush, 1000,
              "When writes to intents RocksDB are stopped and the number of Raft operations after "
              "the last write to the intents RocksDB "
              "is greater than this value, the intents RocksDB would be requested to flush.");
+
+DEFINE_bool(delete_intents_sst_files, true,
+            "Delete whole intents .SST files when possible.");
 
 DEFINE_test_flag(
     bool, tablet_verify_flushed_frontier_after_modifying, false,
@@ -337,7 +341,9 @@ Tablet::Tablet(
     std::string log_prefix_suffix,
     TransactionParticipantContext* transaction_participant_context,
     client::LocalTabletFilter local_tablet_filter,
-    TransactionCoordinatorContext* transaction_coordinator_context)
+    TransactionCoordinatorContext* transaction_coordinator_context,
+    IsSysCatalogTablet is_sys_catalog,
+    TransactionsEnabled txns_enabled)
     : key_schema_(metadata->schema().CreateKeyProjection()),
       metadata_(metadata),
       table_type_(metadata->table_type()),
@@ -351,7 +357,9 @@ Tablet::Tablet(
       tablet_options_(tablet_options),
       client_future_(client_future),
       local_tablet_filter_(std::move(local_tablet_filter)),
-      log_prefix_suffix_(std::move(log_prefix_suffix)) {
+      log_prefix_suffix_(std::move(log_prefix_suffix)),
+      is_sys_catalog_(is_sys_catalog),
+      txns_enabled_(txns_enabled) {
   CHECK(schema()->has_column_ids());
 
   if (metric_registry) {
@@ -383,7 +391,10 @@ Tablet::Tablet(
     mem_tracker_->SetMetricEntity(metric_entity_);
   }
 
-  if (transaction_participant_context && metadata->schema().table_properties().is_transactional()) {
+  if (txns_enabled_ &&
+      (is_sys_catalog_ || (
+        transaction_participant_context &&
+        metadata->schema().table_properties().is_transactional()))) {
     transaction_participant_ = std::make_unique<TransactionParticipant>(
         transaction_participant_context, this, metric_entity_);
     // Create transaction manager for secondary index update.
@@ -593,6 +604,7 @@ Status Tablet::OpenKeyValueTablet() {
     rocksdb::DB* intents_db = nullptr;
     RETURN_NOT_OK(rocksdb::DB::Open(rocksdb_options, db_dir + kIntentsDBSuffix, &intents_db));
     intents_db_.reset(intents_db);
+    intents_db_->ListenFilesChanged(std::bind(&Tablet::CleanupIntentFiles, this));
   }
 
   ql_storage_.reset(new docdb::QLRocksDBStorage(doc_db()));
@@ -615,6 +627,63 @@ Status Tablet::OpenKeyValueTablet() {
                         << ", obj: " << db;
 
   return Status::OK();
+}
+
+void Tablet::SetCleanupPool(ThreadPool* thread_pool) {
+  cleanup_intent_files_token_ = thread_pool->NewToken(ThreadPool::ExecutionMode::SERIAL);
+}
+
+void Tablet::CleanupIntentFiles() {
+  ScopedPendingOperation scoped_read_operation(&pending_op_counter_);
+  if (!scoped_read_operation.ok() || state_ != State::kOpen || !FLAGS_delete_intents_sst_files ||
+      !cleanup_intent_files_token_) {
+    return;
+  }
+
+  WARN_NOT_OK(
+      cleanup_intent_files_token_->SubmitFunc(std::bind(&Tablet::DoCleanupIntentFiles, this)),
+      "Submit cleanup intent files failed");
+}
+
+void Tablet::DoCleanupIntentFiles() {
+  HybridTime best_file_max_ht = HybridTime::kMax;
+  std::vector<rocksdb::LiveFileMetaData> files;
+  // Stops when there are no more files to delete.
+  for (;;) {
+    ScopedPendingOperation scoped_read_operation(&pending_op_counter_);
+    if (!scoped_read_operation.ok()) {
+      break;
+    }
+
+    best_file_max_ht = HybridTime::kMax;
+    const rocksdb::LiveFileMetaData* best_file = nullptr;
+    files.clear();
+    intents_db_->GetLiveFilesMetaData(&files);
+    for (const auto& file : files) {
+      auto& frontier = down_cast<docdb::ConsensusFrontier&>(*file.largest.user_frontier);
+      auto file_max_ht = frontier.hybrid_time();
+      if (file_max_ht < best_file_max_ht) {
+        best_file = &file;
+        best_file_max_ht = file_max_ht;
+      }
+    }
+
+    auto min_running_start_ht = transaction_participant_->MinRunningHybridTime();
+    if (!min_running_start_ht.is_valid() || min_running_start_ht <= best_file_max_ht) {
+      break;
+    }
+
+    LOG_WITH_PREFIX(INFO)
+        << "Intents SST file will be deleted: " << best_file->ToString()
+        << ", max ht: " << best_file_max_ht << ", min running transaction start ht: "
+        << min_running_start_ht;
+    regular_db_->Flush(rocksdb::FlushOptions());
+    intents_db_->DeleteFile(best_file->name);
+  }
+
+  if (best_file_max_ht != HybridTime::kMax) {
+    transaction_participant_->WaitMinRunningHybridTime(best_file_max_ht);
+  }
 }
 
 Status Tablet::EnableCompactions() {
@@ -669,6 +738,8 @@ void Tablet::Shutdown(IsDropTable is_drop_table) {
     return;
   }
 
+  cleanup_intent_files_token_.reset();
+
   if (transaction_coordinator_) {
     transaction_coordinator_->Shutdown();
   }
@@ -718,7 +789,8 @@ Result<std::unique_ptr<common::YQLRowwiseIteratorIf>> Tablet::NewRowIterator(
   auto mapped_projection = std::make_unique<Schema>();
   RETURN_NOT_OK(schema.GetMappedReadProjection(projection, mapped_projection.get()));
 
-  auto txn_op_ctx = CreateTransactionOperationContext(transaction_id);
+  auto txn_op_ctx = CreateTransactionOperationContext(
+      transaction_id, schema.table_properties().is_ysql_catalog_table());
   auto read_time = ReadHybridTime::SingleTime(SafeTime(RequireLease::kFalse));
   auto result = std::make_unique<DocRowwiseIterator>(
       std::move(mapped_projection), schema, txn_op_ctx, doc_db(),
@@ -995,7 +1067,7 @@ Status Tablet::HandleQLReadRequest(
   }
 
   Result<TransactionOperationContextOpt> txn_op_ctx =
-      CreateTransactionOperationContext(transaction_metadata);
+      CreateTransactionOperationContext(transaction_metadata, /* is_ysql_catalog_table */ false);
   RETURN_NOT_OK(txn_op_ctx);
   return AbstractTablet::HandleQLReadRequest(
       deadline, read_time, ql_read_request, *txn_op_ctx, result);
@@ -1059,7 +1131,9 @@ void Tablet::KeyValueBatchFromQLWriteBatch(std::unique_ptr<WriteOperation> opera
   doc_ops.reserve(ql_write_batch->size());
 
   Result<TransactionOperationContextOpt> txn_op_ctx =
-      CreateTransactionOperationContext(operation->request()->write_batch().transaction());
+      CreateTransactionOperationContext(
+          operation->request()->write_batch().transaction(),
+          /* is_ysql_catalog_table */ false);
   if (!txn_op_ctx.ok()) {
     WriteOperation::StartSynchronization(std::move(operation), txn_op_ctx.status());
     return;
@@ -1275,7 +1349,9 @@ Status Tablet::HandlePgsqlReadRequest(
   }
 
   Result<TransactionOperationContextOpt> txn_op_ctx =
-      CreateTransactionOperationContext(transaction_metadata);
+      CreateTransactionOperationContext(
+          transaction_metadata,
+          table_info->schema.table_properties().is_ysql_catalog_table());
   RETURN_NOT_OK(txn_op_ctx);
   return AbstractTablet::HandlePgsqlReadRequest(
       deadline, read_time, pgsql_read_request, *txn_op_ctx, result);
@@ -1321,9 +1397,8 @@ Status Tablet::KeyValueBatchFromPgsqlWriteBatch(WriteOperation* operation) {
 
   doc_ops.reserve(pgsql_write_batch->size());
 
-  Result<TransactionOperationContextOpt> txn_op_ctx =
-      CreateTransactionOperationContext(operation->request()->write_batch().transaction());
-  RETURN_NOT_OK(txn_op_ctx);
+  Result<TransactionOperationContextOpt> txn_op_ctx(boost::none);
+
   for (size_t i = 0; i < pgsql_write_batch->size(); i++) {
     PgsqlWriteRequestPB* req = pgsql_write_batch->Mutable(i);
     PgsqlResponsePB* resp = operation->response()->add_pgsql_response_batch();
@@ -1331,6 +1406,13 @@ Status Tablet::KeyValueBatchFromPgsqlWriteBatch(WriteOperation* operation) {
     if (table_info->schema_version != req->schema_version()) {
       resp->set_status(PgsqlResponsePB::PGSQL_STATUS_SCHEMA_VERSION_MISMATCH);
     } else {
+      if (doc_ops.empty()) {
+        // Use the value of is_ysql_catalog_table from the first operation in the batch.
+        txn_op_ctx = CreateTransactionOperationContext(
+            operation->request()->write_batch().transaction(),
+            table_info->schema.table_properties().is_ysql_catalog_table());
+        RETURN_NOT_OK(txn_op_ctx);
+      }
       auto write_op = std::make_unique<PgsqlWriteOperation>(table_info->schema, *txn_op_ctx);
       RETURN_NOT_OK(write_op->Init(req, resp));
       doc_ops.emplace_back(std::move(write_op));
@@ -1502,8 +1584,11 @@ Status Tablet::CreatePreparedChangeMetadata(ChangeMetadataOperationState *operat
                                             const Schema* schema) {
   if (schema) {
     if (!key_schema_.KeyEquals(*schema)) {
-      return STATUS(InvalidArgument, "Schema keys cannot be altered",
-          schema->CreateKeyProjection().ToString());
+      return STATUS_FORMAT(
+          InvalidArgument,
+          "Schema keys cannot be altered. New schema key: $0. Existing schema key: $1",
+          schema->CreateKeyProjection(),
+          key_schema_.CreateKeyProjection());
     }
 
     if (!schema->has_column_ids()) {
@@ -1812,6 +1897,13 @@ void Tablet::FlushIntentsDbIfNecessary(const yb::OpId& lastest_log_entry_op_id) 
   }
 }
 
+bool Tablet::IsTransactionalRequest(bool is_ysql_request) const {
+  // We consider all YSQL tables within the sys catalog transactional.
+  return txns_enabled_ && (
+      SchemaRef().table_properties().is_transactional() ||
+          (is_sys_catalog_ && is_ysql_request));
+}
+
 Result<HybridTime> Tablet::MaxPersistentHybridTime() const {
   ScopedPendingOperation scoped_read_operation(&pending_op_counter_);
   RETURN_NOT_OK(scoped_read_operation);
@@ -1888,7 +1980,14 @@ Status Tablet::StartDocWriteOperation(WriteOperation* operation) {
   const IsolationLevel isolation_level = VERIFY_RESULT(GetIsolationLevelFromPB(*write_batch));
   const RowMarkType row_mark_type = GetRowMarkTypeFromPB(*write_batch);
 
-  const bool transactional_table = metadata_->schema().table_properties().is_transactional();
+  const bool transactional_table = metadata_->schema().table_properties().is_transactional() ||
+                                   operation->force_txn_path();
+
+  if (!transactional_table && isolation_level != IsolationLevel::NON_TRANSACTIONAL) {
+    YB_LOG_WITH_PREFIX_EVERY_N_SECS(DFATAL, 30)
+        << "An attempt to perform a transactional operation on a non-transactional table: "
+        << operation->ToString();
+  }
 
   const auto partial_range_key_intents = UsePartialRangeKeyIntents(metadata_.get());
   auto prepare_result = VERIFY_RESULT(docdb::PrepareDocWriteOperation(
@@ -1904,7 +2003,7 @@ Status Tablet::StartDocWriteOperation(WriteOperation* operation) {
   auto read_time = operation->read_time();
   const bool allow_immediate_read_restart = !read_time;
 
-  if (transactional_table) {
+  if (txns_enabled_ && transactional_table) {
     if (isolation_level == IsolationLevel::NON_TRANSACTIONAL) {
       auto now = clock_->Now();
       auto result = VERIFY_RESULT(docdb::ResolveOperationConflicts(
@@ -1977,7 +2076,7 @@ Status Tablet::StartDocWriteOperation(WriteOperation* operation) {
         table_type_ == TableType::REDIS_TABLE_TYPE
             ? InitMarkerBehavior::kRequired
             : InitMarkerBehavior::kOptional,
-        &monotonic_counter_, &restart_read_ht));
+        &monotonic_counter_, &restart_read_ht, metadata_->table_name()));
 
     // For serializable isolation we don't fix read time, so could do read restart locally,
     // instead of failing whole transaction.
@@ -2213,35 +2312,33 @@ std::pair<int, int> Tablet::GetNumMemtables() const {
 // ------------------------------------------------------------------------------------------------
 
 Result<TransactionOperationContextOpt> Tablet::CreateTransactionOperationContext(
-    const TransactionMetadataPB& transaction_metadata) const {
-  if (metadata_->schema().table_properties().is_transactional()) {
-    if (transaction_metadata.has_transaction_id()) {
-      Result<TransactionId> txn_id = FullyDecodeTransactionId(
-          transaction_metadata.transaction_id());
-      RETURN_NOT_OK(txn_id);
-      return Result<TransactionOperationContextOpt>(boost::make_optional(
-          TransactionOperationContext(*txn_id, transaction_participant())));
-    } else {
-      // We still need context with transaction participant in order to resolve intents during
-      // possible reads.
-      return Result<TransactionOperationContextOpt>(boost::make_optional(
-          TransactionOperationContext(GenerateTransactionId(), transaction_participant())));
-    }
+    const TransactionMetadataPB& transaction_metadata,
+    bool is_ysql_catalog_table) const {
+  if (!txns_enabled_)
+    return boost::none;
+
+  if (transaction_metadata.has_transaction_id()) {
+    Result<TransactionId> txn_id = FullyDecodeTransactionId(
+        transaction_metadata.transaction_id());
+    RETURN_NOT_OK(txn_id);
+    return CreateTransactionOperationContext(boost::make_optional(*txn_id), is_ysql_catalog_table);
   } else {
-    return Result<TransactionOperationContextOpt>(boost::none);
+    return CreateTransactionOperationContext(boost::none, is_ysql_catalog_table);
   }
 }
 
 TransactionOperationContextOpt Tablet::CreateTransactionOperationContext(
-    const boost::optional<TransactionId>& transaction_id) const {
-  if (metadata_->schema().table_properties().is_transactional()) {
-    if (transaction_id.is_initialized()) {
-      return TransactionOperationContext(transaction_id.get(), transaction_participant());
-    } else {
-      // We still need context with transaction participant in order to resolve intents during
-      // possible reads.
-      return TransactionOperationContext(GenerateTransactionId(), transaction_participant());
-    }
+    const boost::optional<TransactionId>& transaction_id,
+    bool is_ysql_catalog_table) const {
+  if (!txns_enabled_)
+    return boost::none;
+
+  if (transaction_id.is_initialized()) {
+    return TransactionOperationContext(transaction_id.get(), transaction_participant());
+  } else if (metadata_->schema().table_properties().is_transactional() || is_ysql_catalog_table) {
+    // We still need context with transaction participant in order to resolve intents during
+    // possible reads.
+    return TransactionOperationContext(GenerateTransactionId(), transaction_participant());
   } else {
     return boost::none;
   }
@@ -2252,7 +2349,9 @@ Status Tablet::CreateReadIntents(
     const google::protobuf::RepeatedPtrField<QLReadRequestPB>& ql_batch,
     const google::protobuf::RepeatedPtrField<PgsqlReadRequestPB>& pgsql_batch,
     docdb::KeyValueWriteBatchPB* write_batch) {
-  auto txn_op_ctx = VERIFY_RESULT(CreateTransactionOperationContext(transaction_metadata));
+  auto txn_op_ctx = VERIFY_RESULT(CreateTransactionOperationContext(
+      transaction_metadata,
+      /* is_ysql_catalog_table */ pgsql_batch.size() > 0 && is_sys_catalog_));
 
   for (const auto& ql_read : ql_batch) {
     docdb::QLReadOperation doc_op(ql_read, txn_op_ctx);
@@ -2261,7 +2360,7 @@ Status Tablet::CreateReadIntents(
 
   for (const auto& pgsql_read : pgsql_batch) {
     docdb::PgsqlReadOperation doc_op(pgsql_read, txn_op_ctx);
-    RETURN_NOT_OK(doc_op.GetIntents(SchemaRef(), write_batch));
+    RETURN_NOT_OK(doc_op.GetIntents(SchemaRef(pgsql_read.table_id()), write_batch));
   }
 
   return Status::OK();

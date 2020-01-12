@@ -179,7 +179,7 @@ declare -i -r YB_DOWNLOAD_LOCK_TIMEOUT_SEC=120
 
 readonly YB_DOWNLOAD_LOCKS_DIR=/tmp/yb_download_locks
 
-readonly YB_NFS_PATH_RE="^/(n|z|u|net|Volumes/net)/"
+readonly YB_NFS_PATH_RE="^/(n|z|u|net|Volumes/net|servers|nfusr)/"
 
 # -------------------------------------------------------------------------------------------------
 # Functions
@@ -1962,10 +1962,12 @@ lint_java_code() {
          ! grep -Eq '@RunWith\((value[ ]*=[ ]*)?YBTestRunner\.class\)' \
              "$java_test_file" &&
          ! grep -Eq '@RunWith\((value[ ]*=[ ]*)?YBTestRunnerNonTsanOnly\.class\)' \
+             "$java_test_file" &&
+         ! grep -Eq '@RunWith\((value[ ]*=[ ]*)?YBTestRunnerNonTsanAsan\.class\)' \
              "$java_test_file"
       then
-        log "$log_prefix: neither YBTestRunner, YBParameterizedTestRunner, nor" \
-            "YBTestRunnerNonTsanOnly are being used in test"
+        log "$log_prefix: neither YBTestRunner, YBParameterizedTestRunner, " \
+            "YBTestRunnerNonTsanOnly, nor YBTestRunnerNonTsanAsan are being used in test"
         num_errors+=1
       fi
       if grep -Fq 'import static org.junit.Assert' "$java_test_file" ||
@@ -2082,6 +2084,7 @@ set_prebuilt_thirdparty_url() {
       fatal "YB_THIRDPARTY_URL is not set, and could not determine the default value."
     fi
 
+    mkdir -p "$BUILD_ROOT"
     echo "$YB_THIRDPARTY_URL" >"$build_thirdparty_url_file"
   fi
 }
