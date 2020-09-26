@@ -10,30 +10,28 @@
 
 package com.yugabyte.yw.commissioner.tasks;
 
-import com.yugabyte.yw.commissioner.SubTaskGroup;
+import com.yugabyte.yw.commissioner.Common.CloudType;
 import com.yugabyte.yw.commissioner.SubTaskGroupQueue;
 import com.yugabyte.yw.commissioner.UserTaskDetails.SubTaskGroupType;
-import com.yugabyte.yw.commissioner.tasks.UniverseDefinitionTaskBase.ServerType;
-import com.yugabyte.yw.commissioner.tasks.UpgradeUniverse.UpgradeTaskType;
-import com.yugabyte.yw.commissioner.tasks.UpgradeUniverse.UpgradeTaskSubType;
 import com.yugabyte.yw.commissioner.tasks.params.NodeTaskParams;
-import com.yugabyte.yw.commissioner.tasks.subtasks.AnsibleConfigureServers;
-import com.yugabyte.yw.commissioner.tasks.subtasks.ChangeMasterConfig;
-import com.yugabyte.yw.commissioner.tasks.subtasks.ModifyBlackList;
-import com.yugabyte.yw.commissioner.tasks.subtasks.WaitForDataMove;
-import com.yugabyte.yw.commissioner.tasks.subtasks.WaitForLoadBalance;
 import com.yugabyte.yw.common.DnsManager;
-import com.yugabyte.yw.common.PlacementInfoUtil;
+import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
+import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.Cluster;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UserIntent;
+import com.yugabyte.yw.models.NodeInstance;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.NodeDetails;
 import com.yugabyte.yw.models.helpers.NodeDetails.NodeState;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -82,11 +80,25 @@ public class AddNodeToUniverse extends UniverseDefinitionTaskBase {
       createSetNodeStateTask(currentNode, NodeState.Adding)
           .setSubTaskGroupType(SubTaskGroupType.StartingNode);
 
+      Cluster cluster = taskParams().getClusterByUuid(currentNode.placementUuid);
       Collection<NodeDetails> node = new HashSet<NodeDetails>(Arrays.asList(currentNode));
 
       // First spawn an instance for Decommissioned node.
       boolean wasDecommissioned = currentNode.state == NodeState.Decommissioned;
       if (wasDecommissioned) {
+        if (cluster.userIntent.providerType.equals(CloudType.onprem)) {
+          // For onprem universes, allocate an available node
+          // from the provider's node_instance table.
+          Map<UUID, List<String>> onpremAzToNodes = new HashMap<UUID, List<String>>();
+          List<String> nodeNameList = new ArrayList<>();
+          nodeNameList.add(currentNode.nodeName);
+          onpremAzToNodes.put(currentNode.azUuid, nodeNameList);
+          String instanceType = currentNode.cloudInfo.instance_type;
+
+          Map<String, NodeInstance> nodeMap = NodeInstance.pickNodes(onpremAzToNodes, instanceType);
+          currentNode.nodeUuid = nodeMap.get(currentNode.nodeName).nodeUuid;
+        }
+
         createSetupServerTasks(node)
             .setSubTaskGroupType(SubTaskGroupType.Provisioning);
 
@@ -94,14 +106,19 @@ public class AddNodeToUniverse extends UniverseDefinitionTaskBase {
             .setSubTaskGroupType(SubTaskGroupType.Provisioning);
       }
 
+      // Re-install software.
+      // TODO: Remove the need for version for existing instance, NodeManger needs changes.
+      createConfigureServerTasks(node, true /* isShell */)
+          .setSubTaskGroupType(SubTaskGroupType.InstallingSoftware);
+
       // Bring up any masters, as needed.
       boolean masterAdded = false;
       if (areMastersUnderReplicated(currentNode, universe)) {
-        // Configures the master to start in shell mode.
-        // TODO: Remove the need for version for existing instance, NodeManger needs changes.
-        createConfigureServerTasks(node, true /* isShell */)
-            .setSubTaskGroupType(SubTaskGroupType.InstallingSoftware);
-
+        LOG.info(
+          "Bringing up master for under replicated universe {} ({})",
+          universe.universeUUID, universe.name
+        );
+        // Set gflags for master.
         createGFlagsOverrideTasks(node, ServerType.MASTER);
 
         // Start a shell master process.
@@ -123,10 +140,25 @@ public class AddNodeToUniverse extends UniverseDefinitionTaskBase {
         masterAdded = true;
       }
 
-      // Configure so that this tserver picks all the master nodes.
-      createConfigureServerTasks(node, false /* isShell */)
-          .setSubTaskGroupType(SubTaskGroupType.InstallingSoftware);
+      UniverseDefinitionTaskParams universeDetails = universe.getUniverseDetails();
 
+      // Explicitly set webserver ports for each dql
+      cluster.userIntent.tserverGFlags.put(
+        "redis_proxy_webserver_port",
+        Integer.toString(universeDetails.communicationPorts.redisServerHttpPort)
+      );
+      cluster.userIntent.tserverGFlags.put(
+        "cql_proxy_webserver_port",
+        Integer.toString(universeDetails.communicationPorts.yqlServerHttpPort)
+      );
+      if (universe.getUniverseDetails().getPrimaryCluster().userIntent.enableYSQL) {
+        cluster.userIntent.tserverGFlags.put(
+          "pgsql_proxy_webserver_port",
+          Integer.toString(universeDetails.communicationPorts.ysqlServerHttpPort)
+        );
+      }
+
+      // Set gflags for the tserver.
       createGFlagsOverrideTasks(node, ServerType.TSERVER);
 
       // Add the tserver process start task.
@@ -196,14 +228,25 @@ public class AddNodeToUniverse extends UniverseDefinitionTaskBase {
     LOG.info("Finished {} task.", getName());
   }
 
-  // Setup a configure task to update the new master list in the conf files of all tservers.
+  // Setup a configure task to update the new master list in the conf files of all servers.
   // Skip the newly added node as it would have gotten the new master list after provisioing.
-  private void createMasterInfoUpdateTask(Universe universe, NodeDetails skipNode) {
-    List<NodeDetails> nodes = universe.getTServers();
-    nodes.removeIf((NodeDetails node) ->
-                    node.cloudInfo.private_ip.equals(skipNode.cloudInfo.private_ip));
+  private void createMasterInfoUpdateTask(Universe universe, NodeDetails addedNode) {
+    Set<NodeDetails> tserverNodes = new HashSet<NodeDetails>(universe.getTServers());
+    Set<NodeDetails> masterNodes = new HashSet<NodeDetails>(universe.getMasters());
+    // We need to add the node explicitly since the node wasn't marked as a master or tserver
+    // before the task is completed.
+    tserverNodes.add(addedNode);
+    masterNodes.add(addedNode);
     // Configure all tservers to pick the new master node ip as well.
-    createConfigureServerTasks(nodes, false /* isShell */, true /* updateMasterAddr */)
+    createConfigureServerTasks(tserverNodes, false /* isShell */, true /* updateMasterAddr */)
         .setSubTaskGroupType(SubTaskGroupType.ConfigureUniverse);
+    // Update the master addresses in memory.
+    createSetFlagInMemoryTasks(tserverNodes, ServerType.TSERVER, true /* force flag update */,
+                               null /* no gflag to update */, true /* updateMasterAddr */);
+    // Change the master addresses in the conf file for the all masters to reflect the changes.
+    createConfigureServerTasks(masterNodes, false /* isShell */, true /* updateMasterAddrs */,
+        true /* isMaster */).setSubTaskGroupType(SubTaskGroupType.ConfigureUniverse);
+    createSetFlagInMemoryTasks(masterNodes, ServerType.MASTER, true /* force flag update */,
+                               null /* no gflag to update */, true /* updateMasterAddr */);
   }
 }

@@ -610,7 +610,7 @@ TEST_F(TabletServerTest, TestDeleteTablet) {
   EasyCurl c;
   faststring buf;
   ASSERT_OK(c.FetchURL(strings::Substitute("http://$0/jsonmetricz",
-                                           ToString(mini_server_->bound_http_addr())),
+                                           AsString(mini_server_->bound_http_addr())),
                                            &buf));
 
   // Verify that after restarting the TS, the tablet is still not in the tablet manager.
@@ -800,10 +800,9 @@ TEST_F(TabletServerTest, TestWriteOutOfBounds) {
   CHECK_OK(PartitionSchema::FromPB(PartitionSchemaPB(), schema, &partition_schema));
 
   Partition partition;
-  ASSERT_OK(
-    mini_server_->server()->tablet_manager()->CreateNewTablet("TestWriteOutOfBoundsTable", tabletId,
-      partition, tabletId, YQL_TABLE_TYPE, schema, partition_schema, boost::none /* index_info */,
-      mini_server_->CreateLocalConfig(), nullptr));
+  ASSERT_OK(mini_server_->server()->tablet_manager()->CreateNewTablet(
+      "TestWriteOutOfBoundsTable", tabletId, partition, "test_ns", tabletId, YQL_TABLE_TYPE, schema,
+      partition_schema, boost::none /* index_info */, mini_server_->CreateLocalConfig(), nullptr));
 
   ASSERT_OK(WaitForTabletRunning(tabletId));
 

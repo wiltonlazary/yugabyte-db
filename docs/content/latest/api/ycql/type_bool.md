@@ -1,7 +1,8 @@
 ---
-title: BOOLEAN
-summary: Boolean values of false or true
-description: BOOLEAN Type
+title: BOOLEAN data type [YCQL]
+headerTitle: BOOLEAN data type
+linkTitle: BOOLEAN
+description: Use the `BOOLEAN` data type to specify values of either "true" or "false".
 menu:
   latest:
     parent: api-cassandra
@@ -15,7 +16,7 @@ showAsideToc: true
 
 ## Synopsis
 
-`BOOLEAN` data type is used to specify values of either `true` or `false`.
+Use the `BOOLEAN` data type to specify values of either `true` or `false`.
 
 ## Syntax
 
@@ -35,23 +36,23 @@ boolean_literal ::= TRUE | FALSE
 ## Examples
 
 ```sql
-cqlsh:example> CREATE TABLE tasks (id INT PRIMARY KEY, finished BOOLEAN);
+ycqlsh:example> CREATE TABLE tasks (id INT PRIMARY KEY, finished BOOLEAN);
 ```
 
 ```sql
-cqlsh:example> INSERT INTO tasks (id, finished) VALUES (1, false);
+ycqlsh:example> INSERT INTO tasks (id, finished) VALUES (1, false);
 ```
 
 ```sql
-cqlsh:example> INSERT INTO tasks (id, finished) VALUES (2, false);
+ycqlsh:example> INSERT INTO tasks (id, finished) VALUES (2, false);
 ```
 
 ```sql
-cqlsh:example> UPDATE tasks SET finished = true WHERE id = 2;
+ycqlsh:example> UPDATE tasks SET finished = true WHERE id = 2;
 ```
 
 ```sql
-cqlsh:example> SELECT * FROM tasks;
+ycqlsh:example> SELECT * FROM tasks;
 ```
 
 ```
@@ -63,4 +64,4 @@ id | finished
 
 ## See also
 
-[Data Types](..#data-types)
+- [Data types](..#data-types)

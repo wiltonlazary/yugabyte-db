@@ -3,9 +3,10 @@
 import React, { Component } from 'react';
 import { Field, FieldArray } from 'redux-form';
 import { Row, Col, Tabs, Tab, Alert } from 'react-bootstrap';
-import { YBModal, YBInputField, YBAddRowButton, YBSelectWithLabel, YBToggle, YBCheckBox } from '../fields';
-import { isNonEmptyArray, isNonEmptyString } from 'utils/ObjectUtils';
-import { getPromiseState } from 'utils/PromiseUtils';
+import { YBModal, YBInputField, YBAddRowButton, YBSelectWithLabel, YBToggle, YBCheckBox,
+         YBRadioButtonBarWithLabel } from '../fields';
+import { isNonEmptyArray, isNonEmptyString } from '../../../../utils/ObjectUtils';
+import { getPromiseState } from '../../../../utils/PromiseUtils';
 import './RollingUpgradeForm.scss';
 import _ from 'lodash';
 import { getPrimaryCluster } from "../../../../utils/UniverseUtils";
@@ -17,7 +18,7 @@ class FlagInput extends Component {
     return (
       <Row>
         <Col lg={5}>
-          <Field name={`${item}.name`} component={YBInputField} className="input-sm" placeHolder="GFlag Name"/>
+          <Field name={`${item}.name`} component={YBInputField} className="input-sm" placeHolder="Flag Name"/>
         </Col>
         <Col lg={5}>
           <Field name={`${item}.value`} component={YBInputField} className="input-sm" placeHolder="Value"/>
@@ -152,7 +153,11 @@ export default class RollingUpgradeForm extends Component {
       return;
     }
     payload.ybSoftwareVersion = values.ybSoftwareVersion;
-    payload.rollingUpgrade = values.rollingUpgrade;
+    if (payload.taskType === "GFlags") {
+      payload.upgradeOption = values.upgradeOption;
+    } else {
+      payload.upgradeOption = values.rollingUpgrade ? "Rolling" : "Non-Rolling";
+    }
     payload.universeUUID = universeUUID;
     payload.nodePrefix = nodePrefix;
     let masterGFlagList = [];
@@ -187,13 +192,13 @@ export default class RollingUpgradeForm extends Component {
   render() {
     const self = this;
     const {onHide, modalVisible, handleSubmit, universe, modal: { visibleModal }, 
-      universe: { error }, resetRollingUpgrade, softwareVersions} = this.props;
-
+      universe: { error }, resetRollingUpgrade, softwareVersions, upgradeOption} = this.props;
     let currentVersion = null;
     if(isDefinedNotNull(universe.currentUniverse.data) && isNonEmptyObject(universe.currentUniverse.data)) {
       const primaryCluster = getPrimaryCluster(universe.currentUniverse.data.universeDetails.clusters);
       currentVersion = primaryCluster && (primaryCluster.userIntent.ybSoftwareVersion || undefined);
     }
+    let shouldEnableRollingUpgradeDelay = upgradeOption === 'Rolling';
 
     const submitAction = handleSubmit(self.setRollingUpgradeProperties);
     let title = "";
@@ -229,7 +234,7 @@ export default class RollingUpgradeForm extends Component {
         </span>
       );
     } else {
-      title = "GFlags";
+      title = "Flags";
       formBody = (
         <div>
           <Tabs defaultActiveKey={1} className="gflag-display-container" id="gflag-container" >
@@ -241,9 +246,12 @@ export default class RollingUpgradeForm extends Component {
             </Tab>
           </Tabs>
           <div className="form-right-aligned-labels top-10 time-delay-container">
-            <Field name="rollingUpgrade" component={YBToggle} label="Rolling Upgrade"/>
+            <Field name="upgradeOption" component={YBRadioButtonBarWithLabel}
+                   options={["Rolling", "Non-Rolling", "Non-Restart"]} label="Upgrade Option"
+                   initialValue="Rolling"/>
             <Field name="timeDelay" component={YBInputField}
-                   label="Rolling Upgrade Delay Between Servers (secs)" />
+                   label="Rolling Upgrade Delay Between Servers (secs)"
+                   isReadOnly={!shouldEnableRollingUpgradeDelay} />
           </div>
         </div>
       );

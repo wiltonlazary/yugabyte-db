@@ -1,8 +1,8 @@
 ---
-title: DROP OPERATOR
+title: DROP OPERATOR statement [YSQL]
+headerTitle: DROP OPERATOR
 linkTitle: DROP OPERATOR
-summary: Remove an operator
-description: DROP OPERATOR
+description: Use the DROP OPERATOR statement to remove an operator.
 menu:
   latest:
     identifier: api-ysql-commands-drop-operator
@@ -62,5 +62,4 @@ yugabyte=# DROP OPERATOR @#@ (NONE, int8);
 ## See also
 
 - [`CREATE OPERATOR`](../ddl_create_operator)
-
-[postgresql-docs-drop-operator]: https://www.postgresql.org/docs/current/sql-dropoperator.html
+- [postgresql-docs-drop-operator](https://www.postgresql.org/docs/current/sql-dropoperator.html)

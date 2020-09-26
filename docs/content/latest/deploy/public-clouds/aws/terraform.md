@@ -1,3 +1,37 @@
+---
+title: Deploy on Amazon Web Services using Terraform
+headerTitle: Amazon Web Services
+linkTitle: Amazon Web Services
+description: Deploy YugabyteDB clusters on Amazon Web Services using Terraform.
+menu:
+  latest:
+    identifier: deploy-in-aws-2-terraform
+    parent: public-clouds
+    weight: 630
+isTocNested: true
+showAsideToc: true
+---
+
+<ul class="nav nav-tabs-alt nav-tabs-yb">
+  <li >
+    <a href="/latest/deploy/public-clouds/aws/cloudformation" class="nav-link">
+      <i class="icon-shell"></i>
+      CloudFormation
+    </a>
+  </li>
+  <li >
+    <a href="/latest/deploy/public-clouds/aws/terraform" class="nav-link active">
+      <i class="icon-shell"></i>
+      Terraform
+    </a>
+  </li>
+  <li>
+    <a href="/latest/deploy/public-clouds/aws/manual-deployment" class="nav-link">
+      <i class="icon-shell"></i>
+      Manual deployment
+    </a>
+  </li>
+</ul>
 
 ## Prerequisites
 
@@ -39,7 +73,7 @@ module "yugabyte-db-cluster" {
   # The name of the cluster to be created, change as per need.
   cluster_name = "test-cluster"
 
-  # Existing custom security group to be passed so that we can connect to the instances.
+  # Existing custom security group to be passed so that you can connect to the instances.
   # Make sure this security group allows your local machine to SSH into these instances.
   custom_security_group_id="SECURITY_GROUP_HERE"
 
@@ -122,7 +156,7 @@ For cluster named `test-cluster`, this security group will be named `yb-ce-test-
 
 ## 4. [Optional] Destroy the cluster
 
-To destroy what we just created, you can run the following command.
+To destroy what you just created, you can run the following command.
 
 ```sh
 $ terraform destroy

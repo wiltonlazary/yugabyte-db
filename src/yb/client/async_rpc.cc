@@ -120,6 +120,7 @@ AsyncRpc::AsyncRpc(AsyncRpcData* data, YBConsistencyLevel yb_consistency_level)
       ops_(std::move(data->ops)),
       start_(MonoTime::Now()),
       async_rpc_metrics_(data->batcher->async_rpc_metrics()) {
+
   mutable_retrier()->mutable_controller()->set_allow_local_calls_in_curr_thread(
       data->allow_local_calls_in_curr_thread);
   if (Trace::CurrentTrace()) {
@@ -164,6 +165,9 @@ const YBTable* AsyncRpc::table() const {
 void AsyncRpc::Finished(const Status& status) {
   Status new_status = status;
   if (tablet_invoker_.Done(&new_status)) {
+    if (tablet().is_split()) {
+      ops_[0]->yb_op->MarkTablePartitionsAsStale();
+    }
     ProcessResponseFromTserver(new_status);
     batcher_->RemoveInFlightOpsAfterFlushing(ops_, new_status, MakeFlushExtraResult());
     batcher_->CheckForFinishedFlush();
@@ -265,8 +269,10 @@ void AsyncRpc::SendRpcToTserver(int attempt_num) {
 }
 
 template <class Req, class Resp>
-AsyncRpcBase<Req, Resp>::AsyncRpcBase(AsyncRpcData* data, YBConsistencyLevel consistency_level)
+AsyncRpcBase<Req, Resp>::AsyncRpcBase(AsyncRpcData* data,
+                                      YBConsistencyLevel consistency_level)
     : AsyncRpc(data, consistency_level) {
+
   req_.set_tablet_id(tablet_invoker_.tablet()->tablet_id());
   req_.set_include_trace(IsTracingEnabled());
   const ConsistentReadPoint* read_point = batcher_->read_point();
@@ -284,8 +290,11 @@ AsyncRpcBase<Req, Resp>::AsyncRpcBase(AsyncRpcData* data, YBConsistencyLevel con
       }
     }
   }
+  if (!ops_.empty()) {
+    req_.set_batch_idx(ops_.front()->batch_idx);
+  }
   auto& transaction_metadata = batcher_->transaction_metadata();
-  if (!transaction_metadata.transaction_id.is_nil()) {
+  if (!transaction_metadata.transaction_id.IsNil()) {
     SetTransactionMetadata(transaction_metadata, &req_);
     bool serializable = transaction_metadata.isolation == IsolationLevel::SERIALIZABLE_ISOLATION;
     LOG_IF(DFATAL, has_read_time && serializable)
@@ -341,7 +350,13 @@ void AsyncRpcBase<Req, Resp>::SendRpcToTserver(int attempt_num) {
 
 WriteRpc::WriteRpc(AsyncRpcData* data)
     : AsyncRpcBase(data, YBConsistencyLevel::STRONG) {
+
   TRACE_TO(trace_, "WriteRpc initiated to $0", data->tablet->tablet_id());
+
+  if (data->write_time_for_backfill_.is_valid()) {
+    req_.set_external_hybrid_time(data->write_time_for_backfill_.ToUint64());
+    ReadHybridTime::SingleTime(data->write_time_for_backfill_).ToPB(req_.mutable_read_time());
+  }
   // Add the rows
   int ctr = 0;
   for (auto& op : ops_) {
@@ -364,6 +379,9 @@ WriteRpc::WriteRpc(AsyncRpcData* data)
         CHECK_EQ(table()->table_type(), YBTableType::PGSQL_TABLE_TYPE);
         auto* pgsql_op = down_cast<YBPgsqlWriteOp*>(op->yb_op.get());
         req_.add_pgsql_write_batch()->Swap(pgsql_op->mutable_request());
+        if (pgsql_op->write_time()) {
+          req_.set_external_hybrid_time(pgsql_op->write_time().ToUint64());
+        }
         break;
       }
       case YBOperation::Type::PGSQL_READ: FALLTHROUGH_INTENDED;
@@ -561,8 +579,13 @@ void WriteRpc::ProcessResponseFromTserver(const Status& status) {
   SwapRequestsAndResponses(false);
 }
 
+bool WriteRpc::ShouldRetryExpiredRequest() {
+  return req_.min_running_request_id() == kInitializeFromMinRunning;
+}
+
 ReadRpc::ReadRpc(AsyncRpcData* data, YBConsistencyLevel yb_consistency_level)
     : AsyncRpcBase(data, yb_consistency_level) {
+
   TRACE_TO(trace_, "ReadRpc initiated to $0", data->tablet->tablet_id());
   req_.set_consistency_level(yb_consistency_level);
   req_.set_proxy_uuid(data->batcher->proxy_uuid());

@@ -18,10 +18,12 @@
 
 #include "yb/yql/pggate/pggate.h"
 #include "yb/yql/pggate/pggate_flags.h"
+#include "yb/yql/pggate/pg_memctx.h"
 #include "yb/yql/pggate/pg_ddl.h"
 #include "yb/yql/pggate/pg_insert.h"
 #include "yb/yql/pggate/pg_update.h"
 #include "yb/yql/pggate/pg_delete.h"
+#include "yb/yql/pggate/pg_truncate_colocated.h"
 #include "yb/yql/pggate/pg_select.h"
 #include "yb/yql/pggate/pg_txn_manager.h"
 #include "yb/yql/pggate/ybc_pggate.h"
@@ -77,7 +79,7 @@ Result<PgApiImpl::MessengerHolder> BuildMessenger(
 
 std::unique_ptr<tserver::TServerSharedObject> InitTServerSharedObject() {
   // Do not use shared memory in initdb or if explicity set to be ignored.
-  if (YBCIsInitDbModeEnvVarSet() || FLAGS_pggate_ignore_tserver_shm ||
+  if (YBCIsInitDbModeEnvVarSet() || FLAGS_TEST_pggate_ignore_tserver_shm ||
       FLAGS_pggate_tserver_shm_fd == -1) {
     return nullptr;
   }
@@ -92,9 +94,8 @@ using client::YBSession;
 
 //--------------------------------------------------------------------------------------------------
 
-PggateOptions::PggateOptions() {
+PggateOptions::PggateOptions() : ServerBaseOptions(kDefaultPort) {
   server_type = "tserver";
-  rpc_opts.default_port = kDefaultPort;
   rpc_opts.connection_keepalive_time_ms = FLAGS_pgsql_rpc_keepalive_time_ms;
 
   if (FLAGS_pggate_proxy_bind_address.empty()) {
@@ -118,7 +119,7 @@ PggateOptions::PggateOptions() {
 
 //--------------------------------------------------------------------------------------------------
 
-PgApiImpl::PgApiImpl(const YBCPgTypeEntity *YBCDataTypeArray, int count)
+PgApiImpl::PgApiImpl(const YBCPgTypeEntity *YBCDataTypeArray, int count, YBCPgCallbacks callbacks)
     : metric_registry_(new MetricRegistry()),
       metric_entity_(METRIC_ENTITY_server.Instantiate(metric_registry_.get(), "yb.pggate")),
       mem_tracker_(MemTracker::CreateTracker("PostgreSQL")),
@@ -136,7 +137,8 @@ PgApiImpl::PgApiImpl(const YBCPgTypeEntity *YBCDataTypeArray, int count)
                          messenger_holder_.messenger.get()),
       clock_(new server::HybridClock()),
       tserver_shared_object_(InitTServerSharedObject()),
-      pg_txn_manager_(new PgTxnManager(&async_client_init_, clock_, tserver_shared_object_.get())) {
+      pg_txn_manager_(new PgTxnManager(&async_client_init_, clock_, tserver_shared_object_.get())),
+      pg_callbacks_(callbacks) {
   CHECK_OK(clock_->Init());
 
   // Setup type mapping.
@@ -150,6 +152,7 @@ PgApiImpl::PgApiImpl(const YBCPgTypeEntity *YBCDataTypeArray, int count)
 
 PgApiImpl::~PgApiImpl() {
   messenger_holder_.messenger->Shutdown();
+  async_client_init_.client()->Shutdown();
 }
 
 const YBCPgTypeEntity *PgApiImpl::FindTypeEntity(int type_oid) {
@@ -177,8 +180,12 @@ Status PgApiImpl::DestroyEnv(PgEnv *pg_env) {
 Status PgApiImpl::InitSession(const PgEnv *pg_env,
                               const string& database_name) {
   CHECK(!pg_session_);
-  auto session = make_scoped_refptr<PgSession>(
-      client(), database_name, pg_txn_manager_, clock_, tserver_shared_object_.get());
+  auto session = make_scoped_refptr<PgSession>(client(),
+                                               database_name,
+                                               pg_txn_manager_,
+                                               clock_,
+                                               tserver_shared_object_.get(),
+                                               pg_callbacks_);
   if (!database_name.empty()) {
     RETURN_NOT_OK(session->ConnectDatabase(database_name));
   }
@@ -189,6 +196,60 @@ Status PgApiImpl::InitSession(const PgEnv *pg_env,
 
 Status PgApiImpl::InvalidateCache() {
   pg_session_->InvalidateCache();
+  return Status::OK();
+}
+
+const bool PgApiImpl::GetDisableTransparentCacheRefreshRetry() {
+  return FLAGS_TEST_ysql_disable_transparent_cache_refresh_retry;
+}
+
+//--------------------------------------------------------------------------------------------------
+
+PgMemctx *PgApiImpl::CreateMemctx() {
+  // Postgres will create YB Memctx when it first use the Memctx to allocate YugaByte object.
+  return PgMemctx::Create();
+}
+
+Status PgApiImpl::DestroyMemctx(PgMemctx *memctx) {
+  // Postgres will destroy YB Memctx by releasing the pointer.
+  return PgMemctx::Destroy(memctx);
+}
+
+Status PgApiImpl::ResetMemctx(PgMemctx *memctx) {
+  // Postgres reset YB Memctx when clearing a context content without clearing its nested context.
+  return PgMemctx::Reset(memctx);
+}
+
+// TODO(neil) Use Arena in the future.
+// - PgStatement should have been declared as derived class of "MCBase".
+// - All objects of PgStatement's derived class should be allocated by YbPgMemctx::Arena.
+// - We cannot use Arena yet because quite a large number of YugaByte objects are being referenced
+//   from other layers.  Those added code violated the original design as they assume ScopedPtr
+//   instead of memory pool is being used. This mess should be cleaned up later.
+//
+// For now, statements is allocated as ScopedPtr and cached in the memory context. The statements
+// would then be destructed when the context is destroyed and all other references are also cleared.
+Status PgApiImpl::AddToCurrentPgMemctx(std::unique_ptr<PgStatement> stmt,
+                                       PgStatement **handle) {
+  *handle = stmt.get();
+  pg_callbacks_.GetCurrentYbMemctx()->Register(stmt.release());
+  return Status::OK();
+}
+
+// TODO(neil) Most like we don't need table_desc. If we do need it, use Arena here.
+// - PgTableDesc should have been declared as derived class of "MCBase".
+// - PgTableDesc objects should be allocated by YbPgMemctx::Arena.
+//
+// For now, table_desc is allocated as ScopedPtr and cached in the memory context. The table_desc
+// would then be destructed when the context is destroyed.
+Status PgApiImpl::AddToCurrentPgMemctx(size_t table_desc_id,
+                                       const PgTableDesc::ScopedRefPtr &table_desc) {
+  pg_callbacks_.GetCurrentYbMemctx()->Cache(table_desc_id, table_desc);
+  return Status::OK();
+}
+
+Status PgApiImpl::GetTabledescFromCurrentPgMemctx(size_t table_desc_id, PgTableDesc **handle) {
+  pg_callbacks_.GetCurrentYbMemctx()->GetCache(table_desc_id, handle);
   return Status::OK();
 }
 
@@ -246,11 +307,10 @@ Status PgApiImpl::DeleteSequenceTuple(int64_t db_oid, int64_t seq_oid) {
 
 //--------------------------------------------------------------------------------------------------
 
-Status PgApiImpl::DeleteStatement(PgStatement *handle) {
+void PgApiImpl::DeleteStatement(PgStatement *handle) {
   if (handle) {
-    handle->Release();
+    PgMemctx::Destroy(handle);
   }
-  return Status::OK();
 }
 
 Status PgApiImpl::ClearBinds(PgStatement *handle) {
@@ -263,15 +323,19 @@ Status PgApiImpl::ConnectDatabase(const char *database_name) {
   return pg_session_->ConnectDatabase(database_name);
 }
 
+Status PgApiImpl::IsDatabaseColocated(const PgOid database_oid, bool *colocated) {
+  return pg_session_->IsDatabaseColocated(database_oid, colocated);
+}
+
 Status PgApiImpl::NewCreateDatabase(const char *database_name,
                                     const PgOid database_oid,
                                     const PgOid source_database_oid,
                                     const PgOid next_oid,
                                     const bool colocated,
                                     PgStatement **handle) {
-  auto stmt = make_scoped_refptr<PgCreateDatabase>(pg_session_, database_name, database_oid,
-                                                   source_database_oid, next_oid, colocated);
-  *handle = stmt.detach();
+  auto stmt = std::make_unique<PgCreateDatabase>(pg_session_, database_name, database_oid,
+                                                 source_database_oid, next_oid, colocated);
+  RETURN_NOT_OK(AddToCurrentPgMemctx(std::move(stmt), handle));
   return Status::OK();
 }
 
@@ -287,8 +351,8 @@ Status PgApiImpl::ExecCreateDatabase(PgStatement *handle) {
 Status PgApiImpl::NewDropDatabase(const char *database_name,
                                   PgOid database_oid,
                                   PgStatement **handle) {
-  auto stmt = make_scoped_refptr<PgDropDatabase>(pg_session_, database_name, database_oid);
-  *handle = stmt.detach();
+  auto stmt = std::make_unique<PgDropDatabase>(pg_session_, database_name, database_oid);
+  RETURN_NOT_OK(AddToCurrentPgMemctx(std::move(stmt), handle));
   return Status::OK();
 }
 
@@ -303,8 +367,8 @@ Status PgApiImpl::ExecDropDatabase(PgStatement *handle) {
 Status PgApiImpl::NewAlterDatabase(const char *database_name,
                                   PgOid database_oid,
                                   PgStatement **handle) {
-  auto stmt = make_scoped_refptr<PgAlterDatabase>(pg_session_, database_name, database_oid);
-  *handle = stmt.detach();
+  auto stmt = std::make_unique<PgAlterDatabase>(pg_session_, database_name, database_oid);
+  RETURN_NOT_OK(AddToCurrentPgMemctx(std::move(stmt), handle));
   return Status::OK();
 }
 
@@ -336,6 +400,53 @@ Status PgApiImpl::GetCatalogMasterVersion(uint64_t *version) {
   return pg_session_->GetCatalogMasterVersion(version);
 }
 
+Result<PgTableDesc::ScopedRefPtr> PgApiImpl::LoadTable(const PgObjectId& table_id) {
+  return pg_session_->LoadTable(table_id);
+}
+
+void PgApiImpl::InvalidateTableCache(const PgObjectId& table_id) {
+  pg_session_->InvalidateTableCache(table_id);
+}
+
+//--------------------------------------------------------------------------------------------------
+
+Status PgApiImpl::NewCreateTablegroup(const char *database_name,
+                                      const PgOid database_oid,
+                                      const PgOid tablegroup_oid,
+                                      PgStatement **handle) {
+  auto stmt = std::make_unique<PgCreateTablegroup>(pg_session_, database_name,
+                                                   database_oid, tablegroup_oid);
+  RETURN_NOT_OK(AddToCurrentPgMemctx(std::move(stmt), handle));
+  return Status::OK();
+}
+
+Status PgApiImpl::ExecCreateTablegroup(PgStatement *handle) {
+  if (!PgStatement::IsValidStmt(handle, StmtOp::STMT_CREATE_TABLEGROUP)) {
+    // Invalid handle.
+    return STATUS(InvalidArgument, "Invalid statement handle");
+  }
+
+  return down_cast<PgCreateTablegroup*>(handle)->Exec();
+}
+
+Status PgApiImpl::NewDropTablegroup(const PgOid database_oid,
+                                    const PgOid tablegroup_oid,
+                                    PgStatement **handle) {
+  auto stmt = std::make_unique<PgDropTablegroup>(pg_session_, database_oid, tablegroup_oid);
+  RETURN_NOT_OK(AddToCurrentPgMemctx(std::move(stmt), handle));
+  return Status::OK();
+}
+
+
+Status PgApiImpl::ExecDropTablegroup(PgStatement *handle) {
+  if (!PgStatement::IsValidStmt(handle, StmtOp::STMT_DROP_TABLEGROUP)) {
+    // Invalid handle.
+    return STATUS(InvalidArgument, "Invalid statement handle");
+  }
+  return down_cast<PgDropTablegroup*>(handle)->Exec();
+}
+
+
 //--------------------------------------------------------------------------------------------------
 
 Status PgApiImpl::NewCreateTable(const char *database_name,
@@ -345,11 +456,13 @@ Status PgApiImpl::NewCreateTable(const char *database_name,
                                  bool is_shared_table,
                                  bool if_not_exist,
                                  bool add_primary_key,
+                                 const bool colocated,
+                                 const PgObjectId& tablegroup_oid,
                                  PgStatement **handle) {
-  auto stmt = make_scoped_refptr<PgCreateTable>(
+  auto stmt = std::make_unique<PgCreateTable>(
       pg_session_, database_name, schema_name, table_name,
-      table_id, is_shared_table, if_not_exist, add_primary_key);
-  *handle = stmt.detach();
+      table_id, is_shared_table, if_not_exist, add_primary_key, colocated, tablegroup_oid);
+  RETURN_NOT_OK(AddToCurrentPgMemctx(std::move(stmt), handle));
   return Status::OK();
 }
 
@@ -373,13 +486,13 @@ Status PgApiImpl::CreateTableSetNumTablets(PgStatement *handle, int32_t num_tabl
   return down_cast<PgCreateTable*>(handle)->SetNumTablets(num_tablets);
 }
 
-Status PgApiImpl::CreateTableSetColocated(PgStatement *handle, bool colocated) {
+Status PgApiImpl::CreateTableAddSplitRow(PgStatement *handle, int num_cols,
+                                           YBCPgTypeEntity **types, uint64_t *data) {
   if (!PgStatement::IsValidStmt(handle, StmtOp::STMT_CREATE_TABLE)) {
     // Invalid handle.
     return STATUS(InvalidArgument, "Invalid statement handle");
   }
-  down_cast<PgCreateTable*>(handle)->SetColocated(colocated);
-  return Status::OK();
+  return down_cast<PgCreateTable*>(handle)->AddSplitRow(num_cols, types, data);
 }
 
 Status PgApiImpl::ExecCreateTable(PgStatement *handle) {
@@ -392,8 +505,8 @@ Status PgApiImpl::ExecCreateTable(PgStatement *handle) {
 
 Status PgApiImpl::NewAlterTable(const PgObjectId& table_id,
                                 PgStatement **handle) {
-  auto stmt = make_scoped_refptr<PgAlterTable>(pg_session_, table_id);
-  *handle = stmt.detach();
+  auto stmt = std::make_unique<PgAlterTable>(pg_session_, table_id);
+  RETURN_NOT_OK(AddToCurrentPgMemctx(std::move(stmt), handle));
   return Status::OK();
 }
 
@@ -453,8 +566,8 @@ Status PgApiImpl::ExecAlterTable(PgStatement *handle) {
 Status PgApiImpl::NewDropTable(const PgObjectId& table_id,
                                bool if_exist,
                                PgStatement **handle) {
-  auto stmt = make_scoped_refptr<PgDropTable>(pg_session_, table_id, if_exist);
-  *handle = stmt.detach();
+  auto stmt = std::make_unique<PgDropTable>(pg_session_, table_id, if_exist);
+  RETURN_NOT_OK(AddToCurrentPgMemctx(std::move(stmt), handle));
   return Status::OK();
 }
 
@@ -468,8 +581,8 @@ Status PgApiImpl::ExecDropTable(PgStatement *handle) {
 
 Status PgApiImpl::NewTruncateTable(const PgObjectId& table_id,
                                    PgStatement **handle) {
-  auto stmt = make_scoped_refptr<PgTruncateTable>(pg_session_, table_id);
-  *handle = stmt.detach();
+  auto stmt = std::make_unique<PgTruncateTable>(pg_session_, table_id);
+  RETURN_NOT_OK(AddToCurrentPgMemctx(std::move(stmt), handle));
   return Status::OK();
 }
 
@@ -483,17 +596,19 @@ Status PgApiImpl::ExecTruncateTable(PgStatement *handle) {
 
 Status PgApiImpl::GetTableDesc(const PgObjectId& table_id,
                                PgTableDesc **handle) {
-  PgTableDesc::ScopedRefPtr table;
-  auto result = pg_session_->LoadTable(table_id);
-  RETURN_NOT_OK(result);
-  *handle = (*result).detach();
-  return Status::OK();
-}
+  // First read from memory context.
+  size_t hash_id = hash_value(table_id);
+  RETURN_NOT_OK(GetTabledescFromCurrentPgMemctx(hash_id, handle));
 
-Status PgApiImpl::DeleteTableDesc(PgTableDesc *handle) {
-  if (handle) {
-    handle->Release();
+  // Read from environment.
+  if (*handle == nullptr) {
+    auto result = pg_session_->LoadTable(table_id);
+    RETURN_NOT_OK(result);
+    RETURN_NOT_OK(AddToCurrentPgMemctx(hash_id, *result));
+
+    *handle = result->get();
   }
+
   return Status::OK();
 }
 
@@ -569,13 +684,14 @@ Status PgApiImpl::NewCreateIndex(const char *database_name,
                                  const PgObjectId& base_table_id,
                                  bool is_shared_index,
                                  bool is_unique_index,
+                                 const bool skip_index_backfill,
                                  bool if_not_exist,
-                                 bool colocated,
+                                 const PgObjectId& tablegroup_oid,
                                  PgStatement **handle) {
-  auto stmt = make_scoped_refptr<PgCreateIndex>(
+  auto stmt = std::make_unique<PgCreateIndex>(
       pg_session_, database_name, schema_name, index_name, index_id, base_table_id,
-      is_shared_index, is_unique_index, if_not_exist, colocated);
-  *handle = stmt.detach();
+      is_shared_index, is_unique_index, skip_index_backfill, if_not_exist, tablegroup_oid);
+  RETURN_NOT_OK(AddToCurrentPgMemctx(std::move(stmt), handle));
   return Status::OK();
 }
 
@@ -592,6 +708,21 @@ Status PgApiImpl::CreateIndexAddColumn(PgStatement *handle, const char *attr_nam
       is_hash, is_range, is_desc, is_nulls_first);
 }
 
+Status PgApiImpl::CreateIndexSetNumTablets(PgStatement *handle, int32_t num_tablets) {
+  SCHECK(PgStatement::IsValidStmt(handle, StmtOp::STMT_CREATE_INDEX),
+         InvalidArgument,
+         "Invalid statement handle");
+  return down_cast<PgCreateIndex*>(handle)->SetNumTablets(num_tablets);
+}
+
+Status PgApiImpl::CreateIndexAddSplitRow(PgStatement *handle, int num_cols,
+                                         YBCPgTypeEntity **types, uint64_t *data) {
+  SCHECK(PgStatement::IsValidStmt(handle, StmtOp::STMT_CREATE_INDEX),
+      InvalidArgument,
+      "Invalid statement handle");
+  return down_cast<PgCreateIndex*>(handle)->AddSplitRow(num_cols, types, data);
+}
+
 Status PgApiImpl::ExecCreateIndex(PgStatement *handle) {
   if (!PgStatement::IsValidStmt(handle, StmtOp::STMT_CREATE_INDEX)) {
     // Invalid handle.
@@ -603,8 +734,8 @@ Status PgApiImpl::ExecCreateIndex(PgStatement *handle) {
 Status PgApiImpl::NewDropIndex(const PgObjectId& index_id,
                                bool if_exist,
                                PgStatement **handle) {
-  auto stmt = make_scoped_refptr<PgDropIndex>(pg_session_, index_id, if_exist);
-  *handle = stmt.detach();
+  auto stmt = std::make_unique<PgDropIndex>(pg_session_, index_id, if_exist);
+  RETURN_NOT_OK(AddToCurrentPgMemctx(std::move(stmt), handle));
   return Status::OK();
 }
 
@@ -614,6 +745,20 @@ Status PgApiImpl::ExecDropIndex(PgStatement *handle) {
     return STATUS(InvalidArgument, "Invalid statement handle");
   }
   return down_cast<PgDropIndex*>(handle)->Exec();
+}
+
+Result<IndexPermissions> PgApiImpl::WaitUntilIndexPermissionsAtLeast(
+    const PgObjectId& table_id,
+    const PgObjectId& index_id,
+    const IndexPermissions& target_index_permissions) {
+  return pg_session_->WaitUntilIndexPermissionsAtLeast(
+      table_id,
+      index_id,
+      target_index_permissions);
+}
+
+Status PgApiImpl::AsyncUpdateIndexPermissions(const PgObjectId& indexed_table_id) {
+  return pg_session_->AsyncUpdateIndexPermissions(indexed_table_id);
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -631,25 +776,21 @@ Status PgApiImpl::DmlBindColumn(PgStatement *handle, int attr_num, PgExpr *attr_
 }
 
 Status PgApiImpl::DmlBindColumnCondEq(PgStatement *handle, int attr_num, PgExpr *attr_value) {
-  return down_cast<PgSelect*>(handle)->BindColumnCondEq(attr_num, attr_value);
+  return down_cast<PgDmlRead*>(handle)->BindColumnCondEq(attr_num, attr_value);
 }
 
 Status PgApiImpl::DmlBindColumnCondBetween(PgStatement *handle, int attr_num, PgExpr *attr_value,
     PgExpr *attr_value_end) {
-  return down_cast<PgSelect*>(handle)->BindColumnCondBetween(attr_num, attr_value, attr_value_end);
+  return down_cast<PgDmlRead*>(handle)->BindColumnCondBetween(attr_num, attr_value, attr_value_end);
 }
 
 Status PgApiImpl::DmlBindColumnCondIn(PgStatement *handle, int attr_num, int n_attr_values,
     PgExpr **attr_values) {
-  return down_cast<PgSelect*>(handle)->BindColumnCondIn(attr_num, n_attr_values, attr_values);
+  return down_cast<PgDmlRead*>(handle)->BindColumnCondIn(attr_num, n_attr_values, attr_values);
 }
 
-Status PgApiImpl::DmlBindIndexColumn(PgStatement *handle, int attr_num, PgExpr *attr_value) {
-  if (!PgStatement::IsValidStmt(handle, StmtOp::STMT_SELECT)) {
-    // Invalid handle.
-    return STATUS(InvalidArgument, "Invalid statement handle");
-  }
-  return down_cast<PgSelect*>(handle)->BindIndexColumn(attr_num, attr_value);
+Status PgApiImpl::DmlBindTable(PgStatement *handle) {
+  return down_cast<PgDml*>(handle)->BindTable();
 }
 
 CHECKED_STATUS PgApiImpl::DmlAssignColumn(PgStatement *handle, int attr_num, PgExpr *attr_value) {
@@ -669,12 +810,24 @@ Status PgApiImpl::DmlBuildYBTupleId(PgStatement *handle, const PgAttrValueDescri
   return Status::OK();
 }
 
-Status PgApiImpl::StartBufferingWriteOperations() {
-  return pg_session_->StartBufferingWriteOperations();
+void PgApiImpl::StartOperationsBuffering() {
+  pg_session_->StartOperationsBuffering();
 }
 
-Status PgApiImpl::FlushBufferedWriteOperations() {
-  return pg_session_->FlushBufferedWriteOperations();
+Status PgApiImpl::StopOperationsBuffering() {
+  return pg_session_->StopOperationsBuffering();
+}
+
+Status PgApiImpl::ResetOperationsBuffering() {
+  return pg_session_->ResetOperationsBuffering();
+}
+
+Status PgApiImpl::FlushBufferedOperations() {
+  return pg_session_->FlushBufferedOperations();
+}
+
+void PgApiImpl::DropBufferedOperations() {
+  pg_session_->DropBufferedOperations();
 }
 
 Status PgApiImpl::DmlExecWriteOp(PgStatement *handle, int32_t *rows_affected_count) {
@@ -682,12 +835,14 @@ Status PgApiImpl::DmlExecWriteOp(PgStatement *handle, int32_t *rows_affected_cou
     case StmtOp::STMT_INSERT:
     case StmtOp::STMT_UPDATE:
     case StmtOp::STMT_DELETE:
+    case StmtOp::STMT_TRUNCATE:
       {
-        Status status = down_cast<PgDmlWrite *>(handle)->Exec();
+        auto dml_write = down_cast<PgDmlWrite *>(handle);
+        RETURN_NOT_OK(dml_write->Exec(rows_affected_count != nullptr /* force_non_bufferable */));
         if (rows_affected_count) {
-          *rows_affected_count = down_cast<PgDmlWrite *>(handle)->GetRowsAffectedCount();
+          *rows_affected_count = dml_write->GetRowsAffectedCount();
         }
-        return status;
+        return Status::OK();
       }
     default:
       break;
@@ -701,9 +856,9 @@ Status PgApiImpl::NewInsert(const PgObjectId& table_id,
                             const bool is_single_row_txn,
                             PgStatement **handle) {
   *handle = nullptr;
-  auto stmt = make_scoped_refptr<PgInsert>(pg_session_, table_id, is_single_row_txn);
+  auto stmt = std::make_unique<PgInsert>(pg_session_, table_id, is_single_row_txn);
   RETURN_NOT_OK(stmt->Prepare());
-  *handle = stmt.detach();
+  RETURN_NOT_OK(AddToCurrentPgMemctx(std::move(stmt), handle));
   return Status::OK();
 }
 
@@ -715,15 +870,34 @@ Status PgApiImpl::ExecInsert(PgStatement *handle) {
   return down_cast<PgInsert*>(handle)->Exec();
 }
 
+Status PgApiImpl::InsertStmtSetUpsertMode(PgStatement *handle) {
+  if (!PgStatement::IsValidStmt(handle, StmtOp::STMT_INSERT)) {
+    // Invalid handle.
+    return STATUS(InvalidArgument, "Invalid statement handle");
+  }
+  down_cast<PgInsert*>(handle)->SetUpsertMode();
+
+  return Status::OK();
+}
+
+Status PgApiImpl::InsertStmtSetWriteTime(PgStatement *handle, const HybridTime write_time) {
+  if (!PgStatement::IsValidStmt(handle, StmtOp::STMT_INSERT)) {
+    // Invalid handle.
+    return STATUS(InvalidArgument, "Invalid statement handle");
+  }
+  RETURN_NOT_OK(down_cast<PgInsert*>(handle)->SetWriteTime(write_time));
+  return Status::OK();
+}
+
 // Update ------------------------------------------------------------------------------------------
 
 Status PgApiImpl::NewUpdate(const PgObjectId& table_id,
                             const bool is_single_row_txn,
                             PgStatement **handle) {
   *handle = nullptr;
-  auto stmt = make_scoped_refptr<PgUpdate>(pg_session_, table_id, is_single_row_txn);
+  auto stmt = std::make_unique<PgUpdate>(pg_session_, table_id, is_single_row_txn);
   RETURN_NOT_OK(stmt->Prepare());
-  *handle = stmt.detach();
+  RETURN_NOT_OK(AddToCurrentPgMemctx(std::move(stmt), handle));
   return Status::OK();
 }
 
@@ -741,9 +915,9 @@ Status PgApiImpl::NewDelete(const PgObjectId& table_id,
                             const bool is_single_row_txn,
                             PgStatement **handle) {
   *handle = nullptr;
-  auto stmt = make_scoped_refptr<PgDelete>(pg_session_, table_id, is_single_row_txn);
+  auto stmt = std::make_unique<PgDelete>(pg_session_, table_id, is_single_row_txn);
   RETURN_NOT_OK(stmt->Prepare());
-  *handle = stmt.detach();
+  RETURN_NOT_OK(AddToCurrentPgMemctx(std::move(stmt), handle));
   return Status::OK();
 }
 
@@ -755,18 +929,52 @@ Status PgApiImpl::ExecDelete(PgStatement *handle) {
   return down_cast<PgDelete*>(handle)->Exec();
 }
 
+// Colocated Truncate ------------------------------------------------------------------------------
+
+Status PgApiImpl::NewTruncateColocated(const PgObjectId& table_id,
+                                       const bool is_single_row_txn,
+                                       PgStatement **handle) {
+  *handle = nullptr;
+  auto stmt = std::make_unique<PgTruncateColocated>(pg_session_, table_id, is_single_row_txn);
+  RETURN_NOT_OK(stmt->Prepare());
+  RETURN_NOT_OK(AddToCurrentPgMemctx(std::move(stmt), handle));
+  return Status::OK();
+}
+
+Status PgApiImpl::ExecTruncateColocated(PgStatement *handle) {
+  if (!PgStatement::IsValidStmt(handle, StmtOp::STMT_TRUNCATE)) {
+    // Invalid handle.
+    return STATUS(InvalidArgument, "Invalid statement handle");
+  }
+  return down_cast<PgTruncateColocated*>(handle)->Exec();
+}
+
 // Select ------------------------------------------------------------------------------------------
 
 Status PgApiImpl::NewSelect(const PgObjectId& table_id,
                             const PgObjectId& index_id,
+                            const PgPrepareParameters *prepare_params,
                             PgStatement **handle) {
+  // Scenarios:
+  // - Sequential Scan: PgSelect to read from table_id.
+  // - Primary Scan: PgSelect from table_id. YugaByte does not have separate table for primary key.
+  // - Index-Only-Scan: PgSelectIndex directly from secondary index_id.
+  // - IndexScan: Use PgSelectIndex to read from index_id and then PgSelect to read from table_id.
+  //     Note that for SysTable, only one request is send for both table_id and index_id.
   *handle = nullptr;
-  auto stmt = make_scoped_refptr<PgSelect>(pg_session_, table_id);
-  if (index_id.IsValid()) {
-    stmt->UseIndex(index_id);
+  std::unique_ptr<PgDmlRead> stmt;
+  if (prepare_params && prepare_params->index_only_scan && prepare_params->use_secondary_index) {
+    if (!index_id.IsValid()) {
+      return STATUS(InvalidArgument, "Cannot run query with invalid index ID");
+    }
+    stmt = std::make_unique<PgSelectIndex>(pg_session_, table_id, index_id, prepare_params);
+  } else {
+    // For IndexScan PgSelect processing will create subquery PgSelectIndex.
+    stmt = std::make_unique<PgSelect>(pg_session_, table_id, index_id, prepare_params);
   }
+
   RETURN_NOT_OK(stmt->Prepare());
-  *handle = stmt.detach();
+  RETURN_NOT_OK(AddToCurrentPgMemctx(std::move(stmt), handle));
   return Status::OK();
 }
 
@@ -775,7 +983,7 @@ Status PgApiImpl::SetForwardScan(PgStatement *handle, bool is_forward_scan) {
     // Invalid handle.
     return STATUS(InvalidArgument, "Invalid statement handle");
   }
-  down_cast<PgSelect*>(handle)->SetForwardScan(is_forward_scan);
+  down_cast<PgDmlRead*>(handle)->SetForwardScan(is_forward_scan);
   return Status::OK();
 }
 
@@ -784,7 +992,7 @@ Status PgApiImpl::ExecSelect(PgStatement *handle, const PgExecParameters *exec_p
     // Invalid handle.
     return STATUS(InvalidArgument, "Invalid statement handle");
   }
-  return down_cast<PgSelect*>(handle)->Exec(exec_params);
+  return down_cast<PgDmlRead*>(handle)->Exec(exec_params);
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -890,6 +1098,80 @@ Result<uint64_t> PgApiImpl::GetSharedCatalogVersion() {
   return pg_session_->GetSharedCatalogVersion();
 }
 
+// Transaction Control -----------------------------------------------------------------------------
+Status PgApiImpl::BeginTransaction() {
+  pg_session_->InvalidateForeignKeyReferenceCache();
+  return pg_txn_manager_->BeginTransaction();
+}
+
+Status PgApiImpl::RecreateTransaction() {
+  pg_session_->InvalidateForeignKeyReferenceCache();
+  return pg_txn_manager_->RecreateTransaction();
+}
+
+Status PgApiImpl::RestartTransaction() {
+  pg_session_->InvalidateForeignKeyReferenceCache();
+  return pg_txn_manager_->RestartTransaction();
+}
+
+Status PgApiImpl::CommitTransaction() {
+  pg_session_->InvalidateForeignKeyReferenceCache();
+  return pg_txn_manager_->CommitTransaction();
+}
+
+Status PgApiImpl::AbortTransaction() {
+  pg_session_->InvalidateForeignKeyReferenceCache();
+  return pg_txn_manager_->AbortTransaction();
+}
+
+Status PgApiImpl::SetTransactionIsolationLevel(int isolation) {
+  return pg_txn_manager_->SetIsolationLevel(isolation);
+}
+
+Status PgApiImpl::SetTransactionReadOnly(bool read_only) {
+  return pg_txn_manager_->SetReadOnly(read_only);
+}
+
+Status PgApiImpl::SetTransactionDeferrable(bool deferrable) {
+  return pg_txn_manager_->SetDeferrable(deferrable);
+}
+
+Status PgApiImpl::EnterSeparateDdlTxnMode() {
+  // Flush all buffered operations as ddl txn use its own transaction session.
+  RETURN_NOT_OK(pg_session_->FlushBufferedOperations());
+  return pg_txn_manager_->EnterSeparateDdlTxnMode();
+}
+
+Status PgApiImpl::ExitSeparateDdlTxnMode(bool success) {
+  // Flush all buffered operations as ddl txn use its own transaction session.
+  if (success) {
+    RETURN_NOT_OK(pg_session_->FlushBufferedOperations());
+  } else {
+    pg_session_->DropBufferedOperations();
+  }
+
+  return pg_txn_manager_->ExitSeparateDdlTxnMode(success);
+}
+
+bool PgApiImpl::ForeignKeyReferenceExists(YBCPgOid table_id, std::string&& ybctid) {
+  return pg_session_->ForeignKeyReferenceExists(table_id, std::move(ybctid));
+}
+
+Status PgApiImpl::CacheForeignKeyReference(YBCPgOid table_id, std::string&& ybctid) {
+  return pg_session_->CacheForeignKeyReference(table_id, std::move(ybctid));
+}
+
+Status PgApiImpl::DeleteForeignKeyReference(YBCPgOid table_id, std::string&& ybctid) {
+  return pg_session_->DeleteForeignKeyReference(table_id, std::move(ybctid));
+}
+
+void PgApiImpl::ClearForeignKeyReferenceCache() {
+  pg_session_->InvalidateForeignKeyReferenceCache();
+}
+
+void PgApiImpl::SetTimeout(const int timeout_ms) {
+  pg_session_->SetTimeout(timeout_ms);
+}
 
 } // namespace pggate
 } // namespace yb

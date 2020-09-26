@@ -16,6 +16,8 @@
 #include "yb/rocksdb/port/stack_trace.h"
 #include "yb/rocksdb/perf_context.h"
 
+#include "yb/util/format.h"
+
 namespace rocksdb {
 
 // DB tests related to bloom filter.
@@ -23,6 +25,18 @@ namespace rocksdb {
 class DBBloomFilterTest : public DBTestBase {
  public:
   DBBloomFilterTest() : DBTestBase("/db_bloom_filter_test") {}
+
+  typedef std::function<const FilterPolicy*()> FilterPolicyCreator;
+  // Creates SST files with num_unique_keys using filter policy provided by write_policy_creator.
+  // Then tries to read created files using filter policy provided by new_policy_creator as main
+  // filter policy while having filter policy provided by write_policy_creator inside
+  // BlockBasedTableOptions::supported_filter_policies.
+  // Checks that keys could be read and bloom filter is checked during reads.
+  // Uses options for RocksDB.
+  // should_be_useful specifies whether bloom filter is expected to be useful.
+  void CheckOtherFilterPoliciesSupport(
+      Options* options, const int num_unique_keys, FilterPolicyCreator write_policy_creator,
+      FilterPolicyCreator new_policy_creator, bool should_be_useful);
 };
 
 // KeyMayExist can lead to a few false positives, but not false negatives.
@@ -75,8 +89,8 @@ TEST_F(DBBloomFilterTest, KeyMayExist) {
               TestGetTickerCount(options, BLOCK_CACHE_MULTI_TOUCH_ADD));
 
     ASSERT_OK(Flush(1));
-    dbfull()->TEST_CompactRange(0, nullptr, nullptr, handles_[1],
-        true /* disallow trivial move */);
+    ASSERT_OK(dbfull()->TEST_CompactRange(
+        0, nullptr, nullptr, handles_[1], true /* disallow trivial move */));
 
     numopen = TestGetTickerCount(options, NO_FILE_OPENS);
     cache_added = TestGetTickerCount(options, BLOCK_CACHE_ADD);
@@ -116,20 +130,20 @@ TEST_F(DBBloomFilterTest, FilterDeletes) {
     WriteBatch batch;
 
     batch.Delete(handles_[1], "a");
-    dbfull()->Write(WriteOptions(), &batch);
+    ASSERT_OK(dbfull()->Write(WriteOptions(), &batch));
     ASSERT_EQ(AllEntriesFor("a", 1), "[ ]");  // Delete skipped
     batch.Clear();
 
     batch.Put(handles_[1], "a", "b");
     batch.Delete(handles_[1], "a");
-    dbfull()->Write(WriteOptions(), &batch);
+    ASSERT_OK(dbfull()->Write(WriteOptions(), &batch));
     ASSERT_EQ(Get(1, "a"), "NOT_FOUND");
     ASSERT_EQ(AllEntriesFor("a", 1), "[ DEL, b ]");  // Delete issued
     batch.Clear();
 
     batch.Delete(handles_[1], "c");
     batch.Put(handles_[1], "c", "d");
-    dbfull()->Write(WriteOptions(), &batch);
+    ASSERT_OK(dbfull()->Write(WriteOptions(), &batch));
     ASSERT_EQ(Get(1, "c"), "d");
     ASSERT_EQ(AllEntriesFor("c", 1), "[ d ]");  // Delete skipped
     batch.Clear();
@@ -137,7 +151,7 @@ TEST_F(DBBloomFilterTest, FilterDeletes) {
     ASSERT_OK(Flush(1));  // A stray Flush
 
     batch.Delete(handles_[1], "c");
-    dbfull()->Write(WriteOptions(), &batch);
+    ASSERT_OK(dbfull()->Write(WriteOptions(), &batch));
     ASSERT_EQ(AllEntriesFor("c", 1), "[ DEL, d ]");  // Delete issued
     batch.Clear();
   } while (ChangeCompactOptions());
@@ -163,7 +177,7 @@ TEST_F(DBBloomFilterTest, GetFilterByPrefixBloom) {
   ASSERT_OK(dbfull()->Put(wo, "barbarbar2", "foo2"));
   ASSERT_OK(dbfull()->Put(wo, "foofoofoo", "bar"));
 
-  dbfull()->Flush(fo);
+  ASSERT_OK(dbfull()->Flush(fo));
 
   ASSERT_EQ("foo", Get("barbarbar"));
   ASSERT_EQ(TestGetTickerCount(options, BLOOM_FILTER_USEFUL), 0);
@@ -201,7 +215,7 @@ TEST_F(DBBloomFilterTest, WholeKeyFilterProp) {
   // ranges.
   ASSERT_OK(dbfull()->Put(wo, "aaa", ""));
   ASSERT_OK(dbfull()->Put(wo, "zzz", ""));
-  dbfull()->Flush(fo);
+  ASSERT_OK(dbfull()->Flush(fo));
 
   Reopen(options);
   ASSERT_EQ("NOT_FOUND", Get("foo"));
@@ -232,7 +246,7 @@ TEST_F(DBBloomFilterTest, WholeKeyFilterProp) {
   // ranges.
   ASSERT_OK(dbfull()->Put(wo, "aaa", ""));
   ASSERT_OK(dbfull()->Put(wo, "zzz", ""));
-  db_->CompactRange(CompactRangeOptions(), nullptr, nullptr);
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
 
   // Reopen with both of whole key off and prefix extractor enabled.
   // Still no bloom filter should be used.
@@ -255,7 +269,7 @@ TEST_F(DBBloomFilterTest, WholeKeyFilterProp) {
   // ranges.
   ASSERT_OK(dbfull()->Put(wo, "aaa", ""));
   ASSERT_OK(dbfull()->Put(wo, "zzz", ""));
-  db_->CompactRange(CompactRangeOptions(), nullptr, nullptr);
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
 
   options.prefix_extractor.reset();
   bbto.whole_key_filtering = true;
@@ -268,7 +282,7 @@ TEST_F(DBBloomFilterTest, WholeKeyFilterProp) {
   // not filtered out by key ranges.
   ASSERT_OK(dbfull()->Put(wo, "aaa", ""));
   ASSERT_OK(dbfull()->Put(wo, "zzz", ""));
-  Flush();
+  ASSERT_OK(Flush());
 
   // Now we have two files:
   // File 1: An older file with prefix bloom.
@@ -329,7 +343,6 @@ TEST_F(DBBloomFilterTest, WholeKeyFilterProp) {
 }
 
 TEST_F(DBBloomFilterTest, BloomFilter) {
-  // TODO - test fixed size policy.
   do {
     Options options = CurrentOptions();
     env_->count_random_reads_ = true;
@@ -354,7 +367,7 @@ TEST_F(DBBloomFilterTest, BloomFilter) {
     for (int i = 0; i < N; i += 100) {
       ASSERT_OK(Put(1, Key(i), Key(i)));
     }
-    Flush(1);
+    ASSERT_OK(Flush(1));
 
     // Prevent auto compactions triggered by seeks
     env_->delay_sstable_sync_.store(true, std::memory_order_release);
@@ -383,10 +396,35 @@ TEST_F(DBBloomFilterTest, BloomFilter) {
   } while (ChangeCompactOptions());
 }
 
+namespace {
+
+// Returns lower bound on expected BLOOM_FILTER_USEFUL given that num_total_keys_missed keys are
+// missed (sum over all SSTs).
+size_t BloomFilterUsefulLowerBound(const size_t num_total_keys_missed) {
+  return num_total_keys_missed *
+         (1 - FilterPolicy::kDefaultFixedSizeFilterErrorRate);
+}
+
+// Following functions calculate metrics expectations for the case when we read all keys from DB
+// with 2 SST, first SST has all num_unique_keys which 2nd has num_2nd_file_keys of these unique
+// keys.
+
+// Returns expected BLOOM_FILTER_CHECKED value.
+size_t BloomFilterCheckedCount(const size_t num_unique_keys, const size_t num_2nd_file_keys) {
+  return 2 * num_unique_keys - num_2nd_file_keys;
+}
+
+// Returns lower bound on expected BLOOM_FILTER_USEFUL.
+size_t BloomFilterUsefulLowerBound(const size_t num_unique_keys, const size_t num_2nd_file_keys) {
+  return BloomFilterUsefulLowerBound(num_unique_keys - num_2nd_file_keys);
+}
+
+} // namespace
+
 TEST_F(DBBloomFilterTest, BloomFilterIndex) {
   do {
     Options options = CurrentOptions();
-    env_->count_random_reads_ = true;
+    options.statistics = rocksdb::CreateDBStatistics();
     options.env = env_;
     // ChangeCompactOptions() only changes compaction style, which does not
     // trigger reset of table_factory
@@ -397,33 +435,52 @@ TEST_F(DBBloomFilterTest, BloomFilterIndex) {
     // Fixed-size bloom filter is not used without block cache.
     table_options.no_block_cache =
         table_options.filter_policy->GetFilterType() != FilterPolicy::kFixedSizeFilter;
+    table_options.cache_index_and_filter_blocks = true;
     options.table_factory.reset(NewBlockBasedTableFactory(table_options));
 
     CreateAndReopenWithCF({"pikachu"}, options);
 
-    // Populate DB
+    // Populate DB with two SST.
     const int key_begin = 100;
     const int key_end = 1000;
+    const auto num_keys = key_end - key_begin;
     for (int i = key_begin; i < key_end; i++) {
       ASSERT_OK(Put(1, Key(i), Key(i)));
     }
-    Flush(1);
+    ASSERT_OK(Flush(1));
+    size_t num_keys_in_small_sst = 0;
+    for (int i = key_begin; i < key_end; i += 100) {
+      ASSERT_OK(Put(1, Key(i), Key(i)));
+      num_keys_in_small_sst++;
+    }
+    ASSERT_OK(Flush(1));
 
     // Prevent auto compactions triggered by seeks
     env_->delay_sstable_sync_.store(true, std::memory_order_release);
 
-    // Lookup present keys.  Should rarely read from small sstable.
-    env_->random_read_counter_.Reset();
+    // Lookup present keys. Should rarely read from small sstable.
     for (int i = key_begin; i < key_end; i++) {
       ASSERT_EQ(Key(i), Get(1, Key(i)));
     }
+    ASSERT_EQ(
+        TestGetTickerCount(options, BLOOM_FILTER_CHECKED),
+        BloomFilterCheckedCount(num_keys, num_keys_in_small_sst));
+    ASSERT_GE(
+        TestGetTickerCount(options, BLOOM_FILTER_USEFUL),
+        BloomFilterUsefulLowerBound(num_keys, num_keys_in_small_sst));
 
-    // Lookup keys out of bloom filter index range.
-    env_->random_read_counter_.Reset();
+    TestResetTickerCount(options, BLOOM_FILTER_CHECKED);
+    TestResetTickerCount(options, BLOOM_FILTER_USEFUL);
+    // Lookup keys out of bloom filter index range. Should rarely read from both sstables.
     for (int i = 0; i < key_begin; i++) {
       ASSERT_EQ("NOT_FOUND", Get(1, Key(i)));
     }
     ASSERT_EQ("NOT_FOUND", Get(1, "zzz"));
+    ASSERT_EQ(
+        TestGetTickerCount(options, BLOOM_FILTER_CHECKED), 2 * (key_begin + 1));
+    ASSERT_GE(
+        TestGetTickerCount(options, BLOOM_FILTER_USEFUL),
+        BloomFilterUsefulLowerBound(2 * (key_begin + 1)));
 
     env_->delay_sstable_sync_.store(false, std::memory_order_release);
     Close();
@@ -442,7 +499,7 @@ TEST_F(DBBloomFilterTest, BloomFilterRate) {
     }
     // Add a large key to make the file contain wide range
     ASSERT_OK(Put(1, Key(maxKey + 55555), Key(maxKey + 55555)));
-    Flush(1);
+    ASSERT_OK(Flush(1));
 
     // Check if they can be found
     for (int i = 0; i < maxKey; i++) {
@@ -473,7 +530,7 @@ TEST_F(DBBloomFilterTest, BloomFilterCompatibility) {
     ASSERT_OK(Put(1, Key(i), Key(i)));
   }
   ASSERT_OK(Put(1, Key(maxKey + 55555), Key(maxKey + 55555)));
-  Flush(1);
+  ASSERT_OK(Flush(1));
 
   // Check db with full filter
   table_options.filter_policy.reset(NewBloomFilterPolicy(10, false));
@@ -502,7 +559,7 @@ TEST_F(DBBloomFilterTest, BloomFilterReverseCompatibility) {
     ASSERT_OK(Put(1, Key(i), Key(i)));
   }
   ASSERT_OK(Put(1, Key(maxKey + 55555), Key(maxKey + 55555)));
-  Flush(1);
+  ASSERT_OK(Flush(1));
 
   // Check db with block_based filter
   table_options.filter_policy.reset(NewBloomFilterPolicy(10, true));
@@ -514,6 +571,129 @@ TEST_F(DBBloomFilterTest, BloomFilterReverseCompatibility) {
     ASSERT_EQ(Key(i), Get(1, Key(i)));
   }
   ASSERT_EQ(TestGetTickerCount(options, BLOOM_FILTER_USEFUL), 0);
+}
+
+namespace {
+
+template <class TKeyTransformer>
+class TestFilterPolicy : public FilterPolicy {
+ public:
+  explicit TestFilterPolicy(const std::string& name) : name_(name) {
+    wrapped_policy_.reset(rocksdb::NewFixedSizeFilterPolicy(
+        FilterPolicy::kDefaultFixedSizeFilterBits,
+        rocksdb::FilterPolicy::kDefaultFixedSizeFilterErrorRate, nullptr));
+  }
+
+  void CreateFilter(const rocksdb::Slice* keys, int n, std::string* dst) const override {
+    wrapped_policy_->CreateFilter(keys, n, dst);
+  }
+
+  bool KeyMayMatch(const rocksdb::Slice& key, const rocksdb::Slice& filter) const override {
+    return wrapped_policy_->KeyMayMatch(key, filter);
+  }
+
+  rocksdb::FilterBitsBuilder* GetFilterBitsBuilder() const override {
+    return wrapped_policy_->GetFilterBitsBuilder();
+  }
+
+  rocksdb::FilterBitsReader* GetFilterBitsReader(const rocksdb::Slice& contents) const override {
+    return wrapped_policy_->GetFilterBitsReader(contents);
+  }
+
+  FilterType GetFilterType() const override { return wrapped_policy_->GetFilterType(); }
+
+  const char* Name() const override { return name_.c_str(); }
+
+  const KeyTransformer* GetKeyTransformer() const override { return &key_transformer_; }
+
+ private:
+  std::string name_;
+  std::unique_ptr<const rocksdb::FilterPolicy> wrapped_policy_;
+  TKeyTransformer key_transformer_;
+};
+
+class KeyToEmptyTransformer : public FilterPolicy::KeyTransformer {
+ public:
+  Slice Transform(Slice key) const override { return Slice(); }
+};
+
+class KeyIdentityTransformer : public FilterPolicy::KeyTransformer {
+ public:
+  Slice Transform(Slice key) const override { return key; }
+};
+
+} // namespace
+
+void DBBloomFilterTest::CheckOtherFilterPoliciesSupport(
+    Options* options, const int num_unique_keys, FilterPolicyCreator write_policy_creator,
+    FilterPolicyCreator new_policy_creator, const bool should_be_useful) {
+  options->statistics = rocksdb::CreateDBStatistics();
+  BlockBasedTableOptions table_options;
+  table_options.filter_policy.reset(write_policy_creator());
+  options->table_factory.reset(NewBlockBasedTableFactory(table_options));
+
+  // Create with policy provided by write_policy_creator.
+  CreateAndReopenWithCF({"test"}, *options);
+
+  for (int i = 0; i < num_unique_keys; i++) {
+    ASSERT_OK(Put(1, Key(i), Key(i)));
+  }
+  ASSERT_OK(Flush(1));
+  size_t num_2nd_file_keys = 0;
+  for (int i = 0; i < num_unique_keys; i += 100) {
+    ASSERT_OK(Put(1, Key(i), Key(i)));
+    num_2nd_file_keys++;
+  }
+  ASSERT_OK(Flush(1));
+
+  // Check with filter policy provided by new_policy_creator as main filter policy.
+  table_options.filter_policy.reset(new_policy_creator());
+  table_options.supported_filter_policies =
+      std::make_shared<BlockBasedTableOptions::FilterPoliciesMap>();
+  const auto supported_policy = BlockBasedTableOptions::FilterPolicyPtr(write_policy_creator());
+  table_options.supported_filter_policies->emplace(supported_policy->Name(), supported_policy);
+  options->table_factory.reset(NewBlockBasedTableFactory(table_options));
+  ReopenWithColumnFamilies({"default", "test"}, *options);
+
+  // Check if keys can be found.
+  for (int i = 0; i < num_unique_keys; i++) {
+    ASSERT_EQ(Key(i), Get(1, Key(i)));
+  }
+
+  ASSERT_EQ(
+      TestGetTickerCount(*options, BLOOM_FILTER_CHECKED),
+      BloomFilterCheckedCount(num_unique_keys, num_2nd_file_keys));
+
+  if (should_be_useful) {
+    ASSERT_GT(
+        TestGetTickerCount(*options, BLOOM_FILTER_USEFUL),
+        BloomFilterUsefulLowerBound(num_unique_keys, num_2nd_file_keys));
+  } else {
+    ASSERT_EQ(TestGetTickerCount(*options, BLOOM_FILTER_USEFUL), 0);
+  }
+}
+
+TEST_F(DBBloomFilterTest, OtherFilterPoliciesSupport) {
+  FilterPolicyCreator emptyPolicyCreator = []{
+    return new TestFilterPolicy<KeyToEmptyTransformer>("EmptyFilterPolicy");
+  };
+  FilterPolicyCreator identityPolicyCreator = []{
+    return new TestFilterPolicy<KeyIdentityTransformer>("IdentityFilterPolicy");
+  };
+
+  constexpr auto kNumKeys = 1000;
+  Options options = CurrentOptions();
+
+  ASSERT_NO_FATALS(CheckOtherFilterPoliciesSupport(
+    &options, kNumKeys, emptyPolicyCreator, identityPolicyCreator, /* should_be_useful =*/ false));
+  // Bloom filter with empty key transformer is not useful.
+  ASSERT_EQ(TestGetTickerCount(options, BLOOM_FILTER_USEFUL), 0);
+
+  DestroyAndReopen(options);
+
+  ASSERT_NO_FATALS(CheckOtherFilterPoliciesSupport(
+    &options, kNumKeys, identityPolicyCreator, emptyPolicyCreator, /* should_be_useful =*/ true));
+  ASSERT_GT(TestGetTickerCount(options, BLOOM_FILTER_USEFUL), 0);
 }
 
 namespace {
@@ -575,7 +755,7 @@ TEST_F(DBBloomFilterTest, BloomFilterWrapper) {
   // Add a large key to make the file contain wide range
   ASSERT_OK(Put(1, Key(maxKey + 55555), Key(maxKey + 55555)));
   ASSERT_EQ(0U, policy->GetCounter());
-  Flush(1);
+  ASSERT_OK(Flush(1));
 
   // Check if they can be found
   for (int i = 0; i < maxKey; i++) {
@@ -745,7 +925,7 @@ TEST_P(BloomStatsTestWithParam, BloomStatsTest) {
   ASSERT_EQ(0, perf_context.bloom_sst_hit_count);
   ASSERT_EQ(0, perf_context.bloom_sst_miss_count);
 
-  Flush();
+  ASSERT_OK(Flush());
 
   // sanity checks
   ASSERT_EQ(0, perf_context.bloom_sst_hit_count);
@@ -798,7 +978,7 @@ TEST_P(BloomStatsTestWithParam, BloomStatsTestWithIter) {
   ASSERT_EQ(1, perf_context.bloom_memtable_miss_count);
   ASSERT_EQ(2, perf_context.bloom_memtable_hit_count);
 
-  Flush();
+  ASSERT_OK(Flush());
 
   iter.reset(dbfull()->NewIterator(ReadOptions()));
 
@@ -850,9 +1030,9 @@ void PrefixScanInit(DBBloomFilterTest* dbtest) {
   snprintf(buf, sizeof(buf), "%02d______:end", 10);
   keystr = std::string(buf);
   ASSERT_OK(dbtest->Put(keystr, keystr));
-  dbtest->Flush();
-  dbtest->dbfull()->CompactRange(CompactRangeOptions(), nullptr,
-      nullptr);  // move to level 1
+  ASSERT_OK(dbtest->Flush());
+  ASSERT_OK(dbtest->dbfull()->CompactRange(
+      CompactRangeOptions(), nullptr, nullptr)); // move to level 1
 
   // GROUP 1
   for (int i = 1; i <= small_range_sstfiles; i++) {
@@ -862,7 +1042,7 @@ void PrefixScanInit(DBBloomFilterTest* dbtest) {
     snprintf(buf, sizeof(buf), "%02d______:end", i + 1);
     keystr = std::string(buf);
     ASSERT_OK(dbtest->Put(keystr, keystr));
-    dbtest->Flush();
+    ASSERT_OK(dbtest->Flush());
   }
 
   // GROUP 2
@@ -873,7 +1053,7 @@ void PrefixScanInit(DBBloomFilterTest* dbtest) {
     snprintf(buf, sizeof(buf), "%02d______:end", small_range_sstfiles + i + 1);
     keystr = std::string(buf);
     ASSERT_OK(dbtest->Put(keystr, keystr));
-    dbtest->Flush();
+    ASSERT_OK(dbtest->Flush());
   }
 }
 }  // namespace
@@ -970,21 +1150,21 @@ TEST_F(DBBloomFilterTest, OptimizeFiltersForHits) {
   for (int key : keys) {
     ASSERT_OK(Put(1, Key(key), "val"));
     if (++num_inserted % 1000 == 0) {
-      dbfull()->TEST_WaitForFlushMemTable();
-      dbfull()->TEST_WaitForCompact();
+      ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+      ASSERT_OK(dbfull()->TEST_WaitForCompact());
     }
   }
   ASSERT_OK(Put(1, Key(0), "val"));
   ASSERT_OK(Put(1, Key(numkeys), "val"));
   ASSERT_OK(Flush(1));
-  dbfull()->TEST_WaitForCompact();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
 
   if (NumTableFilesAtLevel(0, 1) == 0) {
     // No Level 0 file. Create one.
     ASSERT_OK(Put(1, Key(0), "val"));
     ASSERT_OK(Put(1, Key(numkeys), "val"));
     ASSERT_OK(Flush(1));
-    dbfull()->TEST_WaitForCompact();
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
   }
 
   for (int i = 1; i < numkeys; i += 2) {
@@ -1084,7 +1264,7 @@ TEST_F(DBBloomFilterTest, OptimizeFiltersForHits) {
       BottommostLevelCompaction::kSkip;
   compact_options.change_level = true;
   compact_options.target_level = 7;
-  db_->CompactRange(compact_options, handles_[1], nullptr, nullptr);
+  ASSERT_OK(db_->CompactRange(compact_options, handles_[1], nullptr, nullptr));
 
   ASSERT_EQ(trivial_move, 1);
   ASSERT_EQ(non_trivial_move, 0);

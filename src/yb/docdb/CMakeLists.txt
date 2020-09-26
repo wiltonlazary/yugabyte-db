@@ -31,6 +31,7 @@ set(DOCDB_ENCODING_SRCS
         primitive_value.cc
         primitive_value_util.cc
         intent.cc
+        doc_scanspec_util.cc
         )
 
 set(DOCDB_ENCODING_DEPS
@@ -46,6 +47,13 @@ ADD_YB_LIBRARY(yb_docdb_encoding
         DEPS ${DOCDB_ENCODING_DEPS}
         )
 
+include_directories(${YB_BUILD_ROOT}/postgres/include/server)
+link_directories(${YB_BUILD_ROOT}/postgres/lib)
+
+add_library(yb_pgbackend SHARED IMPORTED)
+set_target_properties(yb_pgbackend PROPERTIES IMPORTED_LOCATION "${YB_PGBACKEND_SHARED_LIB}")
+message("Added shared library dependency yb_pgbackend: ${YB_PGBACKEND_SHARED_LIB}")
+
 set(DOCDB_SRCS
         bounded_rocksdb_iterator.cc
         conflict_resolution.cc
@@ -54,11 +62,14 @@ set(DOCDB_SRCS
         deadline_info.cc
         doc_boundary_values_extractor.cc
         docdb.cc
+        docdb_debug.cc
+        docdb_pgapi.cc
         docdb_util.cc
         doc_ttl_util.cc
         docdb_compaction_filter.cc
         docdb_compaction_filter_intents.cc
         docdb-internal.cc
+        doc_reader.cc
         docdb_rocksdb_util.cc
         doc_expr.cc
         doc_pgsql_scanspec.cc
@@ -87,7 +98,9 @@ set(DOCDB_DEPS
         server_common
         rpc_introspection_proto
         yb_pggate_util
+        yb_pggate
         ql_util
+        yb_pgbackend
         )
 
 ADD_YB_LIBRARY(yb_docdb
@@ -103,6 +116,8 @@ add_dependencies(
         gen_src_yb_tablet_tablet_proto
         gen_src_yb_tserver_tserver_proto
 )
+
+add_dependencies(yb_docdb postgres)
 
 cotire(yb_docdb_encoding)
 cotire(yb_docdb)

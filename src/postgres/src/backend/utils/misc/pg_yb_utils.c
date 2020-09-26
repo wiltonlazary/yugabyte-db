@@ -24,6 +24,7 @@
  *-------------------------------------------------------------------------
  */
 
+#include <assert.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -60,8 +61,6 @@ uint64_t yb_catalog_cache_version = YB_CATCACHE_VERSION_UNINITIALIZED;
 int ybc_pg_double_write = -1;
 int ybc_disable_pg_locking = -1;
 
-YBCStatus ybc_commit_status = NULL;
-
 /* Forward declarations */
 static void YBCInstallTxnDdlHook();
 
@@ -84,7 +83,9 @@ CheckIsYBSupportedRelationByKind(char relkind)
 {
 	if (!(relkind == RELKIND_RELATION || relkind == RELKIND_INDEX ||
 		  relkind == RELKIND_VIEW || relkind == RELKIND_SEQUENCE ||
-		  relkind == RELKIND_COMPOSITE_TYPE))
+		  relkind == RELKIND_COMPOSITE_TYPE || relkind == RELKIND_PARTITIONED_TABLE ||
+		  relkind == RELKIND_PARTITIONED_INDEX))
+
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 								errmsg("This feature is not supported in YugaByte.")));
@@ -101,8 +102,9 @@ IsYBRelation(Relation relation)
 
 	/* Currently only support regular tables and indexes.
 	 * Temp tables and views are supported, but they are not YB relations. */
-	return (relkind == RELKIND_RELATION || relkind == RELKIND_INDEX)
-				 && relation->rd_rel->relpersistence != RELPERSISTENCE_TEMP;
+	return (relkind == RELKIND_RELATION || relkind == RELKIND_INDEX || relkind == RELKIND_PARTITIONED_TABLE ||
+	        relkind == RELKIND_PARTITIONED_INDEX) &&
+	        relation->rd_rel->relpersistence != RELPERSISTENCE_TEMP;
 }
 
 bool
@@ -120,6 +122,19 @@ IsYBBackedRelation(Relation relation)
 	return IsYBRelation(relation) ||
 		(relation->rd_rel->relkind == RELKIND_VIEW &&
 		relation->rd_rel->relpersistence != RELPERSISTENCE_TEMP);
+}
+
+bool IsRealYBColumn(Relation rel, int attrNum)
+{
+	return (attrNum > 0 && !TupleDescAttr(rel->rd_att, attrNum - 1)->attisdropped) ||
+	       (rel->rd_rel->relhasoids && attrNum == ObjectIdAttributeNumber);
+}
+
+bool IsYBSystemColumn(int attrNum)
+{
+	return (attrNum == YBRowIdAttributeNumber ||
+			attrNum == YBIdxBaseTupleIdAttributeNumber ||
+			attrNum == YBUniqueIdxKeySuffixAttributeNumber);
 }
 
 bool
@@ -142,6 +157,71 @@ AttrNumber YBGetFirstLowInvalidAttributeNumberFromOid(Oid relid)
 	AttrNumber attr_num = YBGetFirstLowInvalidAttributeNumber(relation);
 	RelationClose(relation);
 	return attr_num;
+}
+
+int YBAttnumToBmsIndex(Relation rel, AttrNumber attnum)
+{
+	return attnum - YBGetFirstLowInvalidAttributeNumber(rel);
+}
+
+AttrNumber YBBmsIndexToAttnum(Relation rel, int idx)
+{
+	return idx + YBGetFirstLowInvalidAttributeNumber(rel);
+}
+
+/*
+ * Get primary key columns as bitmap of a table,
+ * subtracting minattr from attributes.
+ */
+static Bitmapset *GetTablePrimaryKeyBms(Relation rel,
+                                        AttrNumber minattr,
+                                        bool includeYBSystemColumns)
+{
+	Oid            dboid         = YBCGetDatabaseOid(rel);
+	Oid            relid         = RelationGetRelid(rel);
+	int            natts         = RelationGetNumberOfAttributes(rel);
+	Bitmapset      *pkey         = NULL;
+	YBCPgTableDesc ybc_tabledesc = NULL;
+
+	/* Get the primary key columns 'pkey' from YugaByte. */
+	HandleYBStatus(YBCPgGetTableDesc(dboid, relid, &ybc_tabledesc));
+	for (AttrNumber attnum = minattr; attnum <= natts; attnum++)
+	{
+		if ((!includeYBSystemColumns && !IsRealYBColumn(rel, attnum)) ||
+			(!IsRealYBColumn(rel, attnum) && !IsYBSystemColumn(attnum)))
+		{
+			continue;
+		}
+
+		bool is_primary = false;
+		bool is_hash    = false;
+		HandleYBTableDescStatus(YBCPgGetColumnInfo(ybc_tabledesc,
+		                                           attnum,
+		                                           &is_primary,
+		                                           &is_hash),
+		                        ybc_tabledesc);
+
+		if (is_hash || is_primary)
+		{
+			pkey = bms_add_member(pkey, attnum - minattr);
+		}
+	}
+
+	return pkey;
+}
+
+Bitmapset *YBGetTablePrimaryKeyBms(Relation rel)
+{
+	return GetTablePrimaryKeyBms(rel,
+	                             YBGetFirstLowInvalidAttributeNumber(rel) /* minattr */,
+	                             false /* includeYBSystemColumns */);
+}
+
+Bitmapset *YBGetTableFullPrimaryKeyBms(Relation rel)
+{
+	return GetTablePrimaryKeyBms(rel,
+	                             YBSystemFirstLowInvalidAttributeNumber + 1 /* minattr */,
+	                             true /* includeYBSystemColumns */);
 }
 
 extern bool YBRelHasOldRowTriggers(Relation rel, CmdType operation)
@@ -211,66 +291,53 @@ YBShouldReportErrorStatus()
 	return cached_value;
 }
 
-char* DupYBStatusMessage(YBCStatus status) {
-  const char* code_as_cstring = YBCStatusCodeAsCString(status);
-  size_t code_strlen = strlen(code_as_cstring);
-	size_t status_len = YBCStatusMessageLen(status);
-	char* msg_buf = palloc(code_strlen + status_len + 3);
-	char* pos = msg_buf;
-	memcpy(msg_buf, code_as_cstring, code_strlen);
-	pos += code_strlen;
-	*pos++ = ':';
-	*pos++ = ' ';
-	memcpy(pos, YBCStatusMessageBegin(status), status_len);
-	pos[status_len] = 0;
-	return msg_buf;
-}
-
 void
 HandleYBStatus(YBCStatus status)
 {
 	if (!status) {
-    return;
-  }
+		return;
+	}
 	/* Copy the message to the current memory context and free the YBCStatus. */
-	char* msg_buf = DupYBStatusMessage(status);
+	const uint32_t pg_err_code = YBCStatusPgsqlError(status);
+	char* msg_buf = DupYBStatusMessage(status, pg_err_code == ERRCODE_UNIQUE_VIOLATION);
 
 	if (YBShouldReportErrorStatus()) {
 		YBC_LOG_ERROR("HandleYBStatus: %s", msg_buf);
 	}
-	const uint32_t pg_err_code  = YBCStatusPgsqlError(status);
 	const uint16_t txn_err_code = YBCStatusTransactionError(status);
 	YBCFreeStatus(status);
 	ereport(ERROR,
 			(errmsg("%s", msg_buf),
 			 errcode(pg_err_code),
-			 yb_txn_errcode(txn_err_code)));
+			 yb_txn_errcode(txn_err_code),
+			 errhidecontext(true)));
 }
 
 void
-HandleYBStmtStatus(YBCStatus status, YBCPgStatement ybc_stmt)
+HandleYBStatusIgnoreNotFound(YBCStatus status, bool *not_found)
 {
-	if (!status)
+	if (!status) {
 		return;
-
-	if (ybc_stmt)
-	{
-		HandleYBStatus(YBCPgDeleteStatement(ybc_stmt));
 	}
+	if (YBCStatusIsNotFound(status)) {
+		*not_found = true;
+		YBCFreeStatus(status);
+		return;
+	}
+	*not_found = false;
 	HandleYBStatus(status);
 }
 
 void
-HandleYBStmtStatusWithOwner(YBCStatus status,
-                            YBCPgStatement ybc_stmt,
-                            ResourceOwner owner)
+HandleYBStatusWithOwner(YBCStatus status,
+												YBCPgStatement ybc_stmt,
+												ResourceOwner owner)
 {
 	if (!status)
 		return;
 
 	if (ybc_stmt)
 	{
-		HandleYBStatus(YBCPgDeleteStatement(ybc_stmt));
 		if (owner != NULL)
 		{
 			ResourceOwnerForgetYugaByteStmt(owner, ybc_stmt);
@@ -285,11 +352,34 @@ HandleYBTableDescStatus(YBCStatus status, YBCPgTableDesc table)
 	if (!status)
 		return;
 
-	if (table)
-	{
-		HandleYBStatus(YBCPgDeleteTableDesc(table));
-	}
 	HandleYBStatus(status);
+}
+
+/*
+ * Fetches relation's unique constraint name to specified buffer.
+ * If relation is not an index and it has primary key the name of primary key index is returned.
+ * In other cases, relation name is used.
+ */
+static void
+FetchUniqueConstraintName(Oid relation_id, char* dest, size_t max_size)
+{
+	// strncat appends source to destination, so destination must be empty.
+	dest[0] = 0;
+	Relation rel = RelationIdGetRelation(relation_id);
+
+	if (!rel->rd_index && rel->rd_pkindex != InvalidOid)
+	{
+		Relation pkey = RelationIdGetRelation(rel->rd_pkindex);
+
+		strncat(dest, RelationGetRelationName(pkey), max_size);
+
+		RelationClose(pkey);
+	} else
+	{
+		strncat(dest, RelationGetRelationName(rel), max_size);
+	}
+
+	RelationClose(rel);
 }
 
 void
@@ -312,7 +402,10 @@ YBInitPostgresBackend(
 		const YBCPgTypeEntity *type_table;
 		int count;
 		YBCGetTypeTable(&type_table, &count);
-		YBCInitPgGate(type_table, count);
+		YBCPgCallbacks callbacks;
+		callbacks.FetchUniqueConstraintName = &FetchUniqueConstraintName;
+		callbacks.GetCurrentYbMemctx = &GetCurrentYbMemctx;
+		YBCInitPgGate(type_table, count, callbacks);
 		YBCInstallTxnDdlHook();
 
 		/*
@@ -328,14 +421,15 @@ YBInitPostgresBackend(
 void
 YBOnPostgresBackendShutdown()
 {
-	static bool shutdown_done = false;
-
-	if (shutdown_done)
-	{
-		return;
-	}
 	YBCDestroyPgGate();
-	shutdown_done = true;
+}
+
+void
+YBCRecreateTransaction()
+{
+	if (!IsYugaByteEnabled())
+		return;
+	HandleYBStatus(YBCPgRecreateTransaction());
 }
 
 void
@@ -346,43 +440,26 @@ YBCRestartTransaction()
 	HandleYBStatus(YBCPgRestartTransaction());
 }
 
-static void
-YBCResetCommitStatus()
-{
-	if (ybc_commit_status)
-	{
-		YBCFreeStatus(ybc_commit_status);
-		ybc_commit_status = NULL;
-	}
-}
-
-bool
+void
 YBCCommitTransaction()
 {
 	if (!IsYugaByteEnabled())
-		return true;
+		return;
 
-	YBCStatus status = YBCPgCommitTransaction();
-	if (status != NULL) {
-		YBCResetCommitStatus();
-		ybc_commit_status = status;
-		return false;
-	}
-
-	return true;
+	HandleYBStatus(YBCPgFlushBufferedOperations());
+	HandleYBStatus(YBCPgCommitTransaction());
 }
 
 void
-YBCHandleCommitError()
+YBCAbortTransaction()
 {
-	YBCStatus status = ybc_commit_status;
-	if (status != NULL) {
-    char* msg = DupYBStatusMessage(status);
-		YBCResetCommitStatus();
-		ereport(ERROR,
-				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-				 errmsg("Error during commit: %s", msg)));
-	}
+	if (!IsYugaByteEnabled())
+		return;
+
+	YBCPgDropBufferedOperations();
+
+	if (YBTransactionsEnabled())
+		HandleYBStatus(YBCPgAbortTransaction());
 }
 
 bool
@@ -645,7 +722,12 @@ YBCGetDatabaseOid(Relation rel)
 void
 YBRaiseNotSupported(const char *msg, int issue_no)
 {
-	int signal_level = YBUnsupportedFeatureSignalLevel();
+	YBRaiseNotSupportedSignal(msg, issue_no, YBUnsupportedFeatureSignalLevel());
+}
+
+void
+YBRaiseNotSupportedSignal(const char *msg, int issue_no, int signal_level)
+{
 	if (issue_no > 0)
 	{
 		ereport(signal_level,
@@ -664,10 +746,34 @@ YBRaiseNotSupported(const char *msg, int issue_no)
 	}
 }
 
+double
+PowerWithUpperLimit(double base, int exp, double upper_limit)
+{
+	assert(base >= 1);
+	assert(exp >= 0);
+
+	double res = 1.0;
+	while (exp)
+	{
+		if (exp & 1)
+			res *= base;
+		if (res >= upper_limit)
+			return upper_limit;
+
+		exp = exp >> 1;
+		base *= base;
+	}
+	return res;
+}
+
 //------------------------------------------------------------------------------
 // YB Debug utils.
 
-bool yb_debug_mode = false;
+bool yb_debug_report_error_stacktrace = false;
+
+bool yb_debug_log_catcache_events = false;
+
+bool yb_debug_log_internal_restarts = false;
 
 const char*
 YBDatumToString(Datum datum, Oid typid)
@@ -723,18 +829,26 @@ YBIsInitDbAlreadyDone()
 static ProcessUtility_hook_type prev_ProcessUtility = NULL;
 static int ddl_nesting_level = 0;
 
-static void YBIncrementDdlNestingLevel() {
-	if (ddl_nesting_level == 0) {
+int
+YBGetDdlNestingLevel()
+{
+	return ddl_nesting_level;
+}
+
+void
+YBIncrementDdlNestingLevel()
+{
+	if (ddl_nesting_level == 0)
 		YBCPgEnterSeparateDdlTxnMode();
-	}
 	ddl_nesting_level++;
 }
 
-static void YBDecrementDdlNestingLevel(bool success) {
+void
+YBDecrementDdlNestingLevel(bool success)
+{
 	ddl_nesting_level--;
-	if (ddl_nesting_level == 0) {
+	if (ddl_nesting_level == 0)
 		YBCPgExitSeparateDdlTxnMode(success);
-	}
 }
 
 static bool IsTransactionalDdlStatement(NodeTag node_tag) {
@@ -769,6 +883,7 @@ static bool IsTransactionalDdlStatement(NodeTag node_tag) {
 		case T_CreateStmt:
 		case T_CreateSubscriptionStmt:
 		case T_CreateTableAsStmt:
+		case T_CreateTableGroupStmt:
 		case T_CreateTableSpaceStmt:
 		case T_CreateTransformStmt:
 		case T_CreateTrigStmt:
@@ -780,6 +895,7 @@ static bool IsTransactionalDdlStatement(NodeTag node_tag) {
 		case T_DropRoleStmt:
 		case T_DropStmt:
 		case T_DropSubscriptionStmt:
+		case T_DropTableGroupStmt:
 		case T_DropTableSpaceStmt:
 		case T_DropUserMappingStmt:
 		case T_DropdbStmt:
@@ -820,6 +936,8 @@ static bool IsTransactionalDdlStatement(NodeTag node_tag) {
 		// T_Grant...
 		case T_GrantStmt:
 		case T_GrantRoleStmt:
+		// T_Index...
+		case T_IndexStmt:
 			return true;
 		default:
 			return false;
@@ -873,3 +991,25 @@ static void YBCInstallTxnDdlHook() {
 		ProcessUtility_hook = YBTxnDdlProcessUtility;
 	}
 };
+
+static int buffering_nesting_level = 0;
+
+void YBBeginOperationsBuffering() {
+	if (++buffering_nesting_level == 1) {
+		YBCPgStartOperationsBuffering();
+	}
+}
+
+void YBEndOperationsBuffering() {
+	// buffering_nesting_level could be 0 because YBResetOperationsBuffering was called
+	// on starting new query and postgres calls standard_ExecutorFinish on non finished executor
+	// from previous failed query.
+	if (buffering_nesting_level && !--buffering_nesting_level) {
+		HandleYBStatus(YBCPgStopOperationsBuffering());
+	}
+}
+
+void YBResetOperationsBuffering() {
+	buffering_nesting_level = 0;
+	YBCPgResetOperationsBuffering();
+}

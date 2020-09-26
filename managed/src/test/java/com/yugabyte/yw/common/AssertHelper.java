@@ -2,11 +2,14 @@
 
 package com.yugabyte.yw.common;
 
+import com.yugabyte.yw.models.Audit;
+
 import com.fasterxml.jackson.databind.JsonNode;
 import play.libs.Json;
 import play.mvc.Result;
 
 import java.util.List;
+import java.util.UUID;
 
 import static org.hamcrest.CoreMatchers.*;
 import static org.hamcrest.MatcherAssert.assertThat;
@@ -15,6 +18,7 @@ import static org.junit.Assert.*;
 import static play.mvc.Http.Status.BAD_REQUEST;
 import static play.mvc.Http.Status.INTERNAL_SERVER_ERROR;
 import static play.mvc.Http.Status.OK;
+import static play.mvc.Http.Status.FORBIDDEN;
 import static play.mvc.Http.Status.UNAUTHORIZED;
 import static play.test.Helpers.contentAsString;
 
@@ -38,6 +42,11 @@ public class AssertHelper {
     assertErrorResponse(result, errorStr);
   }
 
+  public static void assertForbidden(Result result, String errorStr) {
+    assertEquals(FORBIDDEN, result.status());
+    assertEquals(errorStr, contentAsString(result));
+  }
+
   public static void assertErrorResponse(Result result, String errorStr) {
     if (errorStr != null) {
         JsonNode json = Json.parse(contentAsString(result));
@@ -47,6 +56,18 @@ public class AssertHelper {
 
   public static void assertValue(JsonNode json, String key, String value) {
     JsonNode targetNode = json.path(key);
+    assertFalse(targetNode.isMissingNode());
+    if (targetNode.isObject()) {
+      assertEquals(value, targetNode.toString());
+    } else {
+      assertEquals(value, targetNode.asText());
+    }
+  }
+
+  // Allows specifying a JsonPath to the expected node.
+  // For example "/foo/bar" locates node bar within node foo in json.
+  public static void assertValueAtPath(JsonNode json, String key, String value) {
+    JsonNode targetNode = json.at(key);
     assertFalse(targetNode.isMissingNode());
     if (targetNode.isObject()) {
       assertEquals(value, targetNode.toString());
@@ -82,5 +103,10 @@ public class AssertHelper {
     expectedJson.fieldNames().forEachRemaining( field ->
             assertEquals(expectedJson.get(field), actualJson.get(field))
     );
+  }
+
+  public static void assertAuditEntry(int numEntries, UUID uuid) {
+    List<Audit> auditEntries = Audit.getAll(uuid);
+    assertEquals(auditEntries.size(), numEntries);
   }
 }

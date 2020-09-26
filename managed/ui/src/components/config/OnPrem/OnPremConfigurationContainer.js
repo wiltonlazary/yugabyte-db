@@ -9,7 +9,7 @@ import { createInstanceType, createInstanceTypeResponse,
   resetProviderBootstrap, fetchCloudMetadata, getProviderList, getProviderListResponse,
   resetOnPremConfigData, setOnPremConfigData, createOnPremProvider,
   createOnPremProviderResponse } from '../../../actions/cloud';
-import { isNonEmptyArray } from 'utils/ObjectUtils';
+import { isNonEmptyArray } from '../../../utils/ObjectUtils';
 import {destroy} from 'redux-form';
 
 const mapStateToProps = (state) => {
@@ -55,7 +55,7 @@ const mapDispatchToProps = (dispatch) => {
     },
 
     createOnPremProvider: (providerType, config) => {
-      dispatch(createOnPremProvider(providerType, config.provider.name, null)).then((response) => {
+      dispatch(createOnPremProvider(providerType, config.provider.name, config.provider.config)).then((response) => {
         dispatch(createOnPremProviderResponse(response.payload));
       });
     },

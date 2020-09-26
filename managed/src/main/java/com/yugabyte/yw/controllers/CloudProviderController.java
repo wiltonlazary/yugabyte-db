@@ -51,10 +51,14 @@ import javax.persistence.PersistenceException;
 
 import static com.yugabyte.yw.common.ConfigHelper.ConfigType.DockerInstanceTypeMetadata;
 import static com.yugabyte.yw.common.ConfigHelper.ConfigType.DockerRegionMetadata;
+import static com.yugabyte.yw.models.helpers.CommonUtils.DEFAULT_YB_HOME_DIR;
 
 public class CloudProviderController extends AuthenticatedController {
   public static final Logger LOG = LoggerFactory.getLogger(CloudProviderController.class);
 
+
+  private static JsonNode KUBERNETES_CLOUD_INSTANCE_TYPE = Json.parse(
+      "{\"instanceTypeCode\": \"cloud\", \"numCores\": 0.5, \"memSizeGB\": 1.5}");
   private static JsonNode KUBERNETES_DEV_INSTANCE_TYPE = Json.parse(
       "{\"instanceTypeCode\": \"dev\", \"numCores\": 0.5, \"memSizeGB\": 0.5}");
   private static JsonNode KUBERNETES_INSTANCE_TYPES = Json.parse("[" +
@@ -130,6 +134,7 @@ public class CloudProviderController extends AuthenticatedController {
       }
       NodeInstance.deleteByProvider(providerUUID);
       provider.delete();
+      Audit.createAuditEntry(ctx(), request());
       return ApiResponse.success("Deleted provider: " + providerUUID);
     } catch (RuntimeException e) {
       LOG.error(e.getMessage());
@@ -177,14 +182,14 @@ public class CloudProviderController extends AuthenticatedController {
           case "kubernetes":
             updateKubeConfig(provider, config, false);
             try {
-              createKubernetesInstanceTypes(provider);
+              createKubernetesInstanceTypes(provider, customerUUID);
             } catch (javax.persistence.PersistenceException ex) {
               // TODO: make instance types more multi-tenant friendly...
             }
-            kubernetesProvision(provider, provider.getConfig(), customerUUID);
             break;
         }
       }
+      Audit.createAuditEntry(ctx(), request(), Json.toJson(formData.data()));
       return ApiResponse.success(provider);
     } catch (RuntimeException e) {
       String errorMsg = "Unable to create provider: " + providerCode;
@@ -246,7 +251,6 @@ public class CloudProviderController extends AuthenticatedController {
       provider = Provider.create(customerUUID, providerCode, formData.name);
       boolean isConfigInProvider = updateKubeConfig(provider, config, false);
       if (isConfigInProvider) {
-        kubernetesProvision(provider, config, customerUUID);
       }
       List<RegionData> regionList = formData.regionList;
       for (RegionData rd : regionList) {
@@ -254,24 +258,23 @@ public class CloudProviderController extends AuthenticatedController {
         Region region = Region.create(provider, rd.code, rd.name, null, rd.latitude, rd.longitude);
         boolean isConfigInRegion = updateKubeConfig(provider, region, regionConfig, false);
         if (isConfigInRegion) {
-          kubernetesProvision(provider, regionConfig, customerUUID);
         }
         for (ZoneData zd : rd.zoneList) {
           Map<String, String> zoneConfig = zd.config;
           AvailabilityZone az = AvailabilityZone.create(region, zd.code, zd.name, null);
           boolean isConfigInZone = updateKubeConfig(provider, region, az, zoneConfig, false);
           if (isConfigInZone) {
-            kubernetesProvision(provider, zoneConfig, customerUUID);
           }
         }
       }
       try {
-        createKubernetesInstanceTypes(provider);
+        createKubernetesInstanceTypes(provider, customerUUID);
       } catch (javax.persistence.PersistenceException ex) {
         provider.delete();
         return ApiResponse.error(INTERNAL_SERVER_ERROR, "Couldn't create instance types");
         // TODO: make instance types more multi-tenant friendly...
       }
+      Audit.createAuditEntry(ctx(), request(), requestBody);
       return ApiResponse.success(provider);
     } catch (RuntimeException e) {
       if (provider != null) {
@@ -355,11 +358,14 @@ public class CloudProviderController extends AuthenticatedController {
     return hasKubeConfig;
   }
 
-  private void updateGCPConfig(Provider provider, Map<String,String> config) {
+  private void updateGCPConfig(Provider provider, Map<String, String> config) {
+    // Remove the key to avoid generating a credentials file unnecessarily.
+    config.remove("GCE_HOST_PROJECT");
     // If we were not given a config file, then no need to do anything here.
     if (config.isEmpty()) {
       return;
     }
+
     String gcpCredentialsFile = null;
     try {
       gcpCredentialsFile = accessManager.createCredentialsFile(
@@ -370,21 +376,27 @@ public class CloudProviderController extends AuthenticatedController {
     }
 
     Map<String, String> newConfig = new HashMap<String, String>();
-    newConfig.put("GCE_EMAIL", config.get("client_email"));
-    newConfig.put("GCE_PROJECT", config.get("project_id"));
-    newConfig.put("GOOGLE_APPLICATION_CREDENTIALS", gcpCredentialsFile);
-
+    if (config.get("project_id") != null) {
+      newConfig.put("GCE_PROJECT", config.get("project_id"));
+    }
+    if (config.get("client_email") != null) {
+      newConfig.put("GCE_EMAIL", config.get("client_email"));
+    }
+    if (gcpCredentialsFile != null) {
+      newConfig.put("GOOGLE_APPLICATION_CREDENTIALS", gcpCredentialsFile);
+    }
     provider.setConfig(newConfig);
     provider.save();
   }
 
-  private void createKubernetesInstanceTypes(Provider provider) {
+  private void createKubernetesInstanceTypes(Provider provider, UUID customerUUID) {
+    Customer customer = Customer.get(customerUUID);
     KUBERNETES_INSTANCE_TYPES.forEach((instanceType -> {
       InstanceType.InstanceTypeDetails idt = new InstanceType.InstanceTypeDetails();
       idt.setVolumeDetailsList(1, 100, InstanceType.VolumeType.SSD);
       InstanceType.upsert(provider.code,
           instanceType.get("instanceTypeCode").asText(),
-          instanceType.get("numCores").asInt(),
+          instanceType.get("numCores").asDouble(),
           instanceType.get("memSizeGB").asDouble(),
           idt
       );
@@ -394,29 +406,21 @@ public class CloudProviderController extends AuthenticatedController {
       idt.setVolumeDetailsList(1, 100, InstanceType.VolumeType.SSD);
       InstanceType.upsert(provider.code,
           KUBERNETES_DEV_INSTANCE_TYPE.get("instanceTypeCode").asText(),
-          KUBERNETES_DEV_INSTANCE_TYPE.get("numCores").asInt(),
+          KUBERNETES_DEV_INSTANCE_TYPE.get("numCores").asDouble(),
           KUBERNETES_DEV_INSTANCE_TYPE.get("memSizeGB").asDouble(),
           idt
       );
     }
-  }
-
-  /* Function to create Commissioner task for provisioning K8s providers
-  // Will also be helpful to provision regions/AZs in the future
-  */
-  private void kubernetesProvision(Provider provider, Map<String, String> config, UUID customerUUID) {
-    KubernetesClusterInitParams taskParams = new KubernetesClusterInitParams();
-    taskParams.config = config;
-    taskParams.providerUUID = provider.uuid;
-    Customer customer = Customer.get(customerUUID);
-    UUID taskUUID = commissioner.submit(TaskType.KubernetesProvision, taskParams);
-    CustomerTask.create(customer,
-      provider.uuid,
-      taskUUID,
-      CustomerTask.TargetType.Provider,
-      CustomerTask.TaskType.Create,
-      provider.name);
-
+    if (customer.code.equals("cloud")) {
+      InstanceType.InstanceTypeDetails idt = new InstanceType.InstanceTypeDetails();
+      idt.setVolumeDetailsList(1, 5, InstanceType.VolumeType.SSD);
+      InstanceType.upsert(provider.code,
+          KUBERNETES_CLOUD_INSTANCE_TYPE.get("instanceTypeCode").asText(),
+          KUBERNETES_CLOUD_INSTANCE_TYPE.get("numCores").asDouble(),
+          KUBERNETES_CLOUD_INSTANCE_TYPE.get("memSizeGB").asDouble(),
+          idt
+      );
+    }
   }
 
   // TODO: This is temporary endpoint, so we can setup docker, will move this
@@ -444,6 +448,7 @@ public class CloudProviderController extends AuthenticatedController {
       Map<String, Object> instanceTypeMetadata = configHelper.getConfig(DockerInstanceTypeMetadata);
       instanceTypeMetadata.forEach((itCode, metadata) ->
           InstanceType.createWithMetadata(newProvider, itCode, Json.toJson(metadata)));
+      Audit.createAuditEntry(ctx(), request());
       return ApiResponse.success(newProvider);
     } catch (Exception e) {
       LOG.error(e.getMessage());
@@ -518,6 +523,7 @@ public class CloudProviderController extends AuthenticatedController {
 
     ObjectNode resultNode = Json.newObject();
     resultNode.put("taskUUID", taskUUID.toString());
+    Audit.createAuditEntry(ctx(), request(), requestBody, taskUUID);
     return ApiResponse.success(resultNode);
   }
 
@@ -569,6 +575,7 @@ public class CloudProviderController extends AuthenticatedController {
       Map<String, String> config = processConfig(formData, Common.CloudType.kubernetes);
       if (config != null) {
         updateKubeConfig(provider, config, true);
+        Audit.createAuditEntry(ctx(), request(), formData);
         return ApiResponse.success(provider);
       }
       else {
@@ -600,6 +607,7 @@ public class CloudProviderController extends AuthenticatedController {
     } catch (RuntimeException e) {
       return ApiResponse.error(INTERNAL_SERVER_ERROR, e.getMessage());
     }
+    Audit.createAuditEntry(ctx(), request());
     return ApiResponse.success(provider);
   }
 
@@ -610,9 +618,22 @@ public class CloudProviderController extends AuthenticatedController {
     if (configNode != null && !configNode.isNull()) {
       if (providerCode.equals(Common.CloudType.gcp)) {
         // We may receive a config file, or we may be asked to use the local service account.
+        // Default to using config file.
+        boolean shouldUseHostCredentials = configNode.has("use_host_credentials")
+                                             && configNode.get("use_host_credentials").asBoolean();
         JsonNode contents = configNode.get("config_file_contents");
-        if (contents != null) {
+        if (!shouldUseHostCredentials && contents != null) {
           config = Json.fromJson(contents, Map.class);
+        }
+
+        contents = configNode.get("host_project_id");
+        if (contents != null && !contents.textValue().isEmpty()) {
+          config.put("GCE_HOST_PROJECT", contents.textValue());
+        }
+
+        contents = configNode.get("YB_FIREWALL_TAGS");
+        if (contents != null && !contents.textValue().isEmpty()) {
+          config.put("YB_FIREWALL_TAGS", contents.textValue());
         }
       } else {
         config = Json.fromJson(configNode, Map.class);

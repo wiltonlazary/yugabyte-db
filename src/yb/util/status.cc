@@ -71,6 +71,8 @@ struct StatusCategories {
     return ss.str();
   }
 
+  // In debug mode log as many details as possible and crash.
+  // In release mode log a warning.
   void ReportMissingCategory(uint8_t category_id, const char* function_name) {
 #ifndef NDEBUG
     LOG(WARNING) << "Known categories: " << KnownCategoriesStr();
@@ -459,7 +461,7 @@ Status Status::CloneAndAddErrorCode(const StatusErrorCode& error_code) const {
   bool inserted = false;
   // Insert encoded error code to existing list of error codes.
   // Which is ordered by category.
-  for (const auto& error : state_->error_codes()) {
+  for (const auto error : state_->error_codes()) {
     auto current_category = *error.data();
     // Appropriate place to insert new error code, when existing category is greater
     // and we did not insert yet.

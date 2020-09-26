@@ -5,7 +5,8 @@ import { BootstrapTable, TableHeaderColumn } from 'react-bootstrap-table';
 import 'react-bootstrap-table/css/react-bootstrap-table.css';
 import { YBLoadingCircleIcon } from '../../common/indicators';
 import { IN_DEVELOPMENT_MODE } from '../../../config';
-import { isDefinedNotNull } from '../../../utils/ObjectUtils';
+import {isDefinedNotNull, isNonEmptyString} from '../../../utils/ObjectUtils';
+import { isNotHidden, isDisabled } from '../../../utils/LayoutUtils';
 import { YBPanelItem } from '../../panels';
 import { NodeAction } from '../../universes';
 import moment from 'moment';
@@ -33,7 +34,17 @@ export default class NodeDetailsTable extends Component {
       }
 
       if (row.nodeAlive) {
-        return <div>{successIcon}&nbsp;<a href={href} target="_blank" rel="noopener noreferrer">{isMaster ? "Master" : "TServer"}</a>{(isMaster && row.isMasterLeader) ? " (Leader)" : ""}</div>;
+        return (
+          <div>{successIcon}&nbsp;{
+            isNotHidden(customer.currentCustomer.data.features, "universes.proxyIp") ? (
+              <a href={href} target="_blank" rel="noopener noreferrer">
+                {isMaster ? "Master" : "TServer"}
+              </a>
+            ) : (
+              <span>{isMaster ? "Master" : "TServer"}</span>
+            )
+          }{(isMaster && row.isMasterLeader) ? " (Leader)" : ""}</div>
+        );
       } else {
         return <div>{row.isLoading ? loadingIcon : warningIcon}&nbsp;{isMaster ? "Master" : "TServer"}</div>;
       }
@@ -47,26 +58,49 @@ export default class NodeDetailsTable extends Component {
     };
 
     const getNodeNameLink = (cell, row) => {
+      const ip = (
+        <div className={"text-lightgray"}>
+          {row['privateIP']}
+        </div>
+      );
+      let nodeName = cell;
+      let onPremNodeName = "";
       if (row.cloudInfo.cloud === "aws") {
         const awsURI = `https://${row.cloudInfo.region}.console.aws.amazon.com/ec2/v2/home?region=${row.cloudInfo.region}#Instances:search=${cell};sort=availabilityZone`;
-        return (<Fragment>
-          <a href={awsURI} target="_blank" rel="noopener noreferrer">{cell}</a>
-          <div className={"text-lightgray"}>{row['privateIP']}</div>
-        </Fragment>);
+        nodeName = (<a href={awsURI} target="_blank" rel="noopener noreferrer">{cell}</a>);
       } else if (row.cloudInfo.cloud === "gcp") {
         const gcpURI = `https://console.cloud.google.com/compute/instancesDetail/zones/${row.azItem}/instances/${cell}`;
+        nodeName = (<a href={gcpURI} target="_blank" rel="noopener noreferrer">{cell}</a>);
+      }
+
+      if (row.cloudInfo.cloud === "onprem") {
+        if (isNonEmptyString(row.instanceName)) {
+          onPremNodeName = row.instanceName;
+        }
+      }
+
+      if (isNonEmptyString(onPremNodeName)) {
+        const instanceId = (
+          <div className={"text-lightgray"}>
+            {onPremNodeName}
+          </div>
+        );
         return (<Fragment>
-          <a href={gcpURI} target="_blank" rel="noopener noreferrer">{cell}</a>
-          <div>{row['privateIP']}</div>
-        </Fragment>);
+          {nodeName}
+          {ip}
+          {instanceId}
+        </Fragment>)
       } else {
-        return cell;
+        return (<Fragment>
+          {nodeName}
+          {ip}
+        </Fragment>);
       }
     };
 
     const getStatusUptime = (cell, row) => {
       let uptime = "_";
-      if(isDefinedNotNull(row.uptime_seconds)) {
+      if (isDefinedNotNull(row.uptime_seconds)) {
         // get the difference between the moments
         const difference = parseFloat(row.uptime_seconds) * 1000;
 
@@ -88,7 +122,7 @@ export default class NodeDetailsTable extends Component {
             ${pluralize(diffArray[idx - 1][1], diffArray[idx - 1][0])}
             ${diffArray[idx - 2][0]}
             ${pluralize(diffArray[idx - 2][1], diffArray[idx - 2][0])}`;
-      };
+      }
       return (<Fragment>
         <div className={cell === "Live" ? 'text-green' : 'text-red'}>{cell}</div>
         {uptime}
@@ -96,7 +130,20 @@ export default class NodeDetailsTable extends Component {
     };
 
     const getNodeAction = function(cell, row, type) {
-      return <NodeAction currentRow={row} providerUUID={providerUUID} />;
+      const hideIP = !isNotHidden(customer.currentCustomer.data.features,
+                                  "universes.proxyIp");
+      const actions_disabled = isDisabled(customer.currentCustomer.data.features,
+                                          "universes.actions");
+
+      if (hideIP) {
+        const index = row.allowedActions.indexOf('CONNECT');
+        if (index > -1) {
+          row.allowedActions.splice(index, 1);
+        }
+      }
+      return (<NodeAction currentRow={row} providerUUID={providerUUID}
+                         disableConnect={hideIP}
+                         disabled={actions_disabled} />);
     };
 
     const formatFloatValue = function(cell, row) {

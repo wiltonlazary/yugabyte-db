@@ -1,8 +1,8 @@
 ---
-title: CREATE SEQUENCE
+title: CREATE SEQUENCE statement [YSQL]
+headerTitle: CREATE SEQUENCE
 linkTitle: CREATE SEQUENCE
-summary: Create a sequence in the current schema
-description: CREATE SEQUENCE
+description: Use the CREATE SEQUENCE statement to create a new sequence in the current schema.
 menu:
   latest:
     identifier: api-ysql-commands-create-sequence
@@ -89,7 +89,7 @@ Stores the last value used or the next value to be used.
 
 Stores whether `last_val` has been used. If false, `last_val` is the next value in the sequence. Otherwise, `last_val` + `INCREMENT` is the next one.
 
-By default (when `INCREMENT` is 1), each call to `nextval()` updates `last_val` for that sequence. In YSQL, the table holding the sequence's data is replicated as opposed to being in the local file system. Each update to this table requires two RPCs (and will be optimized to one RPC in the future), In any case, the latency experienced by a call to `nextval()` in YSQL will be significantly higher than the same operation in Postgres. To avoid such performance degradation, we recommend using a cache value with a value large enough. Cached values are stored in the memory of the local node, and retrieving such values avoids any RPCs, so the latency of one cache allocation can be amortized over all the numbers allocated for the cache.
+By default (when `INCREMENT` is 1), each call to `nextval()` updates `last_val` for that sequence. In YSQL, the table holding the sequence's data is replicated as opposed to being in the local file system. Each update to this table requires two RPCs (and will be optimized to one RPC in the future), In any case, the latency experienced by a call to `nextval()` in YSQL will be significantly higher than the same operation in Postgres. To avoid such performance degradation, Yugabyte recommends using a cache value with a value large enough. Cached values are stored in the memory of the local node, and retrieving such values avoids any RPCs, so the latency of one cache allocation can be amortized over all the numbers allocated for the cache.
 
 `SERIAL` types create a sequence with a cache with default value of 1. So `SERIAL` types should be avoided, and their equivalent statement should be used.
 Instead of creating a table with a `SERIAL` type like this:
@@ -191,6 +191,6 @@ nextval
 
 - [`ALTER SEQUENCE`](../ddl_alter_sequence)
 - [`DROP SEQUENCE`](../ddl_drop_sequence)
-- [`currval()`](../currval_sequence)
-- [`lastval()`](../lastval_sequence)
-- [`nextval()`](../nextval_sequence)
+- [`currval()`](../../exprs/func_currval)
+- [`lastval()`](../../exprs/func_lastval)
+- [`nextval()`](../../exprs/func_nextval)

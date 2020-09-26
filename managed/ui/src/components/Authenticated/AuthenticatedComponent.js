@@ -2,8 +2,10 @@
 
 import React, { Component } from 'react';
 import { withRouter } from 'react-router';
-import { isNonEmptyArray } from 'utils/ObjectUtils';
-const PropTypes = require('prop-types');
+import { isNonEmptyArray } from '../../utils/ObjectUtils';
+import { getPromiseState } from '../../utils/PromiseUtils';
+import { isHidden } from '../../utils/LayoutUtils';
+import PropTypes from 'prop-types';
 
 class AuthenticatedComponent extends Component {
   constructor(props) {
@@ -24,6 +26,7 @@ class AuthenticatedComponent extends Component {
     this.props.fetchTableColumnTypes();
     this.props.getEBSListItems();
     this.props.getGCPListItems();
+    this.props.getAZUListItems();
     this.props.getProviderListItems();
     this.props.getSupportedRegionList();
     this.props.getYugaWareVersion();
@@ -81,8 +84,10 @@ class AuthenticatedComponent extends Component {
   };
 
   render() {
+    const { currentCustomer } = this.props;
+    const sidebarHidden = getPromiseState(currentCustomer).isSuccess() && isHidden(currentCustomer.data.features, "menu.sidebar");
     return (
-      <div className="full-height-container">
+      <div className={sidebarHidden ? 'full-height-container sidebar-hidden' : 'full-height-container'}>
         {this.props.children}
       </div>
     );

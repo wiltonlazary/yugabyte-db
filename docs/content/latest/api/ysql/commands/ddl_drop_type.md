@@ -1,8 +1,8 @@
 ---
-title: DROP TYPE
+title: DROP TYPE statement [YSQL]
+headerTitle: DROP TYPE
 linkTitle: DROP TYPE
-summary: Remove a type
-description: DROP TYPE
+description: Use the DROP TYPE statement to remove a user-defined type from the database.
 menu:
   latest:
     identifier: api-ysql-commands-drop-type
@@ -88,4 +88,3 @@ yugabyte=# DROP TYPE feature_range RESTRICT;
 ## See also
 
 - [`CREATE TYPE`](../ddl_create_type)
-

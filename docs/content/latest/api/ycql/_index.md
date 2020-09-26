@@ -1,7 +1,8 @@
 ---
-title: YCQL
+title: Yugabyte Cloud Query Language (YCQL)
+headerTitle: Yugabyte Cloud Query Language (YCQL)
 linkTitle: YCQL
-description: Yugabyte Cloud Query Language (YCQL)
+description: YCQL is a semi-relational API that is best fit for internet-scale OLTP & HTAP applications.
 summary: Reference for the YCQL API
 image: /images/section_icons/api/ycql.png
 headcontent:
@@ -19,9 +20,9 @@ showAsideToc: true
 
 ## Introduction
 
-YCQL is a SQL-based, flexible-schema API that is best fit for internet-scale OLTP application needing a semi-relational API highly optimized for write-intensive applications as well as blazing-fast queries. It supports distributed transactions, strongly consistent secondary indexes, and a native JSON column type. It has its roots in the [Cassandra Query Language (CQL)](http://cassandra.apache.org/doc/latest/cql/index.html). 
+Yugabyte Cloud Query Language (YCQL) is a semi-relational SQL API that is best fit for internet-scale OLTP and HTAP applications needing massive data ingestion and blazing-fast queries. It supports strongly consistent secondary indexes, a native JSON column type, and distributed transactions. It has its roots in the [Cassandra Query Language (CQL)](http://cassandra.apache.org/doc/latest/cql/index.html). 
 
-YCQL supports the following features.
+This page covers the following YCQL features.
 
 - Data definition language (DDL) statements.
 - Data manipulation language (DML) statements.
@@ -57,7 +58,7 @@ Statement | Description |
 
 Security statements are instructions for managing and restricting operations on the database objects.
 
-This feature is enabled by setting the YB-TServer configuration option [`use_cassandra_authentication`](../../reference/configuration/yb-tserver/#use-cassandra-authentication) to `true`.
+This feature is enabled by setting the YB-TServer configuration flag [`--use_cassandra_authentication`](../../reference/configuration/yb-tserver/#use-cassandra-authentication) to `true`.
 
 - Create, grant, and revoke users and roles
 - Grant, and revoke permissions on database objects
@@ -121,7 +122,7 @@ Primitive Type | Allowed in Key | Type Parameters | Description |
 [`BLOB`](type_blob) | Yes | - | String of binary characters |
 [`BOOLEAN`](type_bool) | Yes | - | Boolean |
 [`COUNTER`](type_int) | No | - | 64-bit signed integer |
-[`DECIMAL`](type_number) | Yes | - | Exact, fixed-point number |
+[`DECIMAL`](type_number) | Yes | - | Exact, arbitrary-precision number, no upper-bound on decimal precision |
 [`DATE`](type_datetime) | Yes | - | Date |
 [`DOUBLE`](type_number) | Yes | - | 64-bit, inexact, floating-point number |
 [`FLOAT`](type_number) | Yes | - | 64-bit, inexact, floating-point number |
@@ -138,12 +139,12 @@ Primitive Type | Allowed in Key | Type Parameters | Description |
 [`TIMEUUID`](type_uuid) | Yes | - | Timed UUID |
 [`TINYINT`](type_int) | Yes | - | 8-bit signed integer |
 [`UUID`](type_uuid) | Yes | - | Standard UUID |
-[`VARINT`](type_integer) | Yes | - | Arbitrary-precision integer |
+[`VARINT`](type_int) | Yes | - | Arbitrary-precision integer |
 [`JSONB`](type_jsonb) | No | - | JSON data type similar to PostgreSQL jsonb |
 
 - [User-defined data types](ddl_create_type) are also supported.
 
-- The following table lists all CQL primitive types that are not yet implemented.
+- The following table lists all YCQL primitive types that are not yet implemented.
 
 Primitive Type |
 ---------------|

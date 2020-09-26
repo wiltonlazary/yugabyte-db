@@ -6,23 +6,23 @@ import { Grid, DropdownButton, MenuItem, Tab, Alert } from 'react-bootstrap';
 import Measure from 'react-measure';
 import { CustomerMetricsPanel } from '../../metrics';
 import { TaskProgressContainer, TaskListTable } from '../../tasks';
-import { RollingUpgradeFormContainer } from 'components/common/forms';
+import { RollingUpgradeFormContainer } from '../../../components/common/forms';
 import { UniverseFormContainer, UniverseStatusContainer, NodeDetailsContainer,
          DeleteUniverseContainer, UniverseAppsModal, UniverseConnectModal,
          UniverseOverviewContainerNew, EncryptionKeyModalContainer } from '../../universes';
 import { YBLabelWithIcon } from '../../common/descriptors';
 import { YBTabsWithLinksPanel } from '../../panels';
-import { ListTablesContainer, ListBackupsContainer } from '../../tables';
+import { ListTablesContainer, ListBackupsContainer, ReplicationContainer } from '../../tables';
 import { isEmptyObject, isNonEmptyObject, isNonEmptyArray, isEmptyArray } from '../../../utils/ObjectUtils';
 import { isKubernetesUniverse } from '../../../utils/UniverseUtils';
 import { getPromiseState } from '../../../utils/PromiseUtils';
-import { hasLiveNodes } from 'utils/UniverseUtils';
+import { hasLiveNodes } from '../../../utils/UniverseUtils';
 
 import { YBLoading, YBErrorIndicator } from '../../common/indicators';
 import { mouseTrap } from 'react-mousetrap';
 import { TASK_SHORT_TIMEOUT } from '../../tasks/constants';
 import UniverseHealthCheckList from './UniverseHealthCheckList/UniverseHealthCheckList.js';
-import { isNonAvailable, isDisabled, isEnabled, isHidden, isNotHidden, getFeatureState } from 'utils/LayoutUtils';
+import { isNonAvailable, isDisabled, isEnabled, isHidden, isNotHidden, getFeatureState } from '../../../utils/LayoutUtils';
 import { LinkContainer } from 'react-router-bootstrap';
 
 import './UniverseDetail.scss';
@@ -76,11 +76,11 @@ class UniverseDetail extends Component {
     }
   }
 
-  componentDidUpdate(prevProps, prevState, snapshot) {
-    const { universe: { currentUniverse }} = this.props;
+  componentDidUpdate(prevProps) {
+    const { universe: { currentUniverse }, universeTables } = this.props;
     if (getPromiseState(currentUniverse).isSuccess() &&
         !getPromiseState(prevProps.universe.currentUniverse).isSuccess()) {
-      if (hasLiveNodes(currentUniverse.data)) {
+      if (hasLiveNodes(currentUniverse.data) && !universeTables.length) {
         this.props.fetchUniverseTables(currentUniverse.data.universeUUID);
       }
     }
@@ -219,49 +219,54 @@ class UniverseDetail extends Component {
         isNotHidden(currentCustomer.data.features, "universes.details.overview") &&
           <Tab.Pane
             eventKey={"overview"}
-            title="Overview"
+            tabtitle="Overview"
             key="overview-tab"
             mountOnEnter={true}
             unmountOnExit={true}
-            disabled={isDisabled(currentCustomer.data.features, "universes.details.overview")}>
+            disabled={isDisabled(currentCustomer.data.features, "universes.details.overview")}
+          >
             <UniverseOverviewContainerNew
               width={width}
               universe={universe}
               updateAvailable={updateAvailable}
               showSoftwareUpgradesModal={showSoftwareUpgradesModal}
-              tabRef={this.ybTabPanel} />
+              tabRef={this.ybTabPanel}
+            />
           </Tab.Pane>,
 
         isNotHidden(currentCustomer.data.features, "universes.details.tables") &&
           <Tab.Pane
             eventKey={"tables"}
-            title="Tables"
+            tabtitle="Tables"
             key="tables-tab"
             mountOnEnter={true}
             unmountOnExit={true}
-            disabled={isDisabled(currentCustomer.data.features, "universes.details.tables")}>
-            <ListTablesContainer/>
+            disabled={isDisabled(currentCustomer.data.features, "universes.details.tables")}
+          >
+            <ListTablesContainer />
           </Tab.Pane>,
 
         isNotHidden(currentCustomer.data.features, "universes.details.nodes") &&
           <Tab.Pane
             eventKey={"nodes"}
-            title={isItKubernetesUniverse ? "Pods" : "Nodes"}
+            tabtitle={isItKubernetesUniverse ? "Pods" : "Nodes"}
             key="nodes-tab"
             mountOnEnter={true}
             unmountOnExit={true}
-            disabled={isDisabled(currentCustomer.data.features, "universes.details.nodes")}>
+            disabled={isDisabled(currentCustomer.data.features, "universes.details.nodes")}
+          >
             <NodeDetailsContainer />
           </Tab.Pane>,
 
         isNotHidden(currentCustomer.data.features, "universes.details.metrics") &&
           <Tab.Pane
             eventKey={"metrics"}
-            title="Metrics"
+            tabtitle="Metrics"
             key="metrics-tab"
             mountOnEnter={true}
             unmountOnExit={true}
-            disabled={isDisabled(currentCustomer.data.features, "universes.details.metrics")}>
+            disabled={isDisabled(currentCustomer.data.features, "universes.details.metrics")}
+          >
             <div className="universe-detail-content-container">
               <CustomerMetricsPanel
                 customer={customer}
@@ -272,10 +277,22 @@ class UniverseDetail extends Component {
             </div>
           </Tab.Pane>,
 
+        isNotHidden(currentCustomer.data.features, "universes.details.replication") &&
+          <Tab.Pane
+            eventKey={"replication"}
+            tabtitle="Replication"
+            key="replication-tab"
+            mountOnEnter={true}
+            unmountOnExit={true}
+            disabled={isDisabled(currentCustomer.data.features, "universes.details.replication")}
+          >
+            <ReplicationContainer />
+          </Tab.Pane>,
+
         isNotHidden(currentCustomer.data.features, "universes.details.tasks") &&
           <Tab.Pane
             eventKey={"tasks"}
-            title="Tasks"
+            tabtitle="Tasks"
             key="tasks-tab"
             mountOnEnter={true}
             unmountOnExit={true}
@@ -293,23 +310,25 @@ class UniverseDetail extends Component {
         isNotHidden(currentCustomer.data.features, "universes.details.backups") &&
           <Tab.Pane
             eventKey={"backups"}
-            title="Backups"
+            tabtitle="Backups"
             key="backups-tab"
             mountOnEnter={true}
             unmountOnExit={true}
-            disabled={isDisabled(currentCustomer.data.features, "universes.details.backups")}>
+            disabled={isDisabled(currentCustomer.data.features, "universes.details.backups")}
+          >
             <ListBackupsContainer currentUniverse={currentUniverse.data} />
           </Tab.Pane>,
 
         isNotHidden(currentCustomer.data.features, "universes.details.health") &&
           <Tab.Pane
             eventKey={"health"}
-            title="Health"
+            tabtitle="Health"
             key="health-tab"
             mountOnEnter={true}
             unmountOnExit={true}
-            disabled={isDisabled(currentCustomer.data.features, "universes.details.heath")}>
-            <UniverseHealthCheckList universe={universe} />
+            disabled={isDisabled(currentCustomer.data.features, "universes.details.heath")}
+          >
+            <UniverseHealthCheckList universe={universe} currentCustomer={currentCustomer} />
           </Tab.Pane>
       ]
     ].filter(element => element);
@@ -345,61 +364,62 @@ class UniverseDetail extends Component {
           </h2>
           <UniverseStatusContainer currentUniverse={currentUniverse.data} showLabelText={true} refreshUniverseData={this.getUniverseInfo}/>
         </div>
-        <div className="page-action-buttons">
+        {isNotHidden(currentCustomer.data.features, "universes.details.pageActions") &&
+          <div className="page-action-buttons">
 
-          {/* UNIVERSE EDIT */}
-          <div className="universe-detail-btn-group">
+            {/* UNIVERSE EDIT */}
+            <div className="universe-detail-btn-group">
 
-            <UniverseConnectModal/>
+              <UniverseConnectModal/>
 
-            <DropdownButton title="More" className={this.showUpgradeMarker() ? "btn-marked": ""} id="bg-nested-dropdown" pullRight>
-              <YBMenuItem eventKey="1" onClick={showSoftwareUpgradesModal} availability={getFeatureState(currentCustomer.data.features, "universes.details.overview.upgradeSoftware")}>
-                <YBLabelWithIcon icon="fa fa-arrow-up fa-fw">
-                  Upgrade Software
-                </YBLabelWithIcon>
-                { this.showUpgradeMarker() ? <span className="badge badge-pill badge-red pull-right">{updateAvailable}</span> : ""}
-              </YBMenuItem>
-              {!isReadOnlyUniverse && isNotHidden(currentCustomer.data.features, "universes.details.metrics") &&
-                <YBMenuItem eventKey="2" to={`/universes/${uuid}/edit/primary`} availability={getFeatureState(currentCustomer.data.features, "universes.details.metrics")}>
-                  <YBLabelWithIcon icon="fa fa-pencil">
-                  Edit Universe
+              <DropdownButton title="More" className={this.showUpgradeMarker() ? "btn-marked": ""} id="bg-nested-dropdown" pullRight>
+                <YBMenuItem eventKey="1" onClick={showSoftwareUpgradesModal} availability={getFeatureState(currentCustomer.data.features, "universes.details.overview.upgradeSoftware")}>
+                  <YBLabelWithIcon icon="fa fa-arrow-up fa-fw">
+                    Upgrade Software
+                  </YBLabelWithIcon>
+                  { this.showUpgradeMarker() ? <span className="badge badge-pill badge-red pull-right">{updateAvailable}</span> : ""}
+                </YBMenuItem>
+                {!isReadOnlyUniverse && isNotHidden(currentCustomer.data.features, "universes.details.overview.editUniverse") &&
+                  <YBMenuItem eventKey="2" to={`/universes/${uuid}/edit/primary`} availability={getFeatureState(currentCustomer.data.features, "universes.details.overview.editUniverse")}>
+                    <YBLabelWithIcon icon="fa fa-pencil">
+                    Edit Universe
+                    </YBLabelWithIcon>
+                  </YBMenuItem>
+                }
+                <YBMenuItem eventKey="4" onClick={showGFlagsModal} availability={getFeatureState(currentCustomer.data.features, "universes.details.overview.editGFlags")}>
+                  <YBLabelWithIcon icon="fa fa-flag fa-fw">
+                    Edit Flags
                   </YBLabelWithIcon>
                 </YBMenuItem>
-              }
-              <YBMenuItem eventKey="4" onClick={showGFlagsModal} availability={getFeatureState(currentCustomer.data.features, "universes.details.overview.editGFlags")}>
-                <YBLabelWithIcon icon="fa fa-flag fa-fw">
-                  Edit GFlags
-                </YBLabelWithIcon>
-              </YBMenuItem>
-              <YBMenuItem eventKey="4" onClick={showManageKeyModal} availability={getFeatureState(currentCustomer.data.features, "universes.details.overview.manageEncryption")}>
-                <YBLabelWithIcon icon="fa fa-key fa-fw">
-                  Manage Encryption Keys
-                </YBLabelWithIcon>
-              </YBMenuItem>
-              {!isReadOnlyUniverse &&
-                <YBMenuItem eventKey="3" to={`/universes/${uuid}/edit/async`} availability={getFeatureState(currentCustomer.data.features, "universes.details.overview.readReplica")}>
-                  <YBLabelWithIcon icon="fa fa-copy fa-fw">
-                    {this.hasReadReplica(universeInfo) ? "Edit" : "Add" } Read Replica
-                  </YBLabelWithIcon>
-                  <span className="badge badge-pill badge-blue pull-right">Beta</span>
-                </YBMenuItem>
-              }
-              <UniverseAppsModal currentUniverse={currentUniverse.data} modal={modal} closeModal={closeModal} button={
-                <YBMenuItem eventKey="0" onClick={showRunSampleAppsModal}>
-                  <YBLabelWithIcon icon="fa fa-terminal">
-                    Run Sample Apps
+                <YBMenuItem eventKey="4" onClick={showManageKeyModal} availability={getFeatureState(currentCustomer.data.features, "universes.details.overview.manageEncryption")}>
+                  <YBLabelWithIcon icon="fa fa-key fa-fw">
+                    Manage Encryption Keys
                   </YBLabelWithIcon>
                 </YBMenuItem>
-              }/>
-              <div className="divider"></div>
-              <YBMenuItem eventKey="5" onClick={showDeleteUniverseModal} availability={getFeatureState(currentCustomer.data.features, "universes.details.overview.deleteUniverse")}>
-                <YBLabelWithIcon icon="fa fa-trash-o fa-fw">
-                  Delete Universe
-                </YBLabelWithIcon>
-              </YBMenuItem>
-            </DropdownButton>
+                {!isReadOnlyUniverse &&
+                  <YBMenuItem eventKey="3" to={`/universes/${uuid}/edit/async`} availability={getFeatureState(currentCustomer.data.features, "universes.details.overview.readReplica")}>
+                    <YBLabelWithIcon icon="fa fa-copy fa-fw">
+                      {this.hasReadReplica(universeInfo) ? "Edit" : "Add" } Read Replica
+                    </YBLabelWithIcon>
+                  </YBMenuItem>
+                }
+                <UniverseAppsModal currentUniverse={currentUniverse.data} modal={modal} closeModal={closeModal} button={
+                  <YBMenuItem eventKey="0" onClick={showRunSampleAppsModal}>
+                    <YBLabelWithIcon icon="fa fa-terminal">
+                      Run Sample Apps
+                    </YBLabelWithIcon>
+                  </YBMenuItem>
+                }/>
+                <div className="divider"></div>
+                <YBMenuItem eventKey="5" onClick={showDeleteUniverseModal} availability={getFeatureState(currentCustomer.data.features, "universes.details.overview.deleteUniverse")}>
+                  <YBLabelWithIcon icon="fa fa-trash-o fa-fw">
+                    Delete Universe
+                  </YBLabelWithIcon>
+                </YBMenuItem>
+              </DropdownButton>
+            </div>
           </div>
-        </div>
+        }
         <RollingUpgradeFormContainer modalVisible={showModal &&
         (visibleModal === "gFlagsModal" || visibleModal ==="softwareUpgradesModal")}
                                       onHide={closeModal} />
@@ -448,7 +468,7 @@ class YBMenuItem extends Component {
       }
     }
     return (
-      <li>
+      <li className={availability}>
         <div className={className}>
           {this.props.children}
         </div>
@@ -489,7 +509,7 @@ class UniverseTaskList extends Component {
     if (isNonEmptyArray(universeTaskHistoryArray)) {
       const errorPlatformMessage = (
         <div className="oss-unavailable-warning">
-          Only available on YugaByte Platform.
+          Only available on Yugabyte Platform.
         </div>
       );
       universeTaskHistory = (

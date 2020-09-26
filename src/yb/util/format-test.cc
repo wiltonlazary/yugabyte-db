@@ -20,6 +20,10 @@
 #include <unordered_map>
 #include <sstream>
 
+#include <boost/multi_index_container.hpp>
+#include <boost/multi_index/ordered_index.hpp>
+#include <boost/multi_index/member.hpp>
+
 #include "yb/gutil/strings/substitute.h"
 
 #include "yb/util/test_util.h"
@@ -143,6 +147,17 @@ TEST(FormatTest, String) {
     CheckPlain(format, string);
     CheckPlain(format, "TempString"s);
   }
+}
+
+// strings::Substitute ignores actual size of array.
+// That is why CheckPlain helper can't be used to check Format with array argument without '\0'.
+TEST(FormatTest, Array) {
+  union {
+    char data[10] = "head-tail";
+    char head[4];
+  } sub_array_accesor;
+  ASSERT_EQ("This should be head only",
+            Format("This should be $0 only", sub_array_accesor.head));
 }
 
 TEST(FormatTest, Collections) {

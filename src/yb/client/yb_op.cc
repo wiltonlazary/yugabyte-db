@@ -44,9 +44,13 @@
 #include "yb/common/redis_protocol.pb.h"
 #include "yb/common/ql_protocol.pb.h"
 #include "yb/common/ql_rowblock.h"
+#include "yb/common/ql_scanspec.h"
+#include "yb/common/ql_type.h"
 #include "yb/common/ql_value.h"
 
 #include "yb/docdb/doc_key.h"
+#include "yb/docdb/doc_scanspec_util.h"
+#include "yb/docdb/primitive_value.h"
 
 #include "yb/tserver/tserver.pb.h"
 #include "yb/tserver/tserver_service.proxy.h"
@@ -54,13 +58,22 @@
 #include "yb/yql/cql/ql/util/errcodes.h"
 #include "yb/yql/redis/redisserver/redis_constants.h"
 
+#include "yb/util/flag_tags.h"
+
 using namespace std::literals;
+
+DEFINE_bool(redis_allow_reads_from_followers, false,
+            "If true, the read will be served from the closest replica in the same AZ, which can "
+            "be a follower.");
+TAG_FLAG(redis_allow_reads_from_followers, evolving);
+TAG_FLAG(redis_allow_reads_from_followers, runtime);
 
 namespace yb {
 namespace client {
 
 using std::shared_ptr;
 using std::unique_ptr;
+using common::QLScanRange;
 
 //--------------------------------------------------------------------------------------------------
 // YBOperation
@@ -91,6 +104,14 @@ bool YBOperation::IsYsqlCatalogOp() const {
   return table_->schema().table_properties().is_ysql_catalog_table();
 }
 
+void YBOperation::MarkTablePartitionsAsStale() {
+  table_->MarkPartitionsAsStale();
+}
+
+Result<bool> YBOperation::MaybeRefreshTablePartitions() {
+  return table_->MaybeRefreshPartitions();
+}
+
 //--------------------------------------------------------------------------------------------------
 // YBRedisOp
 //--------------------------------------------------------------------------------------------------
@@ -98,8 +119,6 @@ bool YBOperation::IsYsqlCatalogOp() const {
 YBRedisOp::YBRedisOp(const shared_ptr<YBTable>& table)
     : YBOperation(table) {
 }
-
-YBRedisOp::~YBRedisOp() {}
 
 RedisResponsePB* YBRedisOp::mutable_response() {
   if (!redis_response_) {
@@ -112,13 +131,16 @@ const RedisResponsePB& YBRedisOp::response() const {
   return *DCHECK_NOTNULL(redis_response_.get());
 }
 
+OpGroup YBRedisReadOp::group() {
+  return FLAGS_redis_allow_reads_from_followers ? OpGroup::kConsistentPrefixRead
+                                                : OpGroup::kLeaderRead;
+}
+
 // YBRedisWriteOp -----------------------------------------------------------------
 
 YBRedisWriteOp::YBRedisWriteOp(const shared_ptr<YBTable>& table)
     : YBRedisOp(table), redis_write_request_(new RedisWriteRequestPB()) {
 }
-
-YBRedisWriteOp::~YBRedisWriteOp() {}
 
 size_t YBRedisWriteOp::space_used_by_request() const {
   return redis_write_request_->ByteSizeLong();
@@ -147,8 +169,6 @@ Status YBRedisWriteOp::GetPartitionKey(std::string *partition_key) const {
 YBRedisReadOp::YBRedisReadOp(const shared_ptr<YBTable>& table)
     : YBRedisOp(table), redis_read_request_(new RedisReadRequestPB()) {
 }
-
-YBRedisReadOp::~YBRedisReadOp() {}
 
 size_t YBRedisReadOp::space_used_by_request() const {
   return redis_read_request_->SpaceUsedLong();
@@ -199,30 +219,30 @@ YBqlWriteOp::YBqlWriteOp(const shared_ptr<YBTable>& table)
 
 YBqlWriteOp::~YBqlWriteOp() {}
 
-static YBqlWriteOp *NewYBqlWriteOp(const shared_ptr<YBTable>& table,
-                                   QLWriteRequestPB::QLStmtType stmt_type) {
-  YBqlWriteOp *op = new YBqlWriteOp(table);
-  QLWriteRequestPB *req = op->mutable_request();
+static std::unique_ptr<YBqlWriteOp> NewYBqlWriteOp(const shared_ptr<YBTable>& table,
+                                                   QLWriteRequestPB::QLStmtType stmt_type) {
+  auto op = std::unique_ptr<YBqlWriteOp>(new YBqlWriteOp(table));
+  QLWriteRequestPB* req = op->mutable_request();
   req->set_type(stmt_type);
   req->set_client(YQL_CLIENT_CQL);
   // TODO: Request ID should be filled with CQL stream ID. Query ID should be replaced too.
-  req->set_request_id(reinterpret_cast<uint64_t>(op));
-  req->set_query_id(reinterpret_cast<int64_t>(op));
+  req->set_request_id(reinterpret_cast<uint64_t>(op.get()));
+  req->set_query_id(op->GetQueryId());
 
   req->set_schema_version(table->schema().version());
 
   return op;
 }
 
-YBqlWriteOp *YBqlWriteOp::NewInsert(const std::shared_ptr<YBTable>& table) {
+std::unique_ptr<YBqlWriteOp> YBqlWriteOp::NewInsert(const std::shared_ptr<YBTable>& table) {
   return NewYBqlWriteOp(table, QLWriteRequestPB::QL_STMT_INSERT);
 }
 
-YBqlWriteOp *YBqlWriteOp::NewUpdate(const std::shared_ptr<YBTable>& table) {
+std::unique_ptr<YBqlWriteOp> YBqlWriteOp::NewUpdate(const std::shared_ptr<YBTable>& table) {
   return NewYBqlWriteOp(table, QLWriteRequestPB::QL_STMT_UPDATE);
 }
 
-YBqlWriteOp *YBqlWriteOp::NewDelete(const std::shared_ptr<YBTable>& table) {
+std::unique_ptr<YBqlWriteOp> YBqlWriteOp::NewDelete(const std::shared_ptr<YBTable>& table) {
   return NewYBqlWriteOp(table, QLWriteRequestPB::QL_STMT_DELETE);
 }
 
@@ -349,13 +369,18 @@ YBqlReadOp::YBqlReadOp(const shared_ptr<YBTable>& table)
 
 YBqlReadOp::~YBqlReadOp() {}
 
-YBqlReadOp *YBqlReadOp::NewSelect(const shared_ptr<YBTable>& table) {
-  YBqlReadOp *op = new YBqlReadOp(table);
+OpGroup YBqlReadOp::group() {
+  return yb_consistency_level_ == YBConsistencyLevel::CONSISTENT_PREFIX
+      ? OpGroup::kConsistentPrefixRead : OpGroup::kLeaderRead;
+}
+
+std::unique_ptr<YBqlReadOp> YBqlReadOp::NewSelect(const shared_ptr<YBTable>& table) {
+  std::unique_ptr<YBqlReadOp> op(new YBqlReadOp(table));
   QLReadRequestPB *req = op->mutable_request();
   req->set_client(YQL_CLIENT_CQL);
   // TODO: Request ID should be filled with CQL stream ID. Query ID should be replaced too.
-  req->set_request_id(reinterpret_cast<uint64_t>(op));
-  req->set_query_id(reinterpret_cast<int64_t>(op));
+  req->set_request_id(reinterpret_cast<uint64_t>(op.get()));
+  req->set_query_id(op->GetQueryId());
 
   req->set_schema_version(table->schema().version());
 
@@ -476,6 +501,98 @@ YBPgsqlOp::YBPgsqlOp(const shared_ptr<YBTable>& table)
 YBPgsqlOp::~YBPgsqlOp() {
 }
 
+namespace {
+
+Status GetRangeComponents(
+    const Schema& schema, const google::protobuf::RepeatedPtrField<PgsqlExpressionPB>& range_cols,
+    std::vector<docdb::PrimitiveValue>* range_components) {
+  int i = 0;
+  int num_range_key_columns = schema.num_range_key_columns();
+  for (const auto& col_id : schema.column_ids()) {
+    if (!schema.is_range_column(col_id)) {
+      continue;
+    }
+
+    const ColumnSchema& column_schema = VERIFY_RESULT(schema.column_by_id(col_id));
+    if (i >= range_cols.size() || range_cols[i].value().value_case() == QLValuePB::VALUE_NOT_SET) {
+      range_components->emplace_back(docdb::ValueType::kLowest);
+    } else {
+      range_components->push_back(docdb::PrimitiveValue::FromQLValuePB(
+          range_cols[i].value(), column_schema.sorting_type()));
+    }
+
+    i++;
+    if (i == num_range_key_columns) {
+      break;
+    }
+  }
+  return Status::OK();
+}
+
+CHECKED_STATUS GetRangePartitionKey(
+    const Schema& schema, const google::protobuf::RepeatedPtrField<PgsqlExpressionPB>& range_cols,
+    std::string* key) {
+  vector<docdb::PrimitiveValue> range_components;
+  DSCHECK(!schema.num_hash_key_columns(), IllegalState,
+      "Cannot get range partition key for hash partitioned table");
+
+  RETURN_NOT_OK(GetRangeComponents(schema, range_cols, &range_components));
+  *key = docdb::DocKey(std::move(range_components)).Encode().ToStringBuffer();
+  return Status::OK();
+}
+
+CHECKED_STATUS GetRangePartitionBounds(const YBPgsqlReadOp& op,
+                                       vector<docdb::PrimitiveValue>* lower_bound,
+                                       vector<docdb::PrimitiveValue>* upper_bound) {
+  const auto& schema = op.table()->InternalSchema();
+  SCHECK(!schema.num_hash_key_columns(), IllegalState,
+         "Cannot set range partition key for hash partitioned table");
+  const auto& request = op.request();
+  const auto& range_cols = request.range_column_values();
+  const auto& condition_expr = request.condition_expr();
+  if (range_cols.size() > 0) {
+    RETURN_NOT_OK(GetRangeComponents(schema, range_cols, lower_bound));
+    *upper_bound = *lower_bound;
+    upper_bound->emplace_back(docdb::ValueType::kHighest);
+  } else if (condition_expr.has_condition()) {
+    QLScanRange scan_range(schema, condition_expr.condition());
+    *lower_bound = docdb::GetRangeKeyScanSpec(schema, &scan_range, true /* lower bound */);
+    *upper_bound = docdb::GetRangeKeyScanSpec(schema, &scan_range, false /* upper bound */);
+  }
+  return Status::OK();
+}
+
+CHECKED_STATUS SetRangePartitionBounds(const YBPgsqlReadOp& op,
+                                       std::string* key,
+                                       std::string* key_upper_bound) {
+  vector<docdb::PrimitiveValue> range_components, range_components_end;
+  RETURN_NOT_OK(GetRangePartitionBounds(op, &range_components, &range_components_end));
+  if (range_components.empty() && range_components_end.empty()) {
+    if (op.request().is_forward_scan()) {
+      key->clear();
+    } else {
+      // In case of backward scan process must be start from the last partition.
+      *key = op.table()->GetPartitions().back();
+    }
+    key_upper_bound->clear();
+    return Status::OK();
+  }
+  auto upper_bound_key = docdb::DocKey(std::move(range_components_end)).Encode().ToStringBuffer();
+  if (op.request().is_forward_scan()) {
+    *key = docdb::DocKey(std::move(range_components)).Encode().ToStringBuffer();
+    *key_upper_bound = std::move(upper_bound_key);
+  } else {
+    // Backward scan should go from upper bound to lower. But because DocDB can check upper bound
+    // only it is not set here. Lower bound will be checked on client side in the
+    // ReviewResponsePagingState function.
+    *key = std::move(upper_bound_key);
+    key_upper_bound->clear();
+  }
+  return Status::OK();
+}
+
+} // namespace
+
 //--------------------------------------------------------------------------------------------------
 // YBPgsqlWriteOp
 
@@ -485,50 +602,74 @@ YBPgsqlWriteOp::YBPgsqlWriteOp(const shared_ptr<YBTable>& table)
 
 YBPgsqlWriteOp::~YBPgsqlWriteOp() {}
 
-static YBPgsqlWriteOp *NewYBPgsqlWriteOp(const shared_ptr<YBTable>& table,
-                                         PgsqlWriteRequestPB::PgsqlStmtType stmt_type) {
-  YBPgsqlWriteOp *op = new YBPgsqlWriteOp(table);
+std::unique_ptr<YBPgsqlWriteOp> YBPgsqlWriteOp::DeepCopy() {
+  auto op = std::make_unique<YBPgsqlWriteOp>(table_);
+  op->mutable_request()->CopyFrom(request());
+  op->set_is_single_row_txn(is_single_row_txn_);
+  op->SetTablet(tablet());
+  return op;
+}
+
+static std::unique_ptr<YBPgsqlWriteOp> NewYBPgsqlWriteOp(
+    const shared_ptr<YBTable>& table,
+    PgsqlWriteRequestPB::PgsqlStmtType stmt_type) {
+  auto op = std::make_unique<YBPgsqlWriteOp>(table);
   PgsqlWriteRequestPB *req = op->mutable_request();
   req->set_stmt_type(stmt_type);
   req->set_client(YQL_CLIENT_PGSQL);
   req->set_table_id(table->id());
   req->set_schema_version(table->schema().version());
+  req->set_stmt_id(op->GetQueryId());
 
   return op;
 }
 
-YBPgsqlWriteOp *YBPgsqlWriteOp::NewInsert(const std::shared_ptr<YBTable>& table) {
+std::unique_ptr<YBPgsqlWriteOp> YBPgsqlWriteOp::NewInsert(const std::shared_ptr<YBTable>& table) {
   return NewYBPgsqlWriteOp(table, PgsqlWriteRequestPB::PGSQL_INSERT);
 }
 
-YBPgsqlWriteOp *YBPgsqlWriteOp::NewUpdate(const std::shared_ptr<YBTable>& table) {
+std::unique_ptr<YBPgsqlWriteOp> YBPgsqlWriteOp::NewUpdate(const std::shared_ptr<YBTable>& table) {
   return NewYBPgsqlWriteOp(table, PgsqlWriteRequestPB::PGSQL_UPDATE);
 }
 
-YBPgsqlWriteOp *YBPgsqlWriteOp::NewDelete(const std::shared_ptr<YBTable>& table) {
+std::unique_ptr<YBPgsqlWriteOp> YBPgsqlWriteOp::NewDelete(const std::shared_ptr<YBTable>& table) {
   return NewYBPgsqlWriteOp(table, PgsqlWriteRequestPB::PGSQL_DELETE);
 }
 
-YBPgsqlWriteOp *YBPgsqlWriteOp::NewUpsert(const std::shared_ptr<YBTable>& table) {
-  return NewYBPgsqlWriteOp(table, PgsqlWriteRequestPB::PGSQL_UPSERT);
+std::unique_ptr<YBPgsqlWriteOp> YBPgsqlWriteOp::NewTruncateColocated(
+    const std::shared_ptr<YBTable>& table) {
+  return NewYBPgsqlWriteOp(table, PgsqlWriteRequestPB::PGSQL_TRUNCATE_COLOCATED);
 }
 
 std::string YBPgsqlWriteOp::ToString() const {
-  return "PGSQL_WRITE " + write_request_->ShortDebugString();
+  return "PGSQL_WRITE " + write_request_->ShortDebugString() +
+         ", response: " + response().ShortDebugString();
 }
 
 Status YBPgsqlWriteOp::GetPartitionKey(string* partition_key) const {
   const auto& ybctid = write_request_->ybctid_column_value().value();
-  if (!IsNull(ybctid)) {
-    const uint16 hash_code = VERIFY_RESULT(docdb::DocKey::DecodeHash(ybctid.binary_value()));
-    write_request_->set_hash_code(hash_code);
-    *partition_key = PartitionSchema::EncodeMultiColumnHashValue(hash_code);
-    return Status::OK();
-  }
+  if (table_->schema().num_hash_key_columns() > 0) {
+    if (!IsNull(ybctid)) {
+      const uint16 hash_code = VERIFY_RESULT(docdb::DocKey::DecodeHash(ybctid.binary_value()));
+      write_request_->set_hash_code(hash_code);
+      *partition_key = PartitionSchema::EncodeMultiColumnHashValue(hash_code);
+      return Status::OK();
+    }
 
-  // Computing the partition_key.
-  return table_->partition_schema().EncodeKey(write_request_->partition_column_values(),
-                                              partition_key);
+    // Computing the partition_key.
+    return table_->partition_schema().EncodeKey(write_request_->partition_column_values(),
+                                                partition_key);
+  } else {
+    // Range partitioned table
+    if (!IsNull(ybctid)) {
+      *partition_key = ybctid.binary_value();
+      return Status::OK();
+    }
+
+    // Computing the range key.
+    return GetRangePartitionKey(table_->InternalSchema(),
+        write_request_->range_column_values(), partition_key);
+  }
 }
 
 void YBPgsqlWriteOp::SetHashCode(const uint16_t hash_code) {
@@ -548,15 +689,23 @@ YBPgsqlReadOp::YBPgsqlReadOp(const shared_ptr<YBTable>& table)
       yb_consistency_level_(YBConsistencyLevel::STRONG) {
 }
 
-YBPgsqlReadOp::~YBPgsqlReadOp() {}
-
-YBPgsqlReadOp *YBPgsqlReadOp::NewSelect(const shared_ptr<YBTable>& table) {
-  YBPgsqlReadOp *op = new YBPgsqlReadOp(table);
+std::unique_ptr<YBPgsqlReadOp> YBPgsqlReadOp::NewSelect(const shared_ptr<YBTable>& table) {
+  std::unique_ptr<YBPgsqlReadOp> op(new YBPgsqlReadOp(table));
   PgsqlReadRequestPB *req = op->mutable_request();
   req->set_client(YQL_CLIENT_PGSQL);
   req->set_table_id(table->id());
   req->set_schema_version(table->schema().version());
+  req->set_stmt_id(op->GetQueryId());
 
+  return op;
+}
+
+std::unique_ptr<YBPgsqlReadOp> YBPgsqlReadOp::DeepCopy() {
+  auto op = NewSelect(table_);
+  op->set_yb_consistency_level(yb_consistency_level());
+  op->SetReadTime(read_time());
+  op->SetTablet(tablet());
+  op->mutable_request()->CopyFrom(request());
   return op;
 }
 
@@ -569,6 +718,7 @@ void YBPgsqlReadOp::SetHashCode(const uint16_t hash_code) {
 }
 
 Status YBPgsqlReadOp::GetPartitionKey(string* partition_key) const {
+  const Schema schema = table_->InternalSchema();
   if (!read_request_->partition_column_values().empty()) {
     // If hashed columns are set, use them to compute the exact key and set the bounds
     RETURN_NOT_OK(table_->partition_schema().EncodeKey(read_request_->partition_column_values(),
@@ -598,41 +748,51 @@ Status YBPgsqlReadOp::GetPartitionKey(string* partition_key) const {
       read_request_->set_max_hash_code(hash_code);
     } // else we are using no-hash scheme (e.g. for postgres syscatalog tables) -- nothing to do.
   } else {
-    // Otherwise, set the partition key to the hash_code (lower bound of the token range).
-    const auto& ybctid = read_request_->ybctid_column_value().value();
-    if (!IsNull(ybctid)) {
-      const uint16 hash_code = VERIFY_RESULT(docdb::DocKey::DecodeHash(ybctid.binary_value()));
-      read_request_->set_hash_code(hash_code);
-      *partition_key = PartitionSchema::EncodeMultiColumnHashValue(hash_code);
+    if (schema.num_hash_key_columns() > 0) {
+      // Set the partition key to the hash_code (lower bound of the token range).
+      const auto &ybctid = read_request_->ybctid_column_value().value();
+      if (!IsNull(ybctid)) {
+        const uint16 hash_code = VERIFY_RESULT(docdb::DocKey::DecodeHash(ybctid.binary_value()));
+        read_request_->set_hash_code(hash_code);
+        *partition_key = PartitionSchema::EncodeMultiColumnHashValue(hash_code);
+      } else {
+        // Default to empty key, this will start a scan from the beginning.
+        partition_key->clear();
+      }
     } else {
-      // Default to empty key, this will start a scan from the beginning.
-      partition_key->clear();
+      // Set the range partition key.
+      const auto &ybctid = read_request_->ybctid_column_value().value();
+      if (!IsNull(ybctid)) {
+        *partition_key = ybctid.binary_value();
+      } else {
+        RETURN_NOT_OK(SetRangePartitionBounds(
+            *this, partition_key, read_request_->mutable_max_partition_key()));
+      }
     }
   }
 
   // If this is a continued query use the partition key from the paging state
   // If paging state is there, set hash_code = paging state. This is only supported for forward
   // scans.
-  if (read_request_->has_paging_state() &&
-      read_request_->paging_state().has_next_partition_key() &&
-      !read_request_->paging_state().next_partition_key().empty()) {
+  if (read_request_->has_paging_state() && read_request_->paging_state().has_next_partition_key()) {
     *partition_key = read_request_->paging_state().next_partition_key();
-
     // Check that the partition key we got from the paging state is within bounds.
-    uint16 paging_state_hash_code = PartitionSchema::DecodeMultiColumnHashValue(*partition_key);
-    if ((read_request_->has_hash_code() &&
-            paging_state_hash_code < read_request_->hash_code()) ||
-        (read_request_->has_max_hash_code() &&
-            paging_state_hash_code > read_request_->max_hash_code())) {
-    return STATUS_SUBSTITUTE(InternalError,
-                             "Out of bounds partition key found in paging state:"
-                             "Query's partition bounds: [%d, %d], paging state partition: %d",
-                             read_request_->hash_code(),
-                             read_request_->max_hash_code() ,
-                             paging_state_hash_code);
-    }
+    if (schema.num_hash_key_columns() > 0 && !partition_key->empty()) {
+      uint16 paging_state_hash_code = PartitionSchema::DecodeMultiColumnHashValue(*partition_key);
+      if ((read_request_->has_hash_code() &&
+          paging_state_hash_code < read_request_->hash_code()) ||
+          (read_request_->has_max_hash_code() &&
+              paging_state_hash_code > read_request_->max_hash_code())) {
+        return STATUS_SUBSTITUTE(InternalError,
+                                 "Out of bounds partition key found in paging state:"
+                                 "Query's partition bounds: [%d, %d], paging state partition: %d",
+                                 read_request_->hash_code(),
+                                 read_request_->max_hash_code(),
+                                 paging_state_hash_code);
+      }
 
-    read_request_->set_hash_code(paging_state_hash_code);
+      read_request_->set_hash_code(paging_state_hash_code);
+    }
   }
 
   return Status::OK();
@@ -670,9 +830,6 @@ Result<QLRowBlock> YBPgsqlReadOp::MakeRowBlock() const {
 
 YBNoOp::YBNoOp(YBTable* table)
   : table_(table) {
-}
-
-YBNoOp::~YBNoOp() {
 }
 
 Status YBNoOp::Execute(const YBPartialRow& key) {
@@ -755,9 +912,48 @@ Status YBNoOp::Execute(const YBPartialRow& key) {
   return Status::OK();
 }
 
-bool YBPgsqlReadOp::wrote_data(IsolationLevel isolation_level) {
+bool YBPgsqlReadOp::should_add_intents(IsolationLevel isolation_level) {
   return isolation_level == IsolationLevel::SERIALIZABLE_ISOLATION ||
          IsValidRowMarkType(GetRowMarkTypeFromPB(*read_request_));
+}
+
+CHECKED_STATUS ReviewResponsePagingState(YBPgsqlReadOp* op) {
+  auto& response = *op->mutable_response();
+  const auto& schema = op->table()->InternalSchema();
+  if (schema.num_hash_key_columns() > 0 ||
+      op->request().is_forward_scan() ||
+      !response.has_paging_state() ||
+      !response.paging_state().has_next_partition_key() ||
+      response.paging_state().has_next_row_key()) {
+    return Status::OK();
+  }
+  // Backward scan of range key only table. next_row_key is not specified in paging state.
+  // In this case next_partition_key must be corrected as now it points to the partition start key
+  // of already scanned tablet. Partition start key of the preceding tablet must be used instead.
+  // Also lower bound is checked here because DocDB can check upper bound only.
+  const auto& current_next_partition_key = response.paging_state().next_partition_key();
+  vector<docdb::PrimitiveValue> lower_bound, upper_bound;
+  RETURN_NOT_OK(GetRangePartitionBounds(*op, &lower_bound, &upper_bound));
+  if (!lower_bound.empty()) {
+    docdb::DocKey current_key(schema);
+    VERIFY_RESULT(current_key.DecodeFrom(
+        current_next_partition_key, docdb::DocKeyPart::kWholeDocKey, docdb::AllowSpecial::kTrue));
+    if (current_key.CompareTo(docdb::DocKey(std::move(lower_bound))) < 0) {
+      response.clear_paging_state();
+      return Status::OK();
+    }
+  }
+  const auto& partitions = op->table()->GetPartitions();
+  const auto idx = FindPartitionStartIndex(partitions, current_next_partition_key);
+  SCHECK_GT(
+      idx, 0,
+      IllegalState, "Paging state for backward scan cannot point to first partition");
+  SCHECK_EQ(
+      partitions[idx], current_next_partition_key,
+      IllegalState, "Paging state for backward scan must point to partition start key");
+  const auto& next_partition_key = partitions[idx - 1];
+  response.mutable_paging_state()->set_next_partition_key(next_partition_key);
+  return Status::OK();
 }
 
 }  // namespace client

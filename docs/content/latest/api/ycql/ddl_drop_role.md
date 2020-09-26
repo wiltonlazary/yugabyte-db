@@ -1,7 +1,8 @@
 ---
-title: DROP ROLE
-summary: Drop role
-description: DROP ROLE
+title: DROP ROLE statement [YCQL]
+headerTitle: DROP ROLE
+linkTitle: DROP ROLE
+description: Use the DROP ROLE statement to delete an existing role.
 menu:
   latest:
     parent: api-cassandra
@@ -15,9 +16,9 @@ showAsideToc: true
 
 ## Synopsis
 
-The `DROP ROLE` deletes an existing role.
+Use the `DROP ROLE` statement to delete an existing role.
 
-This statement is enabled by setting the YB-TServer configuration option [`use_cassandra_authentication`](../../../reference/configuration/yb-tserver/#use-cassandra-authentication) to `true`.
+This statement is enabled by setting the YB-TServer flag [`use_cassandra_authentication`](../../../reference/configuration/yb-tserver/#use-cassandra-authentication) to `true`.
 
 ## Syntax
 
@@ -48,19 +49,18 @@ Where
 You can do this as shown below.
 
 ```sql
-cqlsh:example> DROP ROLE role1;
+ycqlsh:example> DROP ROLE role1;
 ```
 
 ```sql
-cqlsh:example> DROP ROLE IF EXISTS role2;
+ycqlsh:example> DROP ROLE IF EXISTS role2;
 ```
 
 ## See also
 
-[`ALTER ROLE`](../ddl_alter_role)
-[`CREATE ROLE`](../ddl_drop_role)
-[`GRANT ROLE`](../ddl_grant_role)
-[`REVOKE ROLE`](../ddl_revoke_role)
-[`GRANT PERMISSION`](../ddl_grant_permission)
-[`REVOKE PERMISSION`](../ddl_revoke_permission)
-[Other CQL Statements](..)
+- [`ALTER ROLE`](../ddl_alter_role)
+- [`CREATE ROLE`](../ddl_drop_role)
+- [`GRANT ROLE`](../ddl_grant_role)
+- [`REVOKE ROLE`](../ddl_revoke_role)
+- [`GRANT PERMISSION`](../ddl_grant_permission)
+- [`REVOKE PERMISSION`](../ddl_revoke_permission)

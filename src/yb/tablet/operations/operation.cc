@@ -37,12 +37,17 @@
 #include "yb/tablet/tablet.h"
 #include "yb/tablet/tablet_peer.h"
 
+#include "yb/tserver/tserver_error.h"
+
 #include "yb/util/size_literals.h"
+#include "yb/util/trace.h"
 
 namespace yb {
 namespace tablet {
 
 using consensus::DriverType;
+using tserver::TabletServerError;
+using tserver::TabletServerErrorPB;
 
 Operation::Operation(std::unique_ptr<OperationState> state,
                      OperationType operation_type)
@@ -85,13 +90,6 @@ OperationState::OperationState(Tablet* tablet)
     : tablet_(tablet) {
 }
 
-Arena* OperationState::arena() {
-  if (!arena_) {
-    arena_.emplace(32_KB, 4_MB);
-  }
-  return arena_.get_ptr();
-}
-
 void OperationState::set_consensus_round(
     const scoped_refptr<consensus::ConsensusRound>& consensus_round) {
   consensus_round_ = consensus_round;
@@ -120,6 +118,29 @@ std::string OperationState::LogPrefix() const {
   return Format("$0: ", this);
 }
 
+HybridTime OperationState::WriteHybridTime() const {
+  return hybrid_time();
+}
+
+std::string OperationState::ConsensusRoundAsString() const {
+  std::lock_guard<simple_spinlock> l(mutex_);
+  return AsString(consensus_round());
+}
+
+void OperationState::LeaderInit(const OpId& op_id, const OpId& committed_op_id) {
+  std::lock_guard<simple_spinlock> l(mutex_);
+  auto* replicate_msg = consensus_round_->replicate_msg().get();
+  op_id.ToPB(replicate_msg->mutable_id());
+  committed_op_id.ToPB(replicate_msg->mutable_committed_op_id());
+  replicate_msg->set_hybrid_time(hybrid_time_.ToUint64());
+  replicate_msg->set_monotonic_counter(*tablet()->monotonic_counter());
+}
+
+void ExclusiveSchemaOperationStateBase::ReleasePermitToken() {
+  permit_token_.Reset();
+  TRACE("Released permit token");
+}
+
 OperationCompletionCallback::OperationCompletionCallback()
     : code_(tserver::TabletServerErrorPB::UNKNOWN_ERROR) {
 }
@@ -133,7 +154,13 @@ void OperationCompletionCallback::set_error(const Status& status,
 void OperationCompletionCallback::set_error(const Status& status) {
   LOG_IF(DFATAL, !status_.ok()) << "OperationCompletionCallback changing from failure status: "
                                 << status_ << " => " << status;
-  status_ = status;
+  TabletServerError ts_error(status);
+
+  if (ts_error.value() == TabletServerErrorPB::Code()) {
+    status_ = status;
+  } else {
+    set_error(status, ts_error.value());
+  }
 }
 
 bool OperationCompletionCallback::has_error() const {

@@ -51,6 +51,7 @@
 #include "yb/util/monotime.h"
 #include "yb/util/opid.h"
 #include "yb/util/restart_safe_clock.h"
+#include "yb/util/tostring.h"
 
 // Used by other classes, now part of the API.
 DECLARE_bool(durable_wal_write);
@@ -79,12 +80,15 @@ extern const int kLogMinorVersion;
 
 class ReadableLogSegment;
 
-// Options for the State Machine/Write Ahead Log
+// Options for the Write Ahead Log. The LogOptions constructor initializes default field values
+// based on flags. See log_util.cc for details.
 struct LogOptions {
 
-  // The size of a Log segment
-  // Logs will rollover upon reaching this size (default 64 MB)
+  // The size of a Log segment.
+  // Logs will roll over upon reaching this size.
   size_t segment_size_bytes;
+
+  size_t initial_segment_size_bytes;
 
   // Whether to call fsync on every call to Append().
   bool durable_wal_write;
@@ -108,6 +112,8 @@ struct LogOptions {
 
   std::string peer_uuid;
 
+  uint64_t initial_active_segment_sequence_number = 0;
+
   LogOptions();
 };
 
@@ -115,6 +121,11 @@ struct LogEntryMetadata {
   RestartSafeCoarseTimePoint entry_time;
   int64_t offset;
   uint64_t active_segment_sequence_number;
+
+  std::string ToString() const {
+    return Format("{ entry_time: $0 offset: $1 active_segment_sequence_number: $2 }",
+                  entry_time, offset, active_segment_sequence_number);
+  }
 };
 
 // A sequence of segments, ordered by increasing sequence number.
@@ -135,6 +146,15 @@ struct ReadEntriesResult {
 
   // Failure status
   Status status;
+};
+
+struct FirstEntryMetadata {
+  OpId op_id;
+  RestartSafeCoarseTimePoint entry_time;
+
+  std::string ToString() const {
+    return YB_STRUCT_TO_STRING(op_id, entry_time);
+  }
 };
 
 // A segment of the log can either be a ReadableLogSegment (for replay and
@@ -182,10 +202,12 @@ class ReadableLogSegment : public RefCountedThreadSafe<ReadableLogSegment> {
   //
   // All gathered information is returned in result.
   // In case of failure status field of result is not ok.
-  ReadEntriesResult ReadEntries();
+  //
+  // Will stop after reading max_entries_to_read entries.
+  ReadEntriesResult ReadEntries(int64_t max_entries_to_read = std::numeric_limits<int64_t>::max());
 
-  // Reads the op ID and time of the first entry in the segment
-  Result<std::pair<yb::OpId, RestartSafeCoarseTimePoint>> ReadFirstEntryMetadata();
+  // Reads the metadata of the first entry in the segment
+  Result<FirstEntryMetadata> ReadFirstEntryMetadata();
 
   // Rebuilds this segment's footer by scanning its entries.
   // This is an expensive operation as it reads and parses the whole segment

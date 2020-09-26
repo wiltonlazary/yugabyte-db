@@ -53,7 +53,8 @@ class GcpCreateInstancesMethod(CreateInstancesMethod):
         self.cloud.get_admin().create_instance(
             args.region, args.zone, args.cloud_subnet, args.search_pattern, args.instance_type,
             server_type, args.use_preemptible, can_ip_forward, machine_image, args.num_volumes,
-            args.volume_type, args.volume_size, args.boot_disk_size_gb, ssh_keys)
+            args.volume_type, args.volume_size, args.boot_disk_size_gb, args.assign_public_ip,
+            ssh_keys)
 
 
 class GcpProvisionInstancesMethod(ProvisionInstancesMethod):
@@ -88,13 +89,8 @@ class GcpQueryRegionsMethod(AbstractMethod):
     def __init__(self, base_command):
         super(GcpQueryRegionsMethod, self).__init__(base_command, "regions")
 
-    def add_extra_args(self):
-        super(GcpQueryRegionsMethod, self).add_extra_args()
-        self.parser.add_argument("--network", default=None,
-                                 help="Network to retrieve active regions for.")
-
     def callback(self, args):
-        print json.dumps(self.cloud.get_regions(args.network))
+        print(json.dumps(self.cloud.get_regions(args)))
 
 
 class GcpQueryVpcMethod(AbstractMethod):
@@ -103,11 +99,11 @@ class GcpQueryVpcMethod(AbstractMethod):
 
     def add_extra_args(self):
         super(GcpQueryVpcMethod, self).add_extra_args()
-        self.parser.add_argument("--network", default=None,
-                                 help="Network to retrieve active regions for.")
+        self.parser.add_argument("--custom_payload", required=False,
+                                 help="JSON payload of per-region data.")
 
     def callback(self, args):
-        print json.dumps(self.cloud.query_vpc(args))
+        print(json.dumps(self.cloud.query_vpc(args)))
 
 
 class GcpQueryZonesMethod(AbstractMethod):
@@ -119,9 +115,11 @@ class GcpQueryZonesMethod(AbstractMethod):
         self.parser.add_argument(
             "--dest_vpc_id", default=None,
             help="Custom VPC to get zone and subnet info for.")
+        self.parser.add_argument("--custom_payload", required=False,
+                                 help="JSON payload of per-region data.")
 
     def callback(self, args):
-        print json.dumps(self.cloud.get_zones(args))
+        print(json.dumps(self.cloud.get_zones(args)))
 
 
 class GcpQueryInstanceTypesMethod(AbstractMethod):
@@ -131,9 +129,11 @@ class GcpQueryInstanceTypesMethod(AbstractMethod):
     def add_extra_args(self):
         super(GcpQueryInstanceTypesMethod, self).add_extra_args()
         self.parser.add_argument("--regions", nargs='+')
+        self.parser.add_argument("--custom_payload", required=False,
+                                 help="JSON payload of per-region data.")
 
     def callback(self, args):
-        print json.dumps(self.cloud.get_instance_types(args))
+        print(json.dumps(self.cloud.get_instance_types(args)))
 
 
 class GcpQueryCurrentHostMethod(AbstractMethod):
@@ -143,7 +143,7 @@ class GcpQueryCurrentHostMethod(AbstractMethod):
         self.need_validation = False
 
     def callback(self, args):
-        print json.dumps(self.cloud.get_current_host_info())
+        print(json.dumps(self.cloud.get_current_host_info()))
 
 
 class GcpQueryPreemptibleInstanceMethod(AbstractMethod):
@@ -159,9 +159,9 @@ class GcpQueryPreemptibleInstanceMethod(AbstractMethod):
         try:
             if args.region is None:
                 raise YBOpsRuntimeError("Must specify a region to query spot price")
-            print json.dumps({'SpotPrice': self.cloud.get_spot_pricing(args)})
+            print(json.dumps({'SpotPrice': self.cloud.get_spot_pricing(args)}))
         except YBOpsRuntimeError as ye:
-            print json.dumps({"error": ye.message})
+            print(json.dumps({"error": ye.message}))
 
 
 class GcpAccessAddKeyMethod(AbstractAccessMethod):
@@ -170,7 +170,7 @@ class GcpAccessAddKeyMethod(AbstractAccessMethod):
 
     def callback(self, args):
         (private_key_file, public_key_file) = self.validate_key_files(args)
-        print json.dumps({"private_key": private_key_file, "public_key": public_key_file})
+        print(json.dumps({"private_key": private_key_file, "public_key": public_key_file}))
 
 
 class GcpAbstractNetworkMethod(AbstractMethod):
@@ -183,6 +183,7 @@ class GcpAbstractNetworkMethod(AbstractMethod):
                                  help="A custom YML metadata override file.")
 
     def preprocess_args(self, args):
+        super(GcpAbstractNetworkMethod, self).preprocess_args(args)
         if args.metadata_override:
             self.cloud.update_metadata(args.metadata_override)
 
@@ -199,9 +200,9 @@ class GcpNetworkBootstrapMethod(GcpAbstractNetworkMethod):
 
     def callback(self, args):
         try:
-            print json.dumps(self.cloud.network_bootstrap(args))
+            print(json.dumps(self.cloud.network_bootstrap(args)))
         except YBOpsRuntimeError as ye:
-            print json.dumps({"error": ye.message})
+            print(json.dumps({"error": ye.message}))
 
 
 class GcpNetworkCleanupMethod(GcpAbstractNetworkMethod):
@@ -216,17 +217,23 @@ class GcpNetworkCleanupMethod(GcpAbstractNetworkMethod):
 
     def callback(self, args):
         try:
-            print json.dumps(self.cloud.network_cleanup(args))
+            print(json.dumps(self.cloud.network_cleanup(args)))
         except YBOpsRuntimeError as ye:
-            print json.dumps({"error": ye.message})
+            print(json.dumps({"error": ye.message}))
 
 
 class GcpNetworkQueryMethod(GcpAbstractNetworkMethod):
     def __init__(self, base_command):
         super(GcpNetworkQueryMethod, self).__init__(base_command, "query")
 
+    def add_extra_args(self):
+        """Setup the CLI options network queries."""
+        super(GcpNetworkQueryMethod, self).add_extra_args()
+        self.parser.add_argument("--custom_payload", required=False,
+                                 help="JSON payload of per-region data.")
+
     def callback(self, args):
         try:
-            print json.dumps(self.cloud.query_vpc(args))
+            print(json.dumps(self.cloud.query_vpc(args)))
         except YBOpsRuntimeError as ye:
-            print json.dumps({"error": ye.message})
+            print(json.dumps({"error": ye.message}))

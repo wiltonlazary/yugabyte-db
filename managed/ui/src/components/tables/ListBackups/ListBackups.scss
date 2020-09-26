@@ -1,6 +1,6 @@
 /* Copyright (c) YugaByte, Inc. */
 
-@import "_style/colors.scss";
+@import "../../../_style/colors.scss";
 
 .backup-list-table {
   .storage-cell {
@@ -45,4 +45,13 @@
     position: relative;
     z-index: 2;
   }
+}
+
+.cron-expr-tooltip {
+  margin-top: 34px;
+  font-size: 1.2em;
+}
+
+.spacing-top {
+  margin-top: 15px;
 }

@@ -11,41 +11,48 @@
 # under the License.
 #
 
+# We need access to the generated pg_type_d.h header from this directory.
+include_directories("${YB_BUILD_ROOT}/postgres_build/src/include")
+
 # Utility functions that are specific for PGGate.
 add_subdirectory(util)
 
 # PGGate API library.
 set(PGGATE_SRCS
     ybc_pggate.cc
+    ybc_pggate_tool.cc
     pggate.cc
-    pggate_c_wrappers_impl.cc
+    pggate_thread_local_vars.cc
     pg_session.cc
     pg_statement.cc
     pg_ddl.cc
-    pg_api_example.cc
     pg_dml.cc
     pg_dml_write.cc
-    pg_insert.cc
-    pg_update.cc
-    pg_delete.cc
+    pg_dml_read.cc
+    pg_type.cc
     pg_select.cc
+    pg_select_index.cc
     pg_expr.cc
     pg_column.cc
     pg_doc_op.cc
     pg_tabledesc.cc
-    pg_txn_manager.cc)
+    pg_txn_manager.cc
+    pg_value.cc
+    pg_memctx.cc)
 
 ADD_YB_LIBRARY(yb_pggate_flags
                SRCS pggate_flags.cc
                DEPS yb_util)
 
 set(PGGATE_LIBS
+    consensus_error
     yb_util
     yb_common
     yb_client
     tserver_util
     yb_pggate_util
-    yb_pggate_flags)
+    yb_pggate_flags
+    tablet_error)
 
 ADD_YB_LIBRARY(yb_pggate
                SRCS ${PGGATE_SRCS}

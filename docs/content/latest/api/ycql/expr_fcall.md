@@ -1,7 +1,8 @@
 ---
-title: Function Call
-summary: Combination of one or more values.
-description: Built-in Function Call
+title: Built-in function call [YCQL]
+headerTitle: Built-in function call
+linkTitle: Function call
+description: Use a function call expression to apply the specified function to to given arguments between parentheses and return the result of the computation.
 menu:
   latest:
     parent: api-cassandra
@@ -15,7 +16,7 @@ showAsideToc: true
 
 ## Synopsis
 
-Function call expression applies the specified function to to given arguments between parentheses and return the result of the computation.
+Use a function call expression to apply the specified function to to given arguments between parentheses and return the result of the computation.
 
 ## Syntax
 
@@ -36,7 +37,7 @@ function_call ::= function_name '(' [ arguments ... ] ')'
 | [CurrentTime](../function_datetime/#currentdate-currenttime-and-currenttimestamp) | [`TIME`](../type_datetime) | () | Return the system current time of day |
 | [CurrentTimestamp](../function_datetime/#currentdate-currenttime-and-currenttimestamp) | [`TIMESTAMP`](../type_datetime) | () | Return the system current timestamp |
 | [Now](../function_datetime/#now) | [`TIMEUUID`](../type_uuid) | () | Returns the UUID of the current timestamp |
-| TTL | [`BIGINT`](../type_int) | (<AnyType>) | Seek time-to-live of a column |
+| [TTL](#ttl-function) | [`BIGINT`](../type_int) | (\<AnyType>) | Get time-to-live of a column |
 | [ToDate](../function_datetime/#todate) | [`DATE`](../type_datetime) | ([`TIMESTAMP`](../type_datetime)) | Conversion |
 | [ToDate](../function_datetime/#todate) | [`DATE`](../type_datetime) | ([`TIMEUUID`](../type_uuid)) | Conversion |
 | ToTime | [`TIME`](../type_datetime) | ([`TIMESTAMP`](../type_datetime))  | Conversion |
@@ -48,7 +49,8 @@ function_call ::= function_name '(' [ arguments ... ] ')'
 | [ToUnixTimestamp](../function_datetime/#tounixtimestamp) | [`BIGINT`](../type_int) | ([`TIMEUUID`](../type_uuid)) | Conversion |
 | [UnixTimestampOf](../function_datetime/#unixtimestampof) | [`BIGINT`](../type_int) | ([`TIMEUUID`](../type_uuid)) | Conversion |
 | [UUID](../function_datetime/#uuid) | [`UUID`](../type_uuid) | () | Returns a version 4 UUID |
-| WriteTime | [`BIGINT`](../type_int) | (<AnyType>) | Returns the time when the column was written |
+| [WriteTime](#writetime-function) | [`BIGINT`](../type_int) | (\<AnyType>) | Returns the timestamp when the column was written |
+| [partition_hash](#partition-hash-function) | [`BIGINT`](../type_int) | () | Computes the partition hash value (uint16) for the partition key columns of a row |
 
 ## Aggregate Functions
 
@@ -87,18 +89,93 @@ CAST function converts the value returned from a table column to the specified d
 | `TIMESTAMP` | `DATE`, `TEXT` |
 | `TIMEUUID` | `DATE`, `TIMESTAMP` |
 
-### Examples
+
+## partition_hash function
+`partition_hash` is a function that takes as arguments the partition key columns of the primary key of a row and 
+returns a `uint16` hash value representing the hash value for the row used for partitioning the table.
+The hash values used for partitioning fall in the `0-65535` (uint16) range. 
+Tables are partitioned into tablets, with each tablet being responsible for a range of partition values. 
+The `partition_hash` of the row is used to decide which tablet the row will reside in.
+
+`partition_hash` can be handy for querying a subset of the data to get approximate row counts or to breakdown 
+full-table operations into smaller sub-tasks that can be run in parallel.
+
+### Querying a subset of the data
+One use of `partition_hash` is to query a subset of the data and get approximate count of rows in the table.
+For example, suppose you have a table `t` with partitioning columns `(h1,h2)`:
 
 ```sql
-cqlsh:example> CREATE TABLE test_cast (k INT PRIMARY KEY, ts TIMESTAMP);
+create table t (h1 int, h2 int, r1 int, r2 int, v int, 
+                         primary key ((h1, h2), r1, r2));
+```
+We can use this function to query a subset of the data (in this case, 1/128 of the data):
+```sql
+select count(*) from t where partition_hash(h1, h2) >= 0 and
+                                      partition_hash(h1, h2) < 512;
+```
+The value `512` comes from dividing the full hash partition range by the number of subsets that you want to query (`65536/128=512`).
+
+### Parallel full table scans
+
+To do a distributed scan, you can issue, in this case, 128 queries each using a different hash range:
+
+```sql
+.. where partition_hash(h1, h2) >= 0 and partition_hash(h1, h2) < 512;
 ```
 
 ```sql
-cqlsh:example> INSERT INTO test_cast (k, ts) VALUES (1, '2018-10-09 12:00:00');
+.. where partition_hash(h1, h2) >= 512 and partition_hash(h1, h2) <1024 ;
+```
+
+and so on, till the last segment/range of `512` in the partition space:
+
+```sql
+.. where partition_hash(h1, h2) >= 65024;
+```
+
+
+## WriteTime function
+
+The `WriteTime` function returns the timestamp in microseconds when a column was written.
+For example, suppose you have a table `page_views` with a column named `views`:
+
+```sql
+ SELECT writetime(views) FROM page_views;
+
+ writetime(views)
+------------------
+ 1572882871160113
+
+(1 rows)
+```
+
+## TTL function
+
+The TTL function returns the number of seconds until a column or row expires. 
+Assuming you have a table `page_views` and a column named `views`:
+
+```sql
+SELECT TTL(views) FROM page_views;
+
+ ttl(views)
+------------
+      86367
+
+(1 rows)
+```
+
+## Examples
+
+```sql
+ycqlsh:example> CREATE TABLE test_cast (k INT PRIMARY KEY, ts TIMESTAMP);
 ```
 
 ```sql
-cqlsh:example> SELECT CAST(ts AS DATE) FROM test_cast;
+ycqlsh:example> INSERT INTO test_cast (k, ts) VALUES (1, '2018-10-09 12:00:00');
+```
+
+```sql
+ycqlsh:example> SELECT CAST(ts AS DATE) FROM test_cast;
 ```
 
 ```
@@ -109,4 +186,4 @@ cqlsh:example> SELECT CAST(ts AS DATE) FROM test_cast;
 
 ## See also
 
-[All Expressions](..##expressions)
+- [All Expressions](..##expressions)

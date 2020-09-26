@@ -22,6 +22,7 @@ import org.slf4j.LoggerFactory;
 import org.yb.pgsql.cleaners.ClusterCleaner;
 import org.yb.pgsql.cleaners.DatabaseCleaner;
 import org.yb.pgsql.cleaners.RoleCleaner;
+import org.yb.util.MiscUtil.ThrowingRunnable;
 import org.yb.util.YBTestRunnerNonTsanOnly;
 
 import java.sql.Connection;
@@ -31,6 +32,7 @@ import java.sql.Statement;
 import java.sql.Timestamp;
 import java.util.Calendar;
 import java.util.Date;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
@@ -71,10 +73,10 @@ public class TestPgAuthorization extends BasePgSQLTest {
   }
 
   @Override
-  protected TreeMap<Integer, ClusterCleaner> getCleaners() {
-    TreeMap<Integer, ClusterCleaner> cleaners = super.getCleaners();
-    cleaners.put(0, new DatabaseCleaner());
-    cleaners.put(1, new RoleCleaner());
+  protected List<ClusterCleaner> getCleaners() {
+    List<ClusterCleaner> cleaners = super.getCleaners();
+    cleaners.add(0, new DatabaseCleaner());
+    cleaners.add(1, new RoleCleaner());
     return cleaners;
   }
 
@@ -97,7 +99,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
       statement.execute("CREATE ROLE some_group ROLE some_role");
     }
 
-    try (Connection connection = newConnectionBuilder().setUser("su").connect();
+    try (Connection connection = getConnectionBuilder().withUser("su").connect();
          Statement statement = connection.createStatement()) {
       assertEquals("su", getSessionUser(statement));
       assertEquals("su", getCurrentUser(statement));
@@ -158,14 +160,14 @@ public class TestPgAuthorization extends BasePgSQLTest {
       assertEquals("unprivileged", getCurrentUser(statement));
     }
 
-    try (Connection connection = newConnectionBuilder().setUser("su").connect();
+    try (Connection connection = getConnectionBuilder().withUser("su").connect();
          Statement statement = connection.createStatement()) {
       // Users have been reset, since this is a new session.
       assertEquals("su", getSessionUser(statement));
       assertEquals("su", getCurrentUser(statement));
     }
 
-    try (Connection connection = newConnectionBuilder().setUser("some_role").connect();
+    try (Connection connection = getConnectionBuilder().withUser("some_role").connect();
          Statement statement = connection.createStatement()) {
       statement.execute("SET ROLE some_group");
 
@@ -202,7 +204,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
     final Condition condition = lock.newCondition();
 
     Thread thread = new Thread(() -> {
-      try (Connection connection = newConnectionBuilder().setUser("su").connect();
+      try (Connection connection = getConnectionBuilder().withUser("su").connect();
            Statement statement = connection.createStatement()) {
         // Signal that superuser session has started.
         lock.lock();
@@ -223,7 +225,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
         throw new RuntimeException(e);
       }
 
-      try (Connection connection = newConnectionBuilder().setUser("su").connect();
+      try (Connection connection = getConnectionBuilder().withUser("su").connect();
            Statement statement = connection.createStatement()) {
         // In a new session, "su" can no longer set session authorization.
         runInvalidQuery(statement, "SET SESSION AUTHORIZATION unprivileged", PERMISSION_DENIED);
@@ -266,7 +268,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
       statement.execute("CREATE ROLE other_group ROLE some_role");
     }
 
-    try (Connection connection = newConnectionBuilder().setUser("some_role").connect();
+    try (Connection connection = getConnectionBuilder().withUser("some_role").connect();
          Statement statement = connection.createStatement()) {
       // Cannot set roles to those who we aren't a member of.
       runInvalidQuery(statement, "SET ROLE unprivileged", PERMISSION_DENIED);
@@ -332,20 +334,20 @@ public class TestPgAuthorization extends BasePgSQLTest {
       assertEquals("some_group", getCurrentUser(statement));
     }
 
-    try (Connection connection = newConnectionBuilder().setUser("some_role").connect();
+    try (Connection connection = getConnectionBuilder().withUser("some_role").connect();
          Statement statement = connection.createStatement()) {
       // Users have been reset, since this is a new session.
       assertEquals("some_role", getSessionUser(statement));
       assertEquals("some_role", getCurrentUser(statement));
     }
 
-    try (Connection connection = newConnectionBuilder().setUser("some_group").connect();
+    try (Connection connection = getConnectionBuilder().withUser("some_group").connect();
          Statement statement = connection.createStatement()) {
       // Cannot set roles to those who are a members of the current role.
       runInvalidQuery(statement, "SET ROLE some_role", PERMISSION_DENIED);
     }
 
-    try (Connection connection = newConnectionBuilder().setUser("su").connect();
+    try (Connection connection = getConnectionBuilder().withUser("su").connect();
          Statement statement = connection.createStatement()) {
       // Superuser can set any role.
       statement.execute("SET ROLE unprivileged");
@@ -380,7 +382,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
       statement.execute("RESET deadlock_timeout");
 
       // Superusers cannot login without LOGIN.
-      try (Connection ignored = newConnectionBuilder().setUser("su").connect()) {
+      try (Connection ignored = getConnectionBuilder().withUser("su").connect()) {
         fail("Expected login attempt to fail");
       } catch (SQLException sqle) {
         assertThat(
@@ -390,7 +392,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
       }
 
       statement.execute("CREATE ROLE su_login SUPERUSER LOGIN");
-      try (Connection suConnection = newConnectionBuilder().setUser("su_login").connect();
+      try (Connection suConnection = getConnectionBuilder().withUser("su_login").connect();
            Statement suStatement = suConnection.createStatement()) {
         suStatement.execute("CREATE TABLE su_login_table(id int)");
       }
@@ -459,12 +461,12 @@ public class TestPgAuthorization extends BasePgSQLTest {
       statement.execute("CREATE ROLE login_user LOGIN");
 
       // Users with LOGIN can connect directly.
-      try (Connection ignored = newConnectionBuilder().setUser("login_user").connect()) {
+      try (Connection ignored = getConnectionBuilder().withUser("login_user").connect()) {
         // No-op.
       }
 
       // Users without LOGIN cannot connect directly.
-      try (Connection ignored = newConnectionBuilder().setUser("unprivileged").connect()) {
+      try (Connection ignored = getConnectionBuilder().withUser("unprivileged").connect()) {
         fail("Expected login attempt to fail");
       } catch (SQLException sqle) {
         assertThat(
@@ -493,10 +495,11 @@ public class TestPgAuthorization extends BasePgSQLTest {
 
       statement.execute("CREATE ROLE limit_role LOGIN CONNECTION LIMIT 2");
 
-      try (Connection ignored1 = newConnectionBuilder().setUser("limit_role").connect()) {
-        try (Connection connection2 = newConnectionBuilder().setUser("limit_role").connect()) {
+      ConnectionBuilder limitRoleUserConnBldr = getConnectionBuilder().withUser("limit_role");
+      try (Connection ignored1 = limitRoleUserConnBldr.connect()) {
+        try (Connection connection2 = limitRoleUserConnBldr.connect()) {
           // Third concurrent connection causes error.
-          try (Connection ignored3 = newConnectionBuilder().setUser("limit_role").connect()) {
+          try (Connection ignored3 = limitRoleUserConnBldr.connect()) {
             fail("Expected third login attempt to fail");
           } catch (SQLException sqle) {
             assertThat(
@@ -509,7 +512,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
           connection2.close();
 
           // New connection now succeeds.
-          try (Connection ignored2 = newConnectionBuilder().setUser("limit_role").connect()) {
+          try (Connection ignored2 = limitRoleUserConnBldr.connect()) {
             // No-op.
           }
         }
@@ -531,14 +534,15 @@ public class TestPgAuthorization extends BasePgSQLTest {
       assertNotEquals(password_hash, "");
       assertNotEquals(password_hash, "pass1");
 
+      ConnectionBuilder passRoleUserConnBldr = getConnectionBuilder().withUser("pass_role");
+
       // Can login with password.
-      try (Connection ignored = newConnectionBuilder().setUser("pass_role")
-          .setPassword("pass1").connect()) {
+      try (Connection ignored = passRoleUserConnBldr.withPassword("pass1").connect()) {
         // No-op.
       }
 
       // Cannot login without password.
-      try (Connection ignored = newConnectionBuilder().setUser("pass_role").connect()) {
+      try (Connection ignored = passRoleUserConnBldr.connect()) {
         fail("Expected login attempt to fail");
       } catch (SQLException sqle) {
         assertThat(
@@ -548,8 +552,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
       }
 
       // Cannot login with incorrect password.
-      try (Connection ignored = newConnectionBuilder().setUser("pass_role")
-          .setPassword("wrong").connect()) {
+      try (Connection ignored = passRoleUserConnBldr.withPassword("wrong").connect()) {
         fail("Expected login attempt to fail");
       } catch (SQLException sqle) {
         assertThat(
@@ -561,8 +564,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
       // Password does not imply login.
       statement.execute("DROP ROLE IF EXISTS pass_role");
       statement.execute("CREATE ROLE pass_role PASSWORD 'pass1'");
-      try (Connection ignored = newConnectionBuilder().setUser("pass_role")
-          .setPassword("pass1").connect()) {
+      try (Connection ignored = passRoleUserConnBldr.withPassword("pass1").connect()) {
         fail("Expected login attempt to fail");
       } catch (SQLException sqle) {
         assertThat(
@@ -588,13 +590,12 @@ public class TestPgAuthorization extends BasePgSQLTest {
       assertNotEquals(password_hash, "pass2");
 
       // Can login with password.
-      try (Connection ignored = newConnectionBuilder().setUser("pass_role")
-          .setPassword("pass2").connect()) {
+      try (Connection ignored = passRoleUserConnBldr.withPassword("pass2").connect()) {
         // No-op.
       }
 
       // Cannot login without password.
-      try (Connection ignored = newConnectionBuilder().setUser("pass_role").connect()) {
+      try (Connection ignored = passRoleUserConnBldr.connect()) {
         fail("Expected login attempt to fail");
       } catch (SQLException sqle) {
         assertThat(
@@ -604,8 +605,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
       }
 
       // Cannot login with incorrect password.
-      try (Connection ignored = newConnectionBuilder().setUser("pass_role")
-          .setPassword("wrong").connect()) {
+      try (Connection ignored = passRoleUserConnBldr.withPassword("wrong").connect()) {
         fail("Expected login attempt to fail");
       } catch (SQLException sqle) {
         assertThat(
@@ -640,8 +640,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
           "VALID UNTIL '" + expiriationTime.toString() + "'");
 
       // Can connect now.
-      try (Connection ignored = newConnectionBuilder().setUser("pass_role")
-          .setPassword("password").connect()) {
+      try (Connection ignored = passRoleUserConnBldr.withPassword("password").connect()) {
         // No-op.
       }
 
@@ -649,8 +648,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
       Thread.sleep(11000);
 
       // Password is no longer valid.
-      try (Connection ignored = newConnectionBuilder().setUser("pass_role")
-          .setPassword("password").connect()) {
+      try (Connection ignored = passRoleUserConnBldr.withPassword("password").connect()) {
         fail("Expected login attempt to fail");
       } catch (SQLException sqle) {
         assertThat(
@@ -761,7 +759,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
       statement.execute("ALTER ROLE cannot_login LOGIN");
 
       // Role "can_login" can no longer login.
-      try (Connection ignored = newConnectionBuilder().setUser("can_login").connect()) {
+      try (Connection ignored = getConnectionBuilder().withUser("can_login").connect()) {
         fail("Expected login attempt to fail");
       } catch (SQLException sqle) {
         assertThat(
@@ -771,7 +769,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
       }
 
       // Role "cannot_login" can now login.
-      try (Connection ignored = newConnectionBuilder().setUser("cannot_login").connect()) {
+      try (Connection ignored = getConnectionBuilder().withUser("cannot_login").connect()) {
         // No-op.
       }
     }
@@ -793,7 +791,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
       statement.execute("GRANT SELECT ON TABLE test_table TO role_with_privileges");
     }
 
-    try (Connection connection = newConnectionBuilder().setUser("no_inh_role").connect();
+    try (Connection connection = getConnectionBuilder().withUser("no_inh_role").connect();
          Statement statement = connection.createStatement()) {
       // NOINHERIT user does not inherit attributes.
       runInvalidQuery(statement, "CREATE ROLE test", PERMISSION_DENIED);
@@ -805,7 +803,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
       runInvalidQuery(statement, "SELECT * FROM test_table", PERMISSION_DENIED);
     }
 
-    try (Connection connection = newConnectionBuilder().setUser("inh_role").connect();
+    try (Connection connection = getConnectionBuilder().withUser("inh_role").connect();
          Statement statement = connection.createStatement()) {
       // INHERIT user does not inherit attributes.
       runInvalidQuery(statement, "CREATE ROLE test", PERMISSION_DENIED);
@@ -920,7 +918,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
       final Condition condition = lock.newCondition();
 
       new Thread(() -> {
-        try (Connection testConnection = newConnectionBuilder().setUser("test_user").connect();
+        try (Connection testConnection = getConnectionBuilder().withUser("test_user").connect();
              Statement testStatement = testConnection.createStatement()) {
           // Get pid of backend process for this connection.
           ResultSet resultSet = testStatement.executeQuery("SELECT pg_backend_pid()");
@@ -1079,7 +1077,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
     try (Statement statement = connection.createStatement()) {
       statement.execute("CREATE ROLE test_role LOGIN");
 
-      try (Connection connection1 = newConnectionBuilder().setUser("test_role").connect();
+      try (Connection connection1 = getConnectionBuilder().withUser("test_role").connect();
            Statement statement1 = connection1.createStatement()) {
         assertQuery(statement1, "SHOW search_path", new Row("\"$user\", public"));
 
@@ -1092,13 +1090,13 @@ public class TestPgAuthorization extends BasePgSQLTest {
         assertQuery(statement1, "SHOW search_path", new Row("\"$user\", public"));
       }
 
-      try (Connection connection1 = newConnectionBuilder().setUser("test_role").connect();
+      try (Connection connection1 = getConnectionBuilder().withUser("test_role").connect();
            Statement statement1 = connection1.createStatement()) {
         // Change is visible in new sessions.
         assertQuery(statement1, "SHOW search_path", new Row("\"some path\""));
       }
 
-      try (Connection connection1 = newConnectionBuilder().connect();
+      try (Connection connection1 = getConnectionBuilder().connect();
            Statement statement1 = connection1.createStatement()) {
         withRole(statement1, "test_role", () -> {
           // Change is not visible if we didn't login as "test_role".
@@ -1108,7 +1106,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
 
       statement.execute("ALTER ROLE test_role RESET search_path");
 
-      try (Connection connection1 = newConnectionBuilder().setUser("test_role").connect();
+      try (Connection connection1 = getConnectionBuilder().withUser("test_role").connect();
            Statement statement1 = connection1.createStatement()) {
         // Search path is reset.
         assertQuery(statement1, "SHOW search_path", new Row("\"$user\", public"));
@@ -1124,7 +1122,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
       // Set configuration variable for "test_role" in "yugabyte".
       statement.execute("ALTER ROLE test_role IN DATABASE yugabyte SET search_path TO 'some path'");
 
-      try (Connection connection1 = newConnectionBuilder().setUser("test_role").connect();
+      try (Connection connection1 = getConnectionBuilder().withUser("test_role").connect();
            Statement statement1 = connection1.createStatement()) {
         // Change is visible in postgres database.
         assertQuery(statement1, "SHOW search_path", new Row("\"some path\""));
@@ -1133,8 +1131,8 @@ public class TestPgAuthorization extends BasePgSQLTest {
       statement.execute("CREATE DATABASE tdb");
       statement.execute("ALTER DATABASE tdb OWNER TO test_role");
 
-      try (Connection connection1 = newConnectionBuilder().setDatabase("tdb")
-          .setUser("test_role").connect();
+      try (Connection connection1 = getConnectionBuilder().withDatabase("tdb")
+          .withUser("test_role").connect();
            Statement statement1 = connection1.createStatement()) {
         // Change is not visible in other databases.
         assertQuery(statement1, "SHOW search_path", new Row("\"$user\", public"));
@@ -1152,11 +1150,11 @@ public class TestPgAuthorization extends BasePgSQLTest {
       statement.execute("ALTER ROLE ALL SET search_path TO 'some path'");
 
       // Change is visible for both users.
-      try (Connection connection1 = newConnectionBuilder().setUser("test_role").connect();
+      try (Connection connection1 = getConnectionBuilder().withUser("test_role").connect();
            Statement statement1 = connection1.createStatement()) {
         assertQuery(statement1, "SHOW search_path", new Row("\"some path\""));
       }
-      try (Connection connection1 = newConnectionBuilder().setUser("other_role").connect();
+      try (Connection connection1 = getConnectionBuilder().withUser("other_role").connect();
            Statement statement1 = connection1.createStatement()) {
         assertQuery(statement1, "SHOW search_path", new Row("\"some path\""));
       }
@@ -1179,7 +1177,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
   public void testDatabasePrivileges() throws Exception {
     try (Statement statement = connection.createStatement()) {
       statement.execute("CREATE DATABASE test_db");
-      ConnectionBuilder tdbConnector = newConnectionBuilder().setDatabase("test_db");
+      ConnectionBuilder tdbConnBldr = getConnectionBuilder().withDatabase("test_db");
 
       // Remove any default privileges.
       statement.execute("REVOKE ALL ON DATABASE test_db FROM PUBLIC");
@@ -1191,7 +1189,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
       statement.execute("CREATE ROLE create_role LOGIN");
       statement.execute("GRANT CREATE ON DATABASE test_db TO create_role");
 
-      try (Connection connection1 = tdbConnector.newBuilder().connect();
+      try (Connection connection1 = tdbConnBldr.connect();
            Statement statement1 = connection1.createStatement()) {
         withRole(statement1, "create_role", () -> {
           // Can create schemas.
@@ -1203,7 +1201,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
       }
 
       // Cannot connect directly to the database.
-      try (Connection ignored = tdbConnector.newBuilder().setUser("create_role").connect()) {
+      try (Connection ignored = tdbConnBldr.withUser("create_role").connect()) {
         fail("Expected connection attempt to fail");
       } catch (SQLException sqle) {
         assertThat(sqle.getMessage(), CoreMatchers.containsString(PERMISSION_DENIED));
@@ -1217,7 +1215,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
       statement.execute("GRANT CONNECT ON DATABASE test_db TO connect_role");
 
       // Can connect directly to the database.
-      try (Connection connection1 = tdbConnector.newBuilder().setUser("connect_role").connect();
+      try (Connection connection1 = tdbConnBldr.withUser("connect_role").connect();
            Statement statement1 = connection1.createStatement()) {
         // Cannot create schemas.
         runInvalidQuery(statement1, "CREATE SCHEMA other_schema", PERMISSION_DENIED);
@@ -1233,7 +1231,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
       statement.execute("CREATE ROLE temp_role LOGIN");
       statement.execute("GRANT TEMP ON DATABASE test_db TO temp_role");
 
-      try (Connection connection1 = tdbConnector.newBuilder().connect();
+      try (Connection connection1 = tdbConnBldr.connect();
            Statement statement1 = connection1.createStatement()) {
         withRole(statement1, "temp_role", () -> {
           // Can create temporary tables.
@@ -1245,7 +1243,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
       }
 
       // Cannot connect directly to the database.
-      try (Connection ignored = tdbConnector.newBuilder().setUser("temp_role").connect()) {
+      try (Connection ignored = tdbConnBldr.withUser("temp_role").connect()) {
         fail("Expected connection attempt to fail");
       } catch (SQLException sqle) {
         assertThat(sqle.getMessage(), CoreMatchers.containsString(PERMISSION_DENIED));
@@ -2390,8 +2388,8 @@ public class TestPgAuthorization extends BasePgSQLTest {
       });
     }
 
-    try (Connection connection = newConnectionBuilder().setDatabase("su2_db")
-        .setUser("su2").connect();
+    try (Connection connection = getConnectionBuilder().withDatabase("su2_db")
+        .withUser("su2").connect();
          Statement statement = connection.createStatement()) {
       // Alter database owner from within database.
       statement.execute("ALTER DATABASE su2_db OWNER TO su1");
@@ -2595,8 +2593,8 @@ public class TestPgAuthorization extends BasePgSQLTest {
       });
     }
 
-    try (Connection connection = newConnectionBuilder().setDatabase("su_db")
-        .setUser("su").connect();
+    try (Connection connection = getConnectionBuilder().withDatabase("su_db")
+        .withUser("su").connect();
          Statement statement = connection.createStatement()) {
       // Create object in "su_db".
       statement.execute("CREATE TABLE test_table(id int)");
@@ -2616,7 +2614,8 @@ public class TestPgAuthorization extends BasePgSQLTest {
     }
 
     // Database was not dropped, so we can reconnect.
-    try (Connection ignored = newConnectionBuilder().setDatabase("su_db").setUser("su").connect()) {
+    try (Connection ignored = getConnectionBuilder().withDatabase("su_db")
+        .withUser("su").connect()) {
       // No-op.
     }
   }
@@ -2636,8 +2635,8 @@ public class TestPgAuthorization extends BasePgSQLTest {
       });
     }
 
-    try (Connection connection = newConnectionBuilder().setDatabase("su_db")
-        .setUser("su").connect();
+    try (Connection connection = getConnectionBuilder().withDatabase("su_db")
+        .withUser("su").connect();
          Statement statement = connection.createStatement()) {
       // Create object in "su_db".
       statement.execute("CREATE TABLE test_table(id int)");
@@ -2696,13 +2695,13 @@ public class TestPgAuthorization extends BasePgSQLTest {
 
   @Test
   public void testRevokeLoginMidSession() throws Exception {
-    try (Connection connection1 = newConnectionBuilder().setTServer(0).connect();
+    try (Connection connection1 = getConnectionBuilder().withTServer(0).connect();
          Statement statement1 = connection1.createStatement()) {
 
       statement1.execute("CREATE ROLE test_role LOGIN");
 
-      try (Connection connection2 = newConnectionBuilder().setTServer(1)
-          .setUser("test_role").connect();
+      try (Connection connection2 = getConnectionBuilder().withTServer(1)
+          .withUser("test_role").connect();
            Statement statement2 = connection2.createStatement()) {
         // Revoke login privileges now that "test_role" has connected.
         statement1.execute("ALTER ROLE test_role NOLOGIN");
@@ -2714,7 +2713,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
       }
 
       // Next login attempt fails.
-      try (Connection ignored = newConnectionBuilder().setUser("test_role").connect()) {
+      try (Connection ignored = getConnectionBuilder().withUser("test_role").connect()) {
         fail("Expected login attempt to fail");
       } catch (SQLException sqle) {
         assertThat(
@@ -2727,13 +2726,13 @@ public class TestPgAuthorization extends BasePgSQLTest {
 
   @Test
   public void testGrantAttributesMidSession() throws Exception {
-    try (Connection connection1 = newConnectionBuilder().setTServer(0).connect();
+    try (Connection connection1 = getConnectionBuilder().withTServer(0).connect();
          Statement statement1 = connection1.createStatement()) {
 
       statement1.execute("CREATE ROLE test_role LOGIN");
 
-      try (Connection connection2 = newConnectionBuilder().setTServer(1)
-          .setUser("test_role").connect();
+      try (Connection connection2 = getConnectionBuilder().withTServer(1)
+          .withUser("test_role").connect();
            Statement statement2 = connection2.createStatement()) {
         runInvalidQuery(statement2, "CREATE ROLE tr", PERMISSION_DENIED);
         runInvalidQuery(statement2, "CREATE DATABASE tdb", PERMISSION_DENIED);
@@ -2775,13 +2774,13 @@ public class TestPgAuthorization extends BasePgSQLTest {
 
   @Test
   public void testRevokeAttributesMidSession() throws Exception {
-    try (Connection connection1 = newConnectionBuilder().setTServer(0).connect();
+    try (Connection connection1 = getConnectionBuilder().withTServer(0).connect();
          Statement statement1 = connection1.createStatement()) {
 
       statement1.execute("CREATE ROLE test_role LOGIN CREATEROLE CREATEDB SUPERUSER");
 
-      try (Connection connection2 = newConnectionBuilder().setTServer(1)
-          .setUser("test_role").connect();
+      try (Connection connection2 = getConnectionBuilder().withTServer(1)
+          .withUser("test_role").connect();
            Statement statement2 = connection2.createStatement()) {
         statement2.execute("CREATE ROLE su SUPERUSER");
 
@@ -2819,13 +2818,13 @@ public class TestPgAuthorization extends BasePgSQLTest {
 
   @Test
   public void testConnectionLimitDecreasedMidSession() throws Exception {
-    try (Connection connection1 = newConnectionBuilder().setTServer(0).connect();
+    try (Connection connection1 = getConnectionBuilder().withTServer(0).connect();
          Statement statement1 = connection1.createStatement()) {
 
       statement1.execute("CREATE ROLE test_role LOGIN CONNECTION LIMIT 1");
 
-      try (Connection connection2 = newConnectionBuilder().setTServer(1)
-          .setUser("test_role").connect();
+      try (Connection connection2 = getConnectionBuilder().withTServer(1)
+          .withUser("test_role").connect();
            Statement statement2 = connection2.createStatement()) {
         // Decrease connection limit now that "test_role" has connected.
         statement1.execute("ALTER ROLE test_role CONNECTION LIMIT 0");
@@ -2837,7 +2836,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
       }
 
       // Next login attempt fails.
-      try (Connection ignored = newConnectionBuilder().setUser("test_role").connect()) {
+      try (Connection ignored = getConnectionBuilder().withUser("test_role").connect()) {
         fail("Expected login attempt to fail");
       } catch (SQLException sqle) {
         assertThat(
@@ -2850,7 +2849,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
 
   @Test
   public void testParentAttributeChangedMidSession() throws Exception {
-    try (Connection connection1 = newConnectionBuilder().setTServer(0).connect();
+    try (Connection connection1 = getConnectionBuilder().withTServer(0).connect();
          Statement statement1 = connection1.createStatement()) {
       statement1.execute("CREATE ROLE test_role INHERIT LOGIN");
       statement1.execute("CREATE ROLE test_group INHERIT ROLE test_role");
@@ -2860,8 +2859,8 @@ public class TestPgAuthorization extends BasePgSQLTest {
       statement1.execute("CREATE TABLE test_table(id int)");
       statement1.execute("GRANT SELECT ON test_table TO test_large_group");
 
-      try (Connection connection2 = newConnectionBuilder().setTServer(1)
-          .setUser("test_role").connect();
+      try (Connection connection2 = getConnectionBuilder().withTServer(1)
+          .withUser("test_role").connect();
            Statement statement2 = connection2.createStatement()) {
         // Connection 2 initially has select privileges.
         statement2.execute("SELECT * FROM test_table");
@@ -2887,7 +2886,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
 
   @Test
   public void testMembershipRevokedInsideGroup() throws Exception {
-    try (Connection connection1 = newConnectionBuilder().setTServer(0).connect();
+    try (Connection connection1 = getConnectionBuilder().withTServer(0).connect();
          Statement statement1 = connection1.createStatement()) {
       statement1.execute("CREATE ROLE test_role LOGIN");
 
@@ -2896,8 +2895,8 @@ public class TestPgAuthorization extends BasePgSQLTest {
       statement1.execute("CREATE TABLE test_table(id int)");
       statement1.execute("GRANT SELECT ON test_table to test_group");
 
-      try (Connection connection2 = newConnectionBuilder().setTServer(1)
-          .setUser("test_role").connect();
+      try (Connection connection2 = getConnectionBuilder().withTServer(1)
+          .withUser("test_role").connect();
            Statement statement2 = connection2.createStatement()) {
         statement2.execute("SET ROLE test_group");
 
@@ -2922,7 +2921,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
 
   @Test
   public void testMembershipRevokedOutsideGroup() throws Exception {
-    try (Connection connection1 = newConnectionBuilder().setTServer(0).connect();
+    try (Connection connection1 = getConnectionBuilder().withTServer(0).connect();
          Statement statement1 = connection1.createStatement()) {
       statement1.execute("CREATE ROLE test_role LOGIN INHERIT");
 
@@ -2931,8 +2930,8 @@ public class TestPgAuthorization extends BasePgSQLTest {
       statement1.execute("CREATE TABLE test_table(id int)");
       statement1.execute("GRANT SELECT ON test_table to test_group");
 
-      try (Connection connection2 = newConnectionBuilder().setTServer(1)
-          .setUser("test_role").connect();
+      try (Connection connection2 = getConnectionBuilder().withTServer(1)
+          .withUser("test_role").connect();
            Statement statement2 = connection2.createStatement()) {
         // Can initially use group privileges.
         assertQuery(statement2, "SELECT * FROM test_table");
@@ -2953,7 +2952,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
 
   @Test
   public void testInheritanceSwitchedWhileInsideGroup() throws Exception {
-    try (Connection connection1 = newConnectionBuilder().setTServer(0).connect();
+    try (Connection connection1 = getConnectionBuilder().withTServer(0).connect();
          Statement statement1 = connection1.createStatement()) {
       statement1.execute("CREATE ROLE test_role LOGIN INHERIT");
 
@@ -2962,8 +2961,8 @@ public class TestPgAuthorization extends BasePgSQLTest {
       statement1.execute("CREATE TABLE test_table(id int)");
       statement1.execute("GRANT SELECT ON test_table to test_group");
 
-      try (Connection connection2 = newConnectionBuilder().setTServer(1)
-          .setUser("test_role").connect();
+      try (Connection connection2 = getConnectionBuilder().withTServer(1)
+          .withUser("test_role").connect();
            Statement statement2 = connection2.createStatement()) {
         // Connection 2 initially has select privileges.
         statement2.execute("SELECT * FROM test_table");
@@ -2989,14 +2988,14 @@ public class TestPgAuthorization extends BasePgSQLTest {
 
   @Test
   public void testRoleRenamingMidSession() throws Exception {
-    try (Connection connection1 = newConnectionBuilder().setTServer(0).connect();
+    try (Connection connection1 = getConnectionBuilder().withTServer(0).connect();
          Statement statement1 = connection1.createStatement()) {
 
       statement1.execute("CREATE ROLE test_role LOGIN");
       statement1.execute("CREATE GROUP test_group ROLE test_role");
 
-      try (Connection connection2 = newConnectionBuilder().setTServer(1)
-          .setUser("test_role").connect();
+      try (Connection connection2 = getConnectionBuilder().withTServer(1)
+          .withUser("test_role").connect();
            Statement statement2 = connection2.createStatement()) {
         statement2.execute("SET ROLE test_group");
 
@@ -3026,8 +3025,8 @@ public class TestPgAuthorization extends BasePgSQLTest {
 
   @Test
   public void testMultiNodePermissionChanges() throws Exception {
-    try (Connection connection1 = newConnectionBuilder().setTServer(0).connect();
-         Connection connection2 = newConnectionBuilder().setTServer(1).connect();
+    try (Connection connection1 = getConnectionBuilder().withTServer(0).connect();
+         Connection connection2 = getConnectionBuilder().withTServer(1).connect();
          Statement statement1 = connection1.createStatement();
          Statement statement2 = connection2.createStatement()) {
       statement1.execute("CREATE TABLE test_table(id int)");
@@ -3068,8 +3067,8 @@ public class TestPgAuthorization extends BasePgSQLTest {
 
   @Test
   public void testAlterDefaultPrivilegesAcrossNodes() throws Exception {
-    try (Connection connection1 = newConnectionBuilder().setTServer(0).connect();
-         Connection connection2 = newConnectionBuilder().setTServer(1).connect();
+    try (Connection connection1 = getConnectionBuilder().withTServer(0).connect();
+         Connection connection2 = getConnectionBuilder().withTServer(1).connect();
          Statement statement1 = connection1.createStatement();
          Statement statement2 = connection2.createStatement()) {
       statement1.execute("CREATE SCHEMA ts");
@@ -3077,8 +3076,8 @@ public class TestPgAuthorization extends BasePgSQLTest {
       statement1.execute("CREATE ROLE test_role LOGIN");
       statement2.execute("CREATE TABLE ts.table1(id int)");
 
-      try (Connection connection3 = newConnectionBuilder().setTServer(2)
-          .setUser("test_role").connect();
+      try (Connection connection3 = getConnectionBuilder().withTServer(2)
+          .withUser("test_role").connect();
            Statement statement3 = connection3.createStatement()) {
         runInvalidQuery(statement3, "SELECT * FROM ts.table1", PERMISSION_DENIED);
 
@@ -3127,8 +3126,8 @@ public class TestPgAuthorization extends BasePgSQLTest {
 
   @Test
   public void testMultiNodeOwnershipChanges() throws Exception {
-    try (Connection connection1 = newConnectionBuilder().setTServer(0).connect();
-         Connection connection2 = newConnectionBuilder().setTServer(1).connect();
+    try (Connection connection1 = getConnectionBuilder().withTServer(0).connect();
+         Connection connection2 = getConnectionBuilder().withTServer(1).connect();
          Statement statement1 = connection1.createStatement();
          Statement statement2 = connection2.createStatement()) {
       statement1.execute("CREATE ROLE role1");
@@ -3179,10 +3178,6 @@ public class TestPgAuthorization extends BasePgSQLTest {
         statement2.execute("DROP TABLE other_table");
       });
     }
-  }
-
-  interface ThrowingRunnable {
-    void run() throws Exception;
   }
 
   private static void withRoles(

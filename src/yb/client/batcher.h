@@ -166,6 +166,10 @@ class Batcher : public RefCountedThreadSafe<Batcher> {
     force_consistent_read_ = value;
   }
 
+  void SetHybridTimeForWrite(const HybridTime ht) {
+    hybrid_time_for_write_ = ht;
+  }
+
   YBTransactionPtr transaction() const;
 
   const TransactionMetadata& transaction_metadata() const {
@@ -189,6 +193,8 @@ class Batcher : public RefCountedThreadSafe<Batcher> {
   }
 
   double RejectionScore(int attempt_num);
+
+  std::string LogPrefix() const;
 
   // This is a status error string used when there are multiple errors that need to be fetched
   // from the error collector.
@@ -251,7 +257,8 @@ class Batcher : public RefCountedThreadSafe<Batcher> {
 
   void TransactionReady(const Status& status, const BatcherPtr& self);
 
-  void ExecuteOperations();
+  // initial - whether this method is called first time for this batch.
+  void ExecuteOperations(Initial initial);
 
   // See note about lock ordering in batcher.cc
   mutable simple_spinlock mutex_;
@@ -307,6 +314,9 @@ class Batcher : public RefCountedThreadSafe<Batcher> {
 
   // The consistent read point for this batch if it is specified.
   ConsistentReadPoint* read_point_ = nullptr;
+
+  // Used for backfilling at a historic timestamp.
+  HybridTime hybrid_time_for_write_ = HybridTime::kInvalid;
 
   // Force consistent read on transactional table, even we have only single shard commands.
   ForceConsistentRead force_consistent_read_;

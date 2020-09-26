@@ -88,7 +88,7 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
   // reset each time a new operation on the universe starts, and is set at the very end of that
   // operation.
   public boolean updateSucceeded = true;
-  
+
   // The next cluster index to be used when a new read-only cluster is added.
   public int nextClusterIndex = 1;
 
@@ -97,6 +97,9 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
   // but defaults to true since we want universes created through pre-TLS YW to be
   // unaffected.
   public boolean allowInsecure = true;
+
+  // Development flag to download package from s3 bucket.
+  public String itestS3PackagePath = "";
 
   /**
    * Allowed states for an imported universe.
@@ -147,7 +150,7 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
 
     // The placement information computed from the user intent.
     public PlacementInfo placementInfo = null;
-    
+
     // The cluster index by which node names are sorted when shown in UI.
     // This is set internally by the placement util in the server, client should not set it.
     public int index = 0;
@@ -175,7 +178,7 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
       }
       ObjectNode clusterJson = (ObjectNode) Json.toJson(this);
       if (userIntent.regionList != null && !userIntent.regionList.isEmpty()) {
-        List<Region> regions = Region.find.where().idIn(userIntent.regionList).findList();
+        List<Region> regions = Region.find.query().where().idIn(userIntent.regionList).findList();
         if (!regions.isEmpty()) {
           clusterJson.set("regions", Json.toJson(regions));
         }
@@ -268,6 +271,13 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
 
     public boolean enableVolumeEncryption = false;
 
+    public String awsArnString;
+
+    // When this is set to true, YW will setup the universe to communicate by way of hostnames
+    // instead of ip addresses. These hostnames will have been provided during on-prem provider
+    // setup and will be in-place of privateIP
+    public boolean useHostname = false;
+
     // Info of all the gflags that the user would like to save to the universe. These will be
     // used during edit universe, for example, to set the flags on new nodes to match
     // existing nodes' settings.
@@ -330,6 +340,27 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
       return false;
     }
 
+    public boolean onlyRegionsChanged(UserIntent other) {
+      if (universeName.equals(other.universeName) &&
+          provider.equals(other.provider) &&
+          providerType == other.providerType &&
+          replicationFactor == other.replicationFactor &&
+          newRegionsAdded(regionList, other.regionList) &&
+          Objects.equals(preferredRegion, other.preferredRegion) &&
+          instanceType.equals(other.instanceType) &&
+          numNodes == other.numNodes &&
+          ybSoftwareVersion.equals(other.ybSoftwareVersion) &&
+          (accessKeyCode == null || accessKeyCode.equals(other.accessKeyCode)) &&
+          assignPublicIP == other.assignPublicIP &&
+          useTimeSync == other.useTimeSync) {
+        return true;
+      }
+      return false;
+    }
+
+    private static boolean newRegionsAdded(List<UUID> left, List<UUID> right) {
+      return (new HashSet<>(left)).containsAll(new HashSet<>(right));
+    }
     /**
      * Helper API to check if the set of regions is the same in two lists. Does not validate that
      * the UUIDs correspond to actual, existing Regions.

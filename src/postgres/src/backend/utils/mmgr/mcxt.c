@@ -25,7 +25,8 @@
 #include "miscadmin.h"
 #include "utils/memdebug.h"
 #include "utils/memutils.h"
-
+#include "yb/yql/pggate/ybc_pggate.h"
+#include "pg_yb_utils.h"
 
 /*****************************************************************************
  *	  GLOBAL MEMORY															 *
@@ -36,6 +37,35 @@
  *		Default memory context for allocations.
  */
 MemoryContext CurrentMemoryContext = NULL;
+
+
+MemoryContext GetThreadLocalCurrentMemoryContext()
+{
+	return (MemoryContext) YBCPgGetThreadLocalCurrentMemoryContext();
+}
+
+MemoryContext SetThreadLocalCurrentMemoryContext(MemoryContext memctx)
+{
+	return (MemoryContext) YBCPgSetThreadLocalCurrentMemoryContext(memctx);
+}
+
+void PrepareThreadLocalCurrentMemoryContext()
+{
+	if (YBCPgGetThreadLocalCurrentMemoryContext() == NULL)
+	{
+		MemoryContext memctx = AllocSetContextCreate((MemoryContext) NULL,
+		                                             "DocDBExprMemoryContext",
+		                                             ALLOCSET_SMALL_SIZES);
+		YBCPgSetThreadLocalCurrentMemoryContext(memctx);
+	}
+}
+
+void ResetThreadLocalCurrentMemoryContext()
+{
+	MemoryContext memctx = (MemoryContext) YBCPgGetThreadLocalCurrentMemoryContext();
+	YBCPgResetCurrentMemCtxThreadLocalVars();
+	MemoryContextReset(memctx);
+}
 
 /*
  * Standard top-level contexts. For a description of the purpose of each
@@ -101,7 +131,7 @@ MemoryContextInit(void)
 											 ALLOCSET_DEFAULT_SIZES);
 
 	/*
-	 * Not having any other place to point CurrentMemoryContext, make it point
+	 * Not having any other place to point GetCurrentMemoryContext(), make it point
 	 * to TopMemoryContext.  Caller should change this soon!
 	 */
 	CurrentMemoryContext = TopMemoryContext;
@@ -141,8 +171,13 @@ MemoryContextReset(MemoryContext context)
 	if (context->firstchild != NULL)
 		MemoryContextDeleteChildren(context);
 
-	/* save a function call if no pallocs since startup or last reset */
-	if (!context->isReset)
+	/*
+	 * Save a function call if no pallocs since startup or last reset.
+	 * NOTE: When "yb_memctx" is not null, ResetOnly() must be called to inform YugaByte code layer
+	 * that resetting is happening. While the state variable "isReset" controls the objects in
+	 * Postgres, and the opaque object "yb_memctx" controls YugaByte objects.
+	 */
+  if (context->yb_memctx || !context->isReset)
 		MemoryContextResetOnly(context);
 }
 
@@ -155,6 +190,14 @@ void
 MemoryContextResetOnly(MemoryContext context)
 {
 	AssertArg(MemoryContextIsValid(context));
+
+	/*
+	 * Reset YugaByte context also.
+	 * Currently reset YugaByte context does not destroy it.  Maybe we should?
+	 */
+	if (context->yb_memctx) {
+		HandleYBStatus(YBCPgResetMemctx(context->yb_memctx));
+	}
 
 	/* Nothing to do if no pallocs since startup or last reset */
 	if (!context->isReset)
@@ -173,6 +216,7 @@ MemoryContextResetOnly(MemoryContext context)
 
 		context->methods->reset(context);
 		context->isReset = true;
+
 		VALGRIND_DESTROY_MEMPOOL(context);
 		VALGRIND_CREATE_MEMPOOL(context, 0, false);
 	}
@@ -213,8 +257,8 @@ MemoryContextDelete(MemoryContext context)
 	AssertArg(MemoryContextIsValid(context));
 	/* We had better not be deleting TopMemoryContext ... */
 	Assert(context != TopMemoryContext);
-	/* And not CurrentMemoryContext, either */
-	Assert(context != CurrentMemoryContext);
+	/* And not GetCurrentMemoryContext(), either */
+	Assert(context != GetCurrentMemoryContext());
 
 	/* save a function call in common case where there are no children */
 	if (context->firstchild != NULL)
@@ -243,6 +287,12 @@ MemoryContextDelete(MemoryContext context)
 	context->ident = NULL;
 
 	context->methods->delete_context(context);
+
+	/*
+	 * Destroy YugaByte memory context.
+	 */
+	HandleYBStatus(YBCPgDestroyMemctx(context->yb_memctx));
+	context->yb_memctx = NULL;
 
 	VALGRIND_DESTROY_MEMPOOL(context);
 }
@@ -741,6 +791,9 @@ MemoryContextCreate(MemoryContext node,
 	node->ident = NULL;
 	node->reset_cbs = NULL;
 
+	/* YugaByte memory context handler */
+	node->yb_memctx = NULL;
+
 	/* OK to link node into context tree */
 	if (parent)
 	{
@@ -925,7 +978,7 @@ palloc(Size size)
 {
 	/* duplicates MemoryContextAlloc to avoid increased overhead */
 	void	   *ret;
-	MemoryContext context = CurrentMemoryContext;
+	MemoryContext context = GetCurrentMemoryContext();
 
 	AssertArg(MemoryContextIsValid(context));
 	AssertNotInCriticalSection(context);
@@ -956,7 +1009,7 @@ palloc0(Size size)
 {
 	/* duplicates MemoryContextAllocZero to avoid increased overhead */
 	void	   *ret;
-	MemoryContext context = CurrentMemoryContext;
+	MemoryContext context = GetCurrentMemoryContext();
 
 	AssertArg(MemoryContextIsValid(context));
 	AssertNotInCriticalSection(context);
@@ -989,7 +1042,7 @@ palloc_extended(Size size, int flags)
 {
 	/* duplicates MemoryContextAllocExtended to avoid increased overhead */
 	void	   *ret;
-	MemoryContext context = CurrentMemoryContext;
+	MemoryContext context = GetCurrentMemoryContext();
 
 	AssertArg(MemoryContextIsValid(context));
 	AssertNotInCriticalSection(context);
@@ -1160,7 +1213,7 @@ MemoryContextStrdup(MemoryContext context, const char *string)
 char *
 pstrdup(const char *in)
 {
-	return MemoryContextStrdup(CurrentMemoryContext, in);
+	return MemoryContextStrdup(GetCurrentMemoryContext(), in);
 }
 
 /*
@@ -1194,4 +1247,20 @@ pchomp(const char *in)
 	while (n > 0 && in[n - 1] == '\n')
 		n--;
 	return pnstrdup(in, n);
+}
+
+/*
+ * Get the YugaByte current memory context.
+ */
+YBCPgMemctx GetCurrentYbMemctx() {
+	MemoryContext context = GetCurrentMemoryContext();
+	AssertArg(MemoryContextIsValid(context));
+	AssertNotInCriticalSection(context);
+
+	if (context->yb_memctx == NULL) {
+		// Create the yugabyte context if this is the first time it is used.
+		context->yb_memctx = YBCPgCreateMemctx();
+	}
+
+	return context->yb_memctx;
 }

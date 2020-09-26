@@ -50,12 +50,9 @@ class MetricEntity;
 namespace cdc {
 
 // Container for all metrics specific to a single tablet.
-class CDCTabletMetrics : public yb::tablet::enterprise::TabletScopedIf {
+class CDCTabletMetrics {
  public:
-  explicit CDCTabletMetrics(const scoped_refptr<MetricEntity>& metric_entity_cdc,
-      const std::string& key);
-
-  virtual std::string Key() const { return key_; }
+  explicit CDCTabletMetrics(const scoped_refptr<MetricEntity>& metric_entity_cdc);
 
   scoped_refptr<Histogram> rpc_payload_bytes_responded;
   scoped_refptr<Counter> rpc_heartbeats_responded;
@@ -64,16 +61,22 @@ class CDCTabletMetrics : public yb::tablet::enterprise::TabletScopedIf {
   // Info about ID last read by CDC Consumer.
   scoped_refptr<AtomicGauge<int64_t> > last_read_opid_term;
   scoped_refptr<AtomicGauge<int64_t> > last_read_opid_index;
+  scoped_refptr<AtomicGauge<int64_t> > last_checkpoint_opid_index;
   scoped_refptr<AtomicGauge<uint64_t> > last_read_hybridtime;
   scoped_refptr<AtomicGauge<uint64_t> > last_read_physicaltime;
+  scoped_refptr<AtomicGauge<uint64_t> > last_checkpoint_physicaltime;
 
   // Info about last majority-replicated OpID by CDC Producer (upon last poll).
   scoped_refptr<AtomicGauge<int64_t> > last_readable_opid_index;
   // For last_committed_hybridtime, use 'hybrid_clock_hybrid_time'.
 
+  // Lag between commit time of last record polled and last record applied on producer.
+  scoped_refptr<AtomicGauge<int64_t> > async_replication_sent_lag_micros;
+  // Lag between last record applied on consumer and producer.
+  scoped_refptr<AtomicGauge<int64_t> > async_replication_committed_lag_micros;
+
  private:
   scoped_refptr<MetricEntity> entity_;
-  std::string key_;
 };
 
 class CDCServerMetrics {

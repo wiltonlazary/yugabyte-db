@@ -50,6 +50,10 @@ CDCClient::~CDCClient() {
   }
 }
 
+void CDCClient::Shutdown() {
+  client->Shutdown();
+}
+
 Result<std::unique_ptr<CDCConsumer>> CDCConsumer::Create(
     std::function<bool(const std::string&)> is_leader_for_tablet,
     rpc::ProxyCache* proxy_cache,
@@ -95,6 +99,7 @@ CDCConsumer::CDCConsumer(std::function<bool(const std::string&)> is_leader_for_t
                          const string& ts_uuid,
                          std::unique_ptr<CDCClient> local_client) :
   is_leader_for_tablet_(std::move(is_leader_for_tablet)),
+  rpcs_(new rpc::Rpcs),
   log_prefix_(Format("[TS $0]: ", ts_uuid)),
   local_client_(std::move(local_client)) {}
 
@@ -110,6 +115,10 @@ void CDCConsumer::Shutdown() {
   }
   cond_.notify_all();
 
+  if (thread_pool_) {
+    thread_pool_->Shutdown();
+  }
+
   {
     std::lock_guard<rw_spinlock> write_lock(master_data_mutex_);
     producer_consumer_tablet_map_from_master_.clear();
@@ -117,18 +126,15 @@ void CDCConsumer::Shutdown() {
     {
       SharedLock<rw_spinlock> read_lock(producer_pollers_map_mutex_);
       for (auto &uuid_and_client : remote_clients_) {
-        uuid_and_client.second->client->Shutdown();
+        uuid_and_client.second->Shutdown();
       }
+      producer_pollers_map_.clear();
     }
     local_client_->client->Shutdown();
   }
 
   if (run_trigger_poll_thread_) {
     WARN_NOT_OK(ThreadJoiner(run_trigger_poll_thread_.get()).Join(), "Could not join thread");
-  }
-
-  if (thread_pool_) {
-    thread_pool_->Shutdown();
   }
 }
 
@@ -174,7 +180,8 @@ void CDCConsumer::UpdateInMemoryState(const cdc::ConsumerRegistryPB* consumer_re
 
   cluster_config_version_.store(cluster_config_version, std::memory_order_release);
   producer_consumer_tablet_map_from_master_.clear();
-  uuid_master_addrs_.clear();
+  decltype(uuid_master_addrs_) old_uuid_master_addrs;
+  uuid_master_addrs_.swap(old_uuid_master_addrs);
 
   if (!consumer_registry) {
     LOG_WITH_PREFIX(INFO) << "Given empty CDC consumer registry: removing Pollers";
@@ -194,6 +201,12 @@ void CDCConsumer::UpdateInMemoryState(const cdc::ConsumerRegistryPB* consumer_re
       std::vector<HostPort> hp;
       HostPortsFromPBs(producer_map.second.master_addrs(), &hp);
       uuid_master_addrs_[producer_map.first] = HostPort::ToCommaSeparatedString(hp);
+
+      // If master addresses changed, mark for YBClient update.
+      if (ContainsKey(old_uuid_master_addrs, producer_map.first) &&
+          uuid_master_addrs_[producer_map.first] != old_uuid_master_addrs[producer_map.first]) {
+        changed_master_addrs_.insert(producer_map.first);
+      }
     }
     // recreate the set of CDCPollers
     for (const auto& stream_entry : producer_entry_pb.stream_map()) {
@@ -219,14 +232,26 @@ void CDCConsumer::UpdateInMemoryState(const cdc::ConsumerRegistryPB* consumer_re
 }
 
 void CDCConsumer::TriggerPollForNewTablets() {
-  SharedLock<rw_spinlock> read_lock_master(master_data_mutex_);
+  std::lock_guard<rw_spinlock> write_lock_master(master_data_mutex_);
 
   for (const auto& entry : producer_consumer_tablet_map_from_master_) {
+    auto uuid = entry.first.universe_uuid;
     bool start_polling;
     {
       SharedLock<rw_spinlock> read_lock_pollers(producer_pollers_map_mutex_);
       start_polling = producer_pollers_map_.find(entry.first) == producer_pollers_map_.end() &&
                       is_leader_for_tablet_(entry.second.tablet_id);
+
+      // Update the Master Addresses, if altered after setup.
+      if (ContainsKey(remote_clients_, uuid) && changed_master_addrs_.count(uuid) > 0) {
+        auto status = remote_clients_[uuid]->client->SetMasterAddresses(uuid_master_addrs_[uuid]);
+        if (status.ok()) {
+          changed_master_addrs_.erase(uuid);
+        } else {
+          LOG_WITH_PREFIX(WARNING) << "Problem Setting Master Addresses for " << uuid
+                                   << ": " << status.ToString();
+        }
+      }
     }
     if (start_polling) {
       std::lock_guard <rw_spinlock> write_lock_pollers(producer_pollers_map_mutex_);
@@ -236,8 +261,6 @@ void CDCConsumer::TriggerPollForNewTablets() {
           is_leader_for_tablet_(entry.second.tablet_id);
       if (start_polling) {
         // This is a new tablet, trigger a poll.
-        auto uuid = entry.first.universe_uuid;
-
         // See if we need to create a new client connection
         if (!ContainsKey(remote_clients_, uuid)) {
           CHECK(ContainsKey(uuid_master_addrs_, uuid));
@@ -269,7 +292,7 @@ void CDCConsumer::TriggerPollForNewTablets() {
           }
 
           auto client_result = yb::client::YBClientBuilder()
-              .set_client_name("CDCConsumerRemote::" + uuid)
+              .set_client_name("CDCConsumerRemote")
               .add_master_server_addr(uuid_master_addrs_[uuid])
               .skip_master_flagfile()
               .default_rpc_timeout(MonoDelta::FromMilliseconds(FLAGS_cdc_read_rpc_timeout_ms))
@@ -293,8 +316,9 @@ void CDCConsumer::TriggerPollForNewTablets() {
             std::bind(&CDCConsumer::ShouldContinuePolling, this, entry.first),
             std::bind(&CDCConsumer::RemoveFromPollersMap, this, entry.first),
             thread_pool_.get(),
-            local_client_->client,
-            remote_clients_[uuid]->client,
+            rpcs_.get(),
+            local_client_,
+            remote_clients_[uuid],
             this,
             use_local_tserver);
         LOG_WITH_PREFIX(INFO) << Format("Start polling for producer tablet $0",
@@ -309,7 +333,7 @@ void CDCConsumer::TriggerPollForNewTablets() {
 void CDCConsumer::RemoveFromPollersMap(const cdc::ProducerTabletInfo producer_tablet_info) {
   LOG_WITH_PREFIX(INFO) << Format("Stop polling for producer tablet $0",
                                   producer_tablet_info.tablet_id);
-  std::shared_ptr<client::YBClient> client_to_delete; // decrement refcount to 0 outside lock
+  std::shared_ptr<CDCClient> client_to_delete; // decrement refcount to 0 outside lock
   {
     SharedLock<rw_spinlock> read_lock_master(master_data_mutex_);
     std::lock_guard<rw_spinlock> write_lock_pollers(producer_pollers_map_mutex_);
@@ -318,7 +342,7 @@ void CDCConsumer::RemoveFromPollersMap(const cdc::ProducerTabletInfo producer_ta
     if (!ContainsKey(uuid_master_addrs_, producer_tablet_info.universe_uuid)) {
       auto it = remote_clients_.find(producer_tablet_info.universe_uuid);
       if (it != remote_clients_.end()) {
-        client_to_delete = it->second->client;
+        client_to_delete = it->second;
         remote_clients_.erase(it);
       }
     }

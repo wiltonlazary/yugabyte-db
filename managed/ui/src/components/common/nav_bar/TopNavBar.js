@@ -7,9 +7,10 @@ import { MenuItem , NavDropdown, Navbar, Nav } from 'react-bootstrap';
 import { Link } from 'react-router';
 import YBLogo from '../YBLogo/YBLogo';
 import './stylesheets/TopNavBar.scss';
-import { getPromiseState } from 'utils/PromiseUtils';
+import { getPromiseState } from '../../../utils/PromiseUtils';
 import { LinkContainer } from 'react-router-bootstrap';
-import { isNotHidden, isDisabled } from 'utils/LayoutUtils';
+import { isNotHidden, isDisabled } from '../../../utils/LayoutUtils';
+import { clearCredentials } from '../../../routes';
 
 class YBMenuItem extends Component {
   render() {
@@ -34,12 +35,7 @@ class YBMenuItem extends Component {
 
 export default class TopNavBar extends Component {
   handleLogout = event => {
-    // Don't remove all localStorage items
-    localStorage.removeItem('authToken');
-    localStorage.removeItem('apiToken');
-    Cookies.remove('authToken');
-    Cookies.remove('apiToken');
-    Cookies.remove('customerId');
+    clearCredentials();
     this.props.logoutProfile();
   };
 
@@ -52,12 +48,13 @@ export default class TopNavBar extends Component {
     // TODO(bogdan): icon for logs...
     return (
       <Navbar fixedTop>
-        <Navbar.Header>
-          <Link to="/" className="left_col text-center">
-            <YBLogo />
-          </Link>
-        </Navbar.Header>
-
+        {getPromiseState(currentCustomer).isSuccess() && isNotHidden(currentCustomer.data.features, "menu.sidebar") &&
+          <Navbar.Header>
+            <Link to="/" className="left_col text-center">
+              <YBLogo />
+            </Link>
+          </Navbar.Header>
+        }
         <div className="flex-grow"></div>
         {getPromiseState(currentCustomer).isSuccess() && isNotHidden(currentCustomer.data.features, "main.dropdown") &&
         <Nav pullRight>
@@ -70,11 +67,6 @@ export default class TopNavBar extends Component {
             {isNotHidden(currentCustomer.data.features, "main.logs") &&
               <YBMenuItem to={"/logs"} disabled={isDisabled(currentCustomer.data.features, "main.logs")}>
                 <i className="fa fa-file fa-fw"></i>Logs
-              </YBMenuItem>
-            }
-            {isNotHidden(currentCustomer.data.features, "main.schedules") &&
-              <YBMenuItem to={"/schedules"} disabled={isDisabled(currentCustomer.data.features, "main.schedules")}>
-                <i className="fa fa-calendar-o fa-fw"></i>Schedules
               </YBMenuItem>
             }
             {isNotHidden(currentCustomer.data.features, "main.certificates") &&

@@ -110,7 +110,7 @@ class DBIter: public Iterator {
     assert(iter_ == nullptr);
     iter_ = iter;
     if (iter_ && iter_pinned_) {
-      iter_->PinData();
+      CHECK_OK(iter_->PinData());
     }
   }
   bool Valid() const override { return valid_; }
@@ -180,6 +180,13 @@ class DBIter: public Iterator {
   void Seek(const Slice& target) override;
   void SeekToFirst() override;
   void SeekToLast() override;
+
+  void RevalidateAfterUpperBoundChange() override {
+    if (iter_->Valid() && direction_ == kForward) {
+      valid_ = true;
+      FindNextUserEntry(/* skipping= */ false);
+    }
+  }
 
  private:
   void ReverseToBackward();
@@ -860,7 +867,7 @@ Iterator* NewDBIterator(Env* env, const ImmutableCFOptions& ioptions,
                  false, max_sequential_skip_in_iterations, version_number,
                  iterate_upper_bound, prefix_same_as_start);
   if (pin_data) {
-    db_iter->PinData();
+    CHECK_OK(db_iter->PinData());
   }
   return db_iter;
 }
@@ -897,6 +904,10 @@ void ArenaWrappedDBIter::RegisterCleanup(CleanupFunction function, void* arg1,
   db_iter_->RegisterCleanup(function, arg1, arg2);
 }
 
+void ArenaWrappedDBIter::RevalidateAfterUpperBoundChange() {
+  db_iter_->RevalidateAfterUpperBoundChange();
+}
+
 ArenaWrappedDBIter* NewArenaWrappedDbIterator(
     Env* env, const ImmutableCFOptions& ioptions,
     const Comparator* user_key_comparator, const SequenceNumber& sequence,
@@ -913,7 +924,7 @@ ArenaWrappedDBIter* NewArenaWrappedDbIterator(
 
   iter->SetDBIter(db_iter);
   if (pin_data) {
-    iter->PinData();
+    CHECK_OK(iter->PinData());
   }
 
   return iter;

@@ -27,6 +27,7 @@
 #include "yb/yql/cql/ql/util/ql_env.h"
 
 #include "yb/util/metrics.h"
+#include "yb/util/object_pool.h"
 
 namespace yb {
 namespace ql {
@@ -62,6 +63,7 @@ class QLProcessor : public Rescheduler {
   QLProcessor(client::YBClient* client,
               std::shared_ptr<client::YBMetaDataCache> cache,
               QLMetrics* ql_metrics,
+              ThreadSafeObjectPool<Parser>* parser_pool,
               const server::ClockPtr& clock,
               TransactionPoolProvider transaction_pool_provider);
   virtual ~QLProcessor();
@@ -101,8 +103,8 @@ class QLProcessor : public Rescheduler {
   // Environment (YBClient) that processor uses to execute statement.
   QLEnv ql_env_;
 
-  // Parsing processor.
-  Parser parser_;
+  // Used for logging audit records.
+  audit::AuditLogger audit_logger_;
 
   // Semantic analysis processor.
   Analyzer analyzer_;
@@ -112,6 +114,8 @@ class QLProcessor : public Rescheduler {
 
   // SQL metrics.
   QLMetrics* const ql_metrics_;
+
+  ThreadSafeObjectPool<Parser>* parser_pool_;
 
  private:
   friend class QLTestBase;

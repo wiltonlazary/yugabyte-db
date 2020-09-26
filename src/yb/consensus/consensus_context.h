@@ -18,6 +18,8 @@
 
 #include "yb/consensus/consensus_fwd.h"
 
+#include "yb/util/status.h"
+
 namespace yb {
 namespace consensus {
 
@@ -43,8 +45,11 @@ class ConsensusContext {
 
   virtual bool ShouldApplyWrite() = 0;
 
+  // Performs steps to prepare request for peer.
+  // For instance it could enqueue some operations to the Raft.
+  //
   // Returns the current safe time, so we can send it from leaders to followers.
-  virtual HybridTime PropagatedSafeTime() = 0;
+  virtual HybridTime PreparePeerRequest() = 0;
 
   // This is called every time majority-replicated watermarks (OpId / leader leases) change. This is
   // used for updating the "propagated safe time" value in MvccManager and unblocking readers
@@ -57,7 +62,12 @@ class ConsensusContext {
   // time value for a read/write operation in case of RF==1 mode.
   virtual void ChangeConfigReplicated(const RaftConfigPB& config) = 0;
 
+  // See DB::GetCurrentVersionNumSSTFiles
   virtual uint64_t NumSSTFiles() = 0;
+
+  // Register listener that will be invoked when number of SST files changed.
+  // Listener could be set only once and then reset.
+  virtual void ListenNumSSTFilesChanged(std::function<void()> listener) = 0;
 
   virtual ~ConsensusContext() = default;
 };

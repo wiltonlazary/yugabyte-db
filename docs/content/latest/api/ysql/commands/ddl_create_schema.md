@@ -1,8 +1,8 @@
 ---
-title: CREATE SCHEMA
+title: CREATE SCHEMA statement [YSQL]
+headerTitle: CREATE SCHEMA
 linkTitle: CREATE SCHEMA
-summary: Create schema
-description: CREATE SCHEMA
+description: Use the CREATE SCHEMA statement to create a new schema in the current database.
 menu:
   latest:
     identifier: api-ysql-commands-create-schema
@@ -92,5 +92,5 @@ yugabyte=# CREATE SCHEMA branch
 - [`CREATE TABLE`](../ddl_create_table)
 - [`CREATE VIEW`](../ddl_create_view)
 - [`CREATE INDEX`](../ddl_create_index)
-- [`CREATE SEQUENCE`](../ddl_create_seq)
+- [`CREATE SEQUENCE`](../ddl_create_sequence)
 - [`GRANT`](../dcl_grant)

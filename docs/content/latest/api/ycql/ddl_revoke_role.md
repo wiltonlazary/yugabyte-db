@@ -1,7 +1,8 @@
 ---
-title: REVOKE ROLE
-summary: Revoke a role to another role
-description: REVOKE ROLE
+title: REVOKE ROLE statement [YCQL]
+headerTitle: REVOKE ROLE
+linkTitle: REVOKE ROLE
+description: Use the `REVOKE ROLE` statement to revoke a role (which represents a group of permissions and the SUPERUSER status) from another role.
 menu:
   latest:
     parent: api-cassandra
@@ -15,9 +16,9 @@ showAsideToc: true
 
 ## Synopsis
 
-The `REVOKE ROLE` statement is used to revoke a role (which represents a group of permissions and the SUPERUSER status) from another role.
+Use the `REVOKE ROLE` statement to revoke a role (which represents a group of permissions and the SUPERUSER status) from another role.
 
-This statement is enabled by setting the YB-TServer configuration option [`use_cassandra_authentication`](../../../reference/configuration/yb-tserver/#config-flags) to `true`.
+This statement is enabled by setting the YB-TServer flag [`--use_cassandra_authentication`](../../../reference/configuration/yb-tserver/#config-flags) to `true`.
 
 ## Syntax
 
@@ -46,15 +47,14 @@ Where
 ## Examples
 
 ```sql
-cqlsh:example> REVOKE ROLE project_y from diana;
+ycqlsh:example> REVOKE ROLE project_y from diana;
 ```
 
 ## See also
 
-[`ALTER ROLE`](../ddl_alter_role)
-[`DROP ROLE`](../ddl_drop_role)
-[`CREATE ROLE`](../ddl_create_role)
-[`GRANT ROLE`](../ddl_grant_role)
-[`GRANT PERMISSION`](../ddl_grant_permission)
-[`REVOKE PERMISSION`](../ddl_revoke_permission)
-[Other CQL Statements](..)
+- [`ALTER ROLE`](../ddl_alter_role)
+- [`DROP ROLE`](../ddl_drop_role)
+- [`CREATE ROLE`](../ddl_create_role)
+- [`GRANT ROLE`](../ddl_grant_role)
+- [`GRANT PERMISSION`](../ddl_grant_permission)
+- [`REVOKE PERMISSION`](../ddl_revoke_permission)

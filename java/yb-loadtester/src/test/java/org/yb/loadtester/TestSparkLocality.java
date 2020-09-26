@@ -17,7 +17,7 @@ import com.yugabyte.sample.apps.CassandraSparkKeyValueCopy;
 import com.yugabyte.sample.common.CmdLineOpts;
 import org.junit.Test;
 import org.junit.runner.RunWith;
-import org.yb.YBTestRunner;
+import org.yb.util.YBTestRunnerNonTsanOnly;
 import org.yb.cql.BaseCQLTest;
 import org.yb.minicluster.IOMetrics;
 import org.yb.minicluster.MiniYBDaemon;
@@ -29,7 +29,7 @@ import java.util.stream.Collectors;
 import static org.yb.AssertionWrappers.assertEquals;
 import static org.yb.AssertionWrappers.assertTrue;
 
-@RunWith(value=YBTestRunner.class)
+@RunWith(value=YBTestRunnerNonTsanOnly.class)
 public class TestSparkLocality extends BaseCQLTest {
 
   // Timeout to wait for load balancing to complete.
@@ -50,9 +50,10 @@ public class TestSparkLocality extends BaseCQLTest {
     // Setup input table.
     session.execute("CREATE KEYSPACE ybdemo_keyspace");
     session.execute("USE ybdemo_keyspace");
-    session.execute("CREATE TABLE CassandraKeyValue(k text primary key, v blob)");
+    session.execute("CREATE TABLE CassandraKeyValue(k text primary key, v1 blob, v2 jsonb)");
     for (int i = 0; i < ROWS_COUNT; i++) {
-      session.execute("INSERT INTO CassandraKeyValue(k,v) VALUES('" + i + "', 0xabcdef012345)");
+      session.execute("INSERT INTO CassandraKeyValue(k, v1, v2) VALUES" +
+                              "('" + i + "', 0xabcdef012345, '{\"a\" : "+ i +" }')");
     }
 
     // Set up the app.

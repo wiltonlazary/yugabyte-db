@@ -34,10 +34,6 @@ public abstract class DevopsBase {
   // Command that we would need to execute eg: instance, network, access.
   protected abstract String getCommandType();
 
-  protected String getBaseCommand() {
-    return YBCLOUD_SCRIPT;
-  }
-
   @Inject
   ShellProcessHandler shellProcessHandler;
 
@@ -83,13 +79,15 @@ public abstract class DevopsBase {
     if (regionUUID != null) {
       region = Region.get(regionUUID);
     }
+
+    Provider provider = null;
     if (region != null) {
       commandList.add(region.provider.code);
       commandList.add("--region");
       commandList.add(region.code);
       extraVars = region.provider.getConfig();
     } else if (providerUUID != null) {
-      Provider provider = Provider.get(providerUUID);
+      provider = Provider.get(providerUUID);
       commandList.add(provider.code);
       extraVars = provider.getConfig();
     } else if (cloudType != null) {

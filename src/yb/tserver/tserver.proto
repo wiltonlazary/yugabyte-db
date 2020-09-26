@@ -139,6 +139,10 @@ message TabletServerErrorPB {
 
     // Tablet server has some tablets pending local bootstraps.
     PENDING_LOCAL_BOOTSTRAPS = 27;
+
+    // Tablet splitting has been started (after split is completed - tablet stays in this state
+    // until it is deleted).
+    TABLET_SPLIT = 28;
   }
 
   // The error code.
@@ -190,6 +194,8 @@ message WriteRequestPB {
   optional double rejection_score = 18;
 
   optional fixed64 external_hybrid_time = 19;
+
+  optional uint64 batch_idx = 20;
 }
 
 message WriteResponsePB {
@@ -289,6 +295,8 @@ message ReadRequestPB {
   optional bool DEPRECATED_may_have_metadata = 12;
 
   optional double rejection_score = 13;
+
+  optional uint64 batch_idx = 14;
 }
 
 message ReadResponsePB {
@@ -324,11 +332,16 @@ message TransactionStatePB {
   // Not used is other cases.
   repeated bytes tablets = 3;
 
+  // Relevant only in SEALED state.
+  // Number of batches that should be replicated at appropriate tablet to interpret transaction as
+  // committed.
+  repeated int64 tablet_batches = 5;
+
   // Relevant only in APPLYING state.
   optional fixed64 commit_hybrid_time = 4;
 
-  // Relevant only in CLEANUP status, true when we cleanup intents of applied transaction,
-  // that was previously sealed.
+  // Relevant only in CLEANUP and APPLYING status, true when we perform request
+  // for a transaction that was previously sealed.
   optional bool sealed = 6;
 }
 

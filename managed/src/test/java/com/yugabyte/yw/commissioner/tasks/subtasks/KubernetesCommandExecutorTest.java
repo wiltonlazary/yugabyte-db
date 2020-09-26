@@ -40,6 +40,10 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 
+import org.pac4j.play.CallbackController;
+import org.pac4j.play.store.PlayCacheSessionStore;
+import org.pac4j.play.store.PlaySessionStore;
+
 import static com.yugabyte.yw.common.ApiUtils.getTestUserIntent;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -73,12 +77,19 @@ public class KubernetesCommandExecutorTest extends SubTaskBaseTest {
   int numNodes = 3;
   Map<String, String> config= new HashMap<String, String>();
 
+  protected CallbackController mockCallbackController;
+  protected PlayCacheSessionStore mockSessionStore;
+
   @Override
   protected Application provideApplication() {
     kubernetesManager = mock(KubernetesManager.class);
+    mockCallbackController = mock(CallbackController.class);
+    mockSessionStore = mock(PlayCacheSessionStore.class);
     return new GuiceApplicationBuilder()
         .configure((Map) Helpers.inMemoryDatabase())
         .overrides(bind(KubernetesManager.class).toInstance(kubernetesManager))
+        .overrides(bind(CallbackController.class).toInstance(mockCallbackController))
+        .overrides(bind(PlaySessionStore.class).toInstance(mockSessionStore))
         .build();
   }
 
@@ -93,7 +104,11 @@ public class KubernetesCommandExecutorTest extends SubTaskBaseTest {
     defaultAZ = AvailabilityZone.create(defaultRegion, "az-1", "PlacementAZ 1", "subnet-1");
     defaultUniverse = ModelFactory.createUniverse(defaultCustomer.getCustomerId());
     defaultUniverse = updateUniverseDetails("small");
-    defaultCert = CertificateInfo.get(CertificateHelper.createRootCA(defaultUniverse.getUniverseDetails().nodePrefix, defaultProvider.customerUUID, "/tmp/certs"));
+    defaultCert = CertificateInfo.get(CertificateHelper.createRootCA(
+        defaultUniverse.getUniverseDetails().nodePrefix,
+        defaultProvider.customerUUID, "/tmp/certs"));
+    defaultUniverse.setConfig(ImmutableMap.of(Universe.HELM2_LEGACY,
+                                              Universe.HelmLegacy.V3.toString()));
   }
 
   @After
@@ -142,14 +157,6 @@ public class KubernetesCommandExecutorTest extends SubTaskBaseTest {
     params.placementInfo = placementInfo;
     kubernetesCommandExecutor.initialize(params);
     return kubernetesCommandExecutor;
-  }
-
-  @Test
-  public void testHelmInit() {
-    KubernetesCommandExecutor kubernetesCommandExecutor =
-        createExecutor(KubernetesCommandExecutor.CommandType.HELM_INIT);
-    kubernetesCommandExecutor.run();
-    verify(kubernetesManager, times(1)).helmInit(config, defaultProvider.uuid);
   }
 
   private Map<String, Object> getExpectedOverrides(boolean exposeAll) {
@@ -221,6 +228,7 @@ public class KubernetesCommandExecutorTest extends SubTaskBaseTest {
     if (defaultUserIntent.enableNodeToNodeEncrypt || defaultUserIntent.enableClientToNodeEncrypt) {
       Map<String, Object> tlsInfo = new HashMap<>();
       tlsInfo.put("enabled", true);
+      tlsInfo.put("insecure", true);
       Map<String, Object> rootCA = new HashMap<>();
       rootCA.put("cert", CertificateHelper.getCertPEM(defaultCert));
       rootCA.put("key", CertificateHelper.getKeyPEM(defaultCert));
@@ -236,10 +244,6 @@ public class KubernetesCommandExecutorTest extends SubTaskBaseTest {
     masterOverrides.put("placement_zone", defaultAZ.code);
     // masterOverrides.put("placement_uuid", defaultUniverse.getUniverseDetails().getPrimaryCluster().uuid);
     masterOverrides.put("placement_uuid", hackPlacementUUID.toString());
-    if (defaultUserIntent.enableClientToNodeEncrypt || defaultUserIntent.enableNodeToNodeEncrypt) {
-      masterOverrides.put("use_node_to_node_encryption", true);
-      masterOverrides.put("allow_insecure_connections", true);
-    }
     gflagOverrides.put("master", masterOverrides);
 
     // Tserver flags.
@@ -249,11 +253,6 @@ public class KubernetesCommandExecutorTest extends SubTaskBaseTest {
     tserverOverrides.put("placement_zone", defaultAZ.code);
     // tserverOverrides.put("placement_uuid", defaultUniverse.getUniverseDetails().getPrimaryCluster().uuid);
     tserverOverrides.put("placement_uuid", hackPlacementUUID.toString());
-    if (defaultUserIntent.enableClientToNodeEncrypt || defaultUserIntent.enableNodeToNodeEncrypt) {
-      tserverOverrides.put("use_node_to_node_encryption", true);
-      tserverOverrides.put("allow_insecure_connections", true);
-      tserverOverrides.put("use_client_to_server_encryption", true);
-    }
 
     gflagOverrides.put("tserver", tserverOverrides);
     // Put all the flags together.
@@ -284,6 +283,12 @@ public class KubernetesCommandExecutorTest extends SubTaskBaseTest {
       }
     }
     expectedOverrides.put("disableYsql", !defaultUserIntent.enableYSQL);
+    Map<String, String> universeConfig = defaultUniverse.getConfig();
+    boolean helmLegacy = Universe.HelmLegacy.valueOf(universeConfig.get(Universe.HELM2_LEGACY))
+        == Universe.HelmLegacy.V2TO3;
+    if (helmLegacy) {
+      expectedOverrides.put("helm2Legacy", helmLegacy);
+    }
 
     return expectedOverrides;
   }
@@ -708,5 +713,46 @@ public class KubernetesCommandExecutorTest extends SubTaskBaseTest {
       assertEquals(node.cloudInfo.az, az);
       assertEquals(node.cloudInfo.region, azToRegion.get(az));
     }
+  }
+
+  @Test
+  public void testHelmInstallLegacy() throws IOException {
+    ShellProcessHandler.ShellResponse shellResponse = new ShellProcessHandler.ShellResponse();
+    shellResponse.message =
+        "{\"items\": [{\"metadata\": {\"name\": \"test\"}, \"spec\": {\"clusterIP\": \"None\"," +
+        "\"type\":\"clusterIP\"}}]}";
+    when(kubernetesManager.getServices(any(), any())).thenReturn(shellResponse);
+    defaultUniverse.setConfig(ImmutableMap.of(Universe.HELM2_LEGACY,
+                                              Universe.HelmLegacy.V2TO3.toString()));
+    assertEquals(hackPlacementUUID, defaultUniverse.getUniverseDetails().getPrimaryCluster().uuid);
+    KubernetesCommandExecutor kubernetesCommandExecutor =
+        createExecutor(KubernetesCommandExecutor.CommandType.HELM_INSTALL,
+                       defaultUniverse.getUniverseDetails().getPrimaryCluster().placementInfo);
+    kubernetesCommandExecutor.run();
+    assertEquals(hackPlacementUUID, defaultUniverse.getUniverseDetails().getPrimaryCluster().uuid);
+
+    ArgumentCaptor<UUID> expectedProviderUUID = ArgumentCaptor.forClass(UUID.class);
+    ArgumentCaptor<String> expectedNodePrefix = ArgumentCaptor.forClass(String.class);
+    ArgumentCaptor<String> expectedOverrideFile = ArgumentCaptor.forClass(String.class);
+    ArgumentCaptor<HashMap> expectedConfig = ArgumentCaptor.forClass(HashMap.class);
+    verify(kubernetesManager, times(1)).helmInstall(expectedConfig.capture(),
+                                                    expectedProviderUUID.capture(),
+                                                    expectedNodePrefix.capture(),
+                                                    expectedOverrideFile.capture());
+    verify(kubernetesManager, times(1)).getServices(expectedConfig.capture(),
+                                                    expectedNodePrefix.capture());
+    assertEquals(config, expectedConfig.getValue());
+    assertEquals(hackPlacementUUID, defaultUniverse.getUniverseDetails().getPrimaryCluster().uuid);
+    assertEquals(defaultProvider.uuid, expectedProviderUUID.getValue());
+    assertEquals(defaultUniverse.getUniverseDetails().nodePrefix, expectedNodePrefix.getValue());
+    String overrideFileRegex = "(.*)" + defaultUniverse.universeUUID + "(.*).yml";
+    assertThat(expectedOverrideFile.getValue(), RegexMatcher.matchesRegex(overrideFileRegex));
+    Yaml yaml = new Yaml();
+    InputStream is = new FileInputStream(new File(expectedOverrideFile.getValue()));
+    Map<String, Object> overrides = yaml.loadAs(is, Map.class);
+
+    // TODO implement exposeAll false case
+    assertEquals(hackPlacementUUID, defaultUniverse.getUniverseDetails().getPrimaryCluster().uuid);
+    assertEquals(getExpectedOverrides(true), overrides);
   }
 }

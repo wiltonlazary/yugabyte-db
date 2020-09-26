@@ -119,6 +119,7 @@ typedef struct CopyStateData
 	List	   *attnumlist;		/* integer list of attnums to copy */
 	char	   *filename;		/* filename, or NULL for STDIN/STDOUT */
 	bool		is_program;		/* is 'filename' a program to popen? */
+	int			batch_size;		/* copy from executes in batch sizes */
 	copy_data_source_cb data_source_cb; /* function for reading data */
 	bool		binary;			/* binary format? */
 	bool		oids;			/* include OIDs? */
@@ -1032,7 +1033,7 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
  * This is exported so that external users of the COPY API can sanity-check
  * a list of options.  In that usage, cstate should be passed as NULL
  * (since external users don't know sizeof(CopyStateData)) and the collected
- * data is just leaked until CurrentMemoryContext is reset.
+ * data is just leaked until GetCurrentMemoryContext() is reset.
  *
  * Note that additional checking, such as whether column names listed in FORCE
  * QUOTE actually exist, has to be applied later.  This just checks for
@@ -1108,6 +1109,17 @@ ProcessCopyOptions(ParseState *pstate,
 						 errmsg("conflicting or redundant options"),
 						 parser_errposition(pstate, defel->location)));
 			cstate->delim = defGetString(defel);
+		}
+		else if (strcmp(defel->defname, "rows_per_transaction") == 0)
+		{
+			int rows = defGetInt32(defel);
+			if (rows > 0)
+				cstate->batch_size = rows;
+			else
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("argument to option \"%s\" must be a positive integer", defel->defname),
+						 parser_errposition(pstate, defel->location)));
 		}
 		else if (strcmp(defel->defname, "null") == 0)
 		{
@@ -1419,7 +1431,7 @@ BeginCopy(ParseState *pstate,
 	 * We allocate everything used by a cstate in a new memory context. This
 	 * avoids memory leaks during repeated use of COPY in a query.
 	 */
-	cstate->copycontext = AllocSetContextCreate(CurrentMemoryContext,
+	cstate->copycontext = AllocSetContextCreate(GetCurrentMemoryContext(),
 												"COPY",
 												ALLOCSET_DEFAULT_SIZES);
 
@@ -2011,7 +2023,7 @@ CopyTo(CopyState cstate)
 	 * datatype output routines, and should be faster than retail pfree's
 	 * anyway.  (We don't need a whole econtext as CopyFrom does.)
 	 */
-	cstate->rowcontext = AllocSetContextCreate(CurrentMemoryContext,
+	cstate->rowcontext = AllocSetContextCreate(GetCurrentMemoryContext(),
 											   "COPY TO",
 											   ALLOCSET_DEFAULT_SIZES);
 
@@ -2072,11 +2084,27 @@ CopyTo(CopyState cstate)
 		bool	   *nulls;
 		HeapScanDesc scandesc;
 		HeapTuple	tuple;
+		bool		is_yb_relation;
+		MemoryContext oldcontext;
+		MemoryContext yb_context;
 
 		values = (Datum *) palloc(num_phys_attrs * sizeof(Datum));
 		nulls = (bool *) palloc(num_phys_attrs * sizeof(bool));
 
 		scandesc = heap_beginscan(cstate->rel, GetActiveSnapshot(), 0, NULL);
+		is_yb_relation = IsYBRelation(cstate->rel);
+
+		/*
+		 * Create and switch to a temporary memory context that we can reset
+		 * once per row to recover Yugabyte palloc'd memory.
+		 */
+		if (is_yb_relation)
+		{
+			yb_context = AllocSetContextCreate(GetCurrentMemoryContext(),
+											   "COPY TO (YB)",
+											   ALLOCSET_DEFAULT_SIZES);
+			oldcontext = MemoryContextSwitchTo(yb_context);
+		}
 
 		processed = 0;
 		while ((tuple = heap_getnext(scandesc, ForwardScanDirection)) != NULL)
@@ -2089,6 +2117,20 @@ CopyTo(CopyState cstate)
 			/* Format and send the data */
 			CopyOneRowTo(cstate, HeapTupleGetOid(tuple), values, nulls);
 			processed++;
+
+			/* Free Yugabyte memory for this row */
+			if (is_yb_relation)
+				MemoryContextReset(yb_context);
+		}
+
+		/*
+		 * Switch out of and delete the temporary memory context for Yugabyte
+		 * palloc'd memory.
+		 */
+		if (is_yb_relation)
+		{
+			MemoryContextSwitchTo(oldcontext);
+			MemoryContextDelete(yb_context);
 		}
 
 		heap_endscan(scandesc);
@@ -2335,7 +2377,7 @@ CopyFrom(CopyState cstate)
 	ModifyTableState *mtstate;
 	ExprContext *econtext;
 	TupleTableSlot *myslot;
-	MemoryContext oldcontext = CurrentMemoryContext;
+	MemoryContext oldcontext = GetCurrentMemoryContext();
 
 	ErrorContextCallback errcallback;
 	CommandId	mycid = GetCurrentCommandId(true);
@@ -2348,6 +2390,9 @@ CopyFrom(CopyState cstate)
 	int			nBufferedTuples = 0;
 	int			prev_leaf_part_index = -1;
 	bool		useNonTxnInsert;
+	bool		isBatchTxnCopy = cstate->batch_size > 0;
+	bool		shouldResetMemoryPerRow = IsYBRelation(cstate->rel) && cstate->filename != NULL;
+	MemoryContext row_context;
 
 #define MAX_BUFFERED_TUPLES 1000
 	HeapTuple  *bufferedTuples = NULL;	/* initialize to silence warning */
@@ -2579,6 +2624,18 @@ CopyFrom(CopyState cstate)
 			ExecSetupChildParentMapForLeaf(proute);
 	}
 
+	if (isBatchTxnCopy &&
+		(!IsYBRelation(cstate->rel) ||
+		 !YBTransactionsEnabled() ||
+		 YBIsDataSent() ||
+		 (resultRelInfo->ri_TrigDesc != NULL &&
+		  (resultRelInfo->ri_TrigDesc->trig_insert_before_statement ||
+		   resultRelInfo->ri_TrigDesc->trig_insert_after_statement))))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("ROWS_PER_TRANSACTION option is not supported for nested transactions or "
+						"temporary tables or tables with statement-level triggers.")));
+
 	/*
 	 * It's more efficient to prepare a bunch of tuples for insertion, and
 	 * insert them in one heap_multi_insert() call, than call heap_insert()
@@ -2654,12 +2711,30 @@ CopyFrom(CopyState cstate)
 				 errhint("Non-transactional COPY is not supported on relations with "
 						 "secondary indices or triggers.")));
 
-	if (useYBMultiInsert)
-		YBCStartBufferingWriteOperations();
-
-	PG_TRY();
+	/*
+	 * For YBRelations copied from stdin, require
+	 * all rows to be held in memory before being inserted into relation.
+	 * Thus, memory context will not be reset per row for stdin query types.
+	 */
+	if (shouldResetMemoryPerRow)
 	{
-		for (;;)
+		row_context =
+			AllocSetContextCreate(GetCurrentMemoryContext(),
+								  "COPY FROM ROW CONTEXT",
+								  ALLOCSET_DEFAULT_SIZES);
+		oldcontext = MemoryContextSwitchTo(row_context);
+	}
+
+	bool has_more_tuples = true;
+	while (has_more_tuples)
+	{
+		/*
+		 * When batch size is not provided from the query option,
+		 * default behavior is to read each line from the file
+		 * until no more lines are left. If batch size is provided,
+		 * lines will be read in batch sizes at a time.
+		 */
+		for (int i = 0; cstate->batch_size == 0 || i < cstate->batch_size; i++)
 		{
 			TupleTableSlot *slot;
 			bool		skip_tuple;
@@ -2678,9 +2753,11 @@ CopyFrom(CopyState cstate)
 			}
 
 			/* Switch into its memory context */
-			MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
+			if (!shouldResetMemoryPerRow)
+				MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
 
-			if (!NextCopyFrom(cstate, econtext, values, nulls, &loaded_oid))
+			has_more_tuples = NextCopyFrom(cstate, econtext, values, nulls, &loaded_oid);
+			if (!has_more_tuples)
 				break;
 
 			/* And now we can form the input tuple. */
@@ -2696,7 +2773,8 @@ CopyFrom(CopyState cstate)
 			tuple->t_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
 
 			/* Triggers and stuff need to be invoked in query context. */
-			MemoryContextSwitchTo(oldcontext);
+			if (!shouldResetMemoryPerRow)
+				MemoryContextSwitchTo(oldcontext);
 
 			/* Place tuple in tuple slot --- but slot shouldn't free it */
 			slot = myslot;
@@ -2937,19 +3015,26 @@ CopyFrom(CopyState cstate)
 				resultRelInfo = saved_resultRelInfo;
 				estate->es_result_relation_info = resultRelInfo;
 			}
+
+			/*
+			 * Free context per row.
+			 */
+			if (shouldResetMemoryPerRow)
+			{
+				MemoryContextReset(row_context);
+			}
+		}
+		/*
+		 * Commit transaction per batch.
+		 * When CopyFrom method is called, we are already inside a transaction block
+		 * and relevant transaction state properties have been previously set.
+		 */
+		if (isBatchTxnCopy)
+		{
+			YBCCommitTransaction();
+			YBInitializeTransaction();
 		}
 	}
-	PG_CATCH();
-	{
-		/* Flush any pending writes and reset the buffer count */
-		if (useYBMultiInsert)
-			YBCFlushBufferedWriteOperations();
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-
-	if (useYBMultiInsert)
-		YBCFlushBufferedWriteOperations();
 
 	/* Flush any remaining buffered tuples */
 	if (nBufferedTuples > 0)
@@ -2964,6 +3049,14 @@ CopyFrom(CopyState cstate)
 	FreeBulkInsertState(bistate);
 
 	MemoryContextSwitchTo(oldcontext);
+	/*
+	 * Delete all context allocated in local context
+	 * including itself and its descendents.
+	 */
+	if (shouldResetMemoryPerRow)
+	{
+		MemoryContextDelete(row_context);
+	}
 
 	/*
 	 * In the old protocol, tell pqcomm that we can process normal protocol
@@ -3639,7 +3732,7 @@ NextCopyFrom(CopyState cstate, ExprContext *econtext,
 		 * per-tuple memory context in it.
 		 */
 		Assert(econtext != NULL);
-		Assert(CurrentMemoryContext == econtext->ecxt_per_tuple_memory);
+		Assert(GetCurrentMemoryContext() == econtext->ecxt_per_tuple_memory);
 
 		values[defmap[i]] = ExecEvalExpr(defexprs[i], econtext,
 										 &nulls[defmap[i]]);

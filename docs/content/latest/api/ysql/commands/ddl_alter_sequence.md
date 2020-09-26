@@ -1,8 +1,8 @@
 ---
-title: ALTER SEQUENCE
+title: ALTER SEQUENCE statement [YSQL]
+headerTitle: ALTER SEQUENCE
 linkTitle: ALTER SEQUENCE
-summary: Alter a sequence in a schema
-description: ALTER SEQUENCE
+description: Use the ALTER SEQUENCE statement to change the definition of an existing sequence in the current schema.
 menu:
   latest:
     identifier: api-ysql-commands-alter-sequence
@@ -161,11 +161,10 @@ yugabyte=# SELECT nextval('s');
 (1 row)
 ```
 
-
 ## See also
 
 - [`CREATE SEQUENCE`](../ddl_create_sequence)
 - [`DROP SEQUENCE`](../ddl_drop_sequence)
-- [`currval()`](../currval_sequence)
-- [`lastval()`](../lastval_sequence)
-- [`nextval()`](../nextval_sequence)
+- [`currval()`](../../exprs/func_currval)
+- [`lastval()`](../../exprs/func_lastval)
+- [`nextval()`](../../exprs/func_nextval)

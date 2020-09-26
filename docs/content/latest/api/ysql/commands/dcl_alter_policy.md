@@ -1,8 +1,8 @@
 ---
-title: ALTER POLICY
+title: ALTER POLICY statement [YSQL]
+headerTitle: ALTER POLICY
 linkTitle: ALTER POLICY
-description: ALTER POLICY
-summary: Alter row level security policy
+description: Use the ALTER POLICY statement to change the definition of an existing row level security policy.
 menu:
   latest:
     identifier: api-ysql-commands-alter-policy
@@ -74,7 +74,6 @@ yugabyte=# ALTER POLICY p1 ON table_foo TO PUBLIC;
 
 ## See also
 
-[`CREATE POLICY`](../dcl_create_policy)
-[`DROP POLICY`](../dcl_drop_policy)
-[`ALTER TABLE`](../ddl_alter_table)
-[Other YSQL Statements](..)
+- [`CREATE POLICY`](../dcl_create_policy)
+- [`DROP POLICY`](../dcl_drop_policy)
+- [`ALTER TABLE`](../ddl_alter_table)

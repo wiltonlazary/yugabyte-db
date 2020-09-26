@@ -1,4 +1,44 @@
+---
+title: Deploy YugabyteDB in Google Cloud Platform with Terraform
+headerTitle: Google Cloud Platform
+linkTitle: Google Cloud Platform
+description: Use Terraform to deploy a YugabyteDB cluster in Google Cloud Platform.
+aliases:
+  - /latest/deploy/public-clouds/gcp/
+menu:
+  latest:
+    identifier: deploy-in-gcp-3-terraform
+    parent: public-clouds
+    weight: 640
+---
+
+<ul class="nav nav-tabs-alt nav-tabs-yb">
+
+  <li >
+    <a href="/latest/deploy/public-clouds/gcp/gcp-deployment-manager" class="nav-link">
+      <i class="icon-shell"></i>
+      Google Cloud Deployment Manager
+    </a>
+  </li>
+
+  <li>
+    <a href="/latest/deploy/public-clouds/gcp/gke" class="nav-link">
+      <i class="fas fa-cubes" aria-hidden="true"></i>
+      Google Kubernetes Engine (GKE)
+    </a>
+  </li>
+
+  <li >
+    <a href="/latest/deploy/public-clouds/gcp/terraform" class="nav-link active">
+      <i class="icon-shell"></i>
+      Terraform
+    </a>
+  </li>
+
+</ul>
+
 ## Prerequisites
+
 1. Download and install [terraform](https://www.terraform.io/downloads.html).
 
 2. Verify by the `terraform` command, it should print a help message that looks similar to that shown below.
@@ -18,10 +58,11 @@ Common commands:
     fmt                Rewrites config files to canonical format
 ```
 
+## 1. Create a terraform configuration file
 
-## 1. Create a terraform config file
-* First create a terraform file with provider details
-  ```
+* First, create a terraform file with provider details.
+
+```
   provider "google"
   {
     # Provide your Creadentilals
@@ -30,11 +71,13 @@ Common commands:
     # The name of your GCP project
     project = "<Your-GCP-Project-Name>"
   }
-  ```
+```
+
   **NOTE:** :- You can get credentials file by following steps given [here](https://cloud.google.com/docs/authentication/getting-started)
 
-* Now add the yugabyte terraform module to your file
-  ```
+* Now add the Yugabyte Terraform module to your file.
+
+```
   module "yugabyte-db-cluster" {
   source = "github.com/Yugabyte/terraform-gcp-yugabyte.git"
 
@@ -55,8 +98,7 @@ Common commands:
   # The number of nodes in the cluster, this cannot be lower than the replication factor.
   node_count = "3"
   }
-  ```
-
+```
 
 ## 2. Create a cluster
 
@@ -71,7 +113,6 @@ To check what changes are going to happen in environment run the following
 ```sh
 $ terraform plan
 ```
-
 
 Now run the following to create the instances and bring up the cluster.
 
@@ -92,7 +133,9 @@ You can check the state of the nodes at any point by running the following comma
 ```sh
 $ terraform show
 ```
+
 ## 3. Verify resources created
+
 The following resources are created by this module:
 
 - `module.terraform-gcp-yugabyte.google_compute_instance.yugabyte_node` The GCP VM instances.
@@ -111,7 +154,7 @@ For cluster named `test-cluster`, this firewall rule will be named `default-yuga
 
 ## 4. Destroy the cluster (optional)
 
-To destroy what we just created, you can run the following command.
+To destroy what you just created, you can run the following command.
 
 ```sh
 $ terraform destroy

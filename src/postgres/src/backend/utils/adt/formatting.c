@@ -91,6 +91,7 @@
 #include "utils/builtins.h"
 #include "utils/date.h"
 #include "utils/datetime.h"
+#include "utils/float.h"
 #include "utils/formatting.h"
 #include "utils/int8.h"
 #include "utils/numeric.h"
@@ -1102,7 +1103,7 @@ NUMDesc_prepare(NUMDesc *num, FormatNode *n)
 		case NUM_D:
 			num->flag |= NUM_F_LDECIMAL;
 			num->need_locale = true;
-			/* FALLTHROUGH */
+			switch_fallthrough();
 		case NUM_DEC:
 			if (IS_DECIMAL(num))
 				ereport(ERROR,

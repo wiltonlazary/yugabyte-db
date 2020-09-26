@@ -23,6 +23,7 @@
 #include "yb/common/ql_protocol.pb.h"
 #include "yb/common/ql_protocol_util.h"
 #include "yb/common/ql_rowblock.h"
+#include "yb/common/ql_value.h"
 #include "yb/common/read_hybrid_time.h"
 
 #include "yb/util/async_util.h"
@@ -60,12 +61,14 @@ class TableHandle {
   CHECKED_STATUS Create(const YBTableName& table_name,
                         int num_tablets,
                         YBClient* client,
-                        YBSchemaBuilder* builder);
+                        YBSchemaBuilder* builder,
+                        IndexInfoPB* index_info = nullptr);
 
   CHECKED_STATUS Create(const YBTableName& table_name,
                         int num_tablets,
                         const YBSchema& schema,
-                        YBClient* client);
+                        YBClient* client,
+                        IndexInfoPB* index_info = nullptr);
 
   CHECKED_STATUS Open(const YBTableName& table_name, YBClient* client);
 
@@ -174,7 +177,7 @@ class TableIterator : public std::iterator<
   }
 
  private:
-  void ExecuteOps();
+  bool ExecuteOps();
   void Move();
   void HandleError(const Status& status);
 

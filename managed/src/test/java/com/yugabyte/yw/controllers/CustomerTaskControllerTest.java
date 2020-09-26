@@ -8,6 +8,7 @@ import com.google.common.collect.ImmutableList;
 import com.yugabyte.yw.commissioner.Commissioner;
 import com.yugabyte.yw.commissioner.UserTaskDetails;
 import com.yugabyte.yw.common.FakeApiHelper;
+import com.yugabyte.yw.common.FakeDBApplication;
 import com.yugabyte.yw.common.ModelFactory;
 import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.CustomerTask;
@@ -32,6 +33,7 @@ import java.util.concurrent.TimeUnit;
 
 import static com.yugabyte.yw.common.AssertHelper.assertValue;
 import static com.yugabyte.yw.common.AssertHelper.assertValues;
+import static com.yugabyte.yw.common.AssertHelper.assertAuditEntry;
 import static com.yugabyte.yw.common.ModelFactory.createUniverse;
 import static com.yugabyte.yw.models.CustomerTask.TaskType.Create;
 import static com.yugabyte.yw.models.CustomerTask.TaskType.Update;
@@ -49,20 +51,10 @@ import static play.test.Helpers.contentAsString;
 import static play.test.Helpers.fakeRequest;
 import static play.test.Helpers.route;
 
-public class CustomerTaskControllerTest extends WithApplication {
+public class CustomerTaskControllerTest extends FakeDBApplication {
   private Customer customer;
   private Users user;
   private Universe universe;
-  private Commissioner mockCommissioner;
-
-  @Override
-  protected Application provideApplication() {
-    mockCommissioner = mock(Commissioner.class);
-    return new GuiceApplicationBuilder()
-      .configure((Map) Helpers.inMemoryDatabase())
-      .overrides(bind(Commissioner.class).toInstance(mockCommissioner))
-      .build();
-  }
 
   @Before
   public void setUp() {
@@ -82,6 +74,7 @@ public class CustomerTaskControllerTest extends WithApplication {
     JsonNode json = Json.parse(contentAsString(result));
     assertTrue(json.isObject());
     assertEquals(0, json.size());
+    assertAuditEntry(0, customer.uuid);
   }
 
   private UUID createTaskWithStatus(UUID targetUUID, CustomerTask.TargetType targetType,
@@ -113,7 +106,7 @@ public class CustomerTaskControllerTest extends WithApplication {
       // creation time.
       try {
         TimeUnit.SECONDS.sleep(3);
-        task.markAsCompleted(); 
+        task.markAsCompleted();
       } catch (Exception e) {
         // Do nothing
       }
@@ -181,6 +174,7 @@ public class CustomerTaskControllerTest extends WithApplication {
     assertThat(task.get("subTaskGroupType").asText(), allOf(notNullValue(),
         equalTo(UserTaskDetails.SubTaskGroupType.ConfigureUniverse.name())));
     assertThat(task.get("creationTime").asText(), is(notNullValue()));
+    assertAuditEntry(0, customer.uuid);
   }
 
   @Test
@@ -220,6 +214,7 @@ public class CustomerTaskControllerTest extends WithApplication {
     assertEquals(2, providerTasks.size());
     assertValues(providerTasks, "id", ImmutableList.of(providerTaskUUID1.toString(),
         providerTaskUUID2.toString()));
+    assertAuditEntry(0, customer.uuid);
   }
 
   @Test
@@ -233,6 +228,7 @@ public class CustomerTaskControllerTest extends WithApplication {
       String url = "/api/customers/" + customer.uuid + "/tasks";
       Result result = FakeApiHelper.doRequestWithAuthToken("GET", url, authToken);
       assertEquals(OK, result.status());
+      assertAuditEntry(0, customer.uuid);
       JsonNode tasksJson = Json.parse(contentAsString(result));
       JsonNode universeTasks = tasksJson.get(universe.universeUUID.toString());
       if (idx == 0) {
@@ -266,6 +262,7 @@ public class CustomerTaskControllerTest extends WithApplication {
     assertTrue(universeTasks.isArray());
     assertEquals(1, universeTasks.size());
     assertValues(universeTasks, "id", ImmutableList.of(taskUUID1.toString()));
+    assertAuditEntry(0, customer.uuid);
   }
 
   @Test
@@ -275,11 +272,14 @@ public class CustomerTaskControllerTest extends WithApplication {
         Create, "Foo", "Success", 100.0);
     Result result = FakeApiHelper.doRequestWithAuthToken("GET", "/api/customers/" +
         customer.uuid + "/tasks", authToken);
-    CustomerTask ct = CustomerTask.find.where().eq("task_uuid", taskUUID.toString()).findUnique();
+    CustomerTask ct = CustomerTask.find.query().where()
+      .eq("task_uuid", taskUUID.toString())
+      .findOne();
     assertEquals(OK, result.status());
     assertThat(contentAsString(result), allOf(notNullValue(),
         containsString("Created Universe : Foo")));
     assertTrue(ct.getCreateTime().before(ct.getCompletionTime()));
+    assertAuditEntry(0, customer.uuid);
   }
 
   @Test
@@ -311,6 +311,7 @@ public class CustomerTaskControllerTest extends WithApplication {
         equalTo("Configuring the universe")));
     assertThat(taskDetailsJson.get(0).get("state").asText(), allOf(notNullValue(),
         equalTo("Success")));
+    assertAuditEntry(0, customer.uuid);
   }
 
   @Test
@@ -325,6 +326,7 @@ public class CustomerTaskControllerTest extends WithApplication {
     JsonNode json = Json.parse(contentAsString(result));
     assertThat(json.get("error").asText(), allOf(notNullValue(),
         equalTo("Invalid Customer Task UUID: " + taskUUID)));
+    assertAuditEntry(0, customer.uuid);
   }
 
   @Test
@@ -340,5 +342,6 @@ public class CustomerTaskControllerTest extends WithApplication {
     String resultString = contentAsString(result);
     assertThat(resultString, allOf(notNullValue(),
         equalTo("Unable To Authenticate User")));
+    assertAuditEntry(0, customer.uuid);
   }
 }

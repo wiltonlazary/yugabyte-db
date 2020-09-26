@@ -20,61 +20,65 @@
 #include "yb/common/roles_permissions.h"
 #include "yb/client/table.h"
 #include "yb/client/yb_table_name.h"
-#include "yb/yql/cql/ql/statement.h"
+
+#include "yb/util/scope_exit.h"
 #include "yb/util/thread_restrictions.h"
 
-DECLARE_bool(use_cassandra_authentication);
+#include "yb/yql/cql/ql/statement.h"
 
-METRIC_DEFINE_histogram(
+DECLARE_bool(use_cassandra_authentication);
+DECLARE_bool(ycql_require_drop_privs_for_truncate);
+
+METRIC_DEFINE_histogram_with_percentiles(
     server, handler_latency_yb_cqlserver_SQLProcessor_ParseRequest,
     "Time spent parsing the SQL query", yb::MetricUnit::kMicroseconds,
     "Time spent parsing the SQL query", 60000000LU, 2);
-METRIC_DEFINE_histogram(
+METRIC_DEFINE_histogram_with_percentiles(
     server, handler_latency_yb_cqlserver_SQLProcessor_AnalyzeRequest,
     "Time spent to analyze the parsed SQL query", yb::MetricUnit::kMicroseconds,
     "Time spent to analyze the parsed SQL query", 60000000LU, 2);
-METRIC_DEFINE_histogram(
+METRIC_DEFINE_histogram_with_percentiles(
     server, handler_latency_yb_cqlserver_SQLProcessor_ExecuteRequest,
     "Time spent executing the parsed SQL query", yb::MetricUnit::kMicroseconds,
     "Time spent executing the parsed SQL query", 60000000LU, 2);
-METRIC_DEFINE_histogram(
+METRIC_DEFINE_histogram_with_percentiles(
     server, handler_latency_yb_cqlserver_SQLProcessor_NumRoundsToAnalyze,
     "Number of rounds to successfully parse a SQL query", yb::MetricUnit::kOperations,
     "Number of rounds to successfully parse a SQL query", 60000000LU, 2);
-METRIC_DEFINE_histogram(
+METRIC_DEFINE_histogram_with_percentiles(
     server, handler_latency_yb_cqlserver_SQLProcessor_NumRetriesToExecute,
     "Number of retries to successfully execute a SQL query", yb::MetricUnit::kOperations,
     "Number of retries to successfully execute a SQL query", 60000000LU, 2);
-METRIC_DEFINE_histogram(
+METRIC_DEFINE_histogram_with_percentiles(
     server, handler_latency_yb_cqlserver_SQLProcessor_NumFlushesToExecute,
     "Number of flushes to successfully execute a SQL query", yb::MetricUnit::kOperations,
     "Number of flushes to successfully execute a SQL query", 60000000LU, 2);
-METRIC_DEFINE_histogram(
+METRIC_DEFINE_histogram_with_percentiles(
     server, handler_latency_yb_cqlserver_SQLProcessor_SelectStmt,
     "Time spent processing a SELECT statement", yb::MetricUnit::kMicroseconds,
     "Time spent processing a SELECT statement", 60000000LU, 2);
-METRIC_DEFINE_histogram(
+METRIC_DEFINE_histogram_with_percentiles(
     server, handler_latency_yb_cqlserver_SQLProcessor_InsertStmt,
     "Time spent processing an INSERT statement", yb::MetricUnit::kMicroseconds,
     "Time spent processing an INSERT statement", 60000000LU, 2);
-METRIC_DEFINE_histogram(
+METRIC_DEFINE_histogram_with_percentiles(
     server, handler_latency_yb_cqlserver_SQLProcessor_UpdateStmt,
     "Time spent processing an UPDATE statement", yb::MetricUnit::kMicroseconds,
     "Time spent processing an UPDATE statement", 60000000LU, 2);
-METRIC_DEFINE_histogram(
+METRIC_DEFINE_histogram_with_percentiles(
     server, handler_latency_yb_cqlserver_SQLProcessor_DeleteStmt,
     "Time spent processing a DELETE statement", yb::MetricUnit::kMicroseconds,
     "Time spent processing a DELETE statement", 60000000LU, 2);
-METRIC_DEFINE_histogram(
+METRIC_DEFINE_histogram_with_percentiles(
     server, handler_latency_yb_cqlserver_SQLProcessor_OtherStmts,
     "Time spent processing any statement other than SELECT/INSERT/UPDATE/DELETE",
     yb::MetricUnit::kMicroseconds,
     "Time spent processing any statement other than SELECT/INSERT/UPDATE/DELETE", 60000000LU, 2);
-METRIC_DEFINE_histogram(
+METRIC_DEFINE_histogram_with_percentiles(
     server, handler_latency_yb_cqlserver_SQLProcessor_Transaction,
     "Time spent processing a transaction", yb::MetricUnit::kMicroseconds,
     "Time spent processing a transaction", 60000000LU, 2);
-METRIC_DEFINE_histogram(
+METRIC_DEFINE_histogram_with_percentiles(
     server, handler_latency_yb_cqlserver_SQLProcessor_ResponseSize,
     "Size of the returned response blob (in bytes)", yb::MetricUnit::kBytes,
     "Size of the returned response blob (in bytes)", 60000000LU, 2);
@@ -122,14 +126,23 @@ QLMetrics::QLMetrics(const scoped_refptr<yb::MetricEntity> &metric_entity) {
       METRIC_handler_latency_yb_cqlserver_SQLProcessor_ResponseSize.Instantiate(metric_entity);
 }
 
+namespace {
+
+ThreadSafeObjectPool<Parser> default_parser_pool;
+
+}
+
 QLProcessor::QLProcessor(client::YBClient* client,
                          shared_ptr<YBMetaDataCache> cache, QLMetrics* ql_metrics,
+                         ThreadSafeObjectPool<Parser>* parser_pool,
                          const server::ClockPtr& clock,
                          TransactionPoolProvider transaction_pool_provider)
     : ql_env_(client, cache, clock, std::move(transaction_pool_provider)),
+      audit_logger_(ql_env_),
       analyzer_(&ql_env_),
-      executor_(&ql_env_, this, ql_metrics),
-      ql_metrics_(ql_metrics) {
+      executor_(&ql_env_, &audit_logger_, this, ql_metrics),
+      ql_metrics_(ql_metrics),
+      parser_pool_(parser_pool ? parser_pool : &default_parser_pool) {
 }
 
 QLProcessor::~QLProcessor() {
@@ -140,13 +153,21 @@ Status QLProcessor::Parse(const string& stmt, ParseTree::UniPtr* parse_tree,
                           const bool internal) {
   // Parse the statement and get the generated parse tree.
   const MonoTime begin_time = MonoTime::Now();
-  RETURN_NOT_OK(parser_.Parse(stmt, reparsed, mem_tracker, internal));
+  auto* parser = parser_pool_->Take();
+  auto scope_exit = ScopeExit([this, parser] {
+    this->parser_pool_->Release(parser);
+  });
+  const Status s = parser->Parse(stmt, reparsed, mem_tracker, internal);
   const MonoTime end_time = MonoTime::Now();
   if (ql_metrics_ != nullptr) {
     const MonoDelta elapsed_time = end_time.GetDeltaSince(begin_time);
     ql_metrics_->time_to_parse_ql_query_->Increment(elapsed_time.ToMicroseconds());
   }
-  *parse_tree = parser_.Done();
+  if (!s.ok()) {
+    RETURN_NOT_OK(audit_logger_.LogStatementError(stmt, s, true /* error_is_formatted */));
+    return s;
+  }
+  *parse_tree = parser->Done();
   DCHECK(*parse_tree) << "Parse tree is null";
   return Status::OK();
 }
@@ -170,11 +191,15 @@ Status QLProcessor::Prepare(const string& stmt, ParseTree::UniPtr* parse_tree,
                             const bool reparsed, const MemTrackerPtr& mem_tracker,
                             const bool internal) {
   RETURN_NOT_OK(Parse(stmt, parse_tree, reparsed, mem_tracker, internal));
-  const Status s = Analyze(parse_tree);
+  Status s = Analyze(parse_tree);
   if (s.IsQLError() && GetErrorCode(s) == ErrorCode::STALE_METADATA && !reparsed) {
     *parse_tree = nullptr;
     RETURN_NOT_OK(Parse(stmt, parse_tree, true /* reparsed */, mem_tracker));
-    return Analyze(parse_tree);
+    s = Analyze(parse_tree);
+  }
+  if (s.IsQLError()) {
+    RETURN_NOT_OK(audit_logger_.LogStatementError((*parse_tree)->root().get(), stmt, s,
+                                                  true /* error_is_formatted */));
   }
   return s;
 }
@@ -228,7 +253,11 @@ Status QLProcessor::CheckNodePermissions(const TreeNode* tnode) {
     }
     case TreeNodeOpcode::kPTTruncateStmt: {
       const YBTableName table_name = static_cast<const PTTruncateStmt*>(tnode)->yb_table_name();
-      s = ql_env_.HasTablePermission(table_name, PermissionType::MODIFY_PERMISSION);
+      if (FLAGS_ycql_require_drop_privs_for_truncate) {
+        s = ql_env_.HasTablePermission(table_name, PermissionType::DROP_PERMISSION);
+      } else {
+        s = ql_env_.HasTablePermission(table_name, PermissionType::MODIFY_PERMISSION);
+      }
       break;
     }
     case TreeNodeOpcode::kPTExplainStmt: {
@@ -422,6 +451,7 @@ void QLProcessor::Reschedule(rpc::ThreadPoolTask* task) {
   // Some unit tests are not executed in CQL proxy. In those cases, just execute the callback
   // directly while disabling thread restrictions.
   const bool allowed = ThreadRestrictions::SetWaitAllowed(true);
+  audit_logger_.MarkRescheduled();
   task->Run();
   // In such tests QLProcessor is deleted right after Run is executed, since QLProcessor tasks
   // do nothing in Done we could just don't execute it.

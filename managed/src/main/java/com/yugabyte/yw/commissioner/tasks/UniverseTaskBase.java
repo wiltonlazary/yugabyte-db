@@ -26,11 +26,12 @@ import com.yugabyte.yw.commissioner.SubTaskGroup;
 import com.yugabyte.yw.commissioner.UserTaskDetails;
 import com.yugabyte.yw.commissioner.UserTaskDetails.SubTaskGroupType;
 import com.yugabyte.yw.commissioner.tasks.UniverseDefinitionTaskBase.ServerType;
-import com.yugabyte.yw.commissioner.tasks.UpgradeUniverse.UpgradeTaskType;
 import com.yugabyte.yw.commissioner.tasks.params.NodeTaskParams;
 import com.yugabyte.yw.commissioner.tasks.subtasks.AnsibleClusterServerCtl;
 import com.yugabyte.yw.commissioner.tasks.subtasks.AnsibleDestroyServer;
 import com.yugabyte.yw.commissioner.tasks.subtasks.BackupTable;
+import com.yugabyte.yw.commissioner.tasks.subtasks.BackupUniverseKeys;
+import com.yugabyte.yw.commissioner.tasks.subtasks.RestoreUniverseKeys;
 import com.yugabyte.yw.commissioner.tasks.subtasks.BulkImport;
 import com.yugabyte.yw.commissioner.tasks.subtasks.ChangeMasterConfig;
 import com.yugabyte.yw.commissioner.tasks.subtasks.CreateTable;
@@ -53,6 +54,8 @@ import com.yugabyte.yw.commissioner.tasks.subtasks.WaitForLeadersOnPreferredOnly
 import com.yugabyte.yw.commissioner.tasks.subtasks.WaitForLoadBalance;
 import com.yugabyte.yw.commissioner.tasks.subtasks.WaitForMasterLeader;
 import com.yugabyte.yw.commissioner.tasks.subtasks.nodes.UpdateNodeProcess;
+import com.yugabyte.yw.commissioner.tasks.subtasks.SetFlagInMemory;
+
 import com.yugabyte.yw.common.DnsManager;
 import com.yugabyte.yw.common.NodeManager;
 import com.yugabyte.yw.common.ShellProcessHandler;
@@ -63,26 +66,17 @@ import com.yugabyte.yw.forms.ITaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UniverseTaskParams;
 import com.yugabyte.yw.forms.UniverseTaskParams.EncryptionAtRestConfig.OpType;
-import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.Cluster;
 import com.yugabyte.yw.models.Backup;
 import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.Provider;
 import com.yugabyte.yw.models.Universe;
-import com.yugabyte.yw.models.helpers.CloudSpecificInfo;
 import com.yugabyte.yw.models.Universe.UniverseUpdater;
-import com.yugabyte.yw.models.helpers.DeviceInfo;
 import com.yugabyte.yw.models.helpers.NodeDetails;
 import com.yugabyte.yw.models.helpers.TableDetails;
 
 import com.yugabyte.yw.commissioner.tasks.subtasks.DestroyEncryptionAtRest;
 import com.yugabyte.yw.commissioner.tasks.subtasks.DisableEncryptionAtRest;
 import com.yugabyte.yw.commissioner.tasks.subtasks.EnableEncryptionAtRest;
-
-import java.util.Base64;
-import java.util.stream.Collectors;
-import java.util.HashMap;
-import java.util.ArrayList;
-import com.yugabyte.yw.models.NodeInstance;
 
 import play.api.Play;
 import play.libs.Json;
@@ -388,10 +382,6 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
     return subTaskGroup;
   }
 
-  /**
-   *
-   * @return
-   */
   public SubTaskGroup createWaitForKeyInMemoryTask(NodeDetails node) {
     SubTaskGroup subTaskGroup = new SubTaskGroup("WaitForEncryptionKeyInMemory", executor);
     WaitForEncryptionKeyInMemory.Params params = new WaitForEncryptionKeyInMemory.Params();
@@ -814,6 +804,17 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
    * @return
    */
   public SubTaskGroup createStopMasterTasks(Collection<NodeDetails> nodes) {
+    return createStopServerTasks(nodes, "master", false);
+  }
+
+  /**
+   * Creates a task list to stop the tservers of the cluster and adds it to the task queue.
+   * @param nodes set of nodes to be stopped as master
+   * @return
+   */
+  public SubTaskGroup createStopServerTasks(Collection<NodeDetails> nodes,
+                                            String serverType,
+                                            boolean isForceDelete) {
     SubTaskGroup subTaskGroup = new SubTaskGroup("AnsibleClusterServerCtl", executor);
     for (NodeDetails node : nodes) {
       AnsibleClusterServerCtl.Params params = new AnsibleClusterServerCtl.Params();
@@ -824,10 +825,11 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
       // Add the az uuid.
       params.azUuid = node.azUuid;
       // The service and the command we want to run.
-      params.process = "master";
+      params.process = serverType;
       params.command = "stop";
       // Set the InstanceType
       params.instanceType = node.cloudInfo.instance_type;
+      params.isForceDelete = isForceDelete;
       // Create the Ansible task to get the server info.
       AnsibleClusterServerCtl task = new AnsibleClusterServerCtl();
       task.initialize(params);
@@ -839,14 +841,39 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
   }
 
   public SubTaskGroup createTableBackupTask(BackupTableParams taskParams, Backup backup) {
-    SubTaskGroup subTaskGroup = null;
+    SubTaskGroup subTaskGroup;
     if (backup == null) {
       subTaskGroup = new SubTaskGroup("BackupTable", executor);
     } else {
       subTaskGroup = new SubTaskGroup("BackupTable", executor, true);
     }
+
     BackupTable task = new BackupTable(backup);
     task.initialize(taskParams);
+    task.setUserTaskUUID(userTaskUUID);
+    subTaskGroup.addTask(task);
+    subTaskGroupQueue.add(subTaskGroup);
+    return subTaskGroup;
+  }
+
+  public SubTaskGroup createEncryptedUniverseKeyBackupTask() {
+    return createEncryptedUniverseKeyBackupTask((BackupTableParams) taskParams());
+  }
+
+  public SubTaskGroup createEncryptedUniverseKeyBackupTask(BackupTableParams params) {
+    SubTaskGroup subTaskGroup = new SubTaskGroup("BackupUniverseKeys", executor);
+    BackupUniverseKeys task = new BackupUniverseKeys();
+    task.initialize(params);
+    task.setUserTaskUUID(userTaskUUID);
+    subTaskGroup.addTask(task);
+    subTaskGroupQueue.add(subTaskGroup);
+    return subTaskGroup;
+  }
+
+  public SubTaskGroup createEncryptedUniverseKeyRestoreTask(BackupTableParams params) {
+    SubTaskGroup subTaskGroup = new SubTaskGroup("RestoreUniverseKeys", executor);
+    RestoreUniverseKeys task = new RestoreUniverseKeys();
+    task.initialize(params);
     task.setUserTaskUUID(userTaskUUID);
     subTaskGroup.addTask(task);
     subTaskGroupQueue.add(subTaskGroup);
@@ -937,7 +964,7 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
     subTaskGroupQueue.add(subTaskGroup);
     return subTaskGroup;
   }
-  
+
   /**
    * Creates a task to wait for leaders to be on preferred regions only.
    */
@@ -996,6 +1023,41 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
     return subTaskGroup;
   }
 
+  // Subtask to update gflags in memory.
+  public void createSetFlagInMemoryTasks(Collection<NodeDetails> nodes,
+                                         ServerType serverType,
+                                         boolean force,
+                                         Map<String, String> gflags,
+                                         boolean updateMasterAddrs) {
+    SubTaskGroup subTaskGroup = new SubTaskGroup("InMemoryGFlagUpdate", executor);
+    for (NodeDetails node : nodes) {
+      // Create the task params.
+      SetFlagInMemory.Params params = new SetFlagInMemory.Params();
+      // Add the node name.
+      params.nodeName = node.nodeName;
+      // Add the universe uuid.
+      params.universeUUID = taskParams().universeUUID;
+      // The server type for the flag.
+      params.serverType = serverType;
+      // If the flags need to be force updated.
+      params.force = force;
+      // The flags to update.
+      params.gflags = gflags;
+      // If only master addresses need to be updated.
+      params.updateMasterAddrs = updateMasterAddrs;
+
+      // Create the task.
+      SetFlagInMemory setFlag = new SetFlagInMemory();
+      setFlag.initialize(params);
+      // Add it to the task list.
+      subTaskGroup.addTask(setFlag);
+    }
+    // Add the task list to the task queue.
+    subTaskGroupQueue.add(subTaskGroup);
+    // Configure the user facing subtask for this task list.
+    subTaskGroup.setSubTaskGroupType(SubTaskGroupType.UpdatingGFlags);
+  }
+
   // Check if the node present in taskParams has a backing instance alive on the IaaS.
   public boolean instanceExists(NodeTaskParams taskParams) {
     // Create the process to fetch information about the node from the cloud provider.
@@ -1027,11 +1089,11 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
 
   private boolean isServerAlive(NodeDetails node, ServerType server, String masterAddrs) {
     YBClientService ybService = Play.current().injector().instanceOf(YBClientService.class);
-    
+
     Universe universe = Universe.get(taskParams().universeUUID);
     String certificate = universe.getCertificate();
     YBClient client = ybService.getClient(masterAddrs, certificate);
-    
+
     HostAndPort hp = HostAndPort.fromParts(node.cloudInfo.private_ip,
         server == ServerType.MASTER ? node.masterRpcPort : node.tserverRpcPort);
     return client.waitForServer(hp, 5000);

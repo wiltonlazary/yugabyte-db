@@ -18,10 +18,17 @@
 
 #include <boost/optional.hpp>
 
+#include "yb/consensus/consensus_error.h"
+
 #include "yb/rpc/rpc_context.h"
 #include "yb/server/clock.h"
-#include "yb/tserver/tablet_peer_lookup.h"
+
 #include "yb/tablet/tablet_peer.h"
+
+#include "yb/tserver/tablet_peer_lookup.h"
+#include "yb/tablet/tablet_error.h"
+#include "yb/tserver/tserver_error.h"
+
 #include "yb/util/logging.h"
 
 namespace yb {
@@ -29,10 +36,29 @@ namespace tserver {
 
 // Non-template helpers.
 
-void SetupErrorAndRespond(TabletServerErrorPB* error,
+inline void SetupErrorAndRespond(TabletServerErrorPB* error,
                           const Status& s,
                           TabletServerErrorPB::Code code,
-                          rpc::RpcContext* context);
+                          rpc::RpcContext* context) {
+  // Generic "service unavailable" errors will cause the client to retry later.
+  if (code == TabletServerErrorPB::UNKNOWN_ERROR) {
+    if (s.IsServiceUnavailable()) {
+      TabletServerDelay delay(s);
+      if (!delay.value().Initialized()) {
+        context->RespondRpcFailure(rpc::ErrorStatusPB::ERROR_SERVER_TOO_BUSY, s);
+        return;
+      }
+    }
+    consensus::ConsensusError consensus_error(s);
+    if (consensus_error.value() == consensus::ConsensusErrorPB::TABLET_SPLIT) {
+      code = TabletServerErrorPB::TABLET_SPLIT;
+    }
+  }
+
+  StatusToPB(s, error->mutable_status());
+  error->set_code(code);
+  context->RespondSuccess();
+}
 
 void SetupErrorAndRespond(TabletServerErrorPB* error,
                           const Status& s,
@@ -49,7 +75,7 @@ bool CheckUuidMatchOrRespond(TabletPeerLookupIf* tablet_manager,
                              RespClass* resp,
                              rpc::RpcContext* context) {
   const string& local_uuid = tablet_manager->NodeInstance().permanent_uuid();
-  if (PREDICT_FALSE(!req->has_dest_uuid())) {
+  if (req->dest_uuid().empty()) {
     // Maintain compat in release mode, but complain.
     string msg = strings::Substitute("$0: Missing destination UUID in request from $1: $2",
         method_name, context->requestor_string(), req->ShortDebugString());
@@ -122,12 +148,9 @@ Result<std::shared_ptr<tablet::TabletPeer>> LookupTabletPeerOrRespond(
   // Check RUNNING state.
   tablet::RaftGroupStatePB state = result->state();
   if (PREDICT_FALSE(state != tablet::RUNNING)) {
-    Status s = STATUS(IllegalState, "Tablet not RUNNING", tablet::RaftGroupStatePB_Name(state));
-    if (state == tablet::FAILED) {
-      s = s.CloneAndAppend(result->error().ToString());
-    }
-    SetupErrorAndRespond(resp->mutable_error(), s,
-                         TabletServerErrorPB::TABLET_NOT_RUNNING, context);
+    Status s = STATUS(IllegalState, "Tablet not RUNNING", tablet::RaftGroupStateError(state))
+        .CloneAndAddErrorCode(TabletServerError(TabletServerErrorPB::TABLET_NOT_RUNNING));
+    SetupErrorAndRespond(resp->mutable_error(), s, context);
     return s;
   }
 

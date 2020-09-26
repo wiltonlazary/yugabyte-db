@@ -53,6 +53,7 @@ class PgTxnManager : public RefCountedThreadSafe<PgTxnManager> {
   virtual ~PgTxnManager();
 
   CHECKED_STATUS BeginTransaction();
+  CHECKED_STATUS RecreateTransaction();
   CHECKED_STATUS RestartTransaction();
   CHECKED_STATUS CommitTransaction();
   CHECKED_STATUS AbortTransaction();
@@ -65,17 +66,23 @@ class PgTxnManager : public RefCountedThreadSafe<PgTxnManager> {
   // Returns the transactional session, starting a new transaction if necessary.
   yb::Result<client::YBSession*> GetTransactionalSession();
 
-  CHECKED_STATUS BeginWriteTransactionIfNecessary(bool read_only_op);
+  CHECKED_STATUS BeginWriteTransactionIfNecessary(bool read_only_op,
+                                                  bool needs_pessimistic_locking = false);
 
   bool CanRestart() { return can_restart_.load(std::memory_order_acquire); }
 
   bool IsDdlMode() const { return ddl_session_.get() != nullptr; }
 
  private:
+  YB_STRONGLY_TYPED_BOOL(NeedsPessimisticLocking);
+  YB_STRONGLY_TYPED_BOOL(SavePriority);
 
   client::TransactionManager* GetOrCreateTransactionManager();
   void ResetTxnAndSession();
   void StartNewSession();
+  Status RecreateTransaction(SavePriority save_priority);
+
+  uint64_t GetPriority(NeedsPessimisticLocking needs_pessimistic_locking);
 
   client::AsyncClientInitialiser* async_client_init_ = nullptr;
   scoped_refptr<ClockBase> clock_;
@@ -98,6 +105,12 @@ class PgTxnManager : public RefCountedThreadSafe<PgTxnManager> {
   client::YBSessionPtr ddl_session_;
 
   std::atomic<bool> can_restart_{true};
+
+  // On a transaction conflict error we want to recreate the transaction with the same priority as
+  // the last transaction. This avoids the case where the current transaction gets a higher priority
+  // and cancels the other transaction.
+  uint64_t saved_priority_ = 0;
+  SavePriority use_saved_priority_ = SavePriority::kFalse;
 
   std::unique_ptr<tserver::TabletServerServiceProxy> tablet_server_proxy_;
 

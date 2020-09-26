@@ -96,6 +96,7 @@ void TableProperties::ToTablePropertiesPB(TablePropertiesPB *pb) const {
     pb->set_num_tablets(num_tablets_);
   }
   pb->set_is_ysql_catalog_table(is_ysql_catalog_table_);
+  pb->set_is_backfilling(is_backfilling_);
 }
 
 TableProperties TableProperties::FromTablePropertiesPB(const TablePropertiesPB& pb) {
@@ -124,6 +125,9 @@ TableProperties TableProperties::FromTablePropertiesPB(const TablePropertiesPB& 
   if (pb.has_is_ysql_catalog_table()) {
     table_properties.set_is_ysql_catalog_table(pb.is_ysql_catalog_table());
   }
+  if (pb.has_is_backfilling()) {
+    table_properties.SetIsBackfilling(pb.is_backfilling());
+  }
   return table_properties;
 }
 
@@ -149,6 +153,9 @@ void TableProperties::AlterFromTablePropertiesPB(const TablePropertiesPB& pb) {
   if (pb.has_is_ysql_catalog_table()) {
     set_is_ysql_catalog_table(pb.is_ysql_catalog_table());
   }
+  if (pb.has_is_backfilling()) {
+    SetIsBackfilling(pb.is_backfilling());
+  }
 }
 
 void TableProperties::Reset() {
@@ -160,6 +167,7 @@ void TableProperties::Reset() {
   use_mangled_column_name_ = false;
   num_tablets_ = 0;
   is_ysql_catalog_table_ = false;
+  is_backfilling_ = false;
 }
 
 string TableProperties::ToString() const {
@@ -220,6 +228,10 @@ void Schema::CopyFrom(const Schema& other) {
   has_statics_ = other.has_statics_;
   table_properties_ = other.table_properties_;
   cotable_id_ = other.cotable_id_;
+  pgtable_id_ = other.pgtable_id_;
+
+  // Schema cannot have both, cotable ID and pgtable ID.
+  DCHECK(cotable_id_.IsNil() || pgtable_id_ == 0);
 }
 
 void Schema::swap(Schema& other) {
@@ -234,18 +246,24 @@ void Schema::swap(Schema& other) {
   std::swap(has_statics_, other.has_statics_);
   std::swap(table_properties_, other.table_properties_);
   std::swap(cotable_id_, other.cotable_id_);
+  std::swap(pgtable_id_, other.pgtable_id_);
+
+  // Schema cannot have both, cotable ID or pgtable ID.
+  DCHECK(cotable_id_.IsNil() || pgtable_id_ == 0);
 }
 
 Status Schema::Reset(const vector<ColumnSchema>& cols,
                      const vector<ColumnId>& ids,
                      int key_columns,
                      const TableProperties& table_properties,
-                     const Uuid& cotable_id) {
+                     const Uuid& cotable_id,
+                     const PgTableOid pgtable_id) {
   cols_ = cols;
   num_key_columns_ = key_columns;
   num_hash_key_columns_ = 0;
   table_properties_ = table_properties;
   cotable_id_ = cotable_id;
+  pgtable_id_ = pgtable_id;
 
   // Determine whether any column is nullable or static, and count number of hash columns.
   has_nullables_ = false;
@@ -275,6 +293,11 @@ Status Schema::Reset(const vector<ColumnSchema>& cols,
   if (PREDICT_FALSE(!ids.empty() && ids.size() != cols_.size())) {
     return STATUS(InvalidArgument, "Bad schema",
       "The number of ids does not match with the number of columns");
+  }
+
+  if (PREDICT_FALSE(!cotable_id.IsNil() && pgtable_id > 0)) {
+    return STATUS(InvalidArgument,
+                  "Bad schema", "Cannot have both cotable ID and pgtable ID");
   }
 
   // Verify that the key columns are not nullable nor static
@@ -351,7 +374,7 @@ Status Schema::CreateProjectionByNames(const std::vector<GStringPiece>& col_name
     }
     cols.push_back(column(idx));
   }
-  return out->Reset(cols, ids, num_key_columns, TableProperties(), cotable_id_);
+  return out->Reset(cols, ids, num_key_columns, TableProperties(), cotable_id_, pgtable_id_);
 }
 
 Status Schema::CreateProjectionByIdsIgnoreMissing(const std::vector<ColumnId>& col_ids,
@@ -366,7 +389,7 @@ Status Schema::CreateProjectionByIdsIgnoreMissing(const std::vector<ColumnId>& c
     cols.push_back(column(idx));
     filtered_col_ids.push_back(id);
   }
-  return out->Reset(cols, filtered_col_ids, 0, TableProperties(), cotable_id_);
+  return out->Reset(cols, filtered_col_ids, 0, TableProperties(), cotable_id_, pgtable_id_);
 }
 
 Schema Schema::CopyWithColumnIds() const {
@@ -375,12 +398,12 @@ Schema Schema::CopyWithColumnIds() const {
   for (int32_t i = 0; i < num_columns(); i++) {
     ids.push_back(ColumnId(kFirstColumnId + i));
   }
-  return Schema(cols_, ids, num_key_columns_, table_properties_, cotable_id_);
+  return Schema(cols_, ids, num_key_columns_, table_properties_, cotable_id_, pgtable_id_);
 }
 
 Schema Schema::CopyWithoutColumnIds() const {
   CHECK(has_column_ids());
-  return Schema(cols_, num_key_columns_, table_properties_, cotable_id_);
+  return Schema(cols_, num_key_columns_, table_properties_, cotable_id_, pgtable_id_);
 }
 
 Status Schema::VerifyProjectionCompatibility(const Schema& projection) const {
@@ -454,7 +477,8 @@ string Schema::ToString() const {
                 JoinStrings(col_strs, ",\n\t"),
                 "\n]\nproperties: ",
                 tablet_properties_pb.ShortDebugString(),
-                cotable_id_.IsNil() ? "" : ("\ncotable_id: " + cotable_id_.ToString()));
+                cotable_id_.IsNil() ? "" : ("\ncotable_id: " + cotable_id_.ToString()),
+                pgtable_id_ == 0 ? "" : ("\npgtable_id: " + std::to_string(pgtable_id_)));
 }
 
 Status Schema::DecodeRowKey(Slice encoded_key,
@@ -519,6 +543,22 @@ size_t Schema::memory_footprint_including_this() const {
   return malloc_usable_size(this) + memory_footprint_excluding_this();
 }
 
+Result<int> Schema::ColumnIndexByName(GStringPiece col_name) const {
+  auto index = find_column(col_name);
+  if (index == kColumnNotFound) {
+    return STATUS_FORMAT(Corruption, "$0 not found in schema $1", col_name, name_to_index_);
+  }
+  return index;
+}
+
+Result<ColumnId> Schema::ColumnIdByName(const std::string& column_name) const {
+  size_t column_index = find_column(column_name);
+  if (column_index == Schema::kColumnNotFound) {
+    return STATUS_FORMAT(NotFound, "Couldn't find column $0 in the schema", column_name);
+  }
+  return ColumnId(column_id(column_index));
+}
+
 ColumnId Schema::first_column_id() {
   return kFirstColumnId;
 }
@@ -533,6 +573,8 @@ void SchemaBuilder::Reset() {
   num_key_columns_ = 0;
   next_id_ = kFirstColumnId;
   table_properties_.Reset();
+  pgtable_id_ = 0;
+  cotable_id_ = Uuid(boost::uuids::nil_uuid());
 }
 
 void SchemaBuilder::Reset(const Schema& schema) {
@@ -554,6 +596,8 @@ void SchemaBuilder::Reset(const Schema& schema) {
     next_id_ = *std::max_element(col_ids_.begin(), col_ids_.end()) + 1;
   }
   table_properties_ = schema.table_properties_;
+  pgtable_id_ = schema.pgtable_id_;
+  cotable_id_ = schema.cotable_id_;
 }
 
 Status SchemaBuilder::AddKeyColumn(const string& name, const shared_ptr<QLType>& type) {

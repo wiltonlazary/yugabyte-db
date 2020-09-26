@@ -1,8 +1,7 @@
 // Copyright (c) YugaByte, Inc.
 
 import { getClusterByType } from "./UniverseUtils";
-
-const _ = require('lodash');
+import _ from 'lodash';
 
 export function isDefinedNotNull(obj) {
   return (typeof obj !== "undefined" && obj !== null);
@@ -189,6 +188,10 @@ export function areUniverseConfigsEqual(config1, config2) {
 
 export function normalizeToPositiveInt(value) {
   return parseInt(Math.abs(value), 10) || 0;
+}
+
+export function normalizeToValidPort(value) {
+  return parseInt(Math.abs(value), 10) || 1;
 }
 
 // Provided a String, return the corresponding positive float value. If invalid value, return 0.00.

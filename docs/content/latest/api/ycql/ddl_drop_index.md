@@ -1,7 +1,8 @@
 ---
-title: DROP INDEX
-summary: Remove an index
-description: DROP INDEX
+title: DROP INDEX statement [YCQL]
+headerTitle: DROP INDEX
+linkTitle: DROP INDEX
+description: Use the DROP INDEX statement to remove an index and all of its data from the database.
 menu:
   latest:
     parent: api-cassandra
@@ -15,7 +16,7 @@ showAsideToc: true
 
 ## Synopsis
 
-The `DROP INDEX` statement removes an index and all of its data from the database.
+Use the `DROP INDEX` statement to remove an index and all of its data from the database.
 
 ## Syntax
 
@@ -41,19 +42,18 @@ Where
 ## Examples
 
 ```sql
-cqlsh:example> CREATE TABLE users(id INT PRIMARY KEY, name TEXT) WITH transactions = { 'enabled' : true };
+ycqlsh:example> CREATE TABLE users(id INT PRIMARY KEY, name TEXT) WITH transactions = { 'enabled' : true };
 ```
 
 ```sql
-cqlsh:example> CREATE INDEX users_by_name ON users(name);
+ycqlsh:example> CREATE INDEX users_by_name ON users(name);
 ```
 
 ```sql
-cqlsh:example> DROP INDEX users_by_name;
+ycqlsh:example> DROP INDEX users_by_name;
 ```
 
 ## See also
 
-[`CREATE TABLE`](../ddl_create_table)
-[`CREATE INDEX`](../ddl_create_index)
-[Other CQL Statements](..)
+- [`CREATE TABLE`](../ddl_create_table)
+- [`CREATE INDEX`](../ddl_create_index)

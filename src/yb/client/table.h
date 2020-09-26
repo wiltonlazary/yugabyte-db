@@ -21,6 +21,8 @@
 #include "yb/common/index.h"
 #include "yb/common/partition.h"
 
+#include "yb/util/locks.h"
+
 DECLARE_int32(max_num_tablets_for_table);
 
 namespace yb {
@@ -44,6 +46,8 @@ struct YBTableInfo {
   IndexMap index_map;
   boost::optional<IndexInfo> index_info;
   YBTableType table_type;
+  bool colocated;
+  boost::optional<master::ReplicationInfoPB> replication_info;
 };
 
 // A YBTable represents a table on a particular cluster. It holds the current
@@ -80,57 +84,98 @@ class YBTable : public std::enable_shared_from_this<YBTable> {
 
   const std::vector<std::string>& GetPartitions() const;
 
+  int32_t GetPartitionCount() const;
+
+  int32_t GetPartitionsVersion() const;
+
   // Indexes available on the table.
   const IndexMap& index_map() const;
 
   // Is this an index?
   bool IsIndex() const;
 
+  bool IsUniqueIndex() const;
+
   // For index table: information about this index.
   const IndexInfo& index_info() const;
 
+  // Is the table colocated?
+  const bool colocated() const;
+
+  // Returns the replication info for the table.
+  const boost::optional<master::ReplicationInfoPB>& replication_info() const;
+
+  std::string ToString() const;
   //------------------------------------------------------------------------------------------------
   // CQL support
   // Create a new QL operation for this table.
-  YBqlWriteOp* NewQLWrite();
-  YBqlWriteOp* NewQLInsert();
-  YBqlWriteOp* NewQLUpdate();
-  YBqlWriteOp* NewQLDelete();
+  std::unique_ptr<YBqlWriteOp> NewQLWrite();
+  std::unique_ptr<YBqlWriteOp> NewQLInsert();
+  std::unique_ptr<YBqlWriteOp> NewQLUpdate();
+  std::unique_ptr<YBqlWriteOp> NewQLDelete();
 
-  YBqlReadOp* NewQLRead();
-  YBqlReadOp* NewQLSelect();
+  std::unique_ptr<YBqlReadOp> NewQLRead();
+  std::unique_ptr<YBqlReadOp> NewQLSelect();
 
   // Finds partition start for specified partition_key.
   // Partitions could be groupped by group_by bunches, in this case start of such bunch is returned.
+  size_t FindPartitionStartIndex(const std::string& partition_key, size_t group_by = 1) const;
   const std::string& FindPartitionStart(
       const std::string& partition_key, size_t group_by = 1) const;
+
+  void MarkPartitionsAsStale();
+  bool ArePartitionsStale() const;
+
+  // Refreshes table partitions if stale.
+  // Returns whether table partitions have been refreshed.
+  Result<bool> MaybeRefreshPartitions();
 
   //------------------------------------------------------------------------------------------------
   // Postgres support
   // Create a new QL operation for this table.
-  YBPgsqlWriteOp* NewPgsqlWrite();
-  YBPgsqlWriteOp* NewPgsqlInsert();
-  YBPgsqlWriteOp* NewPgsqlUpdate();
-  YBPgsqlWriteOp* NewPgsqlDelete();
+  std::unique_ptr<YBPgsqlWriteOp> NewPgsqlWrite();
+  std::unique_ptr<YBPgsqlWriteOp> NewPgsqlInsert();
+  std::unique_ptr<YBPgsqlWriteOp> NewPgsqlUpdate();
+  std::unique_ptr<YBPgsqlWriteOp> NewPgsqlDelete();
+  std::unique_ptr<YBPgsqlWriteOp> NewPgsqlTruncateColocated();
 
-  YBPgsqlReadOp* NewPgsqlRead();
-  YBPgsqlReadOp* NewPgsqlSelect();
+  std::unique_ptr<YBPgsqlReadOp> NewPgsqlRead();
+  std::unique_ptr<YBPgsqlReadOp> NewPgsqlSelect();
 
  private:
   friend class YBClient;
   friend class internal::GetTableSchemaRpc;
 
+  struct VersionedPartitions {
+    std::vector<std::string> keys;
+    // See SysTabletsEntryPB::partitions_version.
+    int32_t version;
+  };
+
   YBTable(client::YBClient* client, const YBTableInfo& info);
 
   CHECKED_STATUS Open();
 
+  // Fetches tablet partitions from master using GetTableLocations RPC.
+  Result<VersionedPartitions> FetchPartitions();
+
   client::YBClient* const client_;
   YBTableType table_type_;
   YBTableInfo info_;
-  std::vector<std::string> partitions_;
+
+  // Mutex protecting partitions_.
+  mutable rw_spinlock mutex_;
+  VersionedPartitions partitions_ GUARDED_BY(mutex_);
+
+  std::atomic<bool> partitions_are_stale_{false};
+  std::mutex partitions_refresh_mutex_;
 
   DISALLOW_COPY_AND_ASSIGN(YBTable);
 };
+
+size_t FindPartitionStartIndex(const std::vector<std::string>& partitions,
+                               const std::string& partition_key,
+                               size_t group_by = 1);
 
 } // namespace client
 } // namespace yb

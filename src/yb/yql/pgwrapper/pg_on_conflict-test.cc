@@ -22,7 +22,6 @@
 using namespace std::literals;
 
 DECLARE_int64(external_mini_cluster_max_log_bytes);
-DECLARE_int64(retryable_rpc_single_call_timeout_ms);
 
 METRIC_DECLARE_entity(tablet);
 METRIC_DECLARE_counter(transaction_not_found);
@@ -412,6 +411,19 @@ TEST_F(PgOnConflictTest, YB_DISABLE_TEST_IN_TSAN(NoTxnOnConflict)) {
 
   thread_holder.WaitAndStop(30s);
   LogResult(ASSERT_RESULT(conn.Fetch("SELECT * FROM test ORDER BY k")).get());
+}
+
+TEST_F(PgOnConflictTest, YB_DISABLE_TEST_IN_TSAN(ValidSessionAfterTxnCommitConflict)) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE test (k int PRIMARY KEY)"));
+  ASSERT_OK(conn.Execute("BEGIN"));
+  ASSERT_OK(conn.Execute("INSERT INTO test VALUES(1)"));
+  auto extra_conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(extra_conn.Execute("INSERT INTO test VALUES(1)"));
+  ASSERT_NOK(conn.Execute("COMMIT"));
+  // Check connection is in valid state after failed COMMIT
+  auto value = ASSERT_RESULT(GetInt32(ASSERT_RESULT(conn.Fetch("SELECT * FROM test")).get(), 0, 0));
+  ASSERT_EQ(value, 1);
 }
 
 } // namespace pgwrapper

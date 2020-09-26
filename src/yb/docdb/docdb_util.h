@@ -55,10 +55,11 @@ class DocDBRocksDBUtil {
 
   const rocksdb::WriteOptions& write_options() const { return write_options_; }
 
-  const rocksdb::Options& options() const { return rocksdb_options_; }
+  const rocksdb::Options& regular_db_options() const { return regular_db_options_; }
 
   CHECKED_STATUS OpenRocksDB();
 
+  void CloseRocksDB();
   CHECKED_STATUS ReopenRocksDB();
   CHECKED_STATUS DestroyRocksDB();
   void ResetMonotonicCounter();
@@ -84,6 +85,9 @@ class DocDBRocksDBUtil {
   // The same as WriteToRocksDB but also clears the write batch afterwards.
   CHECKED_STATUS WriteToRocksDBAndClear(DocWriteBatch* dwb, const HybridTime& hybrid_time,
                                         bool decode_dockey = true, bool increment_write_id = true);
+
+  // Writes value fully determined by its index using DefaultWriteBatch.
+  CHECKED_STATUS WriteSimple(int index);
 
   void SetHistoryCutoffHybridTime(HybridTime history_cutoff);
 
@@ -161,7 +165,8 @@ class DocDBRocksDBUtil {
   }
 
   CHECKED_STATUS DisableCompactions() {
-    rocksdb_options_.compaction_style = rocksdb::kCompactionStyleNone;
+    regular_db_options_.compaction_style = rocksdb::kCompactionStyleNone;
+    intents_db_options_.compaction_style = rocksdb::kCompactionStyleNone;
     return ReopenRocksDB();
   }
 
@@ -176,12 +181,17 @@ class DocDBRocksDBUtil {
 
   void SetInitMarkerBehavior(InitMarkerBehavior init_marker_behavior);
 
+  // Returns DocWriteBatch created with MakeDocWriteBatch.
+  // Could be used when single DocWriteBatch is enough.
+  DocWriteBatch& DefaultDocWriteBatch();
+
  protected:
   std::string IntentsDBDir();
 
-  std::unique_ptr<rocksdb::DB> rocksdb_;
+  std::unique_ptr<rocksdb::DB> regular_db_;
   std::unique_ptr<rocksdb::DB> intents_db_;
-  rocksdb::Options rocksdb_options_;
+  rocksdb::Options regular_db_options_;
+  rocksdb::Options intents_db_options_;
   std::string rocksdb_dir_;
 
   // This is used for auto-assigning op ids to RocksDB write batches to emulate what a tablet would
@@ -201,30 +211,7 @@ class DocDBRocksDBUtil {
 
  private:
   std::atomic<int64_t> monotonic_counter_{0};
-};
-
-// An implementation of the document node visitor interface that dumps all events (document
-// start/end, object keys and values, etc.) to a string as separate lines.
-class DebugDocVisitor : public DocVisitor {
- public:
-  DebugDocVisitor();
-  virtual ~DebugDocVisitor();
-
-  CHECKED_STATUS StartSubDocument(const SubDocKey &key) override;
-
-  CHECKED_STATUS VisitKey(const PrimitiveValue& key) override;
-  CHECKED_STATUS VisitValue(const PrimitiveValue& value) override;
-
-  CHECKED_STATUS EndSubDocument() override;
-  CHECKED_STATUS StartObject() override;
-  CHECKED_STATUS EndObject() override;
-  CHECKED_STATUS StartArray() override;
-  CHECKED_STATUS EndArray() override;
-
-  std::string ToString();
-
- private:
-  std::stringstream out_;
+  boost::optional<DocWriteBatch> doc_write_batch_;
 };
 
 }  // namespace docdb

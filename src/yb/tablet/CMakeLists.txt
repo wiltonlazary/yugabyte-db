@@ -30,33 +30,51 @@
 # under the License.
 #
 
-YB_INCLUDE_EXTENSIONS()
+include_directories(${YB_BUILD_ROOT}/postgres/include)
+link_directories(${YB_BUILD_ROOT}/postgres/lib)
+
+add_library(pq SHARED IMPORTED)
+set_target_properties(pq PROPERTIES IMPORTED_LOCATION "${PQ_SHARED_LIB}")
+message("Added shared library dependency pq: ${PQ_SHARED_LIB}")
 
 set(TABLET_SRCS
   abstract_tablet.cc
+  apply_intents_task.cc
+  cleanup_aborts_task.cc
+  cleanup_intents_task.cc
+  remove_intents_task.cc
+  running_transaction.cc
+  tablet_snapshots.cc
   tablet.cc
   tablet_bootstrap.cc
   tablet_bootstrap_if.cc
+  tablet_component.cc
   tablet_metrics.cc
   tablet_peer_mm_ops.cc
   tablet_peer.cc
   transaction_coordinator.cc
   transaction_participant.cc
+  transaction_status_resolver.cc
   operation_order_verifier.cc
   operations/operation.cc
   operations/change_metadata_operation.cc
+  operations/history_cutoff_operation.cc
   operations/operation_driver.cc
   operations/operation_tracker.cc
+  operations/snapshot_operation.cc
+  operations/split_operation.cc
   operations/truncate_operation.cc
   operations/update_txn_operation.cc
   operations/write_operation.cc
-  operations/snapshot_operation.cc
   maintenance_manager.cc
   mvcc.cc
   tablet_metadata.cc
   tablet_retention_policy.cc
   preparer.cc
   ${TABLET_SRCS_EXTENSIONS})
+
+set(TABLET_DEPS
+  pq)
 
 PROTOBUF_GENERATE_CPP(
   TABLET_PROTO_SRCS TABLET_PROTO_HDRS TABLET_PROTO_TGTS
@@ -75,8 +93,16 @@ ADD_YB_LIBRARY(tablet_proto
   DEPS ${TABLET_PROTO_LIBS} opid_proto
   NONLINK_DEPS ${TABLET_PROTO_TGTS})
 
-add_library(tablet ${TABLET_SRCS})
+ADD_YB_LIBRARY(
+  tablet
+  SRCS ${TABLET_SRCS}
+  DEPS ${TABLET_DEPS})
 cotire(tablet)
+
+ADD_YB_LIBRARY(
+  tablet_error
+  SRCS tablet_error.cc
+  DEPS tablet_proto yb_util)
 
 target_link_libraries(tablet
   tablet_proto
@@ -90,7 +116,8 @@ target_link_libraries(tablet
   rocksdb
   yb_docdb
   yb_client
-  yb_pggate_util)
+  yb_pggate_util
+  tablet_error)
 
 add_library(tablet_test_util
             local_tablet_writer.cc

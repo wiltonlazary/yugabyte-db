@@ -1,7 +1,8 @@
 ---
-title: Date and time Functions
+title: Date and time functions
 summary: Functions that work on data types related to date and time.
-description: Date and Ttme Functions
+description: Date and time functions
+block_indexing: true
 menu:
   v1.3:
     parent: api-cassandra

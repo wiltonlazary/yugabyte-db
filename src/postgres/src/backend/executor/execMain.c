@@ -130,7 +130,7 @@ static void EvalPlanQualStart(EPQState *epqstate, EState *parentestate,
  *
  * eflags contains flag bits as described in executor.h.
  *
- * NB: the CurrentMemoryContext when this is called will become the parent
+ * NB: the GetCurrentMemoryContext() when this is called will become the parent
  * of the per-query context used for this Executor invocation.
  *
  * We provide a function hook variable that lets loadable plugins
@@ -157,6 +157,9 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	/* sanity checks: queryDesc must not be started already */
 	Assert(queryDesc != NULL);
 	Assert(queryDesc->estate == NULL);
+
+	if (IsYugaByteEnabled())
+		YBBeginOperationsBuffering();
 
 	/*
 	 * If the transaction is read-only, we need to check if any writes are
@@ -213,7 +216,6 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	switch (queryDesc->operation)
 	{
 		case CMD_SELECT:
-
 			/*
 			 * SELECT FOR [KEY] UPDATE/SHARE and modifying CTEs need to mark
 			 * tuples
@@ -438,6 +440,10 @@ standard_ExecutorFinish(QueryDesc *queryDesc)
 	/* Execute queued AFTER triggers, unless told not to */
 	if (!(estate->es_top_eflags & EXEC_FLAG_SKIP_TRIGGERS))
 		AfterTriggerEndQuery(estate);
+
+	// Flush buffered operations straight before elapsed time calculation.
+	if (IsYugaByteEnabled())
+		YBEndOperationsBuffering();
 
 	if (queryDesc->totaltime)
 		InstrStopNode(queryDesc->totaltime, 0);

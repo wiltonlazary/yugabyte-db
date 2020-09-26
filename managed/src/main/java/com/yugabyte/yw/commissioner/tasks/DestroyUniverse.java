@@ -14,6 +14,7 @@ import com.yugabyte.yw.forms.UniverseTaskParams;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.yugabyte.yw.commissioner.Common.CloudType;
 import com.yugabyte.yw.commissioner.SubTaskGroup;
 import com.yugabyte.yw.commissioner.SubTaskGroupQueue;
 import com.yugabyte.yw.commissioner.UserTaskDetails.SubTaskGroupType;
@@ -62,9 +63,20 @@ public class DestroyUniverse extends UniverseTaskBase {
                                   primaryCluster.userIntent.universeName)
             .setSubTaskGroupType(SubTaskGroupType.RemovingUnusedServers);
 
+        if (primaryCluster.userIntent.providerType.equals(CloudType.onprem)) {
+          // Stop master and tservers.
+          createStopServerTasks(universe.getNodes(), "master", params().isForceDelete)
+              .setSubTaskGroupType(SubTaskGroupType.StoppingNodeProcesses);
+          createStopServerTasks(universe.getNodes(), "tserver", params().isForceDelete)
+              .setSubTaskGroupType(SubTaskGroupType.StoppingNodeProcesses);
+        }
+
         // Create tasks to destroy the existing nodes.
-        createDestroyServerTasks(universe.getNodes(), params().isForceDelete, true)
-            .setSubTaskGroupType(SubTaskGroupType.RemovingUnusedServers);
+        createDestroyServerTasks(
+          universe.getNodes(),
+          params().isForceDelete,
+          true /* delete node */
+        ).setSubTaskGroupType(SubTaskGroupType.RemovingUnusedServers);
       }
 
       // Create tasks to remove the universe entry from the Universe table.

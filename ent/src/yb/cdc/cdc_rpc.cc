@@ -62,7 +62,9 @@ class CDCWriteRpc : public rpc::Rpc, public client::internal::TabletRpc {
     req_.Swap(req);
   }
 
-  ~CDCWriteRpc() = default;
+  virtual ~CDCWriteRpc() {
+    CHECK(called_);
+  }
 
   void SendRpc() override {
     invoker_.Execute(tablet_id());
@@ -88,7 +90,7 @@ class CDCWriteRpc : public rpc::Rpc, public client::internal::TabletRpc {
  private:
   void SendRpcToTserver(int attempt_num) override {
     InvokeAsync(invoker_.proxy().get(),
-                PrepareController(invoker_.client().default_rpc_timeout()),
+                PrepareController(),
                 std::bind(&CDCWriteRpc::Finished, this, Status::OK()));
   }
 
@@ -101,7 +103,13 @@ class CDCWriteRpc : public rpc::Rpc, public client::internal::TabletRpc {
   }
 
   void InvokeCallback(const Status &status) {
-    callback_(status, resp_);
+    if (!called_) {
+      called_ = true;
+      callback_(status, resp_);
+    } else {
+      LOG(WARNING) << "Multiple invocation of CDCWriteRpc: "
+                   << status.ToString() << " : " << resp_.DebugString();
+    }
   }
 
   void InvokeAsync(TabletServerServiceProxy *proxy,
@@ -115,6 +123,7 @@ class CDCWriteRpc : public rpc::Rpc, public client::internal::TabletRpc {
   WriteRequestPB req_;
   WriteResponsePB resp_;
   WriteCDCRecordCallback callback_;
+  bool called_ = false;
 };
 
 rpc::RpcCommandPtr CreateCDCWriteRpc(
@@ -166,9 +175,6 @@ class CDCReadRpc : public rpc::Rpc, public client::internal::TabletRpc {
     Status new_status = status;
     if (invoker_.Done(&new_status)) {
       InvokeCallback(new_status);
-    } else if(!called_) {
-      // Clear any response errors that were set.
-      resp_.Clear();
     }
   }
 
@@ -207,17 +213,17 @@ class CDCReadRpc : public rpc::Rpc, public client::internal::TabletRpc {
     return nullptr;
   }
 
- private:
   void SendRpcToTserver(int attempt_num) override {
     // should be fast because the proxy cache has EndPoint from the tablet lookup.
     cdc_proxy_ = std::make_shared<CDCServiceProxy>(
        &invoker_.client().proxy_cache(), invoker_.ProxyEndpoint());
 
     InvokeAsync(cdc_proxy_.get(),
-        PrepareController(invoker_.client().default_rpc_timeout()),
+        PrepareController(),
         std::bind(&CDCReadRpc::Finished, this, Status::OK()));
   }
 
+ private:
   const std::string &tablet_id() const {
     return req_.tablet_id();
   }

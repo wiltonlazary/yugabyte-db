@@ -26,14 +26,22 @@
 #include "postgres.h"
 #include "nodes/plannodes.h"
 #include "nodes/relation.h"
+#include "utils/rel.h"
 
-bool YBCIsSupportedSingleRowModifyWriteExpr(Expr *expr);
+
+void YBCExprInstantiateParams(Expr* expr, ParamListInfo paramLI);
+
+bool YBCIsSupportedSingleRowModifyWhereExpr(Expr *expr);
+
+bool YBCIsSupportedSingleRowModifyAssignExpr(Expr *expr,
+                                             AttrNumber target_attno,
+                                             bool *needs_pushdown);
 
 bool YBCIsSingleRowModify(PlannedStmt *pstmt);
 
 bool YBCIsSingleRowUpdateOrDelete(ModifyTable *modifyTable);
 
-bool YBCAllPrimaryKeysProvided(Oid relid, Bitmapset *attrs);
+bool YBCAllPrimaryKeysProvided(Relation rel, Bitmapset *attrs);
 
 #endif // YBCPLAN_H
 

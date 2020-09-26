@@ -34,7 +34,8 @@ TEST_F(PggateTestSelectMultiTablets, TestSelectMultiTablets) {
   CHECK_YBC_STATUS(YBCPgNewCreateTable(kDefaultDatabase, kDefaultSchema, tabname,
                                        kDefaultDatabaseOid, tab_oid,
                                        false /* is_shared_table */, true /* if_not_exist */,
-                                       false /* add_primary_key */, &pg_stmt));
+                                       false /* add_primary_key */, true /* colocated */,
+                                       kInvalidOid /*tablegroup_id*/, &pg_stmt));
   CHECK_YBC_STATUS(YBCTestCreateTableAddColumn(pg_stmt, "hash_key", ++col_count,
                                              DataType::INT64, true, true));
   CHECK_YBC_STATUS(YBCTestCreateTableAddColumn(pg_stmt, "id", ++col_count,
@@ -48,12 +49,12 @@ TEST_F(PggateTestSelectMultiTablets, TestSelectMultiTablets) {
   CHECK_YBC_STATUS(YBCTestCreateTableAddColumn(pg_stmt, "job", ++col_count,
                                              DataType::STRING, false, false));
   CHECK_YBC_STATUS(YBCPgExecCreateTable(pg_stmt));
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
   pg_stmt = nullptr;
 
   // SELECT: Empty Table ---------------------------------------------------------------------------
   LOG(INFO) << "Test SELECTing from empty table";
-  CHECK_YBC_STATUS(YBCPgNewSelect(kDefaultDatabaseOid, tab_oid, kInvalidOid, &pg_stmt));
+  CHECK_YBC_STATUS(YBCPgNewSelect(kDefaultDatabaseOid, tab_oid,
+                                  NULL /* prepare_params */, &pg_stmt));
 
   // Specify the selected expressions.
   YBCPgExpr colref;
@@ -83,7 +84,6 @@ TEST_F(PggateTestSelectMultiTablets, TestSelectMultiTablets) {
   }
 
   // Deallocate statement.
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
   pg_stmt = nullptr;
 
   // INSERT ----------------------------------------------------------------------------------------
@@ -136,12 +136,12 @@ TEST_F(PggateTestSelectMultiTablets, TestSelectMultiTablets) {
     YBCPgUpdateConstChar(expr_job, job.c_str(), job.size(), false);
   }
 
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
   pg_stmt = nullptr;
 
   // SELECT ----------------------------------------------------------------------------------------
   LOG(INFO) << "Test SELECTing from partitioned table WITH specifying RANGE column";
-  CHECK_YBC_STATUS(YBCPgNewSelect(kDefaultDatabaseOid, tab_oid, kInvalidOid, &pg_stmt));
+  CHECK_YBC_STATUS(YBCPgNewSelect(kDefaultDatabaseOid, tab_oid,
+                                  NULL /* prepare_params */, &pg_stmt));
 
   // Specify the selected expressions.
   YBCTestNewColumnRef(pg_stmt, 1, DataType::INT64, &colref);
@@ -208,12 +208,12 @@ TEST_F(PggateTestSelectMultiTablets, TestSelectMultiTablets) {
   }
   CHECK_EQ(select_row_count, 1) << "Unexpected row count";
 
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
   pg_stmt = nullptr;
 
   // SELECT ----------------------------------------------------------------------------------------
   LOG(INFO) << "Test SELECTing from partitioned table WITHOUT specifying RANGE column";
-  CHECK_YBC_STATUS(YBCPgNewSelect(kDefaultDatabaseOid, tab_oid, kInvalidOid, &pg_stmt));
+  CHECK_YBC_STATUS(YBCPgNewSelect(kDefaultDatabaseOid, tab_oid,
+                                  NULL /* prepare_params */, &pg_stmt));
 
   // Specify the selected expressions.
   YBCTestNewColumnRef(pg_stmt, 1, DataType::INT64, &colref);
@@ -265,7 +265,6 @@ TEST_F(PggateTestSelectMultiTablets, TestSelectMultiTablets) {
     CHECK_EQ(selected_job_name, expected_job_name);
   }
 
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
   pg_stmt = nullptr;
 }
 

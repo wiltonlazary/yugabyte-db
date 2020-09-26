@@ -16,7 +16,6 @@ package org.yb.cql;
 import java.nio.ByteBuffer;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -27,6 +26,7 @@ import java.util.UUID;
 import java.util.stream.Collectors;
 
 import com.datastax.driver.core.SimpleStatement;
+import com.datastax.driver.core.exceptions.ServerError;
 import com.google.common.net.HostAndPort;
 import org.junit.After;
 import org.junit.BeforeClass;
@@ -34,11 +34,8 @@ import org.junit.Test;
 import com.datastax.driver.core.ResultSet;
 import com.datastax.driver.core.Row;
 import org.yb.client.YBClient;
-import org.yb.minicluster.BaseMiniClusterTest;
-import org.yb.minicluster.Metrics;
-import org.yb.minicluster.MiniYBCluster;
+import org.yb.minicluster.*;
 import org.yb.master.Master;
-import org.yb.minicluster.MiniYBDaemon;
 
 import static org.yb.AssertionWrappers.assertEquals;
 import static org.yb.AssertionWrappers.assertFalse;
@@ -60,6 +57,12 @@ public class TestSystemTables extends BaseCQLTest {
   private static final String PLACEMENT_REGION = "region1";
   private static final String PLACEMENT_ZONE = "zone1";
 
+  @Override
+  protected void customizeMiniClusterBuilder(MiniYBClusterBuilder builder) {
+    super.customizeMiniClusterBuilder(builder);
+    builder.tserverHeartbeatTimeoutMs(5000);
+  }
+
   @After
   public void verifyMasterReads() throws Exception {
     // Verify all reads went to the leader master.
@@ -67,7 +70,7 @@ public class TestSystemTables extends BaseCQLTest {
     HostAndPort leaderMaster = client.getLeaderMasterHostAndPort();
     Map<HostAndPort, MiniYBDaemon> masters = miniCluster.getMasters();
     for (Map.Entry<HostAndPort, MiniYBDaemon> master : masters.entrySet()) {
-      Metrics metrics = new Metrics(master.getKey().getHostText(),master.getValue().getWebPort(),
+      Metrics metrics = new Metrics(master.getKey().getHost(),master.getValue().getWebPort(),
         "server");
       long numOps = metrics.getHistogram(TSERVER_READ_METRIC).totalCount;
       if (leaderMaster.equals(master.getKey())) {
@@ -95,6 +98,7 @@ public class TestSystemTables extends BaseCQLTest {
         assertNotNull(row.getUUID("host_id"));
         assertNotNull(row.getString("data_center"));
         assertNotNull(row.getString("rack"));
+        assertEquals(row.getString("release_version"), RELEASE_VERSION);
       }
       assertTrue(found);
     }
@@ -175,7 +179,7 @@ public class TestSystemTables extends BaseCQLTest {
         miniCluster.getTabletServers().keySet().iterator().next());
 
     // Wait for TServer to timeout.
-    Thread.sleep(2 * MiniYBCluster.TSERVER_HEARTBEAT_TIMEOUT_MS);
+    Thread.sleep(2 * miniCluster.getClusterParameters().getTServerHeartbeatTimeoutMs());
 
     // Now verify one tserver is missing.
     long start = System.currentTimeMillis();
@@ -541,4 +545,16 @@ public class TestSystemTables extends BaseCQLTest {
     assertEquals(all_rows, getRowsAsStringList(rs));
   }
 
+  @Test
+  public void testCorrectErrorForSystemPeersV2() throws Exception {
+    try {
+      SimpleStatement select = new SimpleStatement("select * from system.peers_v2");
+      ResultSet rs = session.execute(select);
+    } catch (ServerError se) {
+      LOG.info("Sudo length of the string" + se.getCause().toString().length());
+      if (!se.getCause().toString().contains("Unknown keyspace/cf pair (system.peers_v2)")) {
+        throw se;
+      }
+    }
+  }
 }

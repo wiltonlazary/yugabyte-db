@@ -4,6 +4,7 @@ import static com.yugabyte.yw.commissioner.Common.CloudType.aws;
 import static com.yugabyte.yw.commissioner.Common.CloudType.kubernetes;
 import static com.yugabyte.yw.common.ApiUtils.getDefaultUserIntent;
 import static com.yugabyte.yw.common.ApiUtils.getDefaultUserIntentSingleAZ;
+import static com.yugabyte.yw.common.AssertHelper.assertAuditEntry;
 import static com.yugabyte.yw.common.ModelFactory.createUniverse;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -26,6 +27,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.yugabyte.yw.commissioner.Common;
 import com.yugabyte.yw.common.ApiHelper;
+import com.yugabyte.yw.common.FakeDBApplication;
 import com.yugabyte.yw.common.KubernetesManager;
 import com.yugabyte.yw.common.ModelFactory;
 import com.yugabyte.yw.common.ShellProcessHandler;
@@ -36,6 +38,10 @@ import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.Users;
 import org.junit.Before;
 import org.junit.Test;
+
+import org.pac4j.play.CallbackController;
+import org.pac4j.play.store.PlayCacheSessionStore;
+import org.pac4j.play.store.PlaySessionStore;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.yugabyte.yw.common.ApiUtils;
@@ -61,16 +67,23 @@ public class MetaMasterControllerTest extends FakeDBApplication {
   Customer defaultCustomer;
   Users defaultUser;
 
+  protected CallbackController mockCallbackController;
+  protected PlayCacheSessionStore mockSessionStore;
+
   @Override
   protected Application provideApplication() {
     ApiHelper mockApiHelper = mock(ApiHelper.class);
     mockKubernetesManager = mock(KubernetesManager.class);
     Executors mockExecutors = mock(Executors.class);
+    mockCallbackController = mock(CallbackController.class);
+    mockSessionStore = mock(PlayCacheSessionStore.class);
     return new GuiceApplicationBuilder()
         .configure((Map) Helpers.inMemoryDatabase())
         .overrides(bind(ApiHelper.class).toInstance(mockApiHelper))
         .overrides(bind(KubernetesManager.class).toInstance(mockKubernetesManager))
         .overrides(bind(Executors.class).toInstance(mockExecutors))
+        .overrides(bind(CallbackController.class).toInstance(mockCallbackController))
+        .overrides(bind(PlaySessionStore.class).toInstance(mockSessionStore))
         .build();
   }
 
@@ -99,6 +112,7 @@ public class MetaMasterControllerTest extends FakeDBApplication {
     String universeUUID = "11111111-2222-3333-4444-555555555555";
     Result result = route(fakeRequest("GET", "/metamaster/universe/" + universeUUID));
     assertRestResult(result, false, BAD_REQUEST);
+    assertAuditEntry(0, defaultCustomer.uuid);
   }
 
   @Test
@@ -124,6 +138,7 @@ public class MetaMasterControllerTest extends FakeDBApplication {
     for (MetaMasterController.MasterNode node : masterList.masters) {
       assertTrue(masterNodeNames.contains(node.cloudInfo.private_ip));
     }
+    assertAuditEntry(0, defaultCustomer.uuid);
   }
 
   @Test
@@ -189,6 +204,7 @@ public class MetaMasterControllerTest extends FakeDBApplication {
       JsonNode json = Json.parse(contentAsString(r));
       assertEquals(expectedHostString, json.asText());
     });
+    assertAuditEntry(0, defaultCustomer.uuid);
   }
 
   @Test
@@ -206,6 +222,7 @@ public class MetaMasterControllerTest extends FakeDBApplication {
       JsonNode json = Json.parse(contentAsString(r));
       assertEquals(expectedHostString, json.asText());
     });
+    assertAuditEntry(0, defaultCustomer.uuid);
   }
 
 
@@ -225,6 +242,7 @@ public class MetaMasterControllerTest extends FakeDBApplication {
       JsonNode json = Json.parse(contentAsString(r));
       assertEquals(completeString, json.asText());
     });
+    assertAuditEntry(0, defaultCustomer.uuid);
   }
 
   @Test
@@ -242,6 +260,7 @@ public class MetaMasterControllerTest extends FakeDBApplication {
       JsonNode json = Json.parse(contentAsString(r));
       assertEquals(expectedHostString, json.asText());
     });
+    assertAuditEntry(0, defaultCustomer.uuid);
   }
 
   @Test
@@ -259,6 +278,7 @@ public class MetaMasterControllerTest extends FakeDBApplication {
       JsonNode json = Json.parse(contentAsString(r));
       assertEquals(expectedHostString, json.asText());
     });
+    assertAuditEntry(0, defaultCustomer.uuid);
   }
 
   @Test
@@ -276,6 +296,7 @@ public class MetaMasterControllerTest extends FakeDBApplication {
       JsonNode json = Json.parse(contentAsString(r));
       assertEquals(expectedHostString, json.asText());
     });
+    assertAuditEntry(0, defaultCustomer.uuid);
   }
   private void assertRestResult(Result result, boolean expectSuccess, int expectStatus) {
     assertEquals(expectStatus, result.status());
@@ -286,6 +307,7 @@ public class MetaMasterControllerTest extends FakeDBApplication {
       assertNotNull(json.get("error"));
       assertFalse(json.get("error").asText().isEmpty());
     }
+    assertAuditEntry(0, defaultCustomer.uuid);
   }
 
   private void testServerGetWithInvalidUniverse(boolean isYql) {
@@ -293,6 +315,7 @@ public class MetaMasterControllerTest extends FakeDBApplication {
     Result result = route(fakeRequest("GET", "/api/customers/" + defaultCustomer.uuid + "/universes/" +
                                        universeUUID + (isYql ? "/yqlservers" : "/redisservers")));
     assertRestResult(result, false, BAD_REQUEST);
+    assertAuditEntry(0, defaultCustomer.uuid);
   }
 
   private void testServerGetWithValidUniverse(boolean isYql) {
@@ -304,6 +327,7 @@ public class MetaMasterControllerTest extends FakeDBApplication {
     Result r = route(fakeRequest("GET", "/api/customers/" + defaultCustomer.uuid + "/universes/" +
                                  u1.universeUUID + (isYql ? "/yqlservers" : "/redisservers")));
     assertRestResult(r, true, OK);
+    assertAuditEntry(0, defaultCustomer.uuid);
   }
 
   private void testNoYSQLServers() {
@@ -316,6 +340,7 @@ public class MetaMasterControllerTest extends FakeDBApplication {
       u1.universeUUID + "/ysqlservers"));
     assertRestResult(r, true, OK);
     assertEquals("", Json.parse(contentAsString(r)).asText());
+    assertAuditEntry(0, defaultCustomer.uuid);
   }
 
   private void testYSQLServers() {
@@ -328,5 +353,6 @@ public class MetaMasterControllerTest extends FakeDBApplication {
       u1.universeUUID + "/ysqlservers"));
     assertRestResult(r, true, OK);
     assertEquals("host-n1:5433,host-n2:5433,host-n3:5433", Json.parse(contentAsString(r)).asText());
+    assertAuditEntry(0, defaultCustomer.uuid);
   }
 }

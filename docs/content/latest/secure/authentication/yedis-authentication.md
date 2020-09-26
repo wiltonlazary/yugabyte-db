@@ -1,8 +1,9 @@
 ---
 title: YEDIS authentication
+headerTitle: YEDIS authentication
 linkTitle: YEDIS authentication
-description: Authentication
-headcontent: Identify that your YSQL users are who they say they are
+description: Identify that your YEDIS users are who they say they are.
+headcontent: Identify that your YEDIS users are who they say they are.
 image: /images/section_icons/secure/authentication.png
 menu:
   latest:
@@ -42,7 +43,7 @@ YEDIS authentication is based on passwords. Each client connecting using the YED
 
 ## 1. Enable YEDIS authentication
 
-You can enable password-based authentication in YEDIS API using the [CONFIG](../../api/yedis/config/) command.
+You can enable password-based authentication in YEDIS API using the [CONFIG](../../../api/yedis/config/) command.
 
 To do so, connect to the cluster using `redis-cli` and run the following command:
 
@@ -66,7 +67,7 @@ Next exit `redis-cli`, connect to the cluster again using `redis-cli` and run th
 (error) NOAUTH PING: Authentication required.
 ```
 
-You would need to authenticate the client (`redis-cli` in this case) by running the [AUTH](../../api/yedis/auth/) command:
+You would need to authenticate the client (`redis-cli` in this case) by running the [AUTH](../../../api/yedis/auth/) command:
 
 ```sql
 127.0.0.1:6379> AUTH password
@@ -90,7 +91,7 @@ PONG
 
 YEDIS allows for multiple passwords (up to 2) to be accepted. This enables performing a graceful change of password without experiencing any application outage. Note that this requires knowing the old password.
 
-Let us assume that the old password is `old-password` and the new password we intend to change it to is `new-password`. The preferred sequence is:
+Let us assume that the old password is `old-password` and the new password you intend to change it to is `new-password`. The preferred sequence is:
 
 - Add a new password
 

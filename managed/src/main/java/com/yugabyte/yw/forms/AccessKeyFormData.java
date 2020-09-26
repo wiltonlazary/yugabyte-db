@@ -20,6 +20,10 @@ public class AccessKeyFormData {
 
     public String sshUser;
 
+    // Normally cloud access keys are created on provider creation, so default to 22 for onprem
+    // providers.
+    public Integer sshPort = 22;
+
     public boolean passwordlessSudoAccess = true;
 
     public boolean airGapInstall = false;

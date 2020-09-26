@@ -52,6 +52,7 @@
 #include "commands/subscriptioncmds.h"
 #include "commands/tablecmds.h"
 #include "commands/tablespace.h"
+#include "commands/tablegroup.h"
 #include "commands/trigger.h"
 #include "commands/typecmds.h"
 #include "commands/user.h"
@@ -73,8 +74,21 @@
 
 #include "pg_yb_utils.h"
 
+static void YBProcessUtilityDefaultHook(PlannedStmt *pstmt,
+                                        const char *queryString,
+                                        ProcessUtilityContext context,
+                                        ParamListInfo params,
+                                        QueryEnvironment *queryEnv,
+                                        DestReceiver *dest,
+                                        char *completionTag);
+
 /* Hook for plugins to get control in ProcessUtility() */
-ProcessUtility_hook_type ProcessUtility_hook = NULL;
+
+/*
+ * Setting YBProcessUtilityDefaultHook directly guaranties it will be the first one.
+ * It will be called after all plugins hooks.
+ */
+ProcessUtility_hook_type ProcessUtility_hook = &YBProcessUtilityDefaultHook;
 
 /* local function declarations */
 static void ProcessUtilitySlow(ParseState *pstate,
@@ -182,6 +196,7 @@ check_xact_readonly(Node *parsetree)
 		case T_CreateStmt:
 		case T_CreateTableAsStmt:
 		case T_RefreshMatViewStmt:
+		case T_CreateTableGroupStmt:
 		case T_CreateTableSpaceStmt:
 		case T_CreateTransformStmt:
 		case T_CreateTrigStmt:
@@ -192,6 +207,7 @@ check_xact_readonly(Node *parsetree)
 		case T_ViewStmt:
 		case T_DropStmt:
 		case T_DropdbStmt:
+		case T_DropTableGroupStmt:
 		case T_DropTableSpaceStmt:
 		case T_DropRoleStmt:
 		case T_GrantStmt:
@@ -529,6 +545,16 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			ExecuteDoStmt((DoStmt *) parsetree, isAtomicContext);
 			break;
 
+		case T_CreateTableGroupStmt:
+			PreventInTransactionBlock(isTopLevel, "CREATE TABLEGROUP");
+			CreateTableGroup((CreateTableGroupStmt *) parsetree);
+			break;
+
+		case T_DropTableGroupStmt:
+			PreventInTransactionBlock(isTopLevel, "DROP TABLEGROUP");
+			DropTableGroup((DropTableGroupStmt *) parsetree);
+			break;
+
 		case T_CreateTableSpaceStmt:
 			/* no event triggers for global objects */
 			PreventInTransactionBlock(isTopLevel, "CREATE TABLESPACE");
@@ -812,6 +838,13 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 							 (int) stmt->kind);
 						break;
 				}
+			}
+			break;
+
+		case T_BackfillIndexStmt:
+			{
+				BackfillIndexStmt *stmt = (BackfillIndexStmt *) parsetree;
+				BackfillIndex(stmt);
 			}
 			break;
 
@@ -1728,7 +1761,7 @@ ExecDropStmt(DropStmt *stmt, bool isTopLevel)
 			if (stmt->concurrent)
 				PreventInTransactionBlock(isTopLevel,
 										  "DROP INDEX CONCURRENTLY");
-			/* fall through */
+			switch_fallthrough();
 
 		case OBJECT_TABLE:
 		case OBJECT_SEQUENCE:
@@ -2029,6 +2062,9 @@ AlterObjectTypeCommandTag(ObjectType objtype)
 		case OBJECT_TABCONSTRAINT:
 			tag = "ALTER TABLE";
 			break;
+		case OBJECT_TABLEGROUP:
+			tag = "ALTER TABLEGROUP";
+			break;
 		case OBJECT_TABLESPACE:
 			tag = "ALTER TABLESPACE";
 			break;
@@ -2201,6 +2237,14 @@ CreateCommandTag(Node *parsetree)
 
 		case T_CreateStmt:
 			tag = "CREATE TABLE";
+			break;
+
+		case T_CreateTableGroupStmt:
+			tag = "CREATE TABLEGROUP";
+			break;
+
+		case T_DropTableGroupStmt:
+			tag = "DROP TABLEGROUP";
 			break;
 
 		case T_CreateTableSpaceStmt:
@@ -2715,6 +2759,10 @@ CreateCommandTag(Node *parsetree)
 
 		case T_ReindexStmt:
 			tag = "REINDEX";
+			break;
+
+		case T_BackfillIndexStmt:
+			tag = "BACKFILL INDEX";
 			break;
 
 		case T_CreateConversionStmt:
@@ -3317,6 +3365,10 @@ GetCommandLogLevel(Node *parsetree)
 			lev = LOGSTMT_ALL;	/* should this be DDL? */
 			break;
 
+		case T_BackfillIndexStmt:
+			lev = LOGSTMT_ALL;	/* should this be DDL? */
+			break;
+
 		case T_CreateConversionStmt:
 			lev = LOGSTMT_DDL;
 			break;
@@ -3458,4 +3510,24 @@ GetCommandLogLevel(Node *parsetree)
 	}
 
 	return lev;
+}
+
+void
+YBProcessUtilityDefaultHook(PlannedStmt *pstmt,
+                            const char *queryString,
+                            ProcessUtilityContext context,
+                            ParamListInfo params,
+                            QueryEnvironment *queryEnv,
+                            DestReceiver *dest,
+                            char *completionTag)
+{
+	if (IsYugaByteEnabled() && !(IsA(pstmt->utilityStmt, ExecuteStmt) ||
+			IsA(pstmt->utilityStmt, PrepareStmt) || IsA(pstmt->utilityStmt, DeallocateStmt) ||
+			IsA(pstmt->utilityStmt, ExplainStmt))) {
+		YBBeginOperationsBuffering();
+		standard_ProcessUtility(pstmt, queryString, context, params, queryEnv, dest, completionTag);
+		YBEndOperationsBuffering();
+  } else {
+		standard_ProcessUtility(pstmt, queryString, context, params, queryEnv, dest, completionTag);
+	}
 }

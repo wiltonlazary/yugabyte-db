@@ -50,12 +50,6 @@ struct ResultTraits<TValue&> {
   static TValue* GetPtr(const Stored* value) { return *value; }
 };
 
-#ifdef __clang__
-#define NODISCARD_CLASS [[nodiscard]] // NOLINT
-#else
-#define NODISCARD_CLASS // NOLINT
-#endif
-
 template<class TValue>
 class NODISCARD_CLASS Result {
  public:
@@ -166,14 +160,16 @@ class NODISCARD_CLASS Result {
 
   bool ok() const {
 #ifndef NDEBUG
+    ANNOTATE_IGNORE_WRITES_BEGIN();
     success_checked_ = true;
+    ANNOTATE_IGNORE_WRITES_END();
 #endif
     return success_;
   }
 
   const Status& status() const& {
 #ifndef NDEBUG
-    CHECK(success_checked_);
+    CHECK(ANNOTATE_UNPROTECTED_READ(success_checked_));
 #endif
     CHECK(!success_);
     return status_;
@@ -181,7 +177,7 @@ class NODISCARD_CLASS Result {
 
   Status& status() & {
 #ifndef NDEBUG
-    CHECK(success_checked_);
+    CHECK(ANNOTATE_UNPROTECTED_READ(success_checked_));
 #endif
     CHECK(!success_);
     return status_;
@@ -189,7 +185,7 @@ class NODISCARD_CLASS Result {
 
   Status&& status() && {
 #ifndef NDEBUG
-    CHECK(success_checked_);
+    CHECK(ANNOTATE_UNPROTECTED_READ(success_checked_));
 #endif
     CHECK(!success_);
     return std::move(status_);
@@ -201,7 +197,7 @@ class NODISCARD_CLASS Result {
 
   TValue&& operator*() && {
 #ifndef NDEBUG
-    CHECK(success_checked_);
+    CHECK(ANNOTATE_UNPROTECTED_READ(success_checked_));
 #endif
     CHECK(success_);
     return value_;
@@ -212,7 +208,7 @@ class NODISCARD_CLASS Result {
 
   auto get_ptr() const {
 #ifndef NDEBUG
-    CHECK(success_checked_);
+    CHECK(ANNOTATE_UNPROTECTED_READ(success_checked_));
 #endif
     CHECK(success_);
     return Traits::GetPtr(&value_);
@@ -220,7 +216,7 @@ class NODISCARD_CLASS Result {
 
   auto get_ptr() {
 #ifndef NDEBUG
-    CHECK(success_checked_);
+    CHECK(ANNOTATE_UNPROTECTED_READ(success_checked_));
 #endif
     CHECK(success_);
     return Traits::GetPtr(&value_);

@@ -77,9 +77,10 @@ class MasterPathHandlers {
  private:
   enum TableType {
     kUserTable,
-    kIndexTable,
+    kUserIndex,
+    kColocatedParentTable,
     kSystemTable,
-    kNumTypes
+    kNumTypes,
   };
 
   const string kSystemPlatformNamespace = "system_platform";
@@ -114,7 +115,7 @@ class MasterPathHandlers {
   // Map of tserver UUID -> TabletCounts
   typedef std::unordered_map<std::string, TabletCounts> TabletCountMap;
 
-  const string table_type_[3] = {"User", "Index", "System"};
+  const string table_type_[kNumTypes] = {"User", "Index", "Colocated", "System"};
 
   const string kNoPlacementUUID = "NONE";
 
@@ -123,7 +124,8 @@ class MasterPathHandlers {
   void TServerDisplay(const std::string& current_uuid,
                       std::vector<std::shared_ptr<TSDescriptor>>* descs,
                       TabletCountMap* tmap,
-                      std::stringstream* output);
+                      std::stringstream* output,
+                      const int hide_dead_node_threshold_override);
 
   // Outputs a ZoneTabletCounts::CloudTree as an html table with a heading.
   static void DisplayTabletZonesTable(
@@ -139,31 +141,40 @@ class MasterPathHandlers {
     const TabletCountMap& tablet_count_map
   );
 
-  void CallIfLeaderOrPrintRedirect(const Webserver::WebRequest& req, std::stringstream* output,
+  void CallIfLeaderOrPrintRedirect(const Webserver::WebRequest& req, Webserver::WebResponse* resp,
                                    const Webserver::PathHandlerCallback& callback);
-
+  void RedirectToLeader(const Webserver::WebRequest& req, Webserver::WebResponse* resp);
   void RootHandler(const Webserver::WebRequest& req,
-                   std::stringstream* output);
+                   Webserver::WebResponse* resp);
   void HandleTabletServers(const Webserver::WebRequest& req,
-                           std::stringstream* output);
+                           Webserver::WebResponse* resp);
   void HandleCatalogManager(const Webserver::WebRequest& req,
-                            std::stringstream* output,
-                            bool skip_system_tables = false);
+                            Webserver::WebResponse* resp,
+                            bool only_user_tables = false);
   void HandleTablePage(const Webserver::WebRequest& req,
-                       std::stringstream* output);
+                       Webserver::WebResponse* resp);
   void HandleTasksPage(const Webserver::WebRequest& req,
-                       std::stringstream* output);
+                       Webserver::WebResponse* resp);
+  void HandleTabletReplicasPage(const Webserver::WebRequest &req, Webserver::WebResponse *resp);
   void HandleMasters(const Webserver::WebRequest& req,
-                     std::stringstream* output);
+                     Webserver::WebResponse* resp);
   void HandleDumpEntities(const Webserver::WebRequest& req,
-                          std::stringstream* output);
+                          Webserver::WebResponse* resp);
   void HandleGetTserverStatus(const Webserver::WebRequest& req,
-                          std::stringstream* output);
-  void HandleGetClusterConfig(const Webserver::WebRequest& req, std::stringstream* output);
-  void HandleHealthCheck(const Webserver::WebRequest& req, std::stringstream* output);
+                          Webserver::WebResponse* resp);
+  void HandleGetClusterConfig(const Webserver::WebRequest& req, Webserver::WebResponse* resp);
+  void HandleGetClusterConfigJSON(const Webserver::WebRequest& req, Webserver::WebResponse* resp);
+  void HandleHealthCheck(const Webserver::WebRequest& req, Webserver::WebResponse* resp);
+  void HandleCheckIfLeader(const Webserver::WebRequest& req, Webserver::WebResponse* resp);
+  void HandleGetMastersStatus(const Webserver::WebRequest& req, Webserver::WebResponse* resp);
+  void HandleGetReplicationStatus(const Webserver::WebRequest &req, Webserver::WebResponse *resp);
 
   // Calcuates number of leaders/followers per table.
   void CalculateTabletMap(TabletCountMap* tablet_map);
+
+  void GetLeaderlessTablets(TabletInfos* leaderless_tablets);
+  // Calculates the YSQL OID of a tablegroup / colocated database parent table
+  string GetParentTableOid(scoped_refptr<TableInfo> parent_table);
 
   // Convert location of peers to HTML, indicating the roles
   // of each tablet server in a consensus configuration.
@@ -182,13 +193,15 @@ class MasterPathHandlers {
   std::string RegistrationToHtml(
       const ServerRegistrationPB& reg, const std::string& link_text) const;
 
+  std::string GetHttpHostPortFromServerRegistration(const ServerRegistrationPB& reg) const;
+
   Master* master_;
 
   const int output_precision_;
   DISALLOW_COPY_AND_ASSIGN(MasterPathHandlers);
 };
 
-void HandleTabletServersPage(const Webserver::WebRequest& req, std::stringstream* output);
+void HandleTabletServersPage(const Webserver::WebRequest& req, Webserver::WebResponse* resp);
 
 } // namespace master
 } // namespace yb

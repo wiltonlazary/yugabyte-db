@@ -87,6 +87,17 @@ extern bool IsYBRelation(Relation relation);
  */
 extern bool IsYBBackedRelation(Relation relation);
 
+/*
+ * Returns whether a relation's attribute is a real column in the backing
+ * YugaByte table. (It implies we can both read from and write to it).
+ */
+extern bool IsRealYBColumn(Relation rel, int attrNum);
+
+/*
+ * Returns whether a relation's attribute is a YB system column.
+ */
+extern bool IsYBSystemColumn(int attrNum);
+
 extern bool YBNeedRetryAfterCacheRefresh(ErrorData *edata);
 
 extern void YBReportFeatureUnsupported(const char *err_msg);
@@ -94,6 +105,22 @@ extern void YBReportFeatureUnsupported(const char *err_msg);
 extern AttrNumber YBGetFirstLowInvalidAttributeNumber(Relation relation);
 
 extern AttrNumber YBGetFirstLowInvalidAttributeNumberFromOid(Oid relid);
+
+extern int YBAttnumToBmsIndex(Relation rel, AttrNumber attnum);
+
+extern AttrNumber YBBmsIndexToAttnum(Relation rel, int idx);
+
+/*
+ * Get primary key columns as bitmap set of a table for real YB columns.
+ * Subtracts YBGetFirstLowInvalidAttributeNumber from column attribute numbers.
+ */
+extern Bitmapset *YBGetTablePrimaryKeyBms(Relation rel);
+
+/*
+ * Get primary key columns as bitmap set of a table for real and system YB columns.
+ * Subtracts (YBSystemFirstLowInvalidAttributeNumber + 1) from column attribute numbers.
+ */
+extern Bitmapset *YBGetTableFullPrimaryKeyBms(Relation rel);
 
 /*
  * Check if a relation has row triggers that may reference the old row.
@@ -119,18 +146,22 @@ extern bool YBTransactionsEnabled();
 extern void	HandleYBStatus(YBCStatus status);
 
 /*
- * Same as HandleYBStatus but delete the statement first if the status is
- * not ok.
+ * Since DDL metadata in master DocDB and postgres system tables is not modified
+ * in an atomic fashion, it is possible that we could have a table existing in
+ * postgres metadata but not in DocDB. In the case of a delete it is really
+ * problematic, since we can't delete the table nor can we create a new one with
+ * the same name. So in this case we just ignore the DocDB 'NotFound' error and
+ * delete our metadata.
  */
-extern void	HandleYBStmtStatus(YBCStatus status, YBCPgStatement ybc_stmt);
+extern void HandleYBStatusIgnoreNotFound(YBCStatus status, bool *not_found);
 
 /*
- * Same as HandleYBStmtStatus but also ask the given resource owner to forget
+ * Same as HandleYBStatus but also ask the given resource owner to forget
  * the given YugaByte statement.
  */
-extern void HandleYBStmtStatusWithOwner(YBCStatus status,
-                                        YBCPgStatement ybc_stmt,
-                                        ResourceOwner owner);
+extern void HandleYBStatusWithOwner(YBCStatus status,
+									YBCPgStatement ybc_stmt,
+									ResourceOwner owner);
 
 /*
  * Same as HandleYBStatus but delete the table description first if the
@@ -152,25 +183,26 @@ extern void YBInitPostgresBackend(const char *program_name,
 extern void YBOnPostgresBackendShutdown();
 
 /*
+ * Signals PgTxnManager to recreate the transaction. This is used when we need
+ * to restart a transaction that failed due to a transaction conflict error.
+ */
+extern void YBCRecreateTransaction();
+
+/*
  * Signals PgTxnManager to restart current transaction - pick a new read point, etc.
  * This relies on transaction/session read time already being marked for restart by YB layer.
  */
 extern void YBCRestartTransaction();
 
 /*
- * Commits the current YugaByte-level transaction. Returns true in case of
- * successful commit and false in case of failure. If there is no transaction in
- * progress, also returns true.
+ * Commits the current YugaByte-level transaction (if any).
  */
-extern bool YBCCommitTransaction();
+extern void YBCCommitTransaction();
 
 /*
- * Handle a commit error if it happened during a previous call to
- * YBCCommitTransaction. We allow deferring this handling in order to be able
- * to make PostgreSQL transaction block state transitions before calling
- * ereport.
+ * Aborts the current YugaByte-level transaction.
  */
-extern void YBCHandleCommitError();
+extern void YBCAbortTransaction();
 
 /*
  * Return true if we want to allow PostgreSQL's own locking. This is needed
@@ -227,14 +259,6 @@ extern void YBReportIfYugaByteEnabled();
 bool YBShouldRestartAllChildrenIfOneCrashes();
 
 /*
- * Define additional inline wrappers around _Status functions that return the
- * real return value and ereport the error status.
- */
-#include "yb/yql/pggate/if_macros_c_pg_wrapper_inl.h"
-#include "yb/yql/pggate/pggate_if.h"
-#include "yb/yql/pggate/if_macros_undef.h"
-
-/*
  * These functions help indicating if we are creating system catalog.
  */
 void YBSetPreparingTemplates();
@@ -273,15 +297,40 @@ Oid YBCGetDatabaseOid(Relation rel);
  * linking to the referenced issue (if any).
  */
 void YBRaiseNotSupported(const char *msg, int issue_no);
+void YBRaiseNotSupportedSignal(const char *msg, int issue_no, int signal_level);
+
+/*
+ * Return the value of (base ^ exponent) bounded by the upper limit.
+ */
+extern double PowerWithUpperLimit(double base, int exponent, double upper_limit);
 
 //------------------------------------------------------------------------------
 // YB Debug utils.
 
 /**
- * YSQL variable that can be used to enable/disable yugabyte debug mode.
- * e.g. 'SET yb_debug_mode=true'.
+ * YSQL guc variables that can be used to toggle yugabyte debug features.
+ * e.g. 'SET yb_debug_report_error_stacktrace=true' and
+ *      'RESET yb_debug_report_error_stacktrace'.
+ * See also the corresponding entries in guc.c.
  */
-extern bool yb_debug_mode;
+
+/* Add stacktrace information to every YSQL error. */
+extern bool yb_debug_report_error_stacktrace;
+
+/* Log cache misses and cache refresh events. */
+extern bool yb_debug_log_catcache_events;
+
+/*
+ * Log automatic statement (or transaction) restarts such as read-restarts and
+ * schema-version restarts (e.g. catalog version mismatch errors).
+ */
+extern bool yb_debug_log_internal_restarts;
+
+/*
+ * See also ybc_util.h which contains additional such variable declarations for
+ * variables that are (also) used in the pggate layer.
+ * Currently: yb_debug_log_docdb_requests.
+ */
 
 /*
  * Get a string representation of a datum (given its type).
@@ -297,5 +346,13 @@ extern const char* YBHeapTupleToString(HeapTuple tuple, TupleDesc tupleDesc);
  * Checks if the master thinks initdb has already been done.
  */
 bool YBIsInitDbAlreadyDone();
+
+int YBGetDdlNestingLevel();
+void YBIncrementDdlNestingLevel();
+void YBDecrementDdlNestingLevel(bool success);
+
+extern void YBBeginOperationsBuffering();
+extern void YBEndOperationsBuffering();
+extern void YBResetOperationsBuffering();
 
 #endif /* PG_YB_UTILS_H */

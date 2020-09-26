@@ -34,11 +34,14 @@ import play.libs.Json;
 import java.util.*;
 import java.util.stream.Collectors;
 
+import org.yb.client.ChangeMasterClusterConfigResponse;
 import static com.yugabyte.yw.common.AssertHelper.assertJsonEqual;
 import static com.yugabyte.yw.common.ModelFactory.createUniverse;
 import static org.junit.Assert.*;
 import static org.mockito.Matchers.any;
+import static org.mockito.Matchers.anyBoolean;
 import static org.mockito.Matchers.anyLong;
+import static org.mockito.Matchers.anyString;
 import static org.mockito.Mockito.*;
 import org.yb.client.ModifyMasterClusterConfigBlacklist;
 
@@ -58,6 +61,7 @@ public class AddNodeToUniverseTest extends CommissionerBaseTest {
   @Before
   public void setUp() {
     super.setUp();
+    ChangeMasterClusterConfigResponse ccr = new ChangeMasterClusterConfigResponse(1111, "", null);
     Region region = Region.create(defaultProvider, "region-1", "Region 1", "yb-image-1");
     AvailabilityZone.create(region, "az-1", "AZ 1", "subnet-1");
     // create default universe
@@ -79,15 +83,18 @@ public class AddNodeToUniverseTest extends CommissionerBaseTest {
     setDefaultNodeState(NodeState.Removed);
 
     mockClient = mock(YBClient.class);
+    when(mockClient.waitForServer(any(), anyLong())).thenReturn(true);
+    try {
+      when(mockClient.changeMasterClusterConfig(any())).thenReturn(ccr);
+      when(mockClient.setFlag(any(), anyString(), anyString(), anyBoolean())).thenReturn(true);
+    } catch (Exception e) {}
+
+    mockWaits(mockClient);
     when(mockYBClient.getClient(any(), any())).thenReturn(mockClient);
     when(mockClient.waitForLoadBalance(anyLong(), anyInt())).thenReturn(true);
-    when(mockClient.waitForServer(any(), anyInt())).thenReturn(true);
     dummyShellResponse = new ShellProcessHandler.ShellResponse();
     when(mockNodeManager.nodeCommand(any(), any())).thenReturn(dummyShellResponse);
     modifyBL = mock(ModifyMasterClusterConfigBlacklist.class);
-    try {
-      doNothing().when(modifyBL).doCall();
-    } catch (Exception e) {}
   }
 
   private void setDefaultNodeState(final NodeState desiredState) {
@@ -161,7 +168,6 @@ public class AddNodeToUniverseTest extends CommissionerBaseTest {
     TaskType.WaitForServer,
     TaskType.ChangeMasterConfig,
     TaskType.AnsibleConfigureServers,
-    TaskType.AnsibleConfigureServers,
     TaskType.AnsibleClusterServerCtl,
     TaskType.UpdateNodeProcess,
     TaskType.WaitForServer,
@@ -169,6 +175,9 @@ public class AddNodeToUniverseTest extends CommissionerBaseTest {
     TaskType.ModifyBlackList,
     TaskType.WaitForLoadBalance,
     TaskType.AnsibleConfigureServers,
+    TaskType.SetFlagInMemory,
+    TaskType.AnsibleConfigureServers,
+    TaskType.SetFlagInMemory,
     TaskType.SetNodeState,
     TaskType.UniverseUpdateSucceeded
   );
@@ -182,9 +191,11 @@ public class AddNodeToUniverseTest extends CommissionerBaseTest {
     Json.toJson(ImmutableMap.of()),
     Json.toJson(ImmutableMap.of()),
     Json.toJson(ImmutableMap.of()),
-    Json.toJson(ImmutableMap.of()),
     Json.toJson(ImmutableMap.of("process", "tserver", "command", "start")),
     Json.toJson(ImmutableMap.of("processType", "TSERVER", "isAdd", true)),
+    Json.toJson(ImmutableMap.of()),
+    Json.toJson(ImmutableMap.of()),
+    Json.toJson(ImmutableMap.of()),
     Json.toJson(ImmutableMap.of()),
     Json.toJson(ImmutableMap.of()),
     Json.toJson(ImmutableMap.of()),
@@ -255,7 +266,8 @@ public class AddNodeToUniverseTest extends CommissionerBaseTest {
     Universe.saveDetails(defaultUniverse.universeUUID, updater);
 
     TaskInfo taskInfo = submitTask(DEFAULT_NODE_NAME, 4);
-    verify(mockNodeManager, times(6)).nodeCommand(any(), any());
+    // 5 calls for setting up the server and then 6 calls for setting the conf files.
+    verify(mockNodeManager, times(11)).nodeCommand(any(), any());
     List<TaskInfo> subTasks = taskInfo.getSubTasks();
     Map<Integer, List<TaskInfo>> subTasksByPosition =
         subTasks.stream().collect(Collectors.groupingBy(w -> w.getPosition()));

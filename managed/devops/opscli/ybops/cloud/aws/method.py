@@ -42,14 +42,17 @@ class AwsCreateInstancesMethod(CreateInstancesMethod):
         super(AwsCreateInstancesMethod, self).add_extra_args()
         self.parser.add_argument("--key_pair_name", default=os.environ.get("YB_EC2_KEY_PAIR_NAME"),
                                  help="AWS Key Pair name")
-        self.parser.add_argument("--security_group_id", default=None, help="AWS security group ID.")
+        self.parser.add_argument("--security_group_id", default=None,
+                                 help="AWS comma delimited security group IDs.")
         self.parser.add_argument("--volume_type", choices=["gp2", "io1"], default="gp2",
                                  help="Volume type for volumes on EBS-backed instances.")
         self.parser.add_argument("--spot_price", default=None,
                                  help="Spot price for each instance (if desired)")
         self.parser.add_argument("--cmk_res_name", help="CMK arn to enable encrypted EBS volumes.")
+        self.parser.add_argument("--iam_profile_arn", help="ARN string for IAM instance profile")
 
     def preprocess_args(self, args):
+        super(AwsCreateInstancesMethod, self).preprocess_args(args)
         if args.region is None:
             raise YBOpsRuntimeError("Must specify a region!")
         # TODO: better handling of this...
@@ -153,7 +156,7 @@ class AwsAccessAddKeyMethod(AbstractAccessMethod):
     def callback(self, args):
         (private_key_file, public_key_file) = self.validate_key_files(args)
         self.cloud.add_key_pair(args)
-        print json.dumps({"private_key": private_key_file, "public_key": public_key_file})
+        print(json.dumps({"private_key": private_key_file, "public_key": public_key_file}))
 
 
 class AwsAccessDeleteKeyMethod(AbstractAccessMethod):
@@ -165,10 +168,10 @@ class AwsAccessDeleteKeyMethod(AbstractAccessMethod):
             self.cloud.delete_key_pair(args)
             for key_file in glob.glob("{}/{}.*".format(args.key_file_path, args.key_pair_name)):
                 os.remove(key_file)
-            print json.dumps({"success": "Keypair {} deleted.".format(args.key_pair_name)})
+            print(json.dumps({"success": "Keypair {} deleted.".format(args.key_pair_name)}))
         except Exception as e:
             logging.error(e)
-            print json.dumps({"error": "Unable to delete Keypair: {}".format(args.key_pair_name)})
+            print(json.dumps({"error": "Unable to delete Keypair: {}".format(args.key_pair_name)}))
 
 
 class AwsAccessListKeysMethod(AbstractMethod):
@@ -183,7 +186,7 @@ class AwsAccessListKeysMethod(AbstractMethod):
                                  help="AWS Key Pair name")
 
     def callback(self, args):
-        print json.dumps(self.cloud.list_key_pair(args))
+        print(json.dumps(self.cloud.list_key_pair(args)))
 
 
 class AwsQueryRegionsMethod(AbstractMethod):
@@ -191,7 +194,7 @@ class AwsQueryRegionsMethod(AbstractMethod):
         super(AwsQueryRegionsMethod, self).__init__(base_command, "regions")
 
     def callback(self, args):
-        print json.dumps(self.cloud.get_regions())
+        print(json.dumps(self.cloud.get_regions()))
 
 
 class AwsQueryZonesMethod(AbstractMethod):
@@ -209,7 +212,7 @@ class AwsQueryZonesMethod(AbstractMethod):
             raise YBOpsRuntimeError("Using --dest_vpc_id requires --region")
 
     def callback(self, args):
-        print json.dumps(self.cloud.get_zones(args))
+        print(json.dumps(self.cloud.get_zones(args)))
 
 
 class AwsQueryVPCMethod(AbstractMethod):
@@ -217,7 +220,7 @@ class AwsQueryVPCMethod(AbstractMethod):
         super(AwsQueryVPCMethod, self).__init__(base_command, "vpc")
 
     def callback(self, args):
-        print json.dumps(self.cloud.query_vpc(args))
+        print(json.dumps(self.cloud.query_vpc(args)))
 
 
 class AwsQueryCurrentHostMethod(AbstractMethod):
@@ -236,9 +239,9 @@ class AwsQueryCurrentHostMethod(AbstractMethod):
 
     def callback(self, args):
         try:
-            print json.dumps(self.cloud.get_current_host_info(args))
+            print(json.dumps(self.cloud.get_current_host_info(args)))
         except YBOpsRuntimeError as ye:
-            print json.dumps({"error": ye.message})
+            print(json.dumps({"error": ye.message}))
 
 
 class AwsQueryPricingMethod(AbstractMethod):
@@ -262,9 +265,9 @@ class AwsQuerySpotPricingMethod(AbstractMethod):
         try:
             if args.region is None or args.zone is None:
                 raise YBOpsRuntimeError("Must specify a region & zone to query spot price")
-            print json.dumps({'SpotPrice': self.cloud.get_spot_pricing(args)})
+            print(json.dumps({'SpotPrice': self.cloud.get_spot_pricing(args)}))
         except YBOpsRuntimeError as ye:
-            print json.dumps({"error": ye.message})
+            print(json.dumps({"error": ye.message}))
 
 
 class AwsNetworkBootstrapMethod(AbstractNetworkMethod):
@@ -279,9 +282,9 @@ class AwsNetworkBootstrapMethod(AbstractNetworkMethod):
 
     def callback(self, args):
         try:
-            print json.dumps(self.cloud.network_bootstrap(args))
+            print(json.dumps(self.cloud.network_bootstrap(args)))
         except YBOpsRuntimeError as ye:
-            print json.dumps({"error": ye.message})
+            print(json.dumps({"error": ye.message}))
 
 
 class AwsNetworkQueryMethod(AbstractNetworkMethod):
@@ -290,9 +293,9 @@ class AwsNetworkQueryMethod(AbstractNetworkMethod):
 
     def callback(self, args):
         try:
-            print json.dumps(self.cloud.query_vpc(args))
+            print(json.dumps(self.cloud.query_vpc(args)))
         except YBOpsRuntimeError as ye:
-            print json.dumps({"error": ye.message})
+            print(json.dumps({"error": ye.message}))
 
 
 class AwsNetworkCleanupMethod(AbstractNetworkMethod):
@@ -307,9 +310,9 @@ class AwsNetworkCleanupMethod(AbstractNetworkMethod):
 
     def callback(self, args):
         try:
-            print json.dumps(self.cloud.network_cleanup(args))
+            print(json.dumps(self.cloud.network_cleanup(args)))
         except YBOpsRuntimeError as ye:
-            print json.dumps({"error": ye.message})
+            print(json.dumps({"error": ye.message}))
 
 
 class AbstractDnsMethod(AbstractMethod):
@@ -328,6 +331,7 @@ class AbstractDnsMethod(AbstractMethod):
                                  help="The CSV of the node IPs to associate to this DNS entry.")
 
     def preprocess_args(self, args):
+        super(AbstractDnsMethod, self).preprocess_args(args)
         if args.node_ips:
             self.ip_list = args.node_ips.split(',')
 
@@ -364,8 +368,8 @@ class AwsListDnsEntryMethod(AbstractDnsMethod):
     def callback(self, args):
         try:
             result = list_dns_record_set(args.hosted_zone_id)
-            print json.dumps({
+            print(json.dumps({
                 'name': result['HostedZone']['Name']
-            })
+            }))
         except Exception as e:
-            print json.dumps({'error': repr(e)})
+            print(json.dumps({'error': repr(e)}))

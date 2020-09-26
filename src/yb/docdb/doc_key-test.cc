@@ -22,6 +22,7 @@
 #include "yb/gutil/strings/substitute.h"
 #include "yb/rocksutil/yb_rocksdb.h"
 #include "yb/util/bytes_formatter.h"
+#include "yb/util/net/net_util.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
 
@@ -61,16 +62,31 @@ class DocKeyTest : public YBTest {
     vector<SubDocKey> sub_doc_keys;
     Uuid cotable_id;
     EXPECT_OK(cotable_id.FromHexString("0123456789abcdef0123456789abcdef"));
-    for (bool has_cotable_id : {false, true}) {
+
+    std::vector<std::pair<Uuid, PgTableOid>> table_id_pairs;
+    table_id_pairs.emplace_back(cotable_id, 0);
+    table_id_pairs.emplace_back(Uuid(boost::uuids::nil_uuid()), 9911);
+    table_id_pairs.emplace_back(Uuid(boost::uuids::nil_uuid()), 0);
+
+    for (const auto& table_id_pair : table_id_pairs) {
       for (int num_hash_keys = 0; num_hash_keys <= kMaxNumHashKeys; ++num_hash_keys) {
         for (int num_range_keys = 0; num_range_keys <= kMaxNumRangeKeys; ++num_range_keys) {
           for (int num_sub_keys = 0; num_sub_keys <= kMaxNumSubKeys; ++num_sub_keys) {
-            for (int has_hybrid_time = 0; has_hybrid_time <= 1; ++has_hybrid_time) {
+            for (bool has_hybrid_time : {false, true}) {
               SubDocKey sub_doc_key;
 
-              if (has_cotable_id) {
+              if (!table_id_pair.first.IsNil()) {
                 sub_doc_key.doc_key().set_cotable_id(cotable_id);
+              } else if (table_id_pair.second > 0) {
+                if ((num_hash_keys == 0 && num_range_keys == 0) &&
+                    (num_sub_keys > 0 || !has_hybrid_time)) {
+                  // This key format currently cannot ever appear because colocated table tombstones
+                  // should both have no subkeys and have a hybrid time, so skip it.
+                  continue;
+                }
+                sub_doc_key.doc_key().set_pgtable_id(table_id_pair.second);
               }
+
               if (num_hash_keys > 0) {
                 sub_doc_key.doc_key().set_hash(kAsciiFriendlyHash);
               }
@@ -244,10 +260,9 @@ TEST_F(DocKeyTest, TestDocKeyEncoding) {
                I\x80\x00\x00\x00\x00\x00\x07\xd0\
                !"
           )#"),
-      FormatBytesAsStr(DocKey(PrimitiveValues("val1", 1000, "val2", 2000)).Encode().data()));
+      FormatSliceAsStr(DocKey(PrimitiveValues("val1", 1000, "val2", 2000)).Encode().AsSlice()));
 
-  InetAddress addr;
-  ASSERT_OK(addr.FromString("1.2.3.4"));
+  InetAddress addr(ASSERT_RESULT(ParseIpAddress("1.2.3.4")));
 
   // To get a descending sorting, we store the negative of a decimal type. 100.2 gets converted to
   // -100.2 which in the encoded form is equal to \x1c\xea\xfe\xd7.
@@ -264,7 +279,7 @@ TEST_F(DocKeyTest, TestDocKeyEncoding) {
              E\xdd\x14\
              !"
           )#"),
-      FormatBytesAsStr(DocKey({
+      FormatSliceAsStr(DocKey({
           PrimitiveValue("val1", SortOrder::kDescending),
           PrimitiveValue(1000),
           PrimitiveValue(1000, SortOrder::kDescending),
@@ -275,7 +290,7 @@ TEST_F(DocKeyTest, TestDocKeyEncoding) {
                                   SortOrder::kDescending),
           PrimitiveValue::Decimal(util::Decimal("0.001").EncodeToComparable(),
                                   SortOrder::kAscending),
-                              }).Encode().data()));
+                              }).Encode().AsSlice()));
 
   ASSERT_STR_EQ_VERBOSE_TRIMMED(
       ApplyEagerLineContinuation(
@@ -289,10 +304,10 @@ TEST_F(DocKeyTest, TestDocKeyEncoding) {
                Srange2\x00\x00\
                I\x80\x00\x00\x00\x00\x00\x07\xd0\
                !")#"),
-      FormatBytesAsStr(DocKey(
+      FormatSliceAsStr(DocKey(
           0xcafe,
           PrimitiveValues("hashed1", "hashed2"),
-          PrimitiveValues("range1", 1000, "range2", 2000)).Encode().data()));
+          PrimitiveValues("range1", 1000, "range2", 2000)).Encode().AsSlice()));
 }
 
 TEST_F(DocKeyTest, TestBasicSubDocKeyEncodingDecoding) {
@@ -317,7 +332,7 @@ TEST_F(DocKeyTest, TestBasicSubDocKeyEncodingDecoding) {
   SubDocKey decoded_subdoc_key;
   ASSERT_OK(decoded_subdoc_key.FullyDecodeFrom(encoded_subdoc_key.AsSlice()));
   ASSERT_EQ(subdoc_key, decoded_subdoc_key);
-  Slice source = encoded_subdoc_key.data();
+  Slice source = encoded_subdoc_key.AsSlice();
   boost::container::small_vector<Slice, 20> slices;
   ASSERT_OK(SubDocKey::PartiallyDecode(&source, &slices));
   const DocKey& dockey = subdoc_key.doc_key();
@@ -378,8 +393,8 @@ TEST_F(DocKeyTest, TestSubDocKeyStartsWith) {
 std::string EncodeSubDocKey(const std::string& hash_key,
     const std::string& range_key, const std::string& sub_key, uint64_t time) {
   DocKey dk(DocKey(0, PrimitiveValues(hash_key), PrimitiveValues(range_key)));
-  return SubDocKey(dk, PrimitiveValue(sub_key),
-      HybridTime::FromMicros(time)).Encode().AsStringRef();
+  return SubDocKey(
+      dk, PrimitiveValue(sub_key), HybridTime::FromMicros(time)).Encode().ToStringBuffer();
 }
 
 std::string EncodeSimpleSubDocKey(const std::string& hash_key) {
@@ -391,7 +406,7 @@ std::string EncodeSimpleSubDocKeyWithDifferentNonHashPart(const std::string& has
 }
 
 TEST_F(DocKeyTest, TestKeyMatching) {
-  DocDbAwareFilterPolicy policy(rocksdb::FilterPolicy::kDefaultFixedSizeFilterBits, nullptr);
+  DocDbAwareV2FilterPolicy policy(rocksdb::FilterPolicy::kDefaultFixedSizeFilterBits, nullptr);
   std::string keys[] = { "foo", "bar", "test" };
   std::string absent_key = "fake";
 
@@ -440,7 +455,7 @@ class IntentCollector {
  public:
   explicit IntentCollector(std::vector<CollectedIntent>* out) : out_(out) {}
 
-  Status operator()(IntentStrength strength, Slice value, KeyBytes* key) {
+  Status operator()(IntentStrength strength, Slice value, KeyBytes* key, LastKey) {
     out_->push_back({strength, *key, value});
     return Status::OK();
   }
@@ -451,47 +466,26 @@ class IntentCollector {
 
 TEST_F(DocKeyTest, TestDecodePrefixLengths) {
   for (const auto& sub_doc_key : GetVariedSubDocKeys()) {
-    std::vector<PrimitiveValue> subkeys;
     const auto encoded_input = sub_doc_key.Encode();
+    const DocKey& doc_key = sub_doc_key.doc_key();
+    const Slice subdockey_slice = encoded_input.AsSlice();
+
     const string test_description = GetTestDescriptionForSubDocKey(sub_doc_key);
     SCOPED_TRACE(test_description);
-    const Slice subdockey_slice = encoded_input.AsSlice();
-    const auto encoded_sizes = ASSERT_RESULT(DocKey::EncodedHashPartAndDocKeySizes(
-        subdockey_slice, AllowSpecial::kFalse));
-    const size_t encoded_hash_key_size = encoded_sizes.first;
-    const size_t encoded_doc_key_size = encoded_sizes.second;
-
-    size_t expected_hash_enc_size = 0;
-    const DocKey& doc_key = sub_doc_key.doc_key();
-    DocKey hash_only_key;
-    if (!doc_key.hashed_group().empty() || doc_key.has_cotable_id()) {
-      if (doc_key.has_cotable_id()) {
-        if (doc_key.hashed_group().empty()) {
-          hash_only_key = DocKey(doc_key.cotable_id());
-        } else {
-          hash_only_key = DocKey(doc_key.cotable_id(), doc_key.hash(), doc_key.hashed_group());
-        }
-      } else {
-        hash_only_key = DocKey(doc_key.hash(), doc_key.hashed_group());
-      }
-      // We subtract 1 because we don't want to include kGroupEnd in the expected hash key size.
-      expected_hash_enc_size = hash_only_key.Encode().size() - 1;
-    }
-    ASSERT_EQ(expected_hash_enc_size, encoded_hash_key_size)
-        << "Expected encoded hash key size based on: " << hash_only_key;
-    ASSERT_EQ(sub_doc_key.doc_key().Encode().size(), encoded_doc_key_size);
 
     SubDocKey cur_key;
     boost::container::small_vector<size_t, 8> prefix_lengths;
     std::vector<size_t> expected_prefix_lengths;
-    if (doc_key.has_hash() || doc_key.has_cotable_id()) {
-      if (doc_key.has_hash() && doc_key.has_cotable_id()) {
-        cur_key.doc_key() = DocKey(doc_key.cotable_id(), doc_key.hash(), doc_key.hashed_group());
-      } else if (doc_key.has_hash()) {
+    if (doc_key.has_hash() || doc_key.has_cotable_id() || doc_key.has_pgtable_id()) {
+      if (doc_key.has_hash()) {
         cur_key.doc_key() = DocKey(doc_key.hash(), doc_key.hashed_group());
-      } else {
-        cur_key.doc_key() = DocKey(doc_key.cotable_id());
       }
+      if (doc_key.has_cotable_id()) {
+        cur_key.doc_key().set_cotable_id(doc_key.cotable_id());
+      } else if (doc_key.has_pgtable_id()) {
+        cur_key.doc_key().set_pgtable_id(doc_key.pgtable_id());
+      }
+
       // Subtract one to avoid counting the final kGroupEnd, unless this is the entire key.
       if (doc_key.range_group().empty()) {
         expected_prefix_lengths.push_back(cur_key.Encode().size());
@@ -531,6 +525,69 @@ TEST_F(DocKeyTest, TestDecodePrefixLengths) {
   }
 }
 
+TEST_F(DocKeyTest, DecodeDocKeyAndSubKeyEnds) {
+  for (const SubDocKey& sub_doc_key : GetVariedSubDocKeys()) {
+    const DocKey& doc_key = sub_doc_key.doc_key();
+    const string test_description = GetTestDescriptionForSubDocKey(sub_doc_key);
+    boost::container::small_vector<size_t, 8> actual_ends;
+    boost::container::small_vector<size_t, 8> input_ends;
+    std::vector<size_t> expected_ends;
+    SubDocKey cur_key;
+
+    SCOPED_TRACE(test_description);
+
+    // Find ID end.
+    if (doc_key.has_cotable_id() || doc_key.has_pgtable_id()) {
+      if (doc_key.has_cotable_id()) {
+        cur_key.doc_key().set_cotable_id(doc_key.cotable_id());
+      } else if (doc_key.has_pgtable_id()) {
+        cur_key.doc_key().set_pgtable_id(doc_key.pgtable_id());
+      }
+      // Subtract one because kGroupEnd doesn't count.
+      expected_ends.push_back(cur_key.Encode().size() - 1);
+    } else {
+      expected_ends.push_back(0);
+    }
+
+    // Find whole DocKey end.
+    if (doc_key.has_hash()) {
+      cur_key.doc_key().set_hash(doc_key.hash());
+      for (const PrimitiveValue& hashed_group_elem : doc_key.hashed_group()) {
+        cur_key.doc_key().hashed_group().push_back(hashed_group_elem);
+      }
+    }
+    for (const PrimitiveValue& range_group_elem : doc_key.range_group()) {
+      cur_key.doc_key().range_group().push_back(range_group_elem);
+    }
+    if (doc_key.has_pgtable_id() &&
+        doc_key.hashed_group().empty() &&
+        doc_key.range_group().empty()) {
+      // ...but an empty key doesn't count (for colocated table tombstones).
+    } else {
+      expected_ends.push_back(cur_key.Encode().size());
+    }
+
+    // Find subkey ends.
+    for (const auto& subkey : sub_doc_key.subkeys()) {
+      cur_key.subkeys().push_back(subkey);
+      expected_ends.push_back(cur_key.Encode().size());
+    }
+
+    // Verify DecodeDocKeyAndSubKeyEnds, supplying all possible valid arguments for its out
+    // parameter.
+    // Verify with empty out.
+    ASSERT_OK(SubDocKey::DecodeDocKeyAndSubKeyEnds(sub_doc_key.Encode().AsSlice(), &actual_ends));
+    ASSERT_EQ(yb::ToString(expected_ends), yb::ToString(actual_ends));
+    for (const size_t input_end : expected_ends) {
+      input_ends.push_back(input_end);
+      actual_ends = input_ends;
+      // Verify with partially filled out.
+      ASSERT_OK(SubDocKey::DecodeDocKeyAndSubKeyEnds(sub_doc_key.Encode().AsSlice(), &actual_ends));
+      ASSERT_EQ(yb::ToString(expected_ends), yb::ToString(actual_ends));
+    }
+  }
+}
+
 TEST_F(DocKeyTest, TestEnumerateIntents) {
   for (const auto& sub_doc_key : GetVariedSubDocKeys()) {
     for (auto partial_range_key_intents : PartialRangeKeyIntents::kValues) {
@@ -567,20 +624,31 @@ TEST_F(DocKeyTest, TestEnumerateIntents) {
       std::vector<SubDocKey> expected_intents;
       SubDocKey current_expected_intent;
 
-      if (sub_doc_key.doc_key().has_cotable_id()) {
-        DocKey cotable_id_only_doc_key;
-        cotable_id_only_doc_key.set_cotable_id(sub_doc_key.doc_key().cotable_id());
-        current_expected_intent = SubDocKey(cotable_id_only_doc_key);
+      if (sub_doc_key.doc_key().has_cotable_id() || sub_doc_key.doc_key().has_pgtable_id()) {
+        DocKey table_id_only_doc_key;
+        if (sub_doc_key.doc_key().has_cotable_id()) {
+          table_id_only_doc_key.set_cotable_id(sub_doc_key.doc_key().cotable_id());
+        } else {
+          table_id_only_doc_key.set_pgtable_id(sub_doc_key.doc_key().pgtable_id());
+        }
+        current_expected_intent = SubDocKey(table_id_only_doc_key);
         expected_intents.push_back(current_expected_intent);
       } else {
         expected_intents.push_back(SubDocKey());
       }
 
       if (!sub_doc_key.doc_key().hashed_group().empty()) {
-        current_expected_intent = SubDocKey(DocKey(
-            sub_doc_key.doc_key().cotable_id(),
-            sub_doc_key.doc_key().hash(),
-            sub_doc_key.doc_key().hashed_group()));
+        if (sub_doc_key.doc_key().has_cotable_id()) {
+          current_expected_intent = SubDocKey(DocKey(
+              sub_doc_key.doc_key().cotable_id(),
+              sub_doc_key.doc_key().hash(),
+              sub_doc_key.doc_key().hashed_group()));
+        } else {
+          current_expected_intent = SubDocKey(DocKey(
+              sub_doc_key.doc_key().pgtable_id(),
+              sub_doc_key.doc_key().hash(),
+              sub_doc_key.doc_key().hashed_group()));
+        }
         expected_intents.push_back(current_expected_intent);
       }
 

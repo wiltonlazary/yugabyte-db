@@ -151,7 +151,7 @@ Status BuildTable(const std::string& dbname,
 
     CompactionIterator c_iter(iter, internal_comparator->user_comparator(),
                               &merge, kMaxSequenceNumber, &snapshots,
-                              earliest_write_conflict_snapshot, env,
+                              earliest_write_conflict_snapshot,
                               true /* internal key corruption is not ok */);
     c_iter.SeekToFirst();
     for (; c_iter.Valid(); c_iter.Next()) {
@@ -197,9 +197,9 @@ Status BuildTable(const std::string& dbname,
     if (s.ok() && !empty && !ioptions.disable_data_sync) {
       StopWatch sw(env, ioptions.statistics, TABLE_SYNC_MICROS);
       if (is_split_sst) {
-        data_file_writer->Sync(ioptions.use_fsync);
+        RETURN_NOT_OK(data_file_writer->Sync(ioptions.use_fsync));
       }
-      base_file_writer->Sync(ioptions.use_fsync);
+      RETURN_NOT_OK(base_file_writer->Sync(ioptions.use_fsync));
     }
     if (s.ok() && !empty && is_split_sst) {
       s = data_file_writer->Close();
@@ -211,7 +211,7 @@ Status BuildTable(const std::string& dbname,
     if (s.ok() && !empty) {
       // Verify that the table is usable
       std::unique_ptr<InternalIterator> it(table_cache->NewIterator(
-          ReadOptions(), env_options, internal_comparator, meta->fd, nullptr,
+          ReadOptions(), env_options, internal_comparator, meta->fd, meta->UserFilter(), nullptr,
           (internal_stats == nullptr) ? nullptr
                                       : internal_stats->GetFileReadHist(0),
           false));
@@ -230,9 +230,9 @@ Status BuildTable(const std::string& dbname,
   }
 
   if (!s.ok() || meta->fd.GetTotalFileSize() == 0) {
-    env->DeleteFile(base_fname);
+    env->CleanupFile(base_fname);
     if (is_split_sst) {
-      env->DeleteFile(data_fname);
+      env->CleanupFile(data_fname);
     }
   }
   return s;

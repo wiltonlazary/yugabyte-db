@@ -12,6 +12,7 @@ import platform
 import shutil
 import sys
 import re
+import distro
 
 from subprocess import call, check_output
 from xml.dom import minidom
@@ -25,8 +26,8 @@ THIRDPARTY_PREFIX_RE = re.compile('^thirdparty/(.*)$')
 
 class ReleaseUtil(object):
     """Packages a YugaByte package with the appropriate file naming schema."""
-    def __init__(self, repository, build_type, distribution_path, force, commit,
-                 build_root):
+    def __init__(self, repository, build_type, distribution_path, force, commit, build_root,
+                 package_name):
         self.repo = repository
         self.build_type = build_type
         self.build_path = os.path.join(self.repo, 'build')
@@ -41,7 +42,7 @@ class ReleaseUtil(object):
             'Unable to read {0} file'.format(RELEASE_VERSION_FILE)
 
         with open(os.path.join(self.repo, RELEASE_MANIFEST_NAME)) as f:
-            self.release_manifest = json.load(f)
+            self.release_manifest = json.load(f)[package_name]
         assert self.release_manifest is not None, \
             'Unable to read {0} file'.format(RELEASE_MANIFEST_NAME)
         self.build_root = build_root
@@ -55,8 +56,7 @@ class ReleaseUtil(object):
         return self.release_manifest
 
     def get_seed_executable_patterns(self):
-        return self.release_manifest['bin'] + [
-            os.path.join(self.build_root, 'postgres', 'bin', '*')]
+        return self.release_manifest['bin']
 
     def expand_value(self, old_value):
         """
@@ -86,12 +86,12 @@ class ReleaseUtil(object):
         """
         Rewrite the release manifest expanding values using expand_value function.
         """
-        for key, values in self.release_manifest.iteritems():
+        for key, values in self.release_manifest.items():
             if isinstance(values, dict):
-                for k, v in values.iteritems():
+                for k, v in values.items():
                     values[k] = self.expand_value(v)
             else:
-                for i in xrange(len(values)):
+                for i in range(len(values)):
                     values[i] = self.expand_value(values[i])
 
     def repo_expand_path(self, path):
@@ -110,7 +110,7 @@ class ReleaseUtil(object):
         """
         for dir_from_manifest in self.release_manifest:
             if dir_from_manifest == '%symlinks%':
-                for dst, target in self.release_manifest[dir_from_manifest].iteritems():
+                for dst, target in self.release_manifest[dir_from_manifest].items():
                     dst = os.path.join(distribution_dir, dst)
                     logging.debug("Creating symlink {} -> {}".format(dst, target))
                     mkdir_p(os.path.dirname(dst))
@@ -146,7 +146,7 @@ class ReleaseUtil(object):
 
     @staticmethod
     def get_head_commit_hash():
-        return check_output(["git", "rev-parse", "HEAD"]).strip()
+        return check_output(["git", "rev-parse", "HEAD"]).strip().decode()
 
     def get_release_file(self):
         """
@@ -163,7 +163,7 @@ class ReleaseUtil(object):
 
         system = platform.system().lower()
         if system == "linux":
-            system = platform.linux_distribution(full_distribution_name=False)[0].lower()
+            system = distro.linux_distribution(full_distribution_name=False)[0].lower()
 
         release_file_name = "yugabyte-{}-{}-{}.tar.gz".format(
             release_name, system, platform.machine().lower())
@@ -182,15 +182,22 @@ class ReleaseUtil(object):
         tmp_distribution_dir = os.path.join(tmp_parent_dir, yugabyte_folder_prefix)
         shutil.move(self.distribution_path, tmp_distribution_dir)
 
+        def change_permissions(mode):
+            logging.info(
+                "Changing permissions recursively on directory '%s': %s", tmp_distribution_dir,
+                mode)
+            cmd_line = ['chmod', '-R', mode, tmp_distribution_dir]
+            run_program(cmd_line, cwd=tmp_parent_dir, log_command=True)
+
         try:
             release_file = self.get_release_file()
-            logging.info(
-                    "Changing permissions recursively on directory '%s' to make it user-writable",
-                    tmp_distribution_dir)
-            run_program(['chmod', '-R', 'u+w', tmp_distribution_dir],
-                        cwd=tmp_parent_dir)
-            logging.info("Creating a package '{}' from directory {}".format(
-                release_file, tmp_distribution_dir))
+            change_permissions('u+w')
+            change_permissions('a+r')
+            # From chmod manpage, "+X" means: set the execute/search bits if the file is a directory
+            # or any of the execute/search bits are set in the original (unmodified) mode.
+            change_permissions('a+X')
+            logging.info("Creating a package '%s' from directory %s",
+                         release_file, tmp_distribution_dir)
             run_program(['gtar', 'cvzf', release_file, yugabyte_folder_prefix],
                         cwd=tmp_parent_dir)
             return release_file
@@ -209,6 +216,6 @@ def check_for_local_changes():
         is_dirty = True
 
     if is_dirty:
-        prompt_input = raw_input("Continue [Y/n]: ").strip().lower()
+        prompt_input = input("Continue [Y/n]: ").strip().lower()
         if prompt_input not in ['y', 'yes', '']:
             sys.exit(1)

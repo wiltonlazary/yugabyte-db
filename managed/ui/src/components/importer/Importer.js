@@ -3,14 +3,14 @@
 import React, { Fragment, Component } from 'react';
 import { Row, Col } from 'react-bootstrap';
 import { YBFormInput, YBFormSelect, YBButton } from '../common/forms/fields';
-import { getPromiseState } from 'utils/PromiseUtils';
+import { getPromiseState } from '../../utils/PromiseUtils';
 import { isNonEmptyObject } from "../../utils/ObjectUtils";
 import Highlight from 'react-highlight';
 import { Link } from 'react-router';
 import { Formik, Field } from 'formik';
 import * as Yup from "yup";
 import './Importer.scss';
-import { showOrRedirect } from 'utils/LayoutUtils';
+import { showOrRedirect } from '../../utils/LayoutUtils';
 
 const stepsEnum = [
   "BEGIN",
@@ -210,12 +210,9 @@ export default class Importer extends Component {
             this.submitForm(payload);
             setSubmitting(false);
           }}
-          render={({
-            handleSubmit,
-            isSubmitting
-          }) => (
-            <form name="ImportUniverse"
-              onSubmit={handleSubmit}>
+        >
+          {({ handleSubmit, isSubmitting }) => (
+            <form name="ImportUniverse" onSubmit={handleSubmit}>
               <Row>
                 <h2 className="content-title">Import Existing Universe</h2>
                 <Col md={8} sm={12}>
@@ -247,7 +244,7 @@ export default class Importer extends Component {
               </Row>
             </form>
           )}
-        />
+        </Formik>
       </div>
     );
   }

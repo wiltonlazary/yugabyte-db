@@ -16,6 +16,7 @@ import time
 
 
 from googleapiclient import discovery
+from googleapiclient.errors import HttpError
 import oauth2client
 from six.moves import http_client
 
@@ -37,7 +38,7 @@ YB_NETWORK_NAME = "yb-gcp-network"
 YB_SUBNET_FORMAT = "yb-subnet-{}"
 YB_PEERING_CONNECTION_FORMAT = "yb-peering-{}-with-{}"
 YB_FIREWALL_NAME = "yb-internal-firewall"
-YB_FIREWALL_TARGET_TAGS = ["cluster-server"]
+YB_FIREWALL_TARGET_TAGS = "cluster-server"
 
 
 GCP_SCRATCH = "scratch"
@@ -92,6 +93,10 @@ def gcp_request_limit_retry(fn):
     return request_retry_decorator(fn, gcp_exception_handler)
 
 
+def get_firewall_tags():
+    return os.environ.get('YB_FIREWALL_TAGS', YB_FIREWALL_TARGET_TAGS).split(',')
+
+
 class GcpMetadata():
     METADATA_URL_BASE = "http://metadata.google.internal/computeMetadata/v1"
     CUSTOM_HEADERS = {
@@ -110,6 +115,15 @@ class GcpMetadata():
     @staticmethod
     def project():
         return GcpMetadata._query_endpoint("/project/project-id")
+
+    @staticmethod
+    def host_project():
+        network_data = GcpMetadata._query_endpoint("instance/network-interfaces/0/network")
+        try:
+            # Network data is of format projects/PROJECT_NUMBER/networks/NETWORK_NAME
+            return network_data.split('/')[1]
+        except (IndexError, AttributeError):
+            return None
 
     @staticmethod
     def network():
@@ -160,7 +174,7 @@ class Waiter():
 
 
 class NetworkManager():
-    def __init__(self, project, compute, metadata, dest_vpc_id, host_vpc_id):
+    def __init__(self, project, compute, metadata, dest_vpc_id, host_vpc_id, per_region_meta):
         self.project = project
         self.compute = compute
         self.metadata = metadata
@@ -174,6 +188,7 @@ class NetworkManager():
         self.host_vpc_id = host_vpc_id if host_vpc_id is not None else GcpMetadata.network()
         if self.host_vpc_id is not None:
             self.host_vpc_id = self.host_vpc_id.split("/")[-1]
+        self.per_region_meta = per_region_meta
 
         self.waiter = Waiter(self.project, self.compute)
 
@@ -184,11 +199,21 @@ class NetworkManager():
         }
 
     def get_network_data(self, network_name):
+        # If user has specified network data through per_region_meta, then do not validate any
+        # data through GCP API and simply return the relevant fields.
+        output_region_to_subnet_map = {}
+        for region in self.per_region_meta.keys():
+            output_region_to_subnet_map[region] = self.per_region_meta.get(
+                region, {}).get("subnetId")
+
+        if output_region_to_subnet_map:
+            return self.network_info_as_json(network_name, output_region_to_subnet_map)
+
         networks = self.get_networks(network_name)
         if len(networks) == 0:
             raise YBOpsRuntimeError("Invalid target VPC: {}".format(network_name))
         network = networks[0]
-        output_region_to_subnet_map = {}
+
         subnet_map = self.get_region_subnet_map(network.get("selfLink"))
         for region_name, scope in subnet_map.iteritems():
             region = region_name.split("/")[1]
@@ -198,7 +223,7 @@ class NetworkManager():
         return self.network_info_as_json(network_name, output_region_to_subnet_map)
 
     def bootstrap(self):
-        # If we were given a target VPC, then just query it's data, don't create anything...
+        # If given a target VPC, then don't create anything.
         if self.dest_vpc_id:
             return self.get_network_data(self.dest_vpc_id)
         # If we were not given a target VPC, then we'll try to provision our custom network.
@@ -294,6 +319,10 @@ class NetworkManager():
             project=self.project, network=network_name).execute()
 
     def get_subnetworks(self, region, name=None):
+        saved_subnet = self.per_region_meta.get(region, {}).get("subnetId")
+        if saved_subnet:
+            return saved_subnet
+
         network_name = YB_NETWORK_NAME
         if self.dest_vpc_id is not None:
             network_name = self.dest_vpc_id
@@ -372,18 +401,27 @@ class NetworkManager():
             "name": firewall_name,
             "network": network_url,
             "description": "Open up all ports for internal IPs",
-            "targetTags": YB_FIREWALL_TARGET_TAGS,
+            "targetTags": get_firewall_tags(),
             "sourceRanges": ip_cidr_list,
             "allowed": [{"IPProtocol": p} for p in ["tcp", "udp", "icmp"]]
             }
         fw_object = self.compute.firewalls()
         if firewall_exists:
-            # Only update if any of these CIDRs are not already there.
+            # Only update if any of these CIDRs are not already there or if targetFlags should
+            # be updated.
             firewall = firewalls[0]
             source_cidrs = set(firewall.get("sourceRanges"))
             new_cidrs = set(ip_cidr_list)
             union_cidrs = source_cidrs | new_cidrs
-            if source_cidrs != union_cidrs:
+
+            current_tags = set(firewall.get("targetTags"))
+            new_tags = set(get_firewall_tags())
+            union_tags = current_tags | new_tags
+            if source_cidrs != union_cidrs or current_tags != union_tags:
+                body["sourceRanges"] = list(union_cidrs)
+                body["targetTags"] = list(union_tags)
+                # Use 'fw_object.update' and not 'fw_object.patch' to update firewall metadata
+                # without removing pre-existing info.
                 return fw_object.update(
                     project=self.project,
                     firewall=firewall_name,
@@ -483,17 +521,20 @@ class GoogleCloudAdmin():
         self.metadata = metadata
         self.waiter = Waiter(self.project, self.compute)
 
-    def network(self, dest_vpc_id=None, host_vpc_id=None):
-        return NetworkManager(self.project, self.compute, self.metadata, dest_vpc_id, host_vpc_id)
+    def network(self, dest_vpc_id=None, host_vpc_id=None, per_region_meta={}):
+        return NetworkManager(
+            self.project, self.compute, self.metadata, dest_vpc_id, host_vpc_id, per_region_meta)
 
     @staticmethod
     def get_current_host_info():
         network = GcpMetadata.network()
+        host_project = GcpMetadata.host_project()
         project = GcpMetadata.project()
         if network is None or project is None:
             raise YBOpsRuntimeError("Host not in GCP.")
         return {
             "network": network.split("/")[-1],
+            "host_project": host_project,
             "project": project
         }
 
@@ -518,6 +559,27 @@ class GoogleCloudAdmin():
                                                         instance=instance,
                                                         body=body).execute()
         self.waiter.wait(operation, zone)
+
+    def update_disk(self, args, instance):
+        zone = args.zone
+        instance_info = self.compute.instances().get(project=self.project, zone=zone,
+                                                     instance=instance).execute()
+        body = {
+            "sizeGb": args.volume_size
+        }
+        print("Got instance info: " + str(instance_info))
+        for disk in instance_info['disks']:
+            # Bootdisk should be ignored.
+            if disk['index'] != 0:
+                # The source is the complete URL of the disk, with the last
+                # component being the name.
+                disk_name = disk['source'].split('/')[-1]
+                print("Updating disk " + disk_name)
+                operation = self.compute.disks().resize(project=self.project,
+                                                        zone=zone,
+                                                        disk=disk_name,
+                                                        body=body).execute()
+                self.waiter.wait(operation, zone=zone)
 
     def delete_instance(self, zone, instance_name):
         operation = self.compute.instances().delete(project=self.project,
@@ -545,14 +607,8 @@ class GoogleCloudAdmin():
         """
 
     def get_zones(self, region, max_results=LIST_MAX_RESULTS):
-        filter = "(status eq UP)(region eq {})".format(REGIONS_RESOURCE_URL_FORMAT.format(
-            self.project, region))
-        fields = "items(name)"
-        zone_items = self.compute.zones().list(project=self.project,
-                                               filter=filter,
-                                               fields=fields,
-                                               maxResults=max_results).execute()
-        return [item["name"] for item in zone_items["items"]]
+        return ["{}-{}".format(region, zone)
+                for zone in self.metadata['regions'].get(region, {}).get('zones', [])]
 
     def get_instance_types_by_zone(self, zone):
         fields = "items(name,description,guestCpus,memoryMb,isSharedCpu)"
@@ -621,10 +677,10 @@ class GoogleCloudAdmin():
 
     def create_instance(self, region, zone, cloud_subnet, instance_name, instance_type, server_type,
                         use_preemptible, can_ip_forward, machine_image, num_volumes, volume_type,
-                        volume_size, boot_disk_size_gb=None, ssh_keys=None):
-        # TODO: we need the network name during create instance and this way we can keep it in the
-        # provider config and set it as an env var.
+                        volume_size, boot_disk_size_gb=None, assign_public_ip=True, ssh_keys=None):
         network_name = os.environ.get("CUSTOM_GCE_NETWORK", YB_NETWORK_NAME)
+        # Name of the project that target VPC network belongs to.
+        host_project = os.environ.get("GCE_HOST_PROJECT", self.project)
 
         boot_disk_json = {
             "autoDelete": True,
@@ -637,6 +693,8 @@ class GoogleCloudAdmin():
             # Default: 10GB
             boot_disk_init_params["diskSizeGb"] = boot_disk_size_gb
         boot_disk_json["initializeParams"] = boot_disk_init_params
+
+        accessConfigs = [{"natIP": None}] if assign_public_ip else None
 
         body = {
             "canIpForward": can_ip_forward,
@@ -657,16 +715,12 @@ class GoogleCloudAdmin():
             },
             "name": instance_name,
             "networkInterfaces": [{
-                "accessConfigs": [{
-                    "natIP": None
-                }],
-                "network": "projects/{}/global/networks/{}".format(
-                    self.project, network_name),
-                "subnetwork": "regions/{}/subnetworks/{}".format(
-                    region, cloud_subnet)
+                "accessConfigs": accessConfigs,
+                "subnetwork": "projects/{}/regions/{}/subnetworks/{}".format(
+                    host_project, region, cloud_subnet)
             }],
             "tags": {
-                "items": YB_FIREWALL_TARGET_TAGS
+                "items": get_firewall_tags()
             },
             "scheduling": {
               "preemptible": use_preemptible

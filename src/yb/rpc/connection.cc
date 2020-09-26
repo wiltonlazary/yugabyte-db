@@ -62,7 +62,7 @@ using strings::Substitute;
 DEFINE_uint64(rpc_connection_timeout_ms, yb::NonTsanVsTsan(15000, 30000),
     "Timeout for RPC connection operations");
 
-METRIC_DEFINE_histogram(
+METRIC_DEFINE_histogram_with_percentiles(
     server, handler_latency_outbound_transfer, "Time taken to transfer the response ",
     yb::MetricUnit::kMicroseconds, "Microseconds spent to queue and write the response to the wire",
     60000000LU, 2);
@@ -148,6 +148,9 @@ void Connection::Shutdown(const Status& status) {
 
   stream_->Shutdown(status);
   timer_.Shutdown();
+
+  // TODO(bogdan): re-enable once we decide how to control verbose logs better...
+  // LOG_WITH_PREFIX(INFO) << "Connection::Shutdown completed, status: " << status;
 }
 
 void Connection::OutboundQueued() {
@@ -166,6 +169,8 @@ void Connection::OutboundQueued() {
 
 void Connection::HandleTimeout(ev::timer& watcher, int revents) {  // NOLINT
   DCHECK(reactor_->IsCurrentThread());
+  DVLOG_WITH_PREFIX(5) << "Connection::HandleTimeout revents: " << revents
+                       << " connected: " << stream_->IsConnected();
 
   if (EV_ERROR & revents) {
     LOG_WITH_PREFIX(WARNING) << "Got an error in handle timeout";
@@ -178,6 +183,7 @@ void Connection::HandleTimeout(ev::timer& watcher, int revents) {  // NOLINT
   if (!stream_->IsConnected()) {
     const MonoDelta timeout = FLAGS_rpc_connection_timeout_ms * 1ms;
     deadline = last_activity_time_ + timeout;
+    DVLOG_WITH_PREFIX(5) << Format("now: $0, deadline: $1, timeout: $2", now, deadline, timeout);
     if (now > deadline) {
       auto passed = reactor_->cur_time() - last_activity_time_;
       reactor_->DestroyConnection(
@@ -239,6 +245,9 @@ size_t Connection::DoQueueOutboundData(OutboundDataPtr outbound_data, bool batch
   DVLOG_WITH_PREFIX(4) << "Connection::DoQueueOutboundData: " << AsString(outbound_data);
 
   if (!shutdown_status_.ok()) {
+    YB_LOG_EVERY_N_SECS(INFO, 5) << "Connection::DoQueueOutboundData data: "
+                                 << AsString(outbound_data) << " shutdown_status_: "
+                                 << shutdown_status_;
     outbound_data->Transferred(shutdown_status_, this);
     return std::numeric_limits<size_t>::max();
   }
@@ -476,6 +485,7 @@ void Connection::Close() {
 
 void Connection::UpdateLastActivity() {
   last_activity_time_ = reactor_->cur_time();
+  VLOG_WITH_PREFIX(4) << "Updated last_activity_time_=" << AsString(last_activity_time_);
 }
 
 void Connection::UpdateLastRead() {

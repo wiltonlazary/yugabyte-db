@@ -1,8 +1,8 @@
 ---
-title: DROP CAST
+title: DROP CAST statement [YSQL]
+headerTitle: DROP CAST
 linkTitle: DROP CAST
-summary: Remove a cast
-description: DROP CAST
+description: Use the DROP CAST statement to remove a cast.
 menu:
   latest:
     identifier: api-ysql-commands-drop-cast
@@ -62,5 +62,4 @@ yugabyte=# DROP CAST (integer AS date);
 ## See also
 
 - [`CREATE CAST`](../ddl_create_cast)
-
-[postgresql-docs-drop-cast]: https://www.postgresql.org/docs/current/sql-dropcast.html
+- [postgresql-docs-drop-cast](https://www.postgresql.org/docs/current/sql-dropcast.html)

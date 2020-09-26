@@ -8,18 +8,18 @@ import PropTypes from 'prop-types';
 import { FormattedDate, FormattedRelative } from 'react-intl';
 import { ClusterInfoPanelContainer, YBWidget } from '../../panels';
 import { OverviewMetricsContainer, StandaloneMetricsPanelContainer, DiskUsagePanel, CpuUsagePanel } from '../../metrics';
-import { YBResourceCount, YBCost, DescriptionList, YBCodeBlock } from 'components/common/descriptors';
+import { YBResourceCount, YBCost, DescriptionList, YBCodeBlock } from '../../../components/common/descriptors';
 import { RegionMap, YBMapLegend} from '../../maps';
 import { isNonEmptyObject, isNullOrEmpty,
-  isNonEmptyArray, isNonEmptyString } from 'utils/ObjectUtils';
+  isNonEmptyArray, isNonEmptyString } from '../../../utils/ObjectUtils';
 import { isKubernetesUniverse, getPrimaryCluster } from '../../../utils/UniverseUtils';
 import { FlexContainer, FlexGrow, FlexShrink } from '../../common/flexbox/YBFlexBox';
 import { isDefinedNotNull } from '../../../utils/ObjectUtils';
-import { getPromiseState } from 'utils/PromiseUtils';
+import { getPromiseState } from '../../../utils/PromiseUtils';
 import { YBButton, YBModal } from '../../common/forms/fields';
 import moment from 'moment';
 import pluralize from 'pluralize';
-import { isEnabled, isDisabled } from 'utils/LayoutUtils';
+import { isEnabled, isDisabled } from '../../../utils/LayoutUtils';
 
 class DatabasePanel extends PureComponent {
   static propTypes = {
@@ -181,9 +181,19 @@ class HealthInfoPanel extends PureComponent {
 
   render() {
     const { healthCheck, universeInfo } = this.props;
+    let disabledUntilStr = '';
     if (getPromiseState(healthCheck).isSuccess()) {
       const healthCheckData = JSON.parse([...healthCheck.data].reverse()[0]);
       const lastUpdateDate = moment(healthCheckData.timestamp);
+      if (universeInfo.universeConfig && 'disableAlertsUntilSecs' in universeInfo.universeConfig) {
+        const disabledUntilSecs = Number(universeInfo.universeConfig.disableAlertsUntilSecs);
+        const now = Date.now() / 1000;
+        if (!Number.isSafeInteger(disabledUntilSecs)) {
+          disabledUntilStr = " Alerts are snoozed";
+        } else if (disabledUntilSecs > now) {
+          disabledUntilStr = " Alerts are snoozed until " + moment.unix(disabledUntilSecs).format("MMM DD hh:mm a");
+        }
+      }
       const totalNodesCounter = healthCheckData.data.length;
       let errorNodesCounter = 0;
 
@@ -217,6 +227,10 @@ class HealthInfoPanel extends PureComponent {
           ? <span className="text-lightgray text-light"><i className={"fa fa-clock-o"}></i> Updated <span className={"text-dark text-normal"}><FormattedRelative
           value={lastUpdateDate} /></span></span>
           : null
+        },
+        {name: "", data: disabledUntilStr
+        ? <span className="text-light"><i className={"fa fa-exclamation-triangle"}>{disabledUntilStr}</i></span>
+        : null
         },
       ];
 
@@ -342,7 +356,7 @@ export default class UniverseOverviewNew extends Component {
         body={
           <FlexContainer direction={"column"} >
             <FlexGrow>
-              <div style={{marginBottom: '30px'}}>Load a retail data set and run queries against it.</div>
+              <div style={{marginBottom: '30px'}}>Load a data set and run queries against it.</div>
             </FlexGrow>
             <FlexShrink className={"centered"}>
               <Fragment>
@@ -358,9 +372,9 @@ export default class UniverseOverviewNew extends Component {
                   cancelLabel={"Close"}
                   showCancelButton={true}
                 >
-                  <div>Create a sample retail database:</div>
+                  <div>Query a sample database:</div>
                   <YBCodeBlock>
-                    yugabyted demo
+                    yugabyted demo connect
                   </YBCodeBlock>
                   <div>Explore YSQL at <a href="https://docs.yugabyte.com/latest/quick-start/explore-ysql/">here</a>.</div>
                 </YBModal>
@@ -547,13 +561,16 @@ export default class UniverseOverviewNew extends Component {
 
   getDatabaseWidget = (universeInfo, tasks) => {
     const lastUpdateDate = this.getLastUpdateDate();
-    const { updateAvailable } = this.props;
+    const { updateAvailable, currentCustomer } = this.props;
+    const showUpdate = updateAvailable &&
+                       isEnabled(currentCustomer.data.features, "universes.actions");
+
     const infoWidget = (<YBWidget
         headerLeft={
           "Info"
         }
         headerRight={
-          updateAvailable ? (
+          showUpdate ? (
             <a onClick={this.props.showSoftwareUpgradesModal}>Upgrade <span className="badge badge-pill badge-orange">{updateAvailable}</span></a>
            ) : null
         }
@@ -610,7 +627,6 @@ export default class UniverseOverviewNew extends Component {
               universeUuid={universeInfo.universeUUID}
               type={"overview"}
               origin={"universe"}
-              width={width}
               nodePrefixes={nodePrefixes}
               isKubernetesUniverse={isItKubernetesUniverse}
             />

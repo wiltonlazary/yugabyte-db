@@ -4,16 +4,17 @@ import React, { Component, Fragment } from 'react';
 import axios from 'axios';
 import 'react-bootstrap-table/css/react-bootstrap-table.css';
 import { YBModal, YBButton } from '../../common/forms/fields';
-import { getUniverseEndpoint } from 'actions/common';
+import { getUniverseEndpoint } from '../../../actions/common';
 import { connect } from 'react-redux';
 import { openDialog, closeDialog } from '../../../actions/modal';
 import { FlexContainer, FlexShrink } from '../../common/flexbox/YBFlexBox';
-import { getPromiseState } from 'utils/PromiseUtils';
+import { getPromiseState } from '../../../utils/PromiseUtils';
 import { isNonEmptyObject } from "../../../utils/ObjectUtils";
 import { YBLoading } from '../../common/indicators';
 import { YBCodeBlock, YBCopyButton } from '../../common/descriptors';
 import { getPrimaryCluster } from '../../../utils/UniverseUtils';
-import { isEnabled } from 'utils/LayoutUtils';
+import { isEnabled } from '../../../utils/LayoutUtils';
+import _ from 'lodash';
 
 import './UniverseConnectModal.scss';
 
@@ -90,10 +91,11 @@ class UniverseConnectModal extends Component {
     }
     if (getPromiseState(currentUniverse).isSuccess() && isNonEmptyObject(currentUniverse.data)) {
       const universeInfo = currentUniverse.data;
-      const { universeDetails: { clusters }} = universeInfo;
+      const { universeDetails: { clusters, communicationPorts }} = universeInfo;
       const primaryCluster = getPrimaryCluster(clusters);
       const userIntent = primaryCluster && primaryCluster.userIntent;
       const universeId = universeInfo.universeUUID;
+      const ysqlRpcPort = _.get(communicationPorts, "ysqlServerRpcPort", 5433);
 
       const ysqlServiceUrl = getUniverseEndpoint(universeId) + "/ysqlservers";
       const ycqlServiceUrl = getUniverseEndpoint(universeId) + "/yqlservers";
@@ -111,7 +113,7 @@ class UniverseConnectModal extends Component {
             {this.state.endpointPayload} {this.state.endpointError}
           </YBCodeBlock>
         </Fragment>
-        );
+      );
       const connectIp = this.state.connectIp || '127.0.0.1';
       content = (<Fragment>
         <h4>Services</h4>
@@ -121,7 +123,7 @@ class UniverseConnectModal extends Component {
               <tr>
                 <td>JDBC</td>
                 <td>:</td>
-                <td title={`jdbc:postgresql://${connectIp}:5433/yugabyte`}>jdbc:postgresql://{connectIp}:5433/yugabyte</td>
+                <td title={`jdbc:postgresql://${connectIp}:${ysqlRpcPort}/yugabyte`}>jdbc:postgresql://{connectIp}:{ysqlRpcPort}/yugabyte</td>
               </tr>
               {(userIntent.enableYSQL || isEnabled(currentCustomer.data.features, "universe.defaultYSQL")) &&
                 <tr>
@@ -133,7 +135,7 @@ class UniverseConnectModal extends Component {
               <tr>
                 <td>YCQL Shell</td>
                 <td>:    </td>
-                <td>bin/cqlsh</td>
+                <td>bin/ycqlsh</td>
               </tr>
               <tr>
                 <td>YEDIS Shell</td>

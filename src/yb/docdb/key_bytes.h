@@ -23,6 +23,7 @@
 #include "yb/docdb/doc_kv_util.h"
 #include "yb/docdb/value_type.h"
 #include "yb/util/bytes_formatter.h"
+#include "yb/util/byte_buffer.h"
 #include "yb/util/decimal.h"
 #include "yb/util/enums.h"
 
@@ -33,10 +34,9 @@ namespace docdb {
 // used in our DocDB layer -> RocksDB mapping.
 class KeyBytes {
  public:
-
-  KeyBytes() {}
+  KeyBytes() = default;
   explicit KeyBytes(const std::string& data) : data_(data) {}
-  explicit KeyBytes(const rocksdb::Slice& slice) : data_(slice.ToBuffer()) {}
+  explicit KeyBytes(const Slice& slice) : data_(slice) {}
 
   KeyBytes(const KeyBytes& rhs) = default;
   KeyBytes& operator=(const KeyBytes& rhs) = default;
@@ -60,19 +60,23 @@ class KeyBytes {
   }
 
   std::string ToString() const {
-    return yb::FormatBytesAsStr(data_);
+    return FormatSliceAsStr(data_.AsSlice());
   }
 
   bool empty() const {
     return data_.empty();
   }
 
-  const std::string& data() const {
+  std::string ToStringBuffer() const {
+    return data().ToString();
+  }
+
+  const KeyBuffer& data() const {
     return data_;
   }
 
   void Append(const KeyBytes& other) {
-    data_ += other.data_;
+    data_.append(other.data_);
   }
 
   void AppendRawBytes(const char* raw_bytes, size_t n) {
@@ -80,11 +84,11 @@ class KeyBytes {
   }
 
   void AppendRawBytes(const Slice& slice) {
-    data_.append(slice.cdata(), slice.size());
+    data_.append(slice);
   }
 
   void AppendRawBytes(const std::string& data) {
-    data_ += data;
+    data_.append(data);
   }
 
   void AppendValueType(ValueType value_type) {
@@ -92,11 +96,12 @@ class KeyBytes {
   }
 
   void AppendValueTypeBeforeGroupEnd(ValueType value_type) {
-    if (data_.empty() || data_[data_.size() - 1] != ValueTypeAsChar::kGroupEnd) {
+    if (data_.empty() || data_.back() != ValueTypeAsChar::kGroupEnd) {
       AppendValueType(value_type);
       AppendValueType(ValueType::kGroupEnd);
     } else {
-      data_.insert(data_.size() - 1, 1, static_cast<char>(value_type));
+      data_.back() = static_cast<char>(value_type);
+      data_.push_back(ValueTypeAsChar::kGroupEnd);
     }
   }
 
@@ -121,6 +126,7 @@ class KeyBytes {
       return;
     }
 
+    data_.reserve(data_.size() + encoded_decimal_str.size());
     for (auto c : encoded_decimal_str) {
       data_.push_back(~c);
     }
@@ -201,10 +207,6 @@ class KeyBytes {
     AppendUInt16ToKey(x, &data_);
   }
 
-  void AppendHybridTimeForSeek(HybridTime hybrid_time) {
-    DocHybridTime(hybrid_time, kMaxWriteId).AppendEncodedInDocDbFormat(&data_);
-  }
-
   void AppendHybridTime(const DocHybridTime& hybrid_time) {
     hybrid_time.AppendEncodedInDocDbFormat(&data_);
   }
@@ -235,29 +237,17 @@ class KeyBytes {
     data_.pop_back();
   }
 
-  // Assuming the key bytes currently end with a hybrid time, replace that hybrid time with a
-  // different one.
-  CHECKED_STATUS ReplaceLastHybridTimeForSeek(HybridTime hybrid_time);
-
   size_t size() const { return data_.size(); }
 
   bool IsPrefixOf(const rocksdb::Slice& slice) const {
-    return slice.starts_with(data_);
+    return slice.starts_with(data_.AsSlice());
   }
 
-  // Checks whether the other slice can be obtained by adding an encoded DocHybridTime to
-  // to this encoded key.
-  CHECKED_STATUS OnlyLacksHybridTimeFrom(const rocksdb::Slice& other_slice, bool* result) const;
+  rocksdb::Slice AsSlice() const { return data_.AsSlice(); }
 
-  rocksdb::Slice AsSlice() const { return rocksdb::Slice(data_); }
+  operator Slice() const { return data_.AsSlice(); }
 
-  operator Slice() const { return Slice(data_); }
-
-  // @return This key prefix as a string reference. Assumes the reference won't be used beyond
-  //         the lifetime of this object.
-  const std::string& AsStringRef() const { return data_; }
-
-  void Reset(rocksdb::Slice slice) {
+  void Reset(const Slice& slice) {
     data_.assign(slice.cdata(), slice.size());
   }
 
@@ -270,26 +260,22 @@ class KeyBytes {
   }
 
   int CompareTo(const KeyBytes& other) const {
-    return data_.compare(other.data_);
+    return data_.AsSlice().compare(other.data_.AsSlice());
   }
 
-  int CompareTo(const rocksdb::Slice& other) const {
-    return rocksdb::Slice(data_).compare(other);
+  int CompareTo(const Slice& other) const {
+    return data_.AsSlice().compare(other);
   }
 
   // This can be used to e.g. move the internal state of KeyBytes somewhere else, including a
   // string field in a protobuf, without copying the bytes.
-  std::string* mutable_data() {
+  KeyBuffer* mutable_data() {
     return &data_;
-  }
-
-  std::string ToShortDebugStr() const {
-    return yb::docdb::ToShortDebugStr(data_);
   }
 
   void Truncate(size_t new_size) {
     DCHECK_LE(new_size, data_.size());
-    data_.resize(new_size);
+    data_.Truncate(new_size);
   }
 
   void RemoveLastByte() {
@@ -298,8 +284,7 @@ class KeyBytes {
   }
 
  private:
-
-  std::string data_;
+  KeyBuffer data_;
 };
 
 inline bool operator<(const KeyBytes& lhs, const KeyBytes& rhs) {
@@ -316,6 +301,14 @@ inline bool operator>(const KeyBytes& lhs, const KeyBytes& rhs) {
 
 inline bool operator<=(const KeyBytes& lhs, const KeyBytes& rhs) {
   return !(rhs < lhs);
+}
+
+inline bool operator==(const KeyBytes& lhs, const KeyBytes& rhs) {
+  return lhs.AsSlice() == rhs.AsSlice();
+}
+
+inline bool operator!=(const KeyBytes& lhs, const KeyBytes& rhs) {
+  return lhs.AsSlice() != rhs.AsSlice();
 }
 
 void AppendDocHybridTime(const DocHybridTime& time, KeyBytes* key);

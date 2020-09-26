@@ -1,14 +1,15 @@
 // Copyright (c) YugaByte, Inc.
 
 import React, { Component } from 'react';
-import { getPromiseState } from 'utils/PromiseUtils';
-import { isNonEmptyObject, isDefinedNotNull, isNonEmptyArray, isNonEmptyString } from 'utils/ObjectUtils';
+import { getPromiseState } from '../../../utils/PromiseUtils';
+import { isNonEmptyObject, isDefinedNotNull, isNonEmptyArray, isNonEmptyString } from '../../../utils/ObjectUtils';
 import { withRouter } from 'react-router';
 import _ from 'lodash';
 import ProviderResultView from './views/ProviderResultView';
 import ProviderBootstrapView from './views/ProviderBootstrapView';
 import AWSProviderInitView from './views/AWSProviderInitView';
 import GCPProviderInitView from './views/GCPProviderInitView';
+import { AzureProviderInitView } from './views/AzureProviderInitView';
 import { YBLoading } from '../../common/indicators';
 
 class ProviderConfiguration extends Component {
@@ -22,11 +23,11 @@ class ProviderConfiguration extends Component {
   }
 
   getInitView = () => {
-    const {providerType} = this.props;
-    if (providerType === "gcp") {
-      return <GCPProviderInitView {...this.props}/>;
-    } else if (providerType === "aws") {
-      return <AWSProviderInitView {...this.props}/>;
+    switch (this.props.providerType) {
+      case 'aws': return <AWSProviderInitView {...this.props} />;
+      case 'gcp': return <GCPProviderInitView {...this.props} />;
+      case 'azu': return <AzureProviderInitView featureFlags={this.props.featureFlags} createAzureProvider={this.props.createAzureProvider} />;
+      default: return <div>Unknown provider type <strong>{this.props.providerType}</strong></div>;
     }
   };
 
@@ -112,7 +113,8 @@ class ProviderConfiguration extends Component {
     const { configuredProviders, modal: { visibleModal }, configuredRegions, universeList,
             accessKeys, hideDeleteProviderModal, initializeProvider, showDeleteProviderModal,
             deleteProviderConfig, providerType, hostInfo } = this.props;
-    const currentProvider = configuredProviders.data.find((provider) => provider.code === providerType);
+    const currentProvider = configuredProviders.data
+                              .find((provider) => provider.code === providerType) || {};
     let keyPairName = "Not Configured";
     if (isDefinedNotNull(accessKeys) && isNonEmptyArray(accessKeys.data)) {
       const currentAccessKey = accessKeys.data.find((accessKey) => accessKey.idKey.providerUUID === currentProvider.uuid);
@@ -169,11 +171,12 @@ class ProviderConfiguration extends Component {
           });
         });
       }
-      let currentModal = "";
-      if (providerType === "aws") {
-        currentModal = "deleteAWSProvider";
-      } else if (providerType === "gcp") {
-        currentModal = "deleteGCPProvider";
+      let currentModal = '';
+      switch (providerType) {
+        case 'aws': currentModal = 'deleteAWSProvider'; break;
+        case 'gcp': currentModal = 'deleteGCPProvider'; break;
+        case 'azu': currentModal = 'deleteAzureProvider'; break;
+        default: break;
       }
       const deleteButtonDisabled = universeExistsForProvider;
       return (<ProviderResultView regions={regions} providerInfo={providerInfo}
@@ -190,11 +193,12 @@ class ProviderConfiguration extends Component {
   getBootstrapView = () => {
     const {configuredProviders, reloadCloudMetadata, cloud: {createProvider}, providerType, showDeleteProviderModal,
            modal: { visibleModal }, deleteProviderConfig, hideDeleteProviderModal} = this.props;
-    let currentModal = "";
-    if (providerType === "aws") {
-      currentModal = "deleteAWSProvider";
-    } else if (providerType === "gcp") {
-      currentModal = "deleteGCPProvider";
+    let currentModal = '';
+    switch (providerType) {
+      case 'aws': currentModal = 'deleteAWSProvider'; break;
+      case 'gcp': currentModal = 'deleteGCPProvider'; break;
+      case 'azu': currentModal = 'deleteAzureProvider'; break;
+      default: break;
     }
 
     const currentConfiguredProvider = configuredProviders.data.find((provider) => provider.code === providerType);

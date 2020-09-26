@@ -37,7 +37,9 @@ import java.util.LinkedHashMap;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.assertNotNull;
 import static play.mvc.Http.Status.OK;
+import static play.mvc.Http.Status.BAD_REQUEST;
 import static play.test.Helpers.contentAsString;
 import static org.mockito.Mockito.when;
 import static com.yugabyte.yw.common.AssertHelper.*;
@@ -54,7 +56,6 @@ public class CertificateControllerTest extends FakeDBApplication {
 
   @Before
   public void setUp() {
-    when(mockAppConfig.getString("yb.storage.path")).thenReturn("/tmp");
     customer = ModelFactory.testCustomer();
     user = ModelFactory.testUser(customer);
     for (String cert: test_certs) {
@@ -83,6 +84,18 @@ public class CertificateControllerTest extends FakeDBApplication {
     return FakeApiHelper.doRequestWithAuthToken("GET", uri, user.createAuthToken());
   }
 
+  private Result createClientCertificate(UUID customerUUID, UUID rootUUID,
+                                         ObjectNode bodyJson) {
+    String uri = "/api/customers/" + customerUUID + "/certificates/" + rootUUID;
+    return FakeApiHelper.doRequestWithAuthTokenAndBody("POST", uri, user.createAuthToken(),
+                                                       bodyJson);
+  }
+
+  private Result getRootCertificate(UUID customerUUID, UUID rootUUID) {
+    String uri = "/api/customers/" + customerUUID + "/certificates/" + rootUUID + "/download";
+    return FakeApiHelper.doRequestWithAuthToken("GET", uri, user.createAuthToken());
+  }
+
   @Test
   public void testListCertificates() {
     Result result = listCertificates(customer.uuid);
@@ -94,9 +107,11 @@ public class CertificateControllerTest extends FakeDBApplication {
     for (LinkedHashMap e : certs) {
       result_uuids.add(UUID.fromString(e.get("uuid").toString()));
       result_labels.add(e.get("label").toString());
+      assertEquals(e.get("certType"), "SelfSigned");
     }
     assertEquals(test_certs, result_labels);
     assertEquals(test_certs_uuids, result_uuids);
+    assertAuditEntry(0, customer.uuid);
   }
 
   @Test
@@ -106,6 +121,7 @@ public class CertificateControllerTest extends FakeDBApplication {
     JsonNode json = Json.parse(contentAsString(result));
     assertEquals(OK, result.status());
     assertEquals(cert_uuid, UUID.fromString(json.asText()));
+    assertAuditEntry(0, customer.uuid);
   }
 
   @Test
@@ -117,6 +133,42 @@ public class CertificateControllerTest extends FakeDBApplication {
     Date date = new Date();
     bodyJson.put("certStart", date.getTime());
     bodyJson.put("certExpiry", date.getTime());
+    bodyJson.put("certType", "SelfSigned");
+    Result result = uploadCertificate(customer.uuid, bodyJson);
+    JsonNode json = Json.parse(contentAsString(result));
+    assertEquals(OK, result.status());
+    UUID certUUID = UUID.fromString(json.asText());
+    CertificateInfo ci = CertificateInfo.get(certUUID);
+    assertEquals(ci.label, "test");
+    assertEquals(ci.certType, CertificateInfo.Type.SelfSigned);
+    assertTrue(ci.certificate.contains("/tmp"));
+    assertAuditEntry(1, customer.uuid);
+  }
+
+  @Test
+  public void testUploadCertificateNoKeyFail() {
+    ObjectNode bodyJson = Json.newObject();
+    bodyJson.put("label", "test");
+    bodyJson.put("certContent", "cert_test");
+    Date date = new Date();
+    bodyJson.put("certStart", date.getTime());
+    bodyJson.put("certExpiry", date.getTime());
+    bodyJson.put("certType", "SelfSigned");
+    Result result = uploadCertificate(customer.uuid, bodyJson);
+    assertEquals(BAD_REQUEST, result.status());
+    assertAuditEntry(0, customer.uuid);
+  }
+
+  @Test
+  public void testUploadCustomCertificate() {
+    ObjectNode bodyJson = Json.newObject();
+    bodyJson.put("label", "test");
+    bodyJson.put("certContent", "cert_test");
+    Date date = new Date();
+    bodyJson.put("certStart", date.getTime());
+    bodyJson.put("certExpiry", date.getTime());
+    bodyJson.put("certType", "CustomCertHostPath");
+
     Result result = uploadCertificate(customer.uuid, bodyJson);
     JsonNode json = Json.parse(contentAsString(result));
     assertEquals(OK, result.status());
@@ -124,18 +176,39 @@ public class CertificateControllerTest extends FakeDBApplication {
     CertificateInfo ci = CertificateInfo.get(certUUID);
     assertEquals(ci.label, "test");
     assertTrue(ci.certificate.contains("/tmp"));
+    assertEquals(ci.certType, CertificateInfo.Type.CustomCertHostPath);
+    assertAuditEntry(1, customer.uuid);
   }
 
   @Test
-  public void testUploadCertificateFail() {
+  public void testCreateClientCertificate() {
     ObjectNode bodyJson = Json.newObject();
-    bodyJson.put("label", "test");
-    bodyJson.put("certContent", "cert_test");
     Date date = new Date();
+    bodyJson.put("username", "test");
     bodyJson.put("certStart", date.getTime());
     bodyJson.put("certExpiry", date.getTime());
-    Result result = uploadCertificate(customer.uuid, bodyJson);
-    assertBadRequest(result, "{\"keyContent\":[\"This field is required\"]}");
+    UUID rootCA = CertificateHelper.createRootCA("test-universe", customer.uuid,
+                                                 "/tmp");
+    Result result = createClientCertificate(customer.uuid, rootCA, bodyJson);
+    JsonNode json = Json.parse(contentAsString(result));
+    assertEquals(OK, result.status());
+    String clientCert = json.get("yugabytedb.crt").asText();
+    String clientKey = json.get("yugabytedb.key").asText();
+    assertNotNull(clientCert);
+    assertNotNull(clientKey);
+    assertAuditEntry(1, customer.uuid);
+  }
+
+  @Test
+  public void testGetRootCertificate() {
+    UUID rootCA = CertificateHelper.createRootCA("test-universe", customer.uuid,
+                                                 "/tmp");
+    Result result = getRootCertificate(customer.uuid, rootCA);
+    JsonNode json = Json.parse(contentAsString(result));
+    assertEquals(OK, result.status());
+    String rootCert = json.get("root.crt").asText();
+    assertNotNull(rootCert);
+    assertAuditEntry(1, customer.uuid);
   }
 
 }

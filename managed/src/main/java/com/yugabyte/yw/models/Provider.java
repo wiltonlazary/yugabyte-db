@@ -12,19 +12,25 @@ import javax.persistence.Entity;
 import javax.persistence.Id;
 import javax.persistence.OneToMany;
 
-import com.avaje.ebean.annotation.DbJson;
+import io.ebean.annotation.DbJson;
 import com.fasterxml.jackson.annotation.JsonBackReference;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.yugabyte.yw.commissioner.Common;
+import com.yugabyte.yw.commissioner.tasks.CloudBootstrap;
+import com.yugabyte.yw.commissioner.tasks.CloudBootstrap.Params.PerRegionMetadata;
+import com.yugabyte.yw.commissioner.tasks.params.CloudTaskParams;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.avaje.ebean.Model;
+import io.ebean.*;
 import play.data.validation.Constraints;
 import play.libs.Json;
 
 import static com.yugabyte.yw.models.helpers.CommonUtils.maskConfig;
+import static com.yugabyte.yw.models.helpers.CommonUtils.DEFAULT_YB_HOME_DIR;
 
 @Entity
 public class Provider extends Model {
@@ -87,10 +93,19 @@ public class Provider extends Model {
     }
   }
 
+  @JsonIgnore
+  public String getYbHome() {
+    String ybHomeDir = this.getConfig().getOrDefault("YB_HOME_DIR", "");
+    if (ybHomeDir.isEmpty()) {
+      ybHomeDir = DEFAULT_YB_HOME_DIR;
+    }
+    return ybHomeDir;
+  }
+
   /**
    * Query Helper for Provider with uuid
    */
-  public static final Find<UUID, Provider> find = new Find<UUID, Provider>(){};
+  public static final Finder<UUID, Provider> find = new Finder<UUID, Provider>(Provider.class){};
 
   /**
    * Create a new Cloud Provider
@@ -134,7 +149,7 @@ public class Provider extends Model {
    * @return instance of cloud provider.
    */
   public static Provider get(UUID customerUUID, UUID providerUUID) {
-    return find.where().eq("customer_uuid", customerUUID).idEq(providerUUID).findUnique();
+    return find.query().where().eq("customer_uuid", customerUUID).idEq(providerUUID).findOne();
   }
 
   /**
@@ -143,7 +158,7 @@ public class Provider extends Model {
    * @return list of cloud providers.
    */
   public static List<Provider> getAll(UUID customerUUID) {
-    return find.where().eq("customer_uuid", customerUUID).findList();
+    return find.query().where().eq("customer_uuid", customerUUID).findList();
   }
 
   /**
@@ -154,7 +169,7 @@ public class Provider extends Model {
    * @return
    */
   public static Provider get(UUID customerUUID, Common.CloudType code) {
-    List<Provider> providerList = find.where().eq("customer_uuid", customerUUID)
+    List<Provider> providerList = find.query().where().eq("customer_uuid", customerUUID)
             .eq("code", code.toString()).findList();
     int size = providerList.size();
 
@@ -185,5 +200,33 @@ public class Provider extends Model {
     currentProviderConfig.put("AWS_HOSTED_ZONE_NAME", hostedZoneName);
     this.setConfig(currentProviderConfig);
     this.save();
+  }
+
+  // Used for GCP providers to pass down region information. Currently maps regions to
+  // their subnets. Only user-input fields should be retrieved here (e.g. zones should
+  // not be included for GCP because they're generated from devops).
+  public CloudBootstrap.Params getCloudParams() {
+    CloudBootstrap.Params newParams = new CloudBootstrap.Params();
+    newParams.perRegionMetadata = new HashMap();
+    if (!this.code.equals(Common.CloudType.gcp.toString())) {
+      return newParams;
+    }
+
+    List<Region> regions = Region.getByProvider(this.uuid);
+    if (regions == null || regions.isEmpty()) {
+      return newParams;
+    }
+
+    for (Region r: regions) {
+      List<AvailabilityZone> zones = AvailabilityZone.getAZsForRegion(r.uuid);
+      if (zones == null || zones.isEmpty()) {
+        continue;
+      }
+      PerRegionMetadata regionData = new PerRegionMetadata();
+      // For GCP, a subnet is assigned to each region, so we only need the first zone's subnet.
+      regionData.subnetId = zones.get(0).subnet;
+      newParams.perRegionMetadata.put(r.code, regionData);
+    }
+    return newParams;
   }
 }

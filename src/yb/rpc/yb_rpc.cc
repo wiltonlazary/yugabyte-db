@@ -26,12 +26,12 @@
 #include "yb/rpc/serialization.h"
 
 #include "yb/util/flag_tags.h"
-#include "yb/util/size_literals.h"
 #include "yb/util/debug/trace_event.h"
 #include "yb/util/memory/memory.h"
+#include "yb/util/size_literals.h"
 
 using google::protobuf::io::CodedInputStream;
-using yb::operator"" _MB;
+using namespace yb::size_literals;
 using namespace std::literals;
 
 DECLARE_bool(rpc_dump_all_traces);
@@ -46,9 +46,16 @@ DEFINE_int32(rpc_max_message_size, 255_MB,
 
 DEFINE_bool(enable_rpc_keepalive, true, "Whether to enable RPC keepalive mechanism");
 
+DEFINE_uint64(min_sidecar_buffer_size, 16_KB, "Minimal buffer to allocate for sidecar");
+
+DEFINE_test_flag(int32, yb_inbound_big_calls_parse_delay_ms, false,
+    "Test flag for simulating slow parsing of inbound calls larger than "
+    "rpc_throttle_threshold_bytes");
+
 using std::placeholders::_1;
-DECLARE_int32(rpc_slow_query_threshold_ms);
 DECLARE_uint64(rpc_connection_timeout_ms);
+DECLARE_int32(rpc_slow_query_threshold_ms);
+DECLARE_int32(rpc_throttle_threshold_bytes);
 
 namespace yb {
 namespace rpc {
@@ -144,13 +151,26 @@ Result<ProcessDataResult> YBInboundConnectionContext::ProcessCalls(
     IoVecs data_copy(data);
     data_copy[0].iov_len -= kConnectionHeaderSize;
     data_copy[0].iov_base = const_cast<uint8_t*>(slice.data() + kConnectionHeaderSize);
-    auto result = VERIFY_RESULT(parser().Parse(connection, data_copy, ReadBufferFull::kFalse));
+    auto result = VERIFY_RESULT(
+        parser().Parse(connection, data_copy, ReadBufferFull::kFalse, &call_tracker()));
     result.consumed += kConnectionHeaderSize;
     return result;
   }
 
-  return parser().Parse(connection, data, read_buffer_full);
+  return parser().Parse(connection, data, read_buffer_full, &call_tracker());
 }
+
+namespace {
+
+CHECKED_STATUS ThrottleRpcStatus(const MemTrackerPtr& throttle_tracker, const YBInboundCall& call) {
+  if (ShouldThrottleRpc(throttle_tracker, call.request_data().size(), "Rejecting RPC call: ")) {
+    return STATUS_FORMAT(ServiceUnavailable, "Call rejected due to memory pressure: $0", call);
+  } else {
+    return Status::OK();
+  }
+}
+
+} // namespace
 
 Status YBInboundConnectionContext::HandleCall(
     const ConnectionPtr& connection, CallData* call_data) {
@@ -167,6 +187,12 @@ Status YBInboundConnectionContext::HandleCall(
   s = Store(call.get());
   if (!s.ok()) {
     return s;
+  }
+
+  auto throttle_status = ThrottleRpcStatus(call_tracker(), *call);
+  if (!throttle_status.ok()) {
+    call->RespondFailure(ErrorStatusPB::ERROR_APPLICATION, throttle_status);
+    return Status::OK();
   }
 
   reactor->messenger()->QueueInboundCall(call);
@@ -267,33 +293,65 @@ Status YBInboundCall::ParseFrom(const MemTrackerPtr& mem_tracker, CallData* call
   return Status::OK();
 }
 
-Status YBInboundCall::AddRpcSidecar(RefCntBuffer car, int* idx) {
-  // Check that the number of sidecars does not exceed the number of payload
-  // slices that are free.
-  *idx = static_cast<int>(sidecars_.size());
-  if(consumption_) {
-    consumption_.Add(car.size());
+size_t YBInboundCall::CopyToLastSidecarBuffer(const Slice& car) {
+  if (sidecar_buffers_.empty()) {
+    return 0;
   }
-  sidecars_.push_back(std::move(car));
+  auto& last_buffer =  sidecar_buffers_.back();
+  auto len = std::min(last_buffer.size() - filled_bytes_in_last_sidecar_buffer_, car.size());
+  memcpy(last_buffer.data() + filled_bytes_in_last_sidecar_buffer_, car.data(), len);
+  filled_bytes_in_last_sidecar_buffer_ += len;
 
-  return Status::OK();
+  return len;
 }
 
-int YBInboundCall::RpcSidecarsSize() const {
-  return sidecars_.size();
-}
+size_t YBInboundCall::AddRpcSidecar(Slice car) {
+  sidecar_offsets_.Add(total_sidecars_size_);
+  total_sidecars_size_ += car.size();
+  // Copy start of sidecar to existing buffer if present.
+  car.remove_prefix(CopyToLastSidecarBuffer(car));
 
-const RefCntBuffer& YBInboundCall::RpcSidecar(int idx) {
-  return sidecars_[idx];
+  // If sidecar did not fit into last buffer, then we should allocate a new one.
+  if (!car.empty()) {
+    DCHECK(sidecar_buffers_.empty() ||
+           filled_bytes_in_last_sidecar_buffer_ == sidecar_buffers_.back().size());
+
+    // Allocate new sidecar buffer and copy remaining part of sidecar to it.
+    AllocateSidecarBuffer(std::max<size_t>(car.size(), FLAGS_min_sidecar_buffer_size));
+    memcpy(sidecar_buffers_.back().data(), car.data(), car.size());
+    filled_bytes_in_last_sidecar_buffer_ = car.size();
+  }
+
+  return num_sidecars_++;
 }
 
 void YBInboundCall::ResetRpcSidecars() {
   if (consumption_) {
-    for (const auto& sidecar : sidecars_) {
-      consumption_.Add(-sidecar.size());
+    for (const auto& buffer : sidecar_buffers_) {
+      consumption_.Add(-buffer.size());
     }
   }
-  sidecars_.clear();
+  num_sidecars_ = 0;
+  filled_bytes_in_last_sidecar_buffer_ = 0;
+  total_sidecars_size_ = 0;
+  sidecar_buffers_.clear();
+  sidecar_offsets_.Clear();
+}
+
+void YBInboundCall::ReserveSidecarSpace(size_t space) {
+  if (num_sidecars_ != 0) {
+    LOG(DFATAL) << "Attempt to ReserveSidecarSpace when there are already sidecars present";
+    return;
+  }
+
+  AllocateSidecarBuffer(space);
+}
+
+void YBInboundCall::AllocateSidecarBuffer(size_t size) {
+  sidecar_buffers_.push_back(RefCntBuffer(size));
+  if (consumption_) {
+    consumption_.Add(size);
+  }
 }
 
 Status YBInboundCall::SerializeResponseBuffer(const google::protobuf::MessageLite& response,
@@ -306,18 +364,15 @@ Status YBInboundCall::SerializeResponseBuffer(const google::protobuf::MessageLit
   ResponseHeader resp_hdr;
   resp_hdr.set_call_id(header_.call_id());
   resp_hdr.set_is_error(!is_success);
-  uint32_t absolute_sidecar_offset = protobuf_msg_size;
-  for (auto& car : sidecars_) {
-    resp_hdr.add_sidecar_offsets(absolute_sidecar_offset);
-    absolute_sidecar_offset += car.size();
+  for (auto& offset : sidecar_offsets_) {
+    offset += protobuf_msg_size;
   }
-
-  int additional_size = absolute_sidecar_offset - protobuf_msg_size;
+  *resp_hdr.mutable_sidecar_offsets() = std::move(sidecar_offsets_);
 
   size_t message_size = 0;
   auto status = SerializeMessage(response,
                                  /* param_buf */ nullptr,
-                                 additional_size,
+                                 total_sidecars_size_,
                                  /* use_cached_size */ true,
                                  /* offset */ 0,
                                  &message_size);
@@ -326,7 +381,7 @@ Status YBInboundCall::SerializeResponseBuffer(const google::protobuf::MessageLit
   }
   size_t header_size = 0;
   status = SerializeHeader(resp_hdr,
-                           message_size + additional_size,
+                           message_size + total_sidecars_size_,
                            &response_buf_,
                            message_size,
                            &header_size);
@@ -335,7 +390,7 @@ Status YBInboundCall::SerializeResponseBuffer(const google::protobuf::MessageLit
   }
   return SerializeMessage(response,
                           &response_buf_,
-                          additional_size,
+                          total_sidecars_size_,
                           /* use_cached_size */ true,
                           header_size);
 }
@@ -390,13 +445,18 @@ void YBInboundCall::Serialize(boost::container::small_vector_base<RefCntBuffer>*
   TRACE_EVENT0("rpc", "YBInboundCall::Serialize");
   CHECK_GT(response_buf_.size(), 0);
   output->push_back(std::move(response_buf_));
-  for (auto& car : sidecars_) {
-    output->push_back(std::move(car));
+  if (!sidecar_buffers_.empty()) {
+    sidecar_buffers_.back().Shrink(filled_bytes_in_last_sidecar_buffer_);
+    for (auto& car : sidecar_buffers_) {
+      output->push_back(std::move(car));
+    }
+    sidecar_buffers_.clear();
   }
-  sidecars_.clear();
 }
 
 Status YBInboundCall::ParseParam(google::protobuf::Message *message) {
+  RETURN_NOT_OK(ThrottleRpcStatus(consumption_.mem_tracker(), *this));
+
   Slice param(serialized_request());
   CodedInputStream in(param.data(), param.size());
   in.SetTotalBytesLimit(FLAGS_rpc_max_message_size, FLAGS_rpc_max_message_size*3/4);
@@ -408,6 +468,11 @@ Status YBInboundCall::ParseParam(google::protobuf::Message *message) {
     return STATUS(InvalidArgument, err);
   }
   consumption_.Add(message->SpaceUsedLong());
+
+  if (PREDICT_FALSE(FLAGS_TEST_yb_inbound_big_calls_parse_delay_ms > 0 &&
+        request_data_.size() > FLAGS_rpc_throttle_threshold_bytes)) {
+    std::this_thread::sleep_for(FLAGS_TEST_yb_inbound_big_calls_parse_delay_ms * 1ms);
+  }
 
   return Status::OK();
 }
@@ -493,18 +558,18 @@ void YBOutboundConnectionContext::AssignConnection(const ConnectionPtr& connecti
 
 Result<ProcessDataResult> YBOutboundConnectionContext::ProcessCalls(
     const ConnectionPtr& connection, const IoVecs& data, ReadBufferFull read_buffer_full) {
-  return parser().Parse(connection, data, read_buffer_full);
+  return parser().Parse(connection, data, read_buffer_full, nullptr /* tracker_for_throttle */);
 }
 
 void YBOutboundConnectionContext::UpdateLastRead(const ConnectionPtr& connection) {
   last_read_time_ = connection->reactor()->cur_time();
-  VLOG(4) << connection->ToString() << ": " << "Updated last_read_time_="
-          << AsString(last_read_time_);
+  VLOG(4) << Format("$0: Updated last_read_time_=$1", connection, last_read_time_);
 }
 
 void YBOutboundConnectionContext::HandleTimeout(ev::timer& watcher, int revents) {  // NOLINT
   const auto connection = connection_.lock();
   if (connection) {
+    VLOG(5) << Format("$0: YBOutboundConnectionContext::HandleTimeout", connection);
     if (EV_ERROR & revents) {
       LOG(WARNING) << connection->ToString() << ": " << "Got an error in handle timeout";
       return;
@@ -514,6 +579,9 @@ void YBOutboundConnectionContext::HandleTimeout(ev::timer& watcher, int revents)
     const MonoDelta timeout = Timeout();
 
     auto deadline = last_read_time_ + timeout;
+    VLOG(5) << Format(
+        "$0: YBOutboundConnectionContext::HandleTimeout last_read_time_: $1, timeout: $2",
+        connection, last_read_time_, timeout);
     if (now > deadline) {
       auto passed = now - last_read_time_;
       const auto status = STATUS_FORMAT(

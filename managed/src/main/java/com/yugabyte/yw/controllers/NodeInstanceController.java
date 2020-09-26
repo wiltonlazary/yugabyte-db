@@ -102,6 +102,7 @@ public class NodeInstanceController extends AuthenticatedController {
         NodeInstance node = NodeInstance.create(zoneUuid, nodeData);
         nodes.put(node.getDetails().ip, node);
       }
+      Audit.createAuditEntry(ctx(), request(), Json.toJson(formData.data()));
       return ApiResponse.success(nodes);
     } catch (Exception e) {
       return ApiResponse.error(INTERNAL_SERVER_ERROR, e.getMessage());
@@ -137,6 +138,7 @@ public class NodeInstanceController extends AuthenticatedController {
       }
       if (nodeToBeFound != null) {
         nodeToBeFound.delete();
+        Audit.createAuditEntry(ctx(), request());
         return Results.status(OK);
       } else {
         return ApiResponse.error(BAD_REQUEST, "Node Not Found");
@@ -183,10 +185,11 @@ public class NodeInstanceController extends AuthenticatedController {
 
       if (nodeAction == NodeActionType.ADD) {
         taskParams.clusters = universe.getUniverseDetails().clusters;
+        taskParams.rootCA = universe.getUniverseDetails().rootCA;
       }
       LOG.info("{} Node {} in universe={}: name={} at version={}.",
                nodeAction.toString(false), nodeName, universe.universeUUID,
-	       universe.name, universe.version);
+               universe.name, universe.version);
 
       UUID taskUUID = commissioner.submit(nodeAction.getCommissionerTask(), taskParams);
       CustomerTask.create(customer, universe.universeUUID,
@@ -196,6 +199,7 @@ public class NodeInstanceController extends AuthenticatedController {
               taskUUID, universe.universeUUID, universe.name, nodeName);
       ObjectNode resultNode = Json.newObject();
       resultNode.put("taskUUID", taskUUID.toString());
+      Audit.createAuditEntry(ctx(), request(), Json.toJson(formData.data()), taskUUID);
       return ApiResponse.success(resultNode);
     } catch (Exception e) {
       return ApiResponse.error(INTERNAL_SERVER_ERROR, e.getMessage());

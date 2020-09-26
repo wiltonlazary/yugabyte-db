@@ -249,8 +249,7 @@ CHECKED_STATUS StringToNumeric(const string& str_val, RTypePtr target, StrToNum 
                                SetTarget setTarget) {
   auto result = strToNum(str_val);
   RETURN_NOT_OK(result);
-  setTarget(*result, target);
-  return Status::OK();
+  return setTarget(*result, target);
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -608,9 +607,8 @@ CHECKED_STATUS ConvertStringToInet(PTypePtr source, RTypePtr target) {
   if (source->IsNull()) {
     target->SetNull();
   } else {
-    InetAddress addr;
-    RETURN_NOT_OK(addr.FromString(source->string_value()));
-    target->set_inetaddress_value(addr);
+    target->set_inetaddress_value(InetAddress(
+        VERIFY_RESULT(HostToAddress(source->string_value()))));
   }
   return Status::OK();
 }

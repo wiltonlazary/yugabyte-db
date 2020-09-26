@@ -1,6 +1,6 @@
 /* Copyright (c) YugaByte, Inc. */
 
-@import "_style/colors.scss";
+@import "../../../_style/colors.scss";
 
 .on-prem-provider-container {
   width: 100%;
@@ -185,7 +185,7 @@
 }
 
 .cell-item {
-  font-weight: 600;
+  font-weight: 500;
   font-size: 16px;
   text-align: center;
   width: 50%;

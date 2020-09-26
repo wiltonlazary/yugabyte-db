@@ -17,6 +17,8 @@
 #include <boost/algorithm/string.hpp>
 
 #include "yb/tools/yb-admin_client.h"
+#include "yb/util/stol_utils.h"
+#include "yb/util/string_case.h"
 #include "yb/util/tostring.h"
 
 namespace yb {
@@ -35,38 +37,91 @@ void ClusterAdminCli::RegisterCommandHandlers(ClusterAdminClientClass* client) {
   super::RegisterCommandHandlers(client);
 
   Register(
-      "list_snapshots", "",
-      [client](const CLIArguments&) -> Status {
-        RETURN_NOT_OK_PREPEND(client->ListSnapshots(),
+      "list_snapshots", " [SHOW_DETAILS] [NOT_SHOW_RESTORED] [SHOW_DELETED]",
+      [client](const CLIArguments& args) -> Status {
+        bool show_details = false;
+        bool show_restored = true;
+        bool show_deleted = false;
+
+        if (args.size() > 4) {
+          return ClusterAdminCli::kInvalidArguments;
+        }
+        for (int i = 2; i < args.size(); ++i) {
+          string uppercase_flag;
+          ToUpperCase(args[i], &uppercase_flag);
+
+          if (uppercase_flag == "SHOW_DETAILS") {
+            show_details = true;
+          } else if (uppercase_flag == "NOT_SHOW_RESTORED") {
+            show_restored = false;
+          } else if (uppercase_flag == "SHOW_DELETED") {
+            show_deleted = true;
+          } else {
+            return ClusterAdminCli::kInvalidArguments;
+          }
+        }
+
+        RETURN_NOT_OK_PREPEND(client->ListSnapshots(show_details, show_restored, show_deleted),
                               "Unable to list snapshots");
         return Status::OK();
       });
 
   Register(
       "create_snapshot",
-      " <keyspace> <table_name> [<keyspace> <table_name>]... [flush_timeout_in_seconds]"
-      " (default 60, set 0 to skip flushing)",
+      " <table>"
+      " [<table>]..."
+      " [flush_timeout_in_seconds] (default 60, set 0 to skip flushing)",
       [client](const CLIArguments& args) -> Status {
-        if (args.size() < 4) {
+        int timeout_secs = 60;
+        const auto tables = VERIFY_RESULT(ResolveTableNames(
+            client, args.begin() + 2, args.end(),
+            [&timeout_secs](auto i, const auto& end) -> Status {
+              if (std::next(i) == end) {
+                timeout_secs = VERIFY_RESULT(CheckedStoi(*i));
+                return Status::OK();
+              }
+              return ClusterAdminCli::kInvalidArguments;
+            }));
+        RETURN_NOT_OK_PREPEND(client->CreateSnapshot(tables, true, timeout_secs),
+                              Substitute("Unable to create snapshot of tables: $0",
+                                         yb::ToString(tables)));
+        return Status::OK();
+      });
+
+  Register(
+      "create_keyspace_snapshot", " [ycql.]<keyspace_name>",
+      [client](const CLIArguments& args) -> Status {
+        if (args.size() != 3) {
           return ClusterAdminCli::kInvalidArguments;
         }
 
-        const int num_tables = (args.size() - 2)/2;
-        vector<YBTableName> tables;
-        tables.reserve(num_tables);
+        const TypedNamespaceName keyspace = VERIFY_RESULT(ParseNamespaceName(args[2]));
+        SCHECK_NE(
+            keyspace.db_type, YQL_DATABASE_PGSQL, InvalidArgument,
+            Format("Wrong keyspace type: $0", YQLDatabase_Name(keyspace.db_type)));
 
-        for (int i = 0; i < num_tables; ++i) {
-          tables.push_back(VERIFY_RESULT(ResolveTableName(client, args[2 + i*2], args[3 + i*2])));
+        RETURN_NOT_OK_PREPEND(client->CreateNamespaceSnapshot(keyspace),
+                              Substitute("Unable to create snapshot of keyspace: $0",
+                                         keyspace.name));
+        return Status::OK();
+      });
+
+  Register(
+      "create_database_snapshot", " [ysql.]<database_name>",
+      [client](const CLIArguments& args) -> Status {
+        if (args.size() != 3) {
+          return ClusterAdminCli::kInvalidArguments;
         }
 
-        int timeout_secs = 60;
-        if (args.size() % 2 == 1) {
-          timeout_secs = std::stoi(args[args.size() - 1].c_str());
-        }
+        const TypedNamespaceName database =
+            VERIFY_RESULT(ParseNamespaceName(args[2], YQL_DATABASE_PGSQL));
+        SCHECK_EQ(
+            database.db_type, YQL_DATABASE_PGSQL, InvalidArgument,
+            Format("Wrong database type: $0", YQLDatabase_Name(database.db_type)));
 
-        RETURN_NOT_OK_PREPEND(client->CreateSnapshot(tables, timeout_secs),
-                              Substitute("Unable to create snapshot of tables: $0",
-                                         yb::ToString(tables)));
+        RETURN_NOT_OK_PREPEND(client->CreateNamespaceSnapshot(database),
+                              Substitute("Unable to create snapshot of database: $0",
+                                         database.name));
         return Status::OK();
       });
 
@@ -100,29 +155,37 @@ void ClusterAdminCli::RegisterCommandHandlers(ClusterAdminClientClass* client) {
       });
 
   Register(
-      "import_snapshot", " <file_name> [<keyspace> <table_name> [<keyspace> <table_name>]...]",
+      "import_snapshot", " <file_name> [[ycql.]<keyspace_name> <table_name> [<table_name>]...]",
       [client](const CLIArguments& args) -> Status {
-        if (args.size() < 3 || args.size() % 2 != 1) {
+        if (args.size() < 3) {
           return ClusterAdminCli::kInvalidArguments;
         }
 
         const string file_name = args[2];
-        const int num_tables = (args.size() - 3)/2;
+        TypedNamespaceName keyspace;
+        int num_tables = 0;
         vector<YBTableName> tables;
-        tables.reserve(num_tables);
 
-        for (int i = 0; i < num_tables; ++i) {
-          const auto typed_namespace = VERIFY_RESULT(ParseNamespaceName(args[3 + i*2]));
-          tables.push_back(
-              YBTableName(typed_namespace.db_type, typed_namespace.name, args[4 + i*2]));
+        if (args.size() >= 4) {
+          keyspace = VERIFY_RESULT(ParseNamespaceName(args[3]));
+          num_tables = args.size() - 4;
+
+          if (num_tables > 0) {
+            LOG_IF(DFATAL, keyspace.name.empty()) << "Uninitialized keyspace: " << keyspace.name;
+            tables.reserve(num_tables);
+
+            for (int i = 0; i < num_tables; ++i) {
+              tables.push_back(YBTableName(keyspace.db_type, keyspace.name, args[4 + i]));
+            }
+          }
         }
 
-        string msg = num_tables > 0 ?
+        const string msg = num_tables > 0 ?
             Substitute("Unable to import tables $0 from snapshot meta file $1",
                        yb::ToString(tables), file_name) :
             Substitute("Unable to import snapshot meta file $0", file_name);
 
-        RETURN_NOT_OK_PREPEND(client->ImportSnapshotMetaFile(file_name, tables), msg);
+        RETURN_NOT_OK_PREPEND(client->ImportSnapshotMetaFile(file_name, keyspace, tables), msg);
         return Status::OK();
       });
 
@@ -140,12 +203,11 @@ void ClusterAdminCli::RegisterCommandHandlers(ClusterAdminClientClass* client) {
       });
 
   Register(
-      "list_replica_type_counts", " <keyspace> <table_name>",
+      "list_replica_type_counts",
+      " <table>",
       [client](const CLIArguments& args) -> Status {
-        if (args.size() != 4) {
-          return ClusterAdminCli::kInvalidArguments;
-        }
-        const auto table_name = VERIFY_RESULT(ResolveTableName(client, args[2], args[3]));
+        const auto table_name = VERIFY_RESULT(
+            ResolveSingleTableName(client, args.begin() + 2, args.end()));
         RETURN_NOT_OK_PREPEND(client->ListReplicaTypeCounts(table_name),
                               "Unable to list live and read-only replica counts");
         return Status::OK();
@@ -238,6 +300,17 @@ void ClusterAdminCli::RegisterCommandHandlers(ClusterAdminClientClass* client) {
       });
 
   Register(
+      "write_universe_key_to_file", " <key_id> <file_name>",
+      [client](const CLIArguments& args) -> Status {
+        if (args.size() != 4) {
+          return ClusterAdminCli::kInvalidArguments;
+        }
+        RETURN_NOT_OK_PREPEND(client->WriteUniverseKeyToFile(args[2], args[3]),
+                              "Unable to write key to file");
+        return Status::OK();
+      });
+
+  Register(
       "create_cdc_stream", " <table_id>",
       [client](const CLIArguments& args) -> Status {
         if (args.size() < 3) {
@@ -250,8 +323,33 @@ void ClusterAdminCli::RegisterCommandHandlers(ClusterAdminClientClass* client) {
       });
 
   Register(
+      "delete_cdc_stream", " <stream_id>",
+      [client](const CLIArguments& args) -> Status {
+        if (args.size() < 3) {
+          return ClusterAdminCli::kInvalidArguments;
+        }
+        const string stream_id = args[2];
+        RETURN_NOT_OK_PREPEND(client->DeleteCDCStream(stream_id),
+            Substitute("Unable to delete CDC stream id $0", stream_id));
+        return Status::OK();
+      });
+
+  Register(
+      "list_cdc_streams", " [table_id]",
+      [client](const CLIArguments& args) -> Status {
+        if (args.size() != 2 && args.size() != 3) {
+          return ClusterAdminCli::kInvalidArguments;
+        }
+        const string table_id = (args.size() == 3 ? args[2] : "");
+        RETURN_NOT_OK_PREPEND(client->ListCDCStreams(table_id),
+            Substitute("Unable to list CDC streams for table $0", table_id));
+        return Status::OK();
+      });
+
+  Register(
       "setup_universe_replication",
-      " <producer_universe_uuid> <producer_master_addresses> <comma_separated_list_of_table_ids>",
+      " <producer_universe_uuid> <producer_master_addresses> <comma_separated_list_of_table_ids>"
+          " [comma_separated_list_of_producer_bootstrap_ids]"  ,
       [client](const CLIArguments& args) -> Status {
         if (args.size() < 5) {
           return ClusterAdminCli::kInvalidArguments;
@@ -264,9 +362,15 @@ void ClusterAdminCli::RegisterCommandHandlers(ClusterAdminClientClass* client) {
         vector<string> table_uuids;
         boost::split(table_uuids, args[4], boost::is_any_of(","));
 
+        vector<string> producer_bootstrap_ids;
+        if (args.size() == 6) {
+          boost::split(producer_bootstrap_ids, args[5], boost::is_any_of(","));
+        }
+
         RETURN_NOT_OK_PREPEND(client->SetupUniverseReplication(producer_uuid,
                                                                producer_addresses,
-                                                               table_uuids),
+                                                               table_uuids,
+                                                               producer_bootstrap_ids),
                               Substitute("Unable to setup replication from universe $0",
                                          producer_uuid));
         return Status::OK();
@@ -286,6 +390,39 @@ void ClusterAdminCli::RegisterCommandHandlers(ClusterAdminClientClass* client) {
       });
 
   Register(
+      "alter_universe_replication",
+      " <producer_universe_uuid>"
+      " {set_master_addresses <producer_master_addresses,...> |"
+      "  add_table <table_id>[, <table_id>...] | remove_table <table_id>[, <table_id>...] }",
+      [client](const CLIArguments& args) -> Status {
+        if (args.size() != 5) {
+          return ClusterAdminCli::kInvalidArguments;
+        }
+        const string producer_uuid = args[2];
+        vector<string> master_addresses;
+        vector<string> add_tables;
+        vector<string> remove_tables;
+
+        vector<string> newElem, *lst;
+        if (args[3] == "set_master_addresses") lst = &master_addresses;
+        else if (args[3] == "add_table") lst = &add_tables;
+        else if (args[3] == "remove_table") lst = &remove_tables;
+        else
+          return ClusterAdminCli::kInvalidArguments;
+
+        boost::split(newElem, args[4], boost::is_any_of(","));
+        lst->insert(lst->end(), newElem.begin(), newElem.end());
+
+        RETURN_NOT_OK_PREPEND(client->AlterUniverseReplication(producer_uuid,
+                                                               master_addresses,
+                                                               add_tables,
+                                                               remove_tables),
+            Substitute("Unable to alter replication for universe $0", producer_uuid));
+
+        return Status::OK();
+      });
+
+  Register(
       "set_universe_replication_enabled", " <producer_universe_uuid> <0|1>",
       [client](const CLIArguments& args) -> Status {
         if (args.size() < 4) {
@@ -297,6 +434,22 @@ void ClusterAdminCli::RegisterCommandHandlers(ClusterAdminClientClass* client) {
             Substitute("Unable to $0 replication for universe $1",
                 is_enabled ? "enable" : "disable",
                 producer_id));
+        return Status::OK();
+      });
+
+
+  Register(
+      "bootstrap_cdc_producer", " <comma_separated_list_of_table_ids>",
+      [client](const CLIArguments& args) -> Status {
+        if (args.size() < 3) {
+          return ClusterAdminCli::kInvalidArguments;
+        }
+
+        vector<string> table_ids;
+        boost::split(table_ids, args[2], boost::is_any_of(","));
+
+        RETURN_NOT_OK_PREPEND(client->BootstrapProducer(table_ids),
+                              "Unable to bootstrap CDC producer");
         return Status::OK();
       });
 }

@@ -86,7 +86,8 @@ class TSDescriptor {
       const NodeInstancePB& instance,
       const TSRegistrationPB& registration,
       CloudInfoPB local_cloud_info,
-      rpc::ProxyCache* proxy_cache);
+      rpc::ProxyCache* proxy_cache,
+      RegisteredThroughHeartbeat registered_through_heartbeat = RegisteredThroughHeartbeat::kTrue);
 
   static std::string generate_placement_id(const CloudInfoPB& ci);
 
@@ -110,6 +111,8 @@ class TSDescriptor {
 
   bool has_tablet_report() const;
   void set_has_tablet_report(bool has_report);
+
+  bool registered_through_heartbeat() const;
 
   // Returns TSRegistrationPB for this TSDescriptor.
   TSRegistrationPB GetRegistration() const;
@@ -240,7 +243,10 @@ class TSDescriptor {
 
   void UpdateMetrics(const TServerMetricsPB& metrics);
 
+  void GetMetrics(TServerMetricsPB* metrics);
+
   void ClearMetrics() {
+    std::lock_guard<decltype(lock_)> l(lock_);
     ts_metrics_.ClearMetrics();
   }
 
@@ -266,6 +272,8 @@ class TSDescriptor {
   explicit TSDescriptor(std::string perm_id);
 
   std::size_t NumTasks() const;
+
+  bool IsLive() const;
 
  protected:
   virtual CHECKED_STATUS RegisterUnlocked(const NodeInstancePB& instance,
@@ -357,6 +365,10 @@ class TSDescriptor {
   // the master's map. As a result, we just store a boolean indicating this entry is removed and
   // shouldn't be surfaced.
   bool removed_ = false;
+
+  // Did this tserver register by heartbeating through master. If false, we registered through
+  // peer's Raft config.
+  RegisteredThroughHeartbeat registered_through_heartbeat_ = RegisteredThroughHeartbeat::kTrue;
 
   DISALLOW_COPY_AND_ASSIGN(TSDescriptor);
 };

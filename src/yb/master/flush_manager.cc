@@ -15,6 +15,7 @@
 #include <map>
 
 #include "yb/master/async_flush_tablets_task.h"
+#include "yb/master/catalog_entity_info.h"
 #include "yb/master/catalog_manager.h"
 #include "yb/master/catalog_manager-internal.h"
 
@@ -40,21 +41,18 @@ Status FlushManager::FlushTables(const FlushTablesRequestPB* req,
   // Create a new flush request UUID.
   const FlushRequestId flush_id = catalog_manager_->GenerateId();
 
+  const auto tables = VERIFY_RESULT(
+      catalog_manager_->CollectTables(req->tables(), req->add_indexes()));
+
   // Per TS tablet lists for all provided tables.
   map<TabletServerId, vector<TabletId>> ts_tablet_map;
   scoped_refptr<TableInfo> table;
 
-  for (const TableIdentifierPB& table_id_pb : req->tables()) {
-    MasterErrorPB::Code error = MasterErrorPB::UNKNOWN_ERROR;
-
-    const Result<TabletInfos> res_tablets = catalog_manager_->GetTabletsOrSetupError(
-        table_id_pb, &error, &table);
-    if (!res_tablets.ok()) {
-      return SetupError(resp->mutable_error(), error, res_tablets.status());
-    }
+  for (const TableDescription& table_description : tables) {
+    table = table_description.table_info;
 
     // Prepare per Tablet Server tablet lists.
-    for (const scoped_refptr<TabletInfo> tablet : *res_tablets) {
+    for (const scoped_refptr<TabletInfo>& tablet : table_description.tablet_infos) {
       TRACE("Locking tablet");
       auto l = tablet->LockForRead();
 
@@ -136,9 +134,10 @@ void FlushManager::SendFlushTabletsRequest(const TabletServerId& ts_uuid,
                                            const FlushRequestId& flush_id,
                                            const bool is_compaction) {
   auto call = std::make_shared<AsyncFlushTablets>(
-      master_, catalog_manager_->WorkerPool(), ts_uuid, table, tablet_ids, flush_id, is_compaction);
+      master_, catalog_manager_->AsyncTaskPool(), ts_uuid, table, tablet_ids, flush_id,
+      is_compaction);
   table->AddTask(call);
-  WARN_NOT_OK(call->Run(), "Failed to send flush tablets request");
+  WARN_NOT_OK(catalog_manager_->ScheduleTask(call), "Failed to send flush tablets request");
 }
 
 void FlushManager::HandleFlushTabletsResponse(const FlushRequestId& flush_id,

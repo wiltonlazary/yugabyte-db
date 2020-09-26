@@ -1,7 +1,8 @@
 ---
-title: INET
-summary: IP Address String
-description: INET type
+title: INET data type [YCQL]
+headerTitle: INET type
+linkTitle: INET
+description: Use the INET data type to specify columns for data of IP addresses.
 menu:
   latest:
     parent: api-cassandra
@@ -15,7 +16,7 @@ showAsideToc: true
 
 ## Synopsis
 
-`INET` data type is used to specify columns for data of IP addresses.
+Use the `INET` data type to specify columns for data of IP addresses.
 
 ## Syntax
 
@@ -33,25 +34,25 @@ type_specification ::= INET
 ## Examples
 
 ```sql
-cqlsh:example> CREATE TABLE dns_table(site_name TEXT PRIMARY KEY, ip_address INET);
+example> CREATE TABLE dns_table(site_name TEXT PRIMARY KEY, ip_address INET);
 ```
 
 ```sql
-cqlsh:example> INSERT INTO dns_table(site_name, ip_address) VALUES ('localhost', '127.0.0.1');
+example> INSERT INTO dns_table(site_name, ip_address) VALUES ('localhost', '127.0.0.1');
 ```
 
 ```sql
-cqlsh:example> INSERT INTO dns_table(site_name, ip_address) VALUES ('example.com', '93.184.216.34'); 
+example> INSERT INTO dns_table(site_name, ip_address) VALUES ('example.com', '93.184.216.34'); 
 ```
 
 `INET` type supports both ipv4 and ipv6 addresses.
 
 ```sql
-cqlsh:example> UPDATE dns_table SET ip_address = '2606:2800:220:1:248:1893:25c8:1946' WHERE site_name = 'example.com'; 
+example> UPDATE dns_table SET ip_address = '2606:2800:220:1:248:1893:25c8:1946' WHERE site_name = 'example.com'; 
 ```
 
 ```sql
-cqlsh:example> SELECT * FROM dns_table;
+example> SELECT * FROM dns_table;
 ```
 
 ```
@@ -63,4 +64,4 @@ cqlsh:example> SELECT * FROM dns_table;
 
 ## See also
 
-[Data Types](..#data-types)
+- [Data types](..#data-types)

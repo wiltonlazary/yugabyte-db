@@ -10,6 +10,7 @@ import com.yugabyte.yw.commissioner.Common;
 import com.yugabyte.yw.common.ApiUtils;
 import com.yugabyte.yw.common.CloudQueryHelper;
 import com.yugabyte.yw.common.FakeApiHelper;
+import com.yugabyte.yw.common.FakeDBApplication;
 import com.yugabyte.yw.common.CallHomeManager.CollectionLevel;
 import com.yugabyte.yw.common.ModelFactory;
 import com.yugabyte.yw.metrics.MetricQueryHelper;
@@ -39,6 +40,7 @@ import java.util.UUID;
 
 import static com.yugabyte.yw.common.AssertHelper.assertBadRequest;
 import static com.yugabyte.yw.common.AssertHelper.assertValue;
+import static com.yugabyte.yw.common.AssertHelper.assertAuditEntry;
 import static com.yugabyte.yw.common.ModelFactory.createUniverse;
 import static org.hamcrest.CoreMatchers.*;
 import static org.hamcrest.core.StringContains.containsString;
@@ -52,24 +54,8 @@ import static play.mvc.Http.Status.OK;
 import static play.mvc.Http.Status.FORBIDDEN;
 import static play.test.Helpers.fakeRequest;
 
-public class CustomerControllerTest extends WithApplication {
-  MetricQueryHelper mockMetricQueryHelper;
-  CloudQueryHelper mockCloudQueryHelper;
+public class CustomerControllerTest extends FakeDBApplication {
   String baseRoute = "/api/customers/";
-
-  @Override
-  protected Application provideApplication() {
-    mockMetricQueryHelper = mock(MetricQueryHelper.class);
-    Commissioner mockCommissioner = mock(Commissioner.class);
-    mockCloudQueryHelper = mock(CloudQueryHelper.class);
-
-    return new GuiceApplicationBuilder()
-      .configure((Map) Helpers.inMemoryDatabase())
-      .overrides(bind(MetricQueryHelper.class).toInstance(mockMetricQueryHelper))
-      .overrides(bind(Commissioner.class).toInstance(mockCommissioner))
-      .overrides(bind(CloudQueryHelper.class).toInstance(mockCloudQueryHelper))
-      .build();
-  }
 
   private Customer customer;
   private Users user;
@@ -90,6 +76,7 @@ public class CustomerControllerTest extends WithApplication {
 
     assertThat(json.get("uuid").asText(), allOf(notNullValue(), equalTo(customer.uuid.toString())));
     assertEquals(json.get("name").asText(), customer.name);
+    assertAuditEntry(0, customer.uuid);
   }
 
   @Test
@@ -103,6 +90,7 @@ public class CustomerControllerTest extends WithApplication {
     String resultString = contentAsString(result);
     assertThat(resultString, allOf(notNullValue(),
         equalTo("Unable To Authenticate User")));
+    assertAuditEntry(0, customer.uuid);
   }
 
   @Test
@@ -115,9 +103,6 @@ public class CustomerControllerTest extends WithApplication {
     params.put("name", "Test Customer");
     params.put("password", "new-password");
     params.put("confirmPassword", "new-password");
-    ObjectNode alertingData = Json.newObject();
-    alertingData.put("sendAlertsToYb", true);
-    params.put("alertingData", alertingData);
     params.put("callhomeLevel", "LOW");
     Result result = route(fakeRequest("PUT", baseRoute + customer.uuid).cookie(validCookie).bodyJson(params));
     assertEquals(OK, result.status());
@@ -127,6 +112,93 @@ public class CustomerControllerTest extends WithApplication {
     JsonNode json = Json.parse(contentAsString(result));
     assertThat(json.get("uuid").asText(), is(equalTo(customer.uuid.toString())));
     assertThat(json.get("name").asText(), is(equalTo("Test Customer")));
+    assertAuditEntry(0, customer.uuid);
+  }
+
+  @Test
+  public void testCustomerPUTWithAlertingData() {
+    String authToken = user.createAuthToken();
+    Http.Cookie validCookie = Http.Cookie.builder("authToken", authToken).build();
+    ObjectNode params = Json.newObject();
+    params.put("code", "tc");
+    params.put("email", "admin");
+    params.put("name", "Test Customer");
+    ObjectNode alertingData = Json.newObject();
+    String alertEmail = "alerts@yugabyte.com";
+    alertingData.put("alertingEmail", alertEmail);
+    alertingData.put("sendAlertsToYb", true);
+    alertingData.put("reportOnlyErrors", false);
+    params.put("alertingData", alertingData);
+    params.put("callhomeLevel", "LOW");
+    Result result = route(fakeRequest("PUT", baseRoute + customer.uuid).cookie(validCookie).bodyJson(params));
+    assertEquals(OK, result.status());
+    CustomerConfig config = CustomerConfig.getAlertConfig(customer.uuid);
+    assertEquals(alertEmail, config.data.get("alertingEmail").asText());
+    JsonNode json = Json.parse(contentAsString(result));
+    assertThat(json.get("uuid").asText(), is(equalTo(customer.uuid.toString())));
+    assertAuditEntry(0, customer.uuid);
+  }
+
+  @Test
+  public void testCustomerPUTWithSmtpData() {
+    String authToken = user.createAuthToken();
+    Http.Cookie validCookie = Http.Cookie.builder("authToken", authToken).build();
+    ObjectNode params = Json.newObject();
+    params.put("code", "tc");
+    params.put("email", "admin");
+    params.put("name", "Test Customer");
+    ObjectNode smtpData = Json.newObject();
+    String smtpEmail = "alerts@yugabyte.com";
+    smtpData.put("smtpUsername", smtpEmail);
+    smtpData.put("smtpServer", "test.foo.bar");
+    params.put("smtpData", smtpData);
+    params.put("callhomeLevel", "MEDIUM");
+    Result result = route(fakeRequest("PUT", baseRoute + customer.uuid)
+                    .cookie(validCookie)
+                    .bodyJson(params));
+    assertEquals(OK, result.status());
+    CustomerConfig config = CustomerConfig.getSmtpConfig(customer.uuid);
+    assertEquals(smtpEmail, config.data.get("smtpUsername").asText());
+    CollectionLevel callhomeLevel = CustomerConfig.getCallhomeLevel(customer.uuid);
+    assertEquals(CollectionLevel.MEDIUM, callhomeLevel);
+    JsonNode json = Json.parse(contentAsString(result));
+    assertThat(json.get("uuid").asText(), is(equalTo(customer.uuid.toString())));
+    assertAuditEntry(0, customer.uuid);
+  }
+
+  @Test
+  public void testCustomerPUTWithSmtpAndAlertData() {
+    String authToken = user.createAuthToken();
+    Http.Cookie validCookie = Http.Cookie.builder("authToken", authToken).build();
+    ObjectNode params = Json.newObject();
+    params.put("code", "tc");
+    params.put("email", "admin");
+    params.put("name", "Test Customer");
+    ObjectNode smtpData = Json.newObject();
+    String smtpEmail = "alerts@yugabyte.com";
+    smtpData.put("smtpUsername", smtpEmail);
+    smtpData.put("smtpServer", "test.foo.bar");
+    params.put("smtpData", smtpData);
+    ObjectNode alertingData = Json.newObject();
+    String alertEmail = "alerts@yugabyte.com";
+    alertingData.put("alertingEmail", alertEmail);
+    alertingData.put("sendAlertsToYb", true);
+    alertingData.put("reportOnlyErrors", false);
+    params.put("alertingData", alertingData);
+    params.put("callhomeLevel", "MEDIUM");
+    Result result = route(fakeRequest("PUT", baseRoute + customer.uuid)
+                    .cookie(validCookie)
+                    .bodyJson(params));
+    assertEquals(OK, result.status());
+    CustomerConfig smtpConfig = CustomerConfig.getSmtpConfig(customer.uuid);
+    CustomerConfig alertConfig = CustomerConfig.getAlertConfig(customer.uuid);
+    assertEquals(smtpEmail, smtpConfig.data.get("smtpUsername").asText());
+    assertEquals(alertEmail, alertConfig.data.get("alertingEmail").asText());
+    CollectionLevel callhomeLevel = CustomerConfig.getCallhomeLevel(customer.uuid);
+    assertEquals(CollectionLevel.MEDIUM, callhomeLevel);
+    JsonNode json = Json.parse(contentAsString(result));
+    assertThat(json.get("uuid").asText(), is(equalTo(customer.uuid.toString())));
+    assertAuditEntry(0, customer.uuid);
   }
 
   @Test
@@ -144,6 +216,7 @@ public class CustomerControllerTest extends WithApplication {
     CustomerConfig callhomeConfig = CustomerConfig.getCallhomeConfig(customer.uuid);
     CollectionLevel callhomeLevel = CustomerConfig.getCallhomeLevel(customer.uuid);
     assertEquals(CollectionLevel.MEDIUM, callhomeLevel);
+    assertAuditEntry(0, customer.uuid);
   }
 
   @Test
@@ -161,6 +234,33 @@ public class CustomerControllerTest extends WithApplication {
     assertEquals(OK, result.status());
     JsonNode json = Json.parse(contentAsString(result));
     assertEquals(features, json.get("features"));
+    assertAuditEntry(0, customer.uuid);
+  }
+
+  @Test
+  public void testCustomerPUTWithValidUserFeatures() {
+    String authToken = user.createAuthToken();
+    Http.Cookie validCookie = Http.Cookie.builder("authToken", authToken).build();
+    ObjectNode params = Json.newObject();
+    params.put("code", "tc");
+    params.put("email", "foo@bar.com");
+    params.put("name", "Test Customer");
+    JsonNode features = Json.parse("{\"foo\": \"bar\"}");
+    params.set("features", features);
+    user.setFeatures(Json.parse("{\"abc\": \"xyz\"}"));
+    user.save();
+    JsonNode expectedFeatures = Json.parse("{\"foo\": \"bar\", \"abc\": \"xyz\"}");
+
+    Result result = route(fakeRequest("PUT", baseRoute + customer.uuid).cookie(validCookie)
+                                                                       .bodyJson(params));
+    assertEquals(OK, result.status());
+    JsonNode json = Json.parse(contentAsString(result));
+    assertEquals(features, json.get("features"));
+    result = route(fakeRequest("GET", baseRoute + customer.uuid).cookie(validCookie));
+    assertEquals(OK, result.status());
+    json = Json.parse(contentAsString(result));
+    assertEquals(expectedFeatures, json.get("features"));
+    assertAuditEntry(0, customer.uuid);
   }
 
   @Test
@@ -175,6 +275,7 @@ public class CustomerControllerTest extends WithApplication {
 
     Result result = route(fakeRequest("PUT", baseRoute + customer.uuid).cookie(validCookie).bodyJson(params));
     assertBadRequest(result, "{\"features\":[\"Invalid value\"]}");
+    assertAuditEntry(0, customer.uuid);
   }
 
   @Test
@@ -188,6 +289,7 @@ public class CustomerControllerTest extends WithApplication {
     assertEquals(OK, result.status());
     JsonNode json = Json.parse(contentAsString(result));
     assertEquals(expectedFeatures, json);
+    assertAuditEntry(1, customer.uuid);
 
     inputFeatures = Json.parse("{\"features\": {\"key\": \"new\"}}");
     expectedFeatures = Json.parse("{\"foo\": \"bar\", \"key\": \"new\"}");
@@ -195,20 +297,7 @@ public class CustomerControllerTest extends WithApplication {
     assertEquals(OK, result.status());
     json = Json.parse(contentAsString(result));
     assertEquals(expectedFeatures, json);
-  }
-
-  @Test
-  public void testCustomerPUTWithInvalidParams() {
-    String authToken = user.createAuthToken();
-    Http.Cookie validCookie = Http.Cookie.builder("authToken", authToken).build();
-    ObjectNode params = Json.newObject();
-    params.put("password", "new-password");
-
-    Result result = route(fakeRequest("PUT", baseRoute + customer.uuid).cookie(validCookie).bodyJson(params));
-    assertEquals(BAD_REQUEST, result.status());
-    JsonNode json = Json.parse(contentAsString(result));
-    assertThat(contentAsString(result), is(containsString("\"name\":[\"This field is required\"]")));
-    assertThat(contentAsString(result), is(containsString("\"email\":[\"This field is required\"]")));
+    assertAuditEntry(2, customer.uuid);
   }
 
   @Test
@@ -222,6 +311,7 @@ public class CustomerControllerTest extends WithApplication {
     String resultString = contentAsString(result);
     assertThat(resultString, allOf(notNullValue(),
         equalTo("Unable To Authenticate User")));
+    assertAuditEntry(0, customer.uuid);
   }
 
   @Test
@@ -232,6 +322,7 @@ public class CustomerControllerTest extends WithApplication {
     assertEquals(OK, result.status());
     JsonNode json = Json.parse(contentAsString(result));
     assertTrue(json.get("success").asBoolean());
+    assertAuditEntry(1, customer.uuid);
   }
 
   @Test
@@ -246,6 +337,7 @@ public class CustomerControllerTest extends WithApplication {
     String resultString = contentAsString(result);
     assertThat(resultString, allOf(notNullValue(),
         equalTo("Unable To Authenticate User")));
+    assertAuditEntry(0, customer.uuid);
   }
 
   @Test
@@ -259,6 +351,7 @@ public class CustomerControllerTest extends WithApplication {
     assertEquals(BAD_REQUEST, result.status());
     assertThat(contentAsString(result), is(containsString("\"start\":[\"This field is required\"]")));
     assertThat(contentAsString(result), is(containsString("\"metrics\":[\"This field is required\"]")));
+    assertAuditEntry(0, customer.uuid);
   }
 
   @Test
@@ -276,6 +369,7 @@ public class CustomerControllerTest extends WithApplication {
     Result result = route(fakeRequest("POST", baseRoute + customer.uuid + "/metrics").cookie(validCookie).bodyJson(params));
     assertEquals(OK, result.status());
     assertThat(contentAsString(result), allOf(notNullValue(), containsString("{\"foo\":\"bar\"}")));
+    assertAuditEntry(0, customer.uuid);
   }
 
   @Test
@@ -306,6 +400,7 @@ public class CustomerControllerTest extends WithApplication {
     assertValue(filters, "namespace", "demo-(.*)");
     assertEquals(OK, result.status());
     assertThat(contentAsString(result), allOf(notNullValue(), containsString("{\"foo\":\"bar\"}")));
+    assertAuditEntry(0, customer.uuid);
   }
 
   @Test
@@ -336,6 +431,7 @@ public class CustomerControllerTest extends WithApplication {
     assertValue(filters, "namespace", "demo");
     assertEquals(OK, result.status());
     assertThat(contentAsString(result), allOf(notNullValue(), containsString("{\"foo\":\"bar\"}")));
+    assertAuditEntry(0, customer.uuid);
   }
 
   @Test
@@ -361,6 +457,7 @@ public class CustomerControllerTest extends WithApplication {
     assertValue(filters, "pod_name", "demo-n1");
     assertEquals(OK, result.status());
     assertThat(contentAsString(result), allOf(notNullValue(), containsString("{\"foo\":\"bar\"}")));
+    assertAuditEntry(0, customer.uuid);
   }
 
   @Test
@@ -378,6 +475,7 @@ public class CustomerControllerTest extends WithApplication {
     Result result = route(fakeRequest("POST", baseRoute + customer.uuid + "/metrics").cookie(validCookie).bodyJson(params));
     assertEquals(BAD_REQUEST, result.status());
     assertThat(contentAsString(result), allOf(notNullValue(), containsString("{\"error\":\"something went wrong\"}")));
+    assertAuditEntry(0, customer.uuid);
   }
 
   @Test
@@ -407,6 +505,7 @@ public class CustomerControllerTest extends WithApplication {
     JsonNode filters = Json.parse(queryParams.getValue().get("filters").toString());
     String tableName = filters.get("table_name").asText();
     assertThat(tableName, allOf(notNullValue(), equalTo("redis")));
+    assertAuditEntry(0, customer.uuid);
   }
 
   @Test
@@ -435,6 +534,7 @@ public class CustomerControllerTest extends WithApplication {
     assertThat(queryParams.getValue(), is(notNullValue()));
     JsonNode filters = Json.parse(queryParams.getValue().get("filters").toString());
     assertThat(filters.get("table_name"), nullValue());
+    assertAuditEntry(0, customer.uuid);
   }
 
 
@@ -453,6 +553,7 @@ public class CustomerControllerTest extends WithApplication {
     Result result = route(fakeRequest("POST", baseRoute + customer.uuid + "/metrics").cookie(validCookie).bodyJson(params));
     assertEquals(BAD_REQUEST, result.status());
     assertThat(contentAsString(result), allOf(notNullValue(), containsString("{\"error\":\"Weird Data provided\"}")));
+    assertAuditEntry(0, customer.uuid);
   }
 
   @Test
@@ -488,6 +589,7 @@ public class CustomerControllerTest extends WithApplication {
     assertThat(nodePrefix, allOf(notNullValue(), containsString("host-b")));
     String[] nodePrefixes = nodePrefix.split("\\|");
     assertEquals(nodePrefixes.length, 2);
+    assertAuditEntry(0, customer.uuid);
   }
 
   @Test
@@ -516,6 +618,7 @@ public class CustomerControllerTest extends WithApplication {
     JsonNode filters = Json.parse(queryParams.getValue().get("filters").toString());
     String nodePrefix = filters.get("node_prefix").asText();
     assertThat(nodePrefix, allOf(notNullValue(), equalTo("host-1")));
+    assertAuditEntry(0, customer.uuid);
   }
 
   @Test
@@ -540,6 +643,7 @@ public class CustomerControllerTest extends WithApplication {
     JsonNode filters = Json.parse(queryParams.getValue().get("filters").toString());
     String nodeName = filters.get("exported_instance").asText();
     assertThat(nodeName, allOf(notNullValue(), equalTo("host-n1")));
+    assertAuditEntry(0, customer.uuid);
   }
 
   private Result getHostInfo(UUID customerUUID) {
@@ -556,6 +660,7 @@ public class CustomerControllerTest extends WithApplication {
     String resultString = contentAsString(result);
     assertThat(resultString, allOf(notNullValue(),
         equalTo("Unable To Authenticate User")));
+    assertAuditEntry(0, customer.uuid);
   }
 
   @Test
@@ -571,5 +676,6 @@ public class CustomerControllerTest extends WithApplication {
     responseNode.put("aws", response);
     responseNode.put("gcp", response);
     assertEquals(json, responseNode);
+    assertAuditEntry(0, customer.uuid);
   }
 }

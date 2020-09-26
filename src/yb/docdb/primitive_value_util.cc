@@ -13,6 +13,7 @@
 
 #include <iostream>
 
+#include "yb/common/ql_expr.h"
 #include "yb/common/ql_value.h"
 #include "yb/docdb/primitive_value_util.h"
 
@@ -20,18 +21,6 @@ using std::vector;
 
 namespace yb {
 namespace docdb {
-namespace {
-
-PrimitiveValue NullValue(ColumnSchema::SortingType sorting) {
-  using SortingType = ColumnSchema::SortingType;
-
-  return PrimitiveValue(
-      sorting == SortingType::kAscendingNullsLast || sorting == SortingType::kDescendingNullsLast
-      ? ValueType::kNullHigh
-      : ValueType::kNullLow);
-}
-
-} // namespace
 
 // Add primary key column values to the component group. Verify that they are in the same order
 // as in the table schema.
@@ -75,7 +64,7 @@ Status InitKeyColumnPrimitiveValues(
     const auto sorting_type = schema.column(column_idx).sorting_type();
     if (column_value.has_value()) {
       const auto& value = column_value.value();
-      components->push_back(IsNull(value) ? NullValue(sorting_type)
+      components->push_back(IsNull(value) ? PrimitiveValue::NullValue(sorting_type)
                                           : PrimitiveValue::FromQLValuePB(value, sorting_type));
     } else {
       // TODO(neil) The current setup only works for CQL as it assumes primary key value must not
@@ -84,14 +73,66 @@ Status InitKeyColumnPrimitiveValues(
       //
       // Use regular executor for now.
       QLExprExecutor executor;
-      QLValue result;
-      RETURN_NOT_OK(executor.EvalExpr(column_value, nullptr, &result));
+      QLExprResult result;
+      RETURN_NOT_OK(executor.EvalExpr(column_value, nullptr, result.Writer(), &schema));
 
-      components->push_back(PrimitiveValue::FromQLValuePB(result.value(), sorting_type));
+      components->push_back(PrimitiveValue::FromQLValuePB(result.Value(), sorting_type));
     }
     column_idx++;
   }
   return Status::OK();
+}
+
+namespace {
+  template <typename TemplatePB>
+  boost::optional<int32_t> HashCodeFromPB(const TemplatePB pb) {
+    return pb.has_hash_code() ? boost::make_optional<int32_t>(pb.hash_code()) : boost::none;
+  }
+
+  template <typename TemplatePB>
+  boost::optional<int32_t> MaxHashCodeFromPB(const TemplatePB pb) {
+    return pb.has_max_hash_code() ? boost::make_optional<int32_t>(pb.max_hash_code()) : boost::none;
+  }
+} // namespace
+
+boost::optional<int32_t> DocHashCode(const PgsqlReadRequestPB& request,
+                                     int64_t batch_arg_index) {
+  if (batch_arg_index < 0) {
+    return HashCodeFromPB(request);
+  }
+  return HashCodeFromPB(request.batch_arguments(batch_arg_index));
+}
+
+boost::optional<int32_t> DocMaxHashCode(const PgsqlReadRequestPB& request,
+                                        int64_t batch_arg_index) {
+  if (batch_arg_index < 0) {
+    return MaxHashCodeFromPB(request);
+  }
+  return MaxHashCodeFromPB(request.batch_arguments(batch_arg_index));
+}
+
+bool
+DocHasPartitionValues(const PgsqlReadRequestPB& request, int64_t batch_arg_index) {
+  return batch_arg_index < 0 ? request.partition_column_values_size() > 0
+      : request.batch_arguments(batch_arg_index).partition_column_values_size() > 0;
+}
+
+const google::protobuf::RepeatedPtrField<PgsqlExpressionPB>&
+DocPartitionValues(const PgsqlReadRequestPB& request, int64_t batch_arg_index) {
+  return batch_arg_index < 0 ? request.partition_column_values()
+                             : request.batch_arguments(batch_arg_index).partition_column_values();
+}
+
+bool
+DocHasRangeValues(const PgsqlReadRequestPB& request, int64_t batch_arg_index) {
+  // Use shared range value in "request" because currently we do not batch RANGE values.
+  return request.range_column_values().size() > 0;
+}
+
+const google::protobuf::RepeatedPtrField<PgsqlExpressionPB>&
+DocRangeValues(const PgsqlReadRequestPB& request, int64_t batch_arg_index) {
+  // Use shared range value in "request" because currently we do not batch RANGE values.
+  return request.range_column_values();
 }
 
 }  // namespace docdb

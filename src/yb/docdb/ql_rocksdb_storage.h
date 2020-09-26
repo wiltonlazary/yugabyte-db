@@ -52,12 +52,34 @@ class QLRocksDBStorage : public common::YQLStorageIf {
 
   //------------------------------------------------------------------------------------------------
   // PGSQL Support.
+  CHECKED_STATUS CreateIterator(const Schema& projection,
+                                const Schema& schema,
+                                const TransactionOperationContextOpt& txn_op_context,
+                                CoarseTimePoint deadline,
+                                const ReadHybridTime& read_time,
+                                common::YQLRowwiseIteratorIf::UniPtr* iter) const override;
+
+  CHECKED_STATUS InitIterator(common::YQLRowwiseIteratorIf* doc_iter,
+                              const PgsqlReadRequestPB& request,
+                              const Schema& schema,
+                              const QLValuePB& ybctid) const override;
+
+  CHECKED_STATUS GetIterator(const PgsqlReadRequestPB& request,
+                             int64_t batch_arg_index,
+                             const Schema& projection,
+                             const Schema& schema,
+                             const TransactionOperationContextOpt& txn_op_context,
+                             CoarseTimePoint deadline,
+                             const ReadHybridTime& read_time,
+                             common::YQLRowwiseIteratorIf::UniPtr* iter) const override;
+
   CHECKED_STATUS GetIterator(const PgsqlReadRequestPB& request,
                              const Schema& projection,
                              const Schema& schema,
                              const TransactionOperationContextOpt& txn_op_context,
                              CoarseTimePoint deadline,
                              const ReadHybridTime& read_time,
+                             const QLValuePB& ybctid,
                              common::YQLRowwiseIteratorIf::UniPtr* iter) const override;
 
  private:

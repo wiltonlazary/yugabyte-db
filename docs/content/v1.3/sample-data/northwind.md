@@ -2,6 +2,7 @@
 title: Northwind sample database
 linkTitle: Northwind
 description: Northwind sample database
+block_indexing: true
 menu:
   v1.3:
     identifier: northwind
@@ -69,8 +70,6 @@ Confirm that you have the Northwind database by listing out the databases on you
 postgres=# \l
 ```
 
-![Northwind list of databases](/images/datasets/northwind/northwind-list-of-dbs.png)
-
 Connect to the Northwind database.
 
 ```
@@ -92,8 +91,6 @@ You can verify that all 14 tables have been created by running the `\d` command.
 ```
 northwind=# \d
 ```
-
-![Northwind list of relations](/images/datasets/northwind/northwind-list-of-relations.png)
 
 ### 5. Load the sample data
 

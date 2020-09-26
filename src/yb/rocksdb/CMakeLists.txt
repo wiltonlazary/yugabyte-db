@@ -73,7 +73,7 @@ set(ROCKSDB_SRCS
     db/write_controller.cc
     db/write_thread.cc
     db/xfunc_test_points.cc
-    memtable/hash_cuckoo_rep.cc
+    db/db_iterator_wrapper.cc
     memtable/hash_linklist_rep.cc
     memtable/hash_skiplist_rep.cc
     memtable/skiplistrep.cc
@@ -90,9 +90,6 @@ set(ROCKSDB_SRCS
     table/block_hash_index.cc
     table/block_prefix_index.cc
     table/bloom_block.cc
-    table/cuckoo_table_builder.cc
-    table/cuckoo_table_factory.cc
-    table/cuckoo_table_reader.cc
     table/flush_block_policy.cc
     table/format.cc
     table/fixed_size_filter_block.cc
@@ -218,17 +215,18 @@ endif()
 
 add_library(rocksdb ${ROCKSDB_SRCS})
 cotire(rocksdb)
-target_link_libraries(rocksdb gflags gutil snappy bz2 z yb_common yb_util opid_proto)
+target_link_libraries(rocksdb gflags gutil snappy z yb_common yb_util opid_proto)
 
 add_library(rocksdb_tools
   tools/ldb_cmd.cc
   tools/ldb_tool.cc
   tools/sst_dump_tool.cc)
-target_link_libraries(rocksdb_tools rocksdb)
+target_link_libraries(rocksdb_tools rocksdb yb_rocksutil)
 
 macro(ADD_YB_ROCKSDB_TOOL tool)
   add_executable(${tool} tools/${tool}.cc)
   target_link_libraries(${tool} rocksdb_tools)
+  set_target_properties(${tool} PROPERTIES COMPILE_FLAGS "-DDISABLE_STATUS_NODISCARD")
 endmacro()
 
 set(ROCKSDB_TEST_UTIL_SRCS
@@ -243,7 +241,7 @@ if (NOT "${CMAKE_BUILD_TYPE}" STREQUAL "RELEASE")
 endif()
 
 add_library(rocksdb_test_util ${ROCKSDB_TEST_UTIL_SRCS})
-target_link_libraries(rocksdb_test_util gmock rocksdb)
+target_link_libraries(rocksdb_test_util gmock rocksdb yb_rocksutil)
 
 ADD_YB_ROCKSDB_TOOL(sst_dump)
 add_executable(db_bench tools/db_bench.cc tools/db_bench_tool.cc)
@@ -251,15 +249,12 @@ target_link_libraries(db_bench rocksdb)
 ADD_YB_ROCKSDB_TOOL(db_sanity_test)
 ADD_YB_ROCKSDB_TOOL(db_stress)
 ADD_YB_ROCKSDB_TOOL(write_stress)
-ADD_YB_ROCKSDB_TOOL(ldb)
 ADD_YB_ROCKSDB_TOOL(db_repl_stress)
 target_link_libraries(db_repl_stress rocksdb_test_util)
-add_executable(rocksdb_dump tools/dump/rocksdb_dump.cc)
-target_link_libraries(rocksdb_dump rocksdb_tools)
 add_executable(rocksdb_undump tools/dump/rocksdb_undump.cc)
 target_link_libraries(rocksdb_undump rocksdb_tools)
 
-set(YB_TEST_LINK_LIBS rocksdb_test_util rocksdb ${YB_MIN_TEST_LIBS})
+set(YB_TEST_LINK_LIBS rocksdb_test_util rocksdb ${YB_MIN_TEST_LIBS} rocksdb_tools)
 
 ADD_YB_TEST(db/compaction_job_test)
 ADD_YB_TEST(db/compaction_picker_test)
@@ -290,8 +285,8 @@ ADD_YB_TEST(table/full_filter_block_test)
 ADD_YB_TEST(table/fixed_size_filter_block_test)
 ADD_YB_TEST(table/merger_test)
 ADD_YB_TEST(table/table_test)
-ADD_YB_TEST(tools/ldb_cmd_test)
 ADD_YB_TEST(tools/sst_dump_test)
+YB_TEST_TARGET_LINK_LIBRARIES(sst_dump_test rocksdb_tools)
 ADD_YB_TEST(util/arena_test)
 ADD_YB_TEST(util/autovector_test)
 ADD_YB_TEST(util/bloom_test)
@@ -321,17 +316,12 @@ ADD_YB_TEST(utilities/transactions/optimistic_transaction_test)
 ADD_YB_TEST(utilities/ttl/ttl_test)
 ADD_YB_TEST(utilities/write_batch_with_index/write_batch_with_index_test)
 
-if(NOT NO_TESTS)
-  target_link_libraries(sst_dump_test rocksdb_tools)
-endif()
-
 if (NOT "${CMAKE_BUILD_TYPE}" STREQUAL "RELEASE")
 ADD_YB_TEST(db/auto_roll_logger_test)
 ADD_YB_TEST(db/column_family_test)
 ADD_YB_TEST(db/compact_files_test)
 ADD_YB_TEST(db/compaction_job_stats_test)
 ADD_YB_TEST(db/corruption_test)
-ADD_YB_TEST(db/cuckoo_table_db_test)
 ADD_YB_TEST(db/db_block_cache_test)
 ADD_YB_TEST(db/db_bloom_filter_test)
 ADD_YB_TEST(db/db_compaction_filter_test)
@@ -355,18 +345,14 @@ ADD_YB_TEST(db/listener_test)
 ADD_YB_TEST(db/plain_table_db_test)
 ADD_YB_TEST(db/version_edit_test)
 ADD_YB_TEST(db/write_callback_test)
-ADD_YB_TEST(table/cuckoo_table_builder_test)
-ADD_YB_TEST(table/cuckoo_table_reader_test)
+ADD_YB_TEST(tools/ldb_cmd_test)
 ADD_YB_TEST(tools/reduce_levels_test)
+YB_TEST_TARGET_LINK_LIBRARIES(reduce_levels_test rocksdb_tools)
 ADD_YB_TEST(util/delete_scheduler_test)
 ADD_YB_TEST(util/thread_local_test)
 ADD_YB_TEST(utilities/backupable/backupable_db_test)
 ADD_YB_TEST(utilities/checkpoint/checkpoint_test)
 ADD_YB_TEST(utilities/memory/memory_test)
 ADD_YB_TEST(utilities/transactions/transaction_test)
-
-if(NOT NO_TESTS)
-  target_link_libraries(reduce_levels_test rocksdb_tools)
-endif()
 
 endif()

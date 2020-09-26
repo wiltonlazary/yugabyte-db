@@ -6,7 +6,7 @@ import { fetchUniverseList, fetchUniverseListResponse, resetUniverseList }
   from '../../actions/universe';
 import { getProviderList, getProviderListResponse, getSupportedRegionData,
   getSupportedRegionDataResponse, getEBSTypeList, getEBSTypeListResponse, getGCPTypeList,
-  getGCPTypeListResponse, listAccessKeysResponse, listAccessKeys }
+  getGCPTypeListResponse, getAZUTypeList, getAZUTypeListResponse, listAccessKeysResponse, listAccessKeys }
   from '../../actions/cloud';
 import { fetchColumnTypes, fetchColumnTypesSuccess, fetchColumnTypesFailure }
   from '../../actions/tables';
@@ -14,7 +14,7 @@ import { fetchSoftwareVersions, fetchSoftwareVersionsSuccess,
   fetchSoftwareVersionsFailure, fetchYugaWareVersion, fetchYugaWareVersionResponse,
   fetchCustomerConfigs, fetchCustomerConfigsResponse, getTlsCertificates,
   getTlsCertificatesResponse, insecureLogin, insecureLoginResponse }
-  from 'actions/customers';
+  from '../../actions/customers';
 import {fetchCustomerTasks, fetchCustomerTasksSuccess, fetchCustomerTasksFailure} from '../../actions/tasks';
 import {setUniverseMetrics} from '../../actions/universe';
 import { queryMetrics } from '../../actions/graph';
@@ -79,6 +79,12 @@ const mapDispatchToProps = (dispatch) => {
       });
     },
 
+    getAZUListItems: () => {
+      dispatch(getAZUTypeList()).then((response) => {
+        dispatch(getAZUTypeListResponse(response.payload));
+      });
+    },
+
     getYugaWareVersion: () => {
       dispatch(fetchYugaWareVersion()).then((response) => {
         dispatch(fetchYugaWareVersionResponse(response.payload));
@@ -136,7 +142,7 @@ const mapDispatchToProps = (dispatch) => {
 const mapStateToProps = (state) => {
   return {
     cloud: state.cloud,
-    customer: state.customer,
+    currentCustomer: state.customer.currentCustomer,
     universe: state.universe,
     tasks: state.tasks,
     fetchMetadata: state.cloud.fetchMetadata,

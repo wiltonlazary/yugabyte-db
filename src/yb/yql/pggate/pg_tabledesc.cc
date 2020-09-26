@@ -17,8 +17,13 @@
 
 #include "yb/client/table.h"
 
+#include "yb/common/pg_system_attr.h"
+#include "yb/docdb/doc_key.h"
+
 namespace yb {
 namespace pggate {
+
+using google::protobuf::RepeatedPtrField;
 
 PgTableDesc::PgTableDesc(std::shared_ptr<client::YBTable> pg_table) : table_(pg_table) {
   const auto& schema = pg_table->schema();
@@ -78,6 +83,36 @@ bool PgTableDesc::IsTransactional() const {
   return table_->schema().table_properties().is_transactional();
 }
 
+bool PgTableDesc::IsColocated() const {
+  return table_->colocated();
+}
+
+const std::vector<std::string>& PgTableDesc::GetPartitions() const {
+  return table_->GetPartitions();
+}
+
+int PgTableDesc::GetPartitionCount() const {
+  return table_->GetPartitionCount();
+}
+
+Result<int> PgTableDesc::FindPartitionStartIndex(const string& partition_key) const {
+  return table_->FindPartitionStartIndex(partition_key);
+}
+
+Result<int> PgTableDesc::FindPartitionStartIndex(const Slice& ybctid, uint16 *hash_code) const {
+  *hash_code = VERIFY_RESULT(docdb::DocKey::DecodeHash(ybctid));
+  string partition_key = PartitionSchema::EncodeMultiColumnHashValue(*hash_code);
+  return table_->FindPartitionStartIndex(partition_key);
+}
+
+Result<int> PgTableDesc::FindPartitionStartIndex(
+    const RepeatedPtrField<PgsqlExpressionPB>& hash_col_values, uint16 *hash_code) const {
+  string partition_key;
+  RETURN_NOT_OK(table_->partition_schema().EncodeKey(hash_col_values, &partition_key));
+  *hash_code = table_->partition_schema().DecodeMultiColumnHashValue(partition_key);
+  return table_->FindPartitionStartIndex(partition_key);
+}
+
 const client::YBTableName& PgTableDesc::table_name() const {
   return table_->name();
 }
@@ -94,20 +129,24 @@ const size_t PgTableDesc::num_columns() const {
   return table_->schema().num_columns();
 }
 
-client::YBPgsqlReadOp* PgTableDesc::NewPgsqlSelect() {
+std::unique_ptr<client::YBPgsqlReadOp> PgTableDesc::NewPgsqlSelect() {
   return table_->NewPgsqlSelect();
 }
 
-client::YBPgsqlWriteOp* PgTableDesc::NewPgsqlInsert() {
+std::unique_ptr<client::YBPgsqlWriteOp> PgTableDesc::NewPgsqlInsert() {
   return table_->NewPgsqlInsert();
 }
 
-client::YBPgsqlWriteOp* PgTableDesc::NewPgsqlUpdate() {
+std::unique_ptr<client::YBPgsqlWriteOp> PgTableDesc::NewPgsqlUpdate() {
   return table_->NewPgsqlUpdate();
 }
 
-client::YBPgsqlWriteOp* PgTableDesc::NewPgsqlDelete() {
+std::unique_ptr<client::YBPgsqlWriteOp> PgTableDesc::NewPgsqlDelete() {
   return table_->NewPgsqlDelete();
+}
+
+std::unique_ptr<client::YBPgsqlWriteOp> PgTableDesc::NewPgsqlTruncateColocated() {
+  return table_->NewPgsqlTruncateColocated();
 }
 
 }  // namespace pggate

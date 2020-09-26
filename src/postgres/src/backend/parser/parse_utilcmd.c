@@ -339,6 +339,12 @@ transformCreateStmt(CreateStmt *stmt, const char *queryString)
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							errmsg("Users cannot create system catalog tables.")));
 		}
+		else if (strcmp(def->defname, "tablegroup") == 0)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("Cannot supply tablegroup through WITH clause.")));
+		}
 		else if (strcmp(def->defname, "colocated") == 0)
 			(void) defGetBoolean(def);
 		else
@@ -765,7 +771,7 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 							 errmsg("primary key constraints are not supported on foreign tables"),
 							 parser_errposition(cxt->pstate,
 												constraint->location)));
-				/* FALL THRU */
+				switch_fallthrough();
 
 			case CONSTR_UNIQUE:
 				if (cxt->isforeign)
@@ -863,6 +869,59 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 	}
 }
 
+static void
+YBCheckDeferrableConstraint(CreateStmtContext *cxt, Constraint *constraint)
+{
+	if (!constraint->deferrable || cxt->relation->relpersistence == RELPERSISTENCE_TEMP)
+		return;
+	const char* message = NULL;
+	switch (constraint->contype)
+	{
+		case CONSTR_PRIMARY:
+			message = "DEFERRABLE primary key constraints are not supported yet";
+			break;
+
+		case CONSTR_UNIQUE:
+			message = "DEFERRABLE unique constraints are not supported yet";
+			break;
+
+		case CONSTR_EXCLUSION:
+			message = "DEFERRABLE exclusion constraints are not supported yet";
+			break;
+
+		case CONSTR_CHECK:
+			message = "DEFERRABLE check constraints are not supported yet";
+			break;
+
+		case CONSTR_FOREIGN:
+			/* DEFERRABLE foreign key constraints are supported */
+			return;
+
+		case CONSTR_NULL:
+		case CONSTR_NOTNULL:
+		case CONSTR_DEFAULT:
+		case CONSTR_ATTR_DEFERRABLE:
+		case CONSTR_ATTR_NOT_DEFERRABLE:
+		case CONSTR_ATTR_DEFERRED:
+		case CONSTR_ATTR_IMMEDIATE:
+			elog(ERROR, "invalid context for constraint type %d",
+				 constraint->contype);
+			return;
+
+		default:
+			elog(ERROR, "unrecognized constraint type: %d",
+				 constraint->contype);
+			return;
+	}
+
+	ereport(ERROR,
+			 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("%s", message),
+			 errhint("See https://github.com/YugaByte/yugabyte-db/issues/1129. "
+			         "Click '+' on the description to raise its priority"),
+			 parser_errposition(cxt->pstate, constraint->location)));
+}
+
 /*
  * transformTableConstraint
  *		transform a Constraint node within CREATE TABLE or ALTER TABLE
@@ -938,6 +997,9 @@ transformTableConstraint(CreateStmtContext *cxt, Constraint *constraint)
 				 constraint->contype);
 			break;
 	}
+
+	if (IsYugaByteEnabled())
+		YBCheckDeferrableConstraint(cxt, constraint);
 }
 
 /*
@@ -2590,6 +2652,24 @@ transformIndexStmt(Oid relid, IndexStmt *stmt, const char *queryString)
 	/* Set up pstate */
 	pstate = make_parsestate(NULL);
 	pstate->p_sourcetext = queryString;
+
+	/*
+	 * We must ensure that no tablegroup option was supplied in the WITH clause.
+	 * Tablegroups cannot be supplied directly for indexes. We check here instead
+	 * of ybccmds as we supply the reloption for the tablegroup of the indexed table
+	 * in DefineIndex(.) if there exists one.
+	 */
+	ListCell *cell;
+	foreach(cell, stmt->options)
+	{
+		DefElem *def = (DefElem*) lfirst(cell);
+		if (strcmp(def->defname, "tablegroup") == 0)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("Cannot supply tablegroup through WITH clause.")));
+		}
+	}
 
 	/*
 	 * Put the parent table into the rtable so that the expressions can refer

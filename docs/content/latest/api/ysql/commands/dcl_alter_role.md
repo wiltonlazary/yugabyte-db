@@ -1,8 +1,8 @@
 ---
-title: ALTER ROLE
+title: ALTER ROLE statement [YSQL]
+headerTitle: ALTER ROLE
 linkTitle: ALTER ROLE
-description: ALTER ROLE
-summary: Roles (users and groups)
+description: Use the ALTER ROLE statement to change the attributes of a role (user or group).
 menu:
   latest:
     identifier: api-ysql-commands-alter-role
@@ -15,9 +15,9 @@ showAsideToc: true
 
 ## Synopsis
 
-`ALTER ROLE` changes the attributes of a role (user or group).
+Use the `ALTER ROLE` statement to change the attributes of a role (user or group).
 
-Superusers can change the attributes of any role. Roles with CREATEROLE privilege can change the attributes of any non-superuser role.
+Superusers can change the attributes of any role. Roles with `CREATEROLE` privilege can change the attributes of any non-superuser role.
 Other roles can only change their own password.
 
 ## Syntax
@@ -70,7 +70,6 @@ Because MD5-encrypted passwords use the role name as cryptographic salt, renamin
 
 `ALTER ROLE SET | RESET config_param` is used to change role's session default for a configuration variable, either for all databases or, when the IN DATABASE clause is specified, only for sessions in the named database. If ALL is specified instead of a role name, this changes the setting for all roles.
 
-
 ## Examples
 
 - Change a role's password.
@@ -93,8 +92,7 @@ yugabyte=# ALTER ROLE Jane SET default_transaction_isolation='serializable';
 
 ## See also
 
-[`CREATE ROLE`](../dcl_create_role)
-[`DROP ROLE`](../dcl_drop_role)
-[`GRANT`](../dcl_grant)
-[`REVOKE`](../dcl_revoke)
-[Other YSQL Statements](..)
+- [`CREATE ROLE`](../dcl_create_role)
+- [`DROP ROLE`](../dcl_drop_role)
+- [`GRANT`](../dcl_grant)
+- [`REVOKE`](../dcl_revoke)

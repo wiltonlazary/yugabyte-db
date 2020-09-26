@@ -52,18 +52,18 @@ public class TestAuthorizationEnforcement extends BaseAuthenticationCQLTest {
   private static final String REVOKE = "revoke";
 
    // Session using 'cassandra' role.
-  private Session s = null;
+  protected Session s = null;
 
   // Session using the created role.
-  private Session s2;
+  protected Session s2;
 
-  private String username;
-  private String anotherUsername;
-  private String password;
-  private String keyspace;
-  private String anotherKeyspace;
-  private String table;
-  private String anotherTable;
+  protected String username;
+  protected String anotherUsername;
+  protected String password;
+  protected String keyspace;
+  protected String anotherKeyspace;
+  protected String table;
+  protected String anotherTable;
 
   @Rule
   public TestName testName = new TestName();
@@ -141,18 +141,18 @@ public class TestAuthorizationEnforcement extends BaseAuthenticationCQLTest {
         String.format("REVOKE %s ON %s %s FROM %s", permission, resourceType, resource,role));
   }
 
-  private void revokePermission(String permission, String resourceType, String resource,
+  protected void revokePermission(String permission, String resourceType, String resource,
                                 String role) throws Exception {
     revokePermissionNoSleep(permission, resourceType, resource, role);
     Thread.sleep(TIME_SLEEP_MS);
   }
 
-  private void grantPermission(String permission, String resourceType, String resource,
+  protected void grantPermission(String permission, String resourceType, String resource,
                                String role) throws Exception {
     grantPermission(permission, resourceType, resource, role, s);
   }
 
-  private void grantAllPermissionsExcept(List<String> exceptions, String resourceType,
+  protected void grantAllPermissionsExcept(List<String> exceptions, String resourceType,
                                          String resource, String role) throws Exception {
     List<String> permissions = getAllPermissionsExcept(exceptions);
     for (String permission : permissions) {
@@ -160,7 +160,7 @@ public class TestAuthorizationEnforcement extends BaseAuthenticationCQLTest {
     }
   }
 
-  private void grantAllPermission(String resourceType, String resource, String role)
+  protected void grantAllPermission(String resourceType, String resource, String role)
       throws Exception {
     grantPermission(ALL, resourceType, resource, role);
   }
@@ -169,7 +169,7 @@ public class TestAuthorizationEnforcement extends BaseAuthenticationCQLTest {
     grantPermission(permission, ALL_KEYSPACES, "", role);
   }
 
-  private void revokePermissionOnAllKeyspaces(String permission, String role) throws Exception {
+  protected void revokePermissionOnAllKeyspaces(String permission, String role) throws Exception {
     revokePermission(permission, ALL_KEYSPACES, "", role);
   }
 
@@ -198,7 +198,7 @@ public class TestAuthorizationEnforcement extends BaseAuthenticationCQLTest {
     assertEquals(1, list.size());
   }
 
-  private void createKeyspaceAndVerify(Session session, String keyspaceName) throws Exception {
+  protected void createKeyspaceAndVerify(Session session, String keyspaceName) throws Exception {
     session.execute("CREATE KEYSPACE " + keyspaceName);
     verifyKeyspaceExists(keyspaceName);
   }
@@ -224,7 +224,7 @@ public class TestAuthorizationEnforcement extends BaseAuthenticationCQLTest {
     assertEquals(1, list.size());
   }
 
-  private void createTableAndVerify(Session session, String keyspaceName, String tableName)
+  protected void createTableAndVerify(Session session, String keyspaceName, String tableName)
       throws Exception {
     // Now, username should be able to create the table.
     session.execute(String.format("CREATE TABLE %s.%s (h int, v int, PRIMARY KEY(h))",
@@ -281,7 +281,7 @@ public class TestAuthorizationEnforcement extends BaseAuthenticationCQLTest {
     verifyRow(s, keyspaceName, tableName, VALUE + 1);
   }
 
-  private void truncateTableAndVerify(Session session, String keyspaceName, String tableName)
+  protected void truncateTableAndVerify(Session session, String keyspaceName, String tableName)
       throws Exception {
     s2.execute(String.format("TRUNCATE %s.%s", keyspaceName, tableName));
 
@@ -289,7 +289,7 @@ public class TestAuthorizationEnforcement extends BaseAuthenticationCQLTest {
     assertEquals(0, rs.all().size());
   }
 
-  private void createTableAndInsertRecord(Session session, String keyspaceName, String tableName)
+  protected void createTableAndInsertRecord(Session session, String keyspaceName, String tableName)
       throws Exception {
     createTableAndVerify(session, keyspaceName, tableName);
     insertRow(session, keyspaceName, tableName);
@@ -2258,6 +2258,42 @@ public class TestAuthorizationEnforcement extends BaseAuthenticationCQLTest {
     // Verify again that level0 can create a keyspace since it is now inheriting two different
     // permissions on ALL KEYSPACES from two different roles.
     level0Session.execute("CREATE KEYSPACE somekeyspace2");
+  }
+
+  // This test a fix for https://github.com/yugabyte/yugabyte-db/issues/4062.
+  // The issue is that when different permissions are inherited from roles granted to another role,
+  // it's possible that they might replace the permissions granted directly.
+  // For example:
+  // If role 'eng' has permission SELECT on table 'releases', and role 'john' has permission
+  // MODIFY on the same table, and role 'eng' is granted to 'john', it's possible (depending on
+  // the order the permissions are received) that permission SELECT will replace permission
+  // MODIFY on table 'releases'.
+  @Test
+  public void testInheritedPermissionsDoNotOverrideGrantedPermissions() throws Exception {
+    createTableAndVerify(s, keyspace, table);
+
+    testCreateRoleHelperWithSession("employees", password, /* canLogin */ true,
+        /* isSuperuser */false, /*verifyConnectivity */ false, /* session */ s);
+    testCreateRoleHelperWithSession("eng", password, /* canLogin */ true,
+        /* isSuperuser */false, /*verifyConnectivity */ false, /* session */ s);
+
+    s.execute(String.format("GRANT employees TO eng"));
+    s.execute(String.format("GRANT SELECT ON %s.%s TO eng", keyspace, table));
+
+    testCreateRoleHelperWithSession("john", password, true, false, false, s);
+
+    s.execute(String.format("GRANT eng TO john"));
+    s.execute(String.format("GRANT MODIFY ON %s.%s TO john", keyspace, table));
+
+
+    Session johnSession = getSession("john", password);
+
+    // Sleep to give the cache some time to be refreshed.
+    Thread.sleep(TIME_SLEEP_MS);
+
+    // Verify that user 'john' can insert a record in the table.
+    insertRow(johnSession, keyspace, table);
+    johnSession.execute(String.format("SELECT * FROM %s.%s", keyspace, table));
   }
 
   public void testGrantAllGrantsCorrectPermissions() throws Exception {

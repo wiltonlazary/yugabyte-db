@@ -1,9 +1,9 @@
 // Copyright (c) YugaByte, Inc.
 
 import React, { Component } from 'react';
-import { YBLabel } from 'components/common/descriptors';
+import { YBLabel } from '../../../../components/common/descriptors';
 import { FormControl } from 'react-bootstrap';
-import { isDefinedNotNull } from 'utils/ObjectUtils';
+import { isDefinedNotNull } from '../../../../utils/ObjectUtils';
 
 export default class YBFormInput extends Component {
   handleChange = event => {
@@ -13,9 +13,9 @@ export default class YBFormInput extends Component {
   };
 
   render() {
-    const { ...rest } = this.props;
+    const { infoContent, ...rest } = this.props;
     return (
-      <YBLabel {...this.props} >
+      <YBLabel {...this.props} infoContent={infoContent}>
         <FormControl
           {...this.props.field}
           {...rest}

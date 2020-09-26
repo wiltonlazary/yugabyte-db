@@ -2,7 +2,7 @@
 
 import React, { Component } from 'react';
 import { withRouter } from 'react-router';
-import { AzureProviderConfigurationContainer, KubernetesProviderConfigurationContainer,
+import { KubernetesProviderConfigurationContainer,
          OnPremConfigurationContainer, ProviderConfigurationContainer, StorageConfigurationContainer,
          SecurityConfiguration } from '../../config';
 import { Tab, Row, Col } from 'react-bootstrap';
@@ -13,7 +13,7 @@ import azureLogo from './images/azure.png';
 import k8sLogo from './images/k8s.png';
 import pksLogo from './images/pks.png';
 import gcpLogo from './images/gcp.png';
-import { isAvailable, showOrRedirect } from 'utils/LayoutUtils';
+import { isAvailable, showOrRedirect } from '../../../utils/LayoutUtils';
 
 
 class DataCenterConfiguration extends Component {
@@ -68,7 +68,7 @@ class DataCenterConfiguration extends Component {
                   <ProviderConfigurationContainer providerType="gcp" />
                 </Tab>
                 <Tab eventKey="azure" title={<img src={azureLogo} alt="Azure" className="azure-logo" />} key="azure-tab" unmountOnExit={true}>
-                  <AzureProviderConfigurationContainer />
+                  <ProviderConfigurationContainer providerType="azu" />
                 </Tab>
                 <Tab eventKey="pks" title={pksTabContent} key="pks-tab" unmountOnExit={true}>
                   <KubernetesProviderConfigurationContainer type="pks" params={params} />

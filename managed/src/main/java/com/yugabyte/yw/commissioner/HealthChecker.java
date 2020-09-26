@@ -29,6 +29,7 @@ import com.yugabyte.yw.commissioner.Common.CloudType;
 import com.yugabyte.yw.forms.NodeInstanceFormData;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.CustomerRegisterFormData.AlertingData;
+import com.yugabyte.yw.forms.CustomerRegisterFormData.SmtpData;
 import com.yugabyte.yw.models.AccessKey;
 import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.CustomerTask;
@@ -127,6 +128,7 @@ public class HealthChecker {
   }
 
   private void initialize() {
+    LOG.info("Scheduling health checker every " + this.healthCheckIntervalMs() + " ms");
     this.actorSystem.scheduler().schedule(
       Duration.create(0, TimeUnit.MILLISECONDS), // initialDelay
       Duration.create(this.healthCheckIntervalMs(), TimeUnit.MILLISECONDS), // interval
@@ -162,17 +164,22 @@ public class HealthChecker {
     return config.getString("yb.health.default_email");
   }
 
-  private void addPromMetrics(Universe u, String response) {
-    if (healthMetric == null) {
-      return;
-    }
-
+  private void processResults(Universe u, String response) {
+    Boolean hasErrors = false;
     try {
       JsonNode healthJSON = Util.convertStringToJson(response);
+      if (healthJSON.get("mail_error") != null) {
+         LOG.warn("Health check had the following errors during mailing: " +
+                  healthJSON.path("mail_error").asText());
+      }
       for (JsonNode entry : healthJSON.path("data")) {
         String nodeName = entry.path("node").asText();
         String checkName = entry.path("message").asText();
         Boolean checkResult = entry.path("has_error").asBoolean();
+        hasErrors = checkResult || hasErrors;
+        if (null == healthMetric)
+          continue;
+
         Gauge.Child prometheusVal = healthMetric.labels(
           u.universeUUID.toString(),
           u.name,
@@ -181,6 +188,8 @@ public class HealthChecker {
         );
         prometheusVal.set(checkResult ? 1 : 0);
       }
+      LOG.info("Health check for universe " + u.name +
+               (hasErrors ? " reported errors." : " reported success."));
      } catch (Exception e) {
       LOG.warn("Failed to convert health check response to prometheus metrics " + e.getMessage());
     }
@@ -197,8 +206,13 @@ public class HealthChecker {
     running.set(true);
     // TODO(bogdan): This will not be too DB friendly when we go multi-tenant.
     for (Customer c : Customer.getAll()) {
-      checkCustomer(c);
+      try {
+        checkCustomer(c);
+      } catch (Exception ex) {
+        LOG.error("Error running health check for customer " + c.uuid, ex);
+      }
     }
+    LOG.info("Completed running health checker.");
     running.set(false);
   }
 
@@ -228,20 +242,29 @@ public class HealthChecker {
       if (shouldSendStatusUpdate) {
         lastStatusUpdateTimeMap.put(c.uuid, now);
       }
-      checkAllUniverses(c, config, shouldSendStatusUpdate);
+      CustomerConfig smtpConfig = CustomerConfig.getSmtpConfig(c.uuid);
+      SmtpData smtpData = null;
+      if (smtpConfig != null) {
+        smtpData =  Json.fromJson(smtpConfig.data, SmtpData.class);
+      }
+      checkAllUniverses(c, config, shouldSendStatusUpdate, smtpData);
     }
   }
 
   public void checkAllUniverses(
-      Customer c, CustomerConfig config, boolean shouldSendStatusUpdate) {
+      Customer c, CustomerConfig config, boolean shouldSendStatusUpdate, SmtpData smtpData) {
     // Process all of a customer's universes.
     for (Universe u : c.getUniverses()) {
-      checkSingleUniverse(u, c, config, shouldSendStatusUpdate);
-    }
+      try {
+        checkSingleUniverse(u, c, config, shouldSendStatusUpdate, smtpData);
+      } catch (Exception ex) {
+        LOG.error("Error running health check for universe " + u.universeUUID, ex);
+      }
+     }
   }
 
-  public void checkSingleUniverse(
-      Universe u, Customer c, CustomerConfig config, boolean shouldSendStatusUpdate) {
+  public void checkSingleUniverse(Universe u, Customer c, CustomerConfig config,
+                                  boolean shouldSendStatusUpdate, SmtpData smtpData) {
     // Validate universe data and make sure nothing is in progress.
     UniverseDefinitionTaskParams details = u.getUniverseDetails();
     if (details == null) {
@@ -278,25 +301,6 @@ public class HealthChecker {
             cluster.placementInfo, details.nodePrefix, provider);
       }
 
-      // TODO(bogdan): We do not have access to the default port constant at this level, as it is
-      // baked in devops...hardcode it for now.
-      // Default to 54422.
-      int sshPort = 54422;
-      if (providerCode.equals(Common.CloudType.onprem.toString())) {
-        // For onprem, technically, each node could have a different port, but let's pick one of
-        // the nodes for now and go from there.
-        // TODO(bogdan): Improve the onprem support in devops to have port per node.
-        for (NodeDetails nd : details.nodeDetailsSet) {
-          NodeInstance onpremNode = NodeInstance.getByName(nd.nodeName);
-          if (onpremNode != null) {
-            NodeInstanceFormData.NodeInstanceData onpremDetails = onpremNode.getDetails();
-            if (onpremDetails != null) {
-              sshPort = onpremDetails.sshPort;
-              break;
-            }
-          }
-        }
-      }
       AccessKey accessKey = AccessKey.get(provider.uuid, cluster.userIntent.accessKeyCode);
       if (accessKey == null || accessKey.getKeyInfo() == null) {
         if (!providerCode.equals(CloudType.kubernetes.toString())) {
@@ -306,7 +310,7 @@ public class HealthChecker {
         }
       } else {
         info.identityFile = accessKey.getKeyInfo().privateKey;
-        info.sshPort = sshPort;
+        info.sshPort = accessKey.getKeyInfo().sshPort;
       }
       if (info.enableYSQL) {
         for (NodeDetails nd : details.nodeDetailsSet) {
@@ -315,6 +319,12 @@ public class HealthChecker {
            break;
           }
         }
+      }
+
+      for (NodeDetails nd : details.nodeDetailsSet) {
+        info.ycqlPort = nd.yqlServerRpcPort;
+        info.redisPort = nd.redisServerRpcPort;
+        break;
       }
     }
     // If any clusters were invalid, abort for this universe.
@@ -332,10 +342,10 @@ public class HealthChecker {
       }
       // TODO: we do not have a good way of marking the whole universe as k8s only.
       if (nd.isMaster) {
-        info.masterNodes.add(nd.cloudInfo.private_ip);
+        info.masterNodes.put(nd.cloudInfo.private_ip, nd.nodeName);
       }
       if (nd.isTserver) {
-        info.tserverNodes.add(nd.cloudInfo.private_ip);
+        info.tserverNodes.put(nd.cloudInfo.private_ip, nd.nodeName);
       }
     }
     // If any nodes were invalid, abort for this universe.
@@ -343,8 +353,9 @@ public class HealthChecker {
       return;
     }
     List<String> destinations = new ArrayList<String>();
+    AlertingData alertingData = null;
     if (config != null) {
-      AlertingData alertingData = Json.fromJson(config.data, AlertingData.class);
+      alertingData = Json.fromJson(config.data, AlertingData.class);
       String ybEmail = ybAlertEmail();
       if (alertingData.sendAlertsToYb && ybEmail != null && !ybEmail.isEmpty()) {
         destinations.add(ybEmail);
@@ -367,22 +378,40 @@ public class HealthChecker {
     String customerTag = String.format("[%s][%s]", c.name, c.code);
     Provider mainProvider = Provider.get(UUID.fromString(
           details.getPrimaryCluster().userIntent.provider));
+
+    String disabledUntilStr = u.getConfig().getOrDefault(Universe.DISABLE_ALERTS_UNTIL, "0");
+    long disabledUntilSecs = 0;
+    try {
+      disabledUntilSecs = Long.parseLong(disabledUntilStr);
+    } catch (NumberFormatException ne) {
+      LOG.warn("invalid universe config for disabled alerts: [ " + disabledUntilStr + " ]");
+      disabledUntilSecs = 0;
+    }
+    boolean silenceEmails = ((System.currentTimeMillis() / 1000) <= disabledUntilSecs);
+
+    boolean reportOnlyErrors = !shouldSendStatusUpdate &&
+                               null != alertingData &&
+                               alertingData.reportOnlyErrors;
+    boolean sendMailAlways = (shouldSendStatusUpdate || lastCheckHadErrors);
     // Call devops and process response.
     ShellProcessHandler.ShellResponse response = healthManager.runCommand(
         mainProvider,
         new ArrayList(clusterMetadata.values()),
         u.name,
         customerTag,
-        (destinations.size() == 0 ? null : String.join(",", destinations)),
+        (destinations.size() == 0 || silenceEmails) ? null : String.join(",", destinations),
         potentialStartTime,
-        (shouldSendStatusUpdate || lastCheckHadErrors));
+        sendMailAlways,
+        reportOnlyErrors,
+        smtpData
+    );
 
     if (response.code == 0) {
-      addPromMetrics(u, response.message);
+      processResults(u, response.message);
       HealthCheck.addAndPrune(u.universeUUID, u.customerId, response.message);
     } else {
       LOG.error(String.format(
-          "Health check script got error: code (%s), msg: ", response.code, response.message));
+          "Health check script got error: code (%s)\n%s", response.code, response.message));
     }
   }
 }

@@ -37,7 +37,9 @@ from enum import Enum
 
 from ybops.common.colors import Colors
 from ybops.common.exceptions import YBOpsRuntimeError
-from replicated import Replicated
+
+if sys.version_info[0] == 2:
+    from replicated import Replicated
 
 BLOCK_SIZE = 4096
 HOME_FOLDER = os.environ["HOME"]
@@ -50,6 +52,9 @@ RSA_KEY_LENGTH = 2048
 RELEASE_VERSION_FILENAME = "version.txt"
 RELEASE_VERSION_PATTERN = "\d+.\d+.\d+.\d+"
 RELEASE_REPOS = set(["devops", "yugaware", "yugabyte"])
+
+# Home directory of node instances. Try to read home dir from env, else assume it's /home/yugabyte.
+YB_HOME_DIR = os.environ.get("YB_HOME_DIR") or "/home/yugabyte"
 
 
 class ReleasePackage(object):
@@ -305,24 +310,6 @@ def can_ssh(host_name, port, username, ssh_key_file):
         ssh_client.close()
 
 
-def get_custom_ssh_port():
-    """This method reads the group variables file and returns
-    yugabyte custom ssh port.
-
-    Returns:
-        (int): custom SSH port number.
-    """
-    group_vars_file = os.path.join(YB_DEVOPS_HOME, "group_vars", "all")
-    with open(group_vars_file, 'r') as stream:
-        try:
-            group_vars = yaml.load(stream)
-            return group_vars["custom_ssh_port"]
-        except yaml.YAMLError as e:
-            raise YBOpsRuntimeError("Reading group vars: {}, {}".format(group_vars_file, e))
-
-    return None
-
-
 def get_internal_datafile_path(file_name):
     """This method returns the data file path, based on where
     the package is installed, for an internal metadata file.
@@ -383,7 +370,7 @@ def get_release_file(repository, release_name, build_type=None):
         # TODO: why are we mkdir-ing during a function that's supposed to return a path...
         os.makedirs(build_dir)
 
-    cur_commit = subprocess.check_output(["git", "rev-parse", "HEAD"]).strip()
+    cur_commit = subprocess.check_output(["git", "rev-parse", "HEAD"]).strip().decode('utf-8')
     release = ReleasePackage.from_pieces(release_name, base_version, cur_commit, build_type)
     file_name = release.get_release_package_name()
     return os.path.join(build_dir, file_name)
@@ -403,7 +390,7 @@ def is_valid_ip_address(ip_addr):
         return False
 
 
-def get_ssh_host_port(host_info, default_port=False):
+def get_ssh_host_port(host_info, custom_port, default_port=False):
     """This method would return ssh_host and port which we should use for ansible. If host_info
     includes a ssh_port key, then we return its value. Otherwise, if the default_port param is
     True, then we return a Default SSH port (22) else, we return a custom ssh port.
@@ -416,7 +403,7 @@ def get_ssh_host_port(host_info, default_port=False):
     """
     ssh_port = host_info.get("ssh_port")
     if ssh_port is None:
-        ssh_port = (DEFAULT_SSH_PORT if default_port else get_custom_ssh_port())
+        ssh_port = (DEFAULT_SSH_PORT if default_port else custom_port)
     return {
         "ssh_port": ssh_port,
         "ssh_host": host_info["private_ip"]

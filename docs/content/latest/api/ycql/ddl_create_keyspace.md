@@ -1,7 +1,8 @@
 ---
-title: CREATE KEYSPACE
-summary: Create a new database
-description: CREATE KEYSPACE
+title: CREATE KEYSPACE statement [YCQL]
+headerTitle: CREATE KEYSPACE
+linkTitle: CREATE KEYSPACE
+description: Use the CREATE KEYSPACE statement to create a keyspace that functions as a grouping mechanism for database objects, such as tables or types.
 menu:
   latest:
     parent: api-cassandra
@@ -15,7 +16,7 @@ showAsideToc: true
 
 ## Synopsis
 
-The `CREATE KEYSPACE` statement creates a `keyspace` that functions as a grouping mechanism for database objects (such as [tables](../ddl_create_table) or [types](../ddl_create_type)).
+Use the `CREATE KEYSPACE` statement to create a `keyspace` that functions as a grouping mechanism for database objects, (such as [tables](../ddl_create_table) or [types](../ddl_create_type)).
 
 ## Syntax
 
@@ -47,16 +48,16 @@ Where
 ## Semantics
 
 - An error is raised if the specified `keyspace_name` already exists unless `IF NOT EXISTS` option is present.
-- CQL keyspace properties are supported in the syntax but have no effect internally (where YugabyteDB defaults are used instead).
+- Cassandra's CQL keyspace properties are supported in the syntax but have no effect internally (where YugabyteDB defaults are used instead).
 
 ## Examples
 
 ```sql
-cqlsh> CREATE KEYSPACE example;
+ycqlsh> CREATE KEYSPACE example;
 ```
 
 ```sql
-cqlsh> DESCRIBE KEYSPACES;
+ycqlsh> DESCRIBE KEYSPACES;
 ```
 
 ```
@@ -64,7 +65,7 @@ example  system_schema  system_auth  system
 ```
 
 ```sql
-cqlsh> DESCRIBE example;
+ycqlsh> DESCRIBE example;
 ```
 
 ```sql
@@ -72,7 +73,7 @@ CREATE KEYSPACE example WITH REPLICATION = {'class': 'SimpleStrategy', 'replicat
 ```
 
 ```sql
-cqlsh> CREATE SCHEMA example;
+ycqlsh> CREATE SCHEMA example;
 ```
 
 ```
@@ -83,7 +84,6 @@ CREATE SCHEMA example;
 
 ## See also
 
-[`ALTER KEYSPACE`](../ddl_alter_keyspace)
-[`DROP KEYSPACE`](../ddl_drop_keyspace)
-[`USE`](../ddl_use)
-[Other CQL Statements](..)
+- [`ALTER KEYSPACE`](../ddl_alter_keyspace)
+- [`DROP KEYSPACE`](../ddl_drop_keyspace)
+- [`USE`](../ddl_use)

@@ -13,6 +13,7 @@ import com.yugabyte.yw.commissioner.Common;
 import com.yugabyte.yw.common.ApiUtils;
 import com.yugabyte.yw.common.CloudQueryHelper;
 import com.yugabyte.yw.common.FakeApiHelper;
+import com.yugabyte.yw.common.FakeDBApplication;
 import com.yugabyte.yw.common.CallHomeManager.CollectionLevel;
 import com.yugabyte.yw.common.ModelFactory;
 import com.yugabyte.yw.metrics.MetricQueryHelper;
@@ -26,6 +27,7 @@ import com.yugabyte.yw.models.Region;
 import com.yugabyte.yw.models.Universe;
 import org.junit.Before;
 import org.junit.Test;
+import org.mindrot.jbcrypt.BCrypt;
 import org.mockito.ArgumentCaptor;
 import play.Application;
 import play.inject.guice.GuiceApplicationBuilder;
@@ -43,6 +45,8 @@ import java.io.*;
 
 import static com.yugabyte.yw.common.AssertHelper.assertBadRequest;
 import static com.yugabyte.yw.common.AssertHelper.assertValue;
+import static com.yugabyte.yw.common.AssertHelper.assertAuditEntry;
+import static com.yugabyte.yw.common.AssertHelper.assertUnauthorized;
 import static com.yugabyte.yw.common.ModelFactory.createUniverse;
 import static com.yugabyte.yw.models.Users.Role;
 import static org.hamcrest.CoreMatchers.*;
@@ -55,26 +59,11 @@ import static play.test.Helpers.*;
 import static org.junit.Assert.*;
 import static play.mvc.Http.Status.OK;
 import static play.mvc.Http.Status.FORBIDDEN;
+import static play.mvc.Http.Status.BAD_REQUEST;
 import static play.test.Helpers.fakeRequest;
 
-public class UsersControllerTest extends WithApplication {
-  MetricQueryHelper mockMetricQueryHelper;
-  CloudQueryHelper mockCloudQueryHelper;
+public class UsersControllerTest extends FakeDBApplication {
   String baseRoute = "/api/customers/%s/users";
-
-  @Override
-  protected Application provideApplication() {
-    mockMetricQueryHelper = mock(MetricQueryHelper.class);
-    Commissioner mockCommissioner = mock(Commissioner.class);
-    mockCloudQueryHelper = mock(CloudQueryHelper.class);
-
-    return new GuiceApplicationBuilder()
-      .configure((Map) Helpers.inMemoryDatabase())
-      .overrides(bind(MetricQueryHelper.class).toInstance(mockMetricQueryHelper))
-      .overrides(bind(Commissioner.class).toInstance(mockCommissioner))
-      .overrides(bind(CloudQueryHelper.class).toInstance(mockCloudQueryHelper))
-      .build();
-  }
 
   private Customer customer1, customer2;
   private Users user1, user2;
@@ -111,12 +100,14 @@ public class UsersControllerTest extends WithApplication {
     assertEquals(userList.size(), 1);
     assertThat(userList.get(0).uuid, allOf(notNullValue(), equalTo(user1.uuid)));
     assertEquals(userList.get(0).email, user1.email);
+    assertAuditEntry(0, customer1.uuid);
   }
 
   @Test
   public void testGetUsersWithInvalidToken() throws IOException {
     List<Users> userList = getListOfUsers(authToken1, customer2);
     assertNull(userList);
+    assertAuditEntry(0, customer1.uuid);
   }
 
   @Test
@@ -137,6 +128,7 @@ public class UsersControllerTest extends WithApplication {
     assertEquals(user.email, "foo@bar.com");
     List<Users> userList = getListOfUsers(authToken1, customer1);
     assertEquals(userList.size(), 2);
+    assertAuditEntry(1, customer1.uuid);
   }
 
   @Test
@@ -147,6 +139,7 @@ public class UsersControllerTest extends WithApplication {
         .cookie(validCookie));
     List<Users> userList = getListOfUsers(authToken1, customer1);
     assertNull(userList);
+    assertAuditEntry(1, customer1.uuid);
   }
 
   @Test
@@ -160,6 +153,57 @@ public class UsersControllerTest extends WithApplication {
         .cookie(validCookie));
     testUser1 = Users.get(testUser1.uuid);
     assertEquals(testUser1.getRole(), Role.ReadOnly);
+    assertAuditEntry(1, customer1.uuid);
   }
 
+  @Test
+  public void testRoleChangeSuperAdmin() throws IOException {
+    Users testUser1 = ModelFactory.testUser(customer1, "tc3@test.com", Role.SuperAdmin);
+    assertEquals(testUser1.getRole(), Role.SuperAdmin);
+    Http.Cookie validCookie = Http.Cookie.builder("authToken", authToken1).build();
+    Result result = route(fakeRequest("PUT",
+        String.format("%s/%s?role=ReadOnly",
+        String.format(baseRoute, customer1.uuid), testUser1.uuid))
+        .cookie(validCookie));
+    assertEquals(result.status(), BAD_REQUEST);
+  }
+
+  @Test
+  public void testPasswordChangeInvalid() throws IOException {
+    Users testUser1 = ModelFactory.testUser(customer1, "tc3@test.com", Role.Admin);
+    assertEquals(testUser1.getRole(), Role.Admin);
+    ObjectNode params = Json.newObject();
+    params.put("email", "tc3@test.com");
+    params.put("password", "new-password");
+    params.put("confirmPassword", "new-password");
+    params.put("role", "Admin");
+    Http.Cookie validCookie = Http.Cookie.builder("authToken", authToken1).build();
+    Result result = route(fakeRequest("PUT",
+        String.format("%s/%s/change_password",
+        String.format(baseRoute, customer1.uuid), testUser1.uuid))
+        .cookie(validCookie).bodyJson(params));
+    testUser1 = Users.get(testUser1.uuid);
+    assertEquals(result.status(), FORBIDDEN);
+  }
+
+  @Test
+  public void testPasswordChangeValid() throws IOException {
+    Users testUser1 = ModelFactory.testUser(customer1, "tc3@test.com", Role.Admin);
+    String authTokenTest = testUser1.createAuthToken();
+    assertEquals(testUser1.getRole(), Role.Admin);
+    ObjectNode params = Json.newObject();
+    params.put("email", "tc3@test.com");
+    params.put("password", "new-password");
+    params.put("confirmPassword", "new-password");
+    params.put("role", "Admin");
+    Http.Cookie validCookie = Http.Cookie.builder("authToken", authTokenTest).build();
+    Result result = route(fakeRequest("PUT",
+        String.format("%s/%s/change_password",
+        String.format(baseRoute, customer1.uuid), testUser1.uuid))
+        .cookie(validCookie).bodyJson(params));
+    testUser1 = Users.get(testUser1.uuid);
+    assertEquals(testUser1.getRole(), Role.Admin);
+    assertTrue(BCrypt.checkpw("new-password", testUser1.passwordHash));
+    assertAuditEntry(0, customer1.uuid);
+  }
 }

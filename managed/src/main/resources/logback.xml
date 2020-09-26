@@ -4,10 +4,12 @@
   <conversionRule conversionWord="coloredLevel" converterClass="play.api.libs.logback.ColoredLevel" />
 
   <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
-    <file>${application.home:-.}/logs/application.log</file>
+    <file>${log.override.path:-${application.home:-.}/logs}/application.log</file>
     <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
         <!-- Daily rollover with compression -->
-        <fileNamePattern>${application.home:-.}/logs/application-log-%d{yyyy-MM-dd}.gz</fileNamePattern>
+        <fileNamePattern>
+          ${log.override.path:-${application.home:-.}/logs}/application-log-%d{yyyy-MM-dd}.gz
+        </fileNamePattern>
         <!-- keep 30 days worth of history -->
         <maxHistory>30</maxHistory>
     </rollingPolicy>
@@ -38,9 +40,6 @@
   <logger name="application" level="DEBUG" />
 
   <!-- Off these ones as they are annoying, and anyway we manage configuration ourselves -->
-  <logger name="com.avaje.ebean.config.PropertyMapLoader" level="OFF" />
-  <logger name="com.avaje.ebeaninternal.server.core.XmlConfigLoader" level="OFF" />
-  <logger name="com.avaje.ebeaninternal.server.lib.BackgroundThread" level="OFF" />
   <logger name="com.gargoylesoftware.htmlunit.javascript" level="OFF" />
 
   <root level="WARN">

@@ -1,7 +1,8 @@
 ---
-title: GRANT PERMISSION
-summary: Grant a permission to a role
-description: GRANT PERMISSION
+title: GRANT PERMISSION statement [YCQL]
+headerTitle: GRANT PERMISSION
+linkTitle: GRANT PERMISSION
+description: Use the GRANT PERMISSION statement to grant a permission (or all the available permissions) to a role.
 menu:
   latest:
     parent: api-cassandra
@@ -15,11 +16,11 @@ showAsideToc: true
 
 ## Synopsis
 
-The `GRANT PERMISSION` statement is used to grant a permission (or all the available permissions) to a role.
+Use the `GRANT PERMISSION` statement to grant a permission (or all the available permissions) to a role.
 
 When a database object is created (keyspace, table, or role), an automatic and explicit grant of all the permissions relevant to the object are granted to the role creating it.
 
-This statement is enabled by setting the YB-TServer configuration option [`use_cassandra_authentication`](../../../reference/configuration/yb-tserver/#config-flags) to `true`.
+This statement is enabled by setting the YB-TServer flag [`--use_cassandra_authentication`](../../../reference/configuration/yb-tserver/#config-flags) to `true`.
 
 ## Syntax
 
@@ -94,27 +95,26 @@ Operation| Permission| Resource|
 ### Grant `MODIFY` permission on a table so role `qa` can insert rows into a table.
 
 ```sql
-cqlsh:example> GRANT MODIFY ON TABLE performance_tests.metrics TO qa;
+ycqlsh:example> GRANT MODIFY ON TABLE performance_tests.metrics TO qa;
 ```
 
 ### Grant `SELECT` permission on a table so role `qa` can read the table.
 
 ```sql
-cqlsh:example> GRANT SELECT ON performance_tests.metrics TO qa;
+ycqlsh:example> GRANT SELECT ON performance_tests.metrics TO qa;
 ```
 
 ### Grant `CREATE` permission on `ALL KEYSPACES` so role `tests` can create new keyspaces.
 
 ```sql
-cqlsh:example> GRANT CREATE ON ALL KEYSPACES TO tests;
+ycqlsh:example> GRANT CREATE ON ALL KEYSPACES TO tests;
 ```
 
 ## See also
 
-[`ALTER ROLE`](../ddl_alter_role)
-[`DROP ROLE`](../ddl_drop_role)
-[`CREATE ROLE`](../ddl_create_role)
-[`REVOKE ROLE`](../ddl_revoke_role)
-[`GRANT PERMISSION`](../ddl_grant_permission)
-[`REVOKE PERMISSION`](../ddl_revoke_permission)
-[Other CQL Statements](..)
+- [`ALTER ROLE`](../ddl_alter_role)
+- [`DROP ROLE`](../ddl_drop_role)
+- [`CREATE ROLE`](../ddl_create_role)
+- [`REVOKE ROLE`](../ddl_revoke_role)
+- [`GRANT PERMISSION`](../ddl_grant_permission)
+- [`REVOKE PERMISSION`](../ddl_revoke_permission)

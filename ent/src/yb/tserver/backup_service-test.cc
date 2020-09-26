@@ -16,6 +16,7 @@
 #include "yb/rpc/messenger.h"
 
 #include "yb/tablet/tablet.h"
+#include "yb/tablet/tablet_snapshots.h"
 
 #include "yb/tserver/backup.proxy.h"
 #include "yb/tserver/mini_tablet_server.h"
@@ -30,7 +31,7 @@ using std::string;
 
 using yb::rpc::RpcController;
 using yb::tablet::TabletPeer;
-using yb::tablet::enterprise::Tablet;
+using yb::tablet::Tablet;
 
 class BackupServiceTest : public TabletServerTestBase {
  public:
@@ -57,13 +58,13 @@ TEST_F(BackupServiceTest, TestCreateTabletSnapshot) {
 
   const string snapshot_id = "00000000000000000000000000000000";
   const string rocksdb_dir = tablet->tablet_metadata()->rocksdb_dir();
-  const string top_snapshots_dir = Tablet::SnapshotsDirName(rocksdb_dir);
+  const string top_snapshots_dir = tablet->tablet_metadata()->snapshots_dir();
   const string snapshot_dir = JoinPathSegments(top_snapshots_dir, snapshot_id);
 
   TabletSnapshotOpRequestPB req;
   TabletSnapshotOpResponsePB resp;
 
-  req.set_operation(TabletSnapshotOpRequestPB::CREATE);
+  req.set_operation(TabletSnapshotOpRequestPB::CREATE_ON_TABLET);
   req.set_dest_uuid(mini_server_->server()->fs_manager()->uuid());
   req.set_snapshot_id(snapshot_id);
 
@@ -76,7 +77,7 @@ TEST_F(BackupServiceTest, TestCreateTabletSnapshot) {
     ASSERT_NOK(StatusFromPB(resp.error().status()));
   }
 
-  req.set_tablet_id(kTabletId);
+  req.add_tablet_id(kTabletId);
 
   ASSERT_TRUE(fs->Exists(rocksdb_dir));
   ASSERT_TRUE(fs->Exists(top_snapshots_dir));
@@ -127,10 +128,10 @@ TEST_F(BackupServiceTest, TestSnapshotData) {
   TabletSnapshotOpResponsePB resp;
 
   // Send the create snapshot request.
-  req.set_operation(TabletSnapshotOpRequestPB::CREATE);
+  req.set_operation(TabletSnapshotOpRequestPB::CREATE_ON_TABLET);
   req.set_dest_uuid(mini_server_->server()->fs_manager()->uuid());
   req.set_snapshot_id(snapshot_id);
-  req.set_tablet_id(kTabletId);
+  req.add_tablet_id(kTabletId);
   {
     RpcController rpc;
     SCOPED_TRACE(req.DebugString());

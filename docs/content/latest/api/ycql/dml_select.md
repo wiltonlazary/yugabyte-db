@@ -1,7 +1,8 @@
 ---
-title: SELECT
-summary: Retrieves rows from a table
-description: SELECT
+title: SELECT statement [YCQL]
+headerTitle: SELECT
+linkTitle: SELECT
+description: Use the SELECT statement to retrieve (part of) rows of specified columns that meet a given condition from a table.
 menu:
   latest:
     parent: api-cassandra
@@ -15,7 +16,7 @@ showAsideToc: true
 
 ## Synopsis
 
-The `SELECT` statement retrieves (part of) rows of specified columns that meet a given condition from a table. It specifies the columns to be retrieved, the name of the table, and the condition each selected row must satisfy.
+Use the `SELECT` statement to retrieve (part of) rows of specified columns that meet a given condition from a table. It specifies the columns to be retrieved, the name of the table, and the condition each selected row must satisfy.
 
 ## Syntax
 
@@ -100,7 +101,7 @@ Ideally, these performance considerations should be taken into account when crea
 ### Select all rows from a table
 
 ```sql
-cqlsh:example> CREATE TABLE employees(department_id INT, 
+ycqlsh:example> CREATE TABLE employees(department_id INT, 
                                       employee_id INT, 
                                       dept_name TEXT STATIC,
                                       employee_name TEXT, 
@@ -108,27 +109,27 @@ cqlsh:example> CREATE TABLE employees(department_id INT,
 ```
 
 ```sql
-cqlsh:example> INSERT INTO employees(department_id, employee_id, dept_name, employee_name) 
+ycqlsh:example> INSERT INTO employees(department_id, employee_id, dept_name, employee_name) 
                    VALUES (1, 1, 'Accounting', 'John');
 ```
 
 ```sql
-cqlsh:example> INSERT INTO employees(department_id, employee_id, dept_name, employee_name) 
+ycqlsh:example> INSERT INTO employees(department_id, employee_id, dept_name, employee_name) 
                    VALUES (1, 2, 'Accounting', 'Jane');
 ```
 
 ```sql
-cqlsh:example> INSERT INTO employees(department_id, employee_id, dept_name, employee_name) 
+ycqlsh:example> INSERT INTO employees(department_id, employee_id, dept_name, employee_name) 
                    VALUES (1, 3, 'Accounting', 'John');
 ```
 
 ```sql
-cqlsh:example> INSERT INTO employees(department_id, employee_id, dept_name, employee_name) 
+ycqlsh:example> INSERT INTO employees(department_id, employee_id, dept_name, employee_name) 
                    VALUES (2, 1, 'Marketing', 'Joe');
 ```
 
 ```sql
-cqlsh:example> SELECT * FROM employees;
+ycqlsh:example> SELECT * FROM employees;
 ```
 
 ```
@@ -143,7 +144,7 @@ cqlsh:example> SELECT * FROM employees;
 ### Select with limit
 
 ```sql
-cqlsh:example> SELECT * FROM employees LIMIT 2;
+ycqlsh:example> SELECT * FROM employees LIMIT 2;
 ```
 
 ```
@@ -156,7 +157,7 @@ cqlsh:example> SELECT * FROM employees LIMIT 2;
 ### Select with offset
 
 ```sql
-cqlsh:example> SELECT * FROM employees LIMIT 2 OFFSET 1;
+ycqlsh:example> SELECT * FROM employees LIMIT 2 OFFSET 1;
 ```
 
 ```
@@ -169,7 +170,7 @@ cqlsh:example> SELECT * FROM employees LIMIT 2 OFFSET 1;
 ### Select distinct values
 
 ```sql
-cqlsh:example> SELECT DISTINCT dept_name FROM employees;
+ycqlsh:example> SELECT DISTINCT dept_name FROM employees;
 ```
 
 ```
@@ -182,7 +183,7 @@ cqlsh:example> SELECT DISTINCT dept_name FROM employees;
 ### Select with a condition on the partitioning column
 
 ```sql
-cqlsh:example> SELECT * FROM employees WHERE department_id = 2;
+ycqlsh:example> SELECT * FROM employees WHERE department_id = 2;
 ```
 
 ```
@@ -194,7 +195,7 @@ cqlsh:example> SELECT * FROM employees WHERE department_id = 2;
 ### Select with condition on the clustering column
 
 ```sql
-cqlsh:example> SELECT * FROM employees WHERE department_id = 1 AND employee_id <= 2;
+ycqlsh:example> SELECT * FROM employees WHERE department_id = 1 AND employee_id <= 2;
 ```
 
 ```
@@ -204,10 +205,10 @@ cqlsh:example> SELECT * FROM employees WHERE department_id = 1 AND employee_id <
              1 |           2 | Accounting |          Jane
 ```
 
-### Select with condition on a regular column, using WHERE clause.
+### Select with condition on a regular column, using WHERE clause
 
 ```sql
-cqlsh:example> SELECT * FROM employees WHERE department_id = 1 AND employee_name = 'John' ALLOW FILTERING;
+ycqlsh:example> SELECT * FROM employees WHERE department_id = 1 AND employee_name = 'John' ALLOW FILTERING;
 ```
 
 ```
@@ -217,10 +218,10 @@ cqlsh:example> SELECT * FROM employees WHERE department_id = 1 AND employee_name
              1 |           3 | Accounting |          John
 ```
 
-### Select with condition on a regular column, using IF clause.
+### Select with condition on a regular column, using IF clause
 
 ```sql
-cqlsh:example> SELECT * FROM employees WHERE department_id = 1 IF employee_name != 'John';
+ycqlsh:example> SELECT * FROM employees WHERE department_id = 1 IF employee_name != 'John';
 ```
 
 ```
@@ -232,7 +233,7 @@ cqlsh:example> SELECT * FROM employees WHERE department_id = 1 IF employee_name 
 ### Select with `ORDER BY` clause
 
 ``` sql
-cqlsh:example> CREATE TABLE sensor_data(device_id INT,
+ycqlsh:example> CREATE TABLE sensor_data(device_id INT,
                                         sensor_id INT,
                                         ts TIMESTAMP,
                                         value TEXT,
@@ -240,29 +241,29 @@ cqlsh:example> CREATE TABLE sensor_data(device_id INT,
 ```
 
 ```sql
-cqlsh:example> INSERT INTO sensor_data(device_id, sensor_id, ts, value)
+ycqlsh:example> INSERT INTO sensor_data(device_id, sensor_id, ts, value)
                    VALUES (1, 1, '2018-1-1 12:30:30 UTC', 'a');
 ```
 
 ```sql
-cqlsh:example> INSERT INTO sensor_data(device_id, sensor_id, ts, value)
+ycqlsh:example> INSERT INTO sensor_data(device_id, sensor_id, ts, value)
                    VALUES (1, 1, '2018-1-1 12:30:31 UTC', 'b');
 ```
 
 ```sql
-cqlsh:example> INSERT INTO sensor_data(device_id, sensor_id, ts, value)
+ycqlsh:example> INSERT INTO sensor_data(device_id, sensor_id, ts, value)
                    VALUES (1, 2, '2018-1-1 12:30:30 UTC', 'x');
 ```
 
 ```sql
-cqlsh:example> INSERT INTO sensor_data(device_id, sensor_id, ts, value)
+ycqlsh:example> INSERT INTO sensor_data(device_id, sensor_id, ts, value)
                    VALUES (1, 2, '2018-1-1 12:30:31 UTC', 'y');
 ```
 
 Reverse scan, opposite of the table's clustering order.
 
 ```sql
-cqlsh:example> SELECT * FROM sensor_data WHERE device_id = 1 ORDER BY sensor_id DESC, ts ASC;
+ycqlsh:example> SELECT * FROM sensor_data WHERE device_id = 1 ORDER BY sensor_id DESC, ts ASC;
 ```
 
 ```
@@ -277,7 +278,7 @@ cqlsh:example> SELECT * FROM sensor_data WHERE device_id = 1 ORDER BY sensor_id 
 Forward scan, same as a SELECT without an ORDER BY clause.
 
 ```sql
-cqlsh:example> SELECT * FROM sensor_data WHERE device_id = 1 ORDER BY sensor_id ASC, ts DESC;
+ycqlsh:example> SELECT * FROM sensor_data WHERE device_id = 1 ORDER BY sensor_id ASC, ts DESC;
 ```
 
 ```
@@ -288,23 +289,23 @@ cqlsh:example> SELECT * FROM sensor_data WHERE device_id = 1 ORDER BY sensor_id 
          1 |         2 | 2018-01-01 12:30:31.000000+0000 |     y
          1 |         2 | 2018-01-01 12:30:30.000000+0000 |     x
 ```
+
 Other orderings are not allowed.
 
 ```sql
-cqlsh:example> SELECT * FROM sensor_data WHERE device_id = 1 ORDER BY sensor_id ASC, ts ASC;
+ycqlsh:example> SELECT * FROM sensor_data WHERE device_id = 1 ORDER BY sensor_id ASC, ts ASC;
 ```
 
 ```
 InvalidRequest: Unsupported order by relation
-SELECT * FROM sensor_data WHERE device_id = 1 ORDER BY sensor_id ASC, ts ASC; 
-                                                        ^^^^^^^^^^^^^^^^^^^^^                                                      
+SELECT * FROM sensor_data WHERE device_id = 1 ORDER BY sensor_id ASC, ts ASC;
+                                                        ^^^^^^^^^^^^^^^^^^^^^
 ```
 
 ## See also
 
-[`CREATE TABLE`](../ddl_create_table)
-[`INSERT`](../dml_insert)
-[`UPDATE`](../dml_update)
-[`DELETE`](../dml_delete)
-[`Expression`](..#expressions)
-[Other CQL Statements](..)
+- [`CREATE TABLE`](../ddl_create_table)
+- [`INSERT`](../dml_insert)
+- [`UPDATE`](../dml_update)
+- [`DELETE`](../dml_delete)
+- [`Expression`](..#expressions)

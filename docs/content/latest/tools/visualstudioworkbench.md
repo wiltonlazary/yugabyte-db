@@ -1,23 +1,24 @@
 ---
-title: Visual Studio Code
+title: Use Visual Studio Code with YugabyteDB YCQL
+headerTitle: Visual Studio Code
 linkTitle: Visual Studio Code
-description: Visual Studio Code 
+description: Configure Visual Studio Code to work with YCQL.
 menu:
   latest:
     identifier: visualstudioworkbench
     parent: tools
-    weight: 2811
+    weight: 2760
 isTocNested: true
 showAsideToc: true
 ---
 
 ## Introduction
 
-In this tutorial, we will show how to install the [Apache Cassandra Workbench](https://marketplace.visualstudio.com/items?itemName=kdcro101.vscode-cassandra#quick-start) extension in Visual Studio Code and configure a connection.
+In this tutorial, you will show how to install the [Apache Cassandra Workbench](https://marketplace.visualstudio.com/items?itemName=kdcro101.vscode-cassandra#quick-start) extension in Visual Studio Code and configure a connection.
 
 ## Install the VS Code extension
 
-In this tutorial, we will show how to install the [Apache Cassandra Workbench](https://marketplace.visualstudio.com/items?itemName=kdcro101.vscode-cassandra#quick-start) extension in Visual Studio Code and configure a connection.
+In this tutorial, you will show how to install the [Apache Cassandra Workbench](https://marketplace.visualstudio.com/items?itemName=kdcro101.vscode-cassandra#quick-start) extension in Visual Studio Code and configure a connection.
 
 Open Visual Studio Code (you can download it from https://code.visualstudio.com for Windows, Mac or Linux) and press `Control + P`.
 

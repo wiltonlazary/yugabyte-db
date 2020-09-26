@@ -1,7 +1,8 @@
 ---
-title: CREATE TYPE
-summary: Create a new data type
-description: CREATE TYPE
+title: CREATE TYPE statement [YCQL]
+headerTitle: CREATE TYPE
+linkTitle: CREATE TYPE
+description: Use the CREATE TYPE statement to create a new user-defined data type in a keyspace.
 menu:
   latest:
     parent: api-cassandra
@@ -15,7 +16,7 @@ showAsideToc: true
 
 ## Synopsis
 
-To `CREATE TYPE` statement creates a new user-defined data type in a keyspace.  It defines the name of the user-defined type and the names and data types for its fields.
+Use the `CREATE TYPE` statement to create a new user-defined data type in a keyspace.  It defines the name of the user-defined type and the names and data types for its fields.
 
 ## Syntax
 
@@ -46,11 +47,11 @@ Where
 Collection types must be frozen to be used inside a user-defined type.
 
 ```sql
-cqlsh:example> CREATE TYPE person(first_name TEXT, last_name TEXT, emails FROZEN<LIST<TEXT>>);
+ycqlsh:example> CREATE TYPE person(first_name TEXT, last_name TEXT, emails FROZEN<LIST<TEXT>>);
 ```
 
 ```sql
-cqlsh:example> DESCRIBE TYPE person;
+ycqlsh:example> DESCRIBE TYPE person;
 ```
 
 ```
@@ -62,16 +63,16 @@ CREATE TYPE example.person (
 ```
 
 ```sql
-cqlsh:example> CREATE TABLE employees(employee_id INT PRIMARY KEY, employee person);
+ycqlsh:example> CREATE TABLE employees(employee_id INT PRIMARY KEY, employee person);
 ```
 
 ```sql
-cqlsh:example> INSERT INTO employees(employee_id, employee)
+ycqlsh:example> INSERT INTO employees(employee_id, employee)
                    VALUES (1, {first_name : 'John', last_name : 'Doe', emails : ['jdoe@example.com']});
 ```
 
 ```sql
-cqlsh:example> SELECT * FROM employees;
+ycqlsh:example> SELECT * FROM employees;
 ```
 
 ```
@@ -83,6 +84,5 @@ cqlsh:example> SELECT * FROM employees;
 
 ## See also
 
-[`CREATE TABLE`](../ddl_create_table)
-[`DROP TYPE`](../ddl_drop_keyspace)
-[Other CQL Statements](..)
+- [`CREATE TABLE`](../ddl_create_table)
+- [`DROP TYPE`](../ddl_drop_keyspace)

@@ -16,7 +16,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
-import java.util.TreeSet;
 import java.util.Queue;
 import java.util.UUID;
 import java.util.stream.Collectors;
@@ -31,6 +30,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.common.collect.ImmutableList;
+import com.yugabyte.yw.common.utils.Pair;
 import com.yugabyte.yw.commissioner.Common.CloudType;
 import com.yugabyte.yw.commissioner.tasks.UniverseDefinitionTaskBase.ServerType;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
@@ -51,6 +51,9 @@ import com.yugabyte.yw.models.helpers.PlacementInfo.PlacementAZ;
 import com.yugabyte.yw.models.helpers.PlacementInfo.PlacementCloud;
 import com.yugabyte.yw.models.helpers.PlacementInfo.PlacementRegion;
 import play.libs.Json;
+
+import static java.util.stream.Collectors.groupingBy;
+import static java.util.stream.Collectors.toCollection;
 
 import static com.yugabyte.yw.common.Util.toBeAddedAzUuidToNumNodes;
 import static com.yugabyte.yw.forms.UniverseDefinitionTaskParams.ClusterType.ASYNC;
@@ -195,6 +198,10 @@ public class PlacementInfoUtil {
       UserIntent tempIntent = newIntent.clone();
       tempIntent.numNodes = existingIntent.numNodes;
       if (!tempIntent.equals(existingIntent)) {
+        if (tempIntent.onlyRegionsChanged(existingIntent)) {
+          LOG.info("Only new regions are added, so we will do expand");
+          return ConfigureNodesMode.UPDATE_CONFIG_FROM_USER_INTENT;
+        }
         return ConfigureNodesMode.NEW_CONFIG;
       }
     }
@@ -981,7 +988,7 @@ public class PlacementInfoUtil {
     // Get node count per azUuid in the current universe.
     Map<UUID, Integer> azUuidToNumNodes = new HashMap<UUID, Integer>();
     for (NodeDetails node : nodeDetailsSet) {
-      if (onlyActive && !node.isActive()) {
+      if ((onlyActive && !node.isActive()) || (node.isMaster && !node.isTserver)) {
         continue;
       }
       UUID azUuid = node.azUuid;
@@ -1009,14 +1016,16 @@ public class PlacementInfoUtil {
   }
 
   // Find a node running tserver only in the given AZ.
-  private static NodeDetails findActiveTServerOnlyInAz(Collection<NodeDetails> nodeDetailsSet,
+  public static NodeDetails findActiveTServerOnlyInAz(Collection<NodeDetails> nodes,
                                                        UUID targetAZUuid) {
-    for (NodeDetails node : nodeDetailsSet) {
-      if (node.isActive() && !node.isMaster && node.isTserver && node.azUuid.equals(targetAZUuid)) {
-        return node;
-      }
-    }
-    return null;
+    NodeDetails activeNode = nodes.stream()
+                                  .filter(node -> node.isActive() && !node.isMaster &&
+                                                  node.isTserver &&
+                                                  node.azUuid.equals(targetAZUuid))
+                                  .max(Comparator.comparingInt(NodeDetails::getNodeIdx))
+                                  .orElse(null);
+    return activeNode;
+
   }
 
   /**
@@ -1110,7 +1119,7 @@ public class PlacementInfoUtil {
 
       boolean isSimpleExpand = true;
       for (UUID requiredAZUUID: requiredAZToNodeMap.keySet()) {
-        if (!existingAZToNodeMap.containsKey(requiredAZUUID) ||
+        if (existingAZToNodeMap.containsKey(requiredAZUUID) &&
             requiredAZToNodeMap.get(requiredAZUUID) < existingAZToNodeMap.get(requiredAZUUID)) {
           isSimpleExpand = false;
           break;
@@ -1195,6 +1204,16 @@ public class PlacementInfoUtil {
     nodes.addAll(deltaNodesSet);
   }
 
+  private static int getNumTserverNodes(Collection<NodeDetails> nodeDetailsSet) {
+    int count = 0;
+    for (NodeDetails node: nodeDetailsSet) {
+      if (node.isTserver) {
+        count++;
+      }
+    }
+    return count;
+  }
+
   private static void configureNodesUsingUserIntent(Cluster cluster,
                                                     Collection<NodeDetails> nodeDetailsSet,
                                                     boolean isEditUniverse) {
@@ -1202,10 +1221,13 @@ public class PlacementInfoUtil {
     Set<NodeDetails> nodesInCluster = nodeDetailsSet.stream()
             .filter(n -> n.placementUuid.equals(cluster.uuid))
             .collect(Collectors.toSet());
-    int numDeltaNodes = userIntent.numNodes - nodesInCluster.size();
+
+    int numTservers = getNumTserverNodes(nodesInCluster);
+    int numDeltaNodes = userIntent.numNodes - numTservers;
     Map<String, NodeDetails> deltaNodesMap = new HashMap<String, NodeDetails>();
     Map<UUID, Integer> azUuidToNumNodes = getAzUuidToNumNodes(nodesInCluster);
-    LOG.info("Nodes desired={} vs existing={}.", userIntent.numNodes, nodesInCluster.size());
+    LOG.info("Nodes desired={} vs existing={}.", userIntent.numNodes,
+            numTservers);
     if (numDeltaNodes < 0) {
       // Desired action is to remove nodes from a given cluster.
       Iterator<NodeDetails> nodeIter = nodeDetailsSet.iterator();
@@ -1229,7 +1251,7 @@ public class PlacementInfoUtil {
           break;
         }
       }
-    } else {
+    } else if (numDeltaNodes > 0) {
       // Desired action is to add nodes.
       LinkedHashSet<PlacementIndexes> indexes =
               findPlacementsOfAZUuid(sortByValues(azUuidToNumNodes, true), cluster);
@@ -1454,68 +1476,69 @@ public class PlacementInfoUtil {
     nodeDetailsSet.addAll(deltaNodesSet);
   }
 
-  public static void selectMasters(Collection<NodeDetails> nodes, int numMastersToChoose) {
-    Map<String, NodeDetails> deltaNodesMap = new HashMap<String, NodeDetails>();
-    for (NodeDetails node : nodes) {
-      deltaNodesMap.put(node.nodeName, node);
-    }
-    selectMasters(deltaNodesMap, numMastersToChoose);
-  }
-
   /**
-   * Given a set of nodes and number of desired masters, select masters from the nodes that
-   * will be added to the universe.
-   *
-   * @param nodesMap   : a map of node name to NodeDetails
-   * @param numMasters : the number of masters to choose
-   */
-  private static void selectMasters(Map<String, NodeDetails> nodesMap, int numMasters) {
-    // Group the cluster nodes by subnets.
-    Map<String, TreeSet<String>> subnetsToNodenameMap = new HashMap<String, TreeSet<String>>();
-    // Tally up the number of entries in the map
-    int numCandidates = 0;
-    for (Entry<String, NodeDetails> entry : nodesMap.entrySet()) {
-      NodeDetails node = entry.getValue();
-      // TODO: Live is checked as some tests use it as the starting state. Should be made ToBeAdded.
-      if (node.state != NodeState.Live && node.state != NodeState.ToBeAdded) {
-        continue;
-      }
-      String subnet = node.cloudInfo.subnet_id;
-      if (!subnetsToNodenameMap.containsKey(subnet)) {
-        subnetsToNodenameMap.put(subnet, new TreeSet<String>());
-      }
-      TreeSet<String> nodeSet = subnetsToNodenameMap.get(subnet);
-      // Add the node name into the node set.
-      nodeSet.add(entry.getKey());
-      numCandidates++;
+  * Select masters according to region and zone. We create an ordered list of nodes:
+  * The nodes are selected per zone, with each zone itself being selected per region.
+  */
+  public static void selectMasters(Collection<NodeDetails> nodes, int numMastersToChoose) {
+    // Map to region to zone to nodes. Using a multi-level map ensures that even if zones names
+    // are similar across regions, there will be no conflict.
+    List<NodeDetails> validNodes = nodes.stream()
+                                        .filter(node -> node.state == NodeState.Live ||
+                                                        node.state == NodeState.ToBeAdded)
+                                        .collect(Collectors.toList());
+
+    Map<String, Map<String, LinkedList<NodeDetails>>> regionToZoneToNode =
+        validNodes.stream().collect(groupingBy(node -> node.getRegion(),
+                                    groupingBy(node -> node.getZone(),
+                                               toCollection(LinkedList::new))));
+
+    // Map to region to zone. This is used to populate the ordering of the region/zone pairs from
+    // which to select nodes.
+    Map<String, LinkedList<String>> regionToZone =
+        validNodes.stream().collect(groupingBy(node -> node.getRegion(),
+                                    Collectors.mapping(node -> node.getZone(),
+                                        Collectors.collectingAndThen(toCollection(HashSet::new),
+                                            values -> new LinkedList(values)))));
+
+    int numCandidates =  validNodes.size();
+
+    if (numMastersToChoose > numCandidates) {
+      throw new IllegalStateException("Could not pick " + numMastersToChoose + " masters, only " +
+              numCandidates + " nodes available. Nodes info. " + nodes);
     }
 
-    // Make sure there are enough nodes in the available subnets to pick masters from
-    if (numCandidates < numMasters) {
-      throw new IllegalStateException("Could not pick " + numMasters + " masters, only " +
-              numCandidates + " nodes available. Nodes info. " + nodesMap);
+    // Create a queue to order the region/zone pairs, so that we place one node in each region,
+    // and then when all regions have a node placed, the next time they'll use a different region/
+    // zone pairing.
+    Queue<Pair<String, String>> queue = new LinkedList<Pair<String, String>>();
+    while (!regionToZone.isEmpty()) {
+      Iterator <Entry<String, LinkedList<String>>> it = regionToZone.entrySet().iterator();
+      while (it.hasNext()) {
+        Entry<String, LinkedList<String>> entry = it.next();
+        String region = entry.getKey();
+        String zone = entry.getValue().pop();
+        queue.add(new Pair(region, zone));
+        if (entry.getValue().isEmpty()) {
+          it.remove();
+        }
+      }
     }
-    LOG.info("Subnet map has {}, nodesMap has {}, need {} masters.",
-            subnetsToNodenameMap.size(), nodesMap.size(), numMasters);
 
-    // Choose the masters such that we have one master per subnet if there are enough subnets.
-    int numMastersChosen = 0;
-    while (numMastersChosen < numMasters) {
-      for (Entry<String, TreeSet<String>> entry : subnetsToNodenameMap.entrySet()) {
-        TreeSet<String> value = entry.getValue();
-        if (value.isEmpty()) {
-          continue;
-        }
-        String nodeName = value.first();
-        value.remove(nodeName);
-        subnetsToNodenameMap.put(entry.getKey(), value);
-        NodeDetails node = nodesMap.get(nodeName);
-        node.isMaster = true;
-        LOG.info("Chose node '{}' as a master from subnet {}.", nodeName, entry.getKey());
-        numMastersChosen++;
-        if (numMastersChosen == numMasters) {
-          break;
-        }
+    // Now that we have the ordering of the region/zones, we place masters.
+    int mastersSelected = 0;
+    while (mastersSelected < numMastersToChoose) {
+      Pair<String, String> regionZone = queue.remove();
+      Map<String, LinkedList<NodeDetails>> zoneToNode =
+          regionToZoneToNode.get(regionZone.first);
+      LinkedList<NodeDetails> nodeList = zoneToNode.get(regionZone.second);
+      NodeDetails node = nodeList.pop();
+      node.isMaster = true;
+      mastersSelected++;
+      // If the region/zone pair doesn't have a node remaining, we don't need
+      // to consider it again.
+      if (!nodeList.isEmpty()) {
+        queue.add(regionZone);
       }
     }
   }
@@ -1677,7 +1700,8 @@ public class PlacementInfoUtil {
 
   // Compute the master addresses of the pods in the deployment if multiAZ.
   public static String computeMasterAddresses(PlacementInfo pi, Map<UUID, Integer> azToNumMasters,
-                                              String nodePrefix, Provider provider) {
+                                              String nodePrefix, Provider provider,
+                                              int masterRpcPort) {
     List<String> masters = new ArrayList<String>();
     Map<UUID, String> azToDomain = getDomainPerAZ(pi);
     if (!isMultiAZ(provider)) {
@@ -1687,9 +1711,8 @@ public class PlacementInfoUtil {
       AvailabilityZone az = AvailabilityZone.get(entry.getKey());
       String domain = azToDomain.get(entry.getKey());
       for (int idx = 0; idx < entry.getValue(); idx++) {
-        int port = 7100;
         String master = String.format("yb-master-%d.yb-masters.%s-%s.%s:%d", idx, nodePrefix, az.code,
-            domain, port);
+            domain, masterRpcPort);
         masters.add(master);
       }
     }
@@ -2028,14 +2051,12 @@ public class PlacementInfoUtil {
             }
           }
 
-          switch (SwamperHelper.TargetType.createFromPort(Integer.valueOf(name[1]))) {
-            case TSERVER_EXPORT:
-                tserverAlive = tserverAlive || alive;
-              break;
-            case MASTER_EXPORT:
-                masterAlive = masterAlive || alive;
-            default:
-              break;
+          int port = Integer.parseInt(name[1]);
+
+          if (port == nodeDetails.masterHttpPort) {
+            masterAlive = masterAlive || alive;
+          } else if (port == nodeDetails.tserverHttpPort) {
+            tserverAlive = tserverAlive || alive;
           }
 
           if (!alive) {
@@ -2130,4 +2151,34 @@ public class PlacementInfoUtil {
 
     return metricQueryResult.has("error") ? metricQueryResult : response;
   }
+
+  public static int getZoneRF(PlacementInfo pi, String cloud,
+                              String region, String zone) {
+    for (PlacementCloud pc : pi.cloudList) {
+      if (pc.code.equals(cloud)) {
+        for (PlacementRegion pr : pc.regionList) {
+          if (pr.code.equals(region)) {
+            for (PlacementAZ pa : pr.azList) {
+              if (pa.name.equals(zone)) {
+                return pa.replicationFactor;
+              }
+            }
+          }
+        }
+      }
+    }
+    return -1;
+  }
+
+  public static int getNumActiveTserversInZone(Collection<NodeDetails> nodes, String cloud,
+                                               String region, String zone) {
+    List<NodeDetails> validNodes = nodes.stream()
+                                        .filter(node -> node.isActive() &&
+                                                        node.cloudInfo.cloud.equals(cloud) &&
+                                                        node.cloudInfo.region.equals(region) &&
+                                                        node.cloudInfo.az.equals(zone))
+                                        .collect(Collectors.toList());
+    return validNodes.size();
+  }
+
 }

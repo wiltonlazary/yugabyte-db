@@ -25,13 +25,15 @@ class TestConsensusContext : public ConsensusContext {
 
   bool ShouldApplyWrite() override { return true; }
 
-  HybridTime PropagatedSafeTime() override { return HybridTime(); }
+  HybridTime PreparePeerRequest() override { return HybridTime(); }
 
   void MajorityReplicated() override {}
 
   void ChangeConfigReplicated(const RaftConfigPB&) override {}
 
   uint64_t NumSSTFiles() override { return 0; }
+
+  void ListenNumSSTFilesChanged(std::function<void()> listener) override {}
 };
 
 } // namespace consensus

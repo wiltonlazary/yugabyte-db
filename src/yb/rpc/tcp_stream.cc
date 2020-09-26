@@ -25,7 +25,7 @@
 using namespace std::literals;
 
 DECLARE_uint64(rpc_connection_timeout_ms);
-DEFINE_test_flag(int32, TEST_delay_connect_ms, 0,
+DEFINE_test_flag(int32, delay_connect_ms, 0,
                  "Delay connect in tests for specified amount of milliseconds.");
 
 namespace yb {
@@ -446,6 +446,7 @@ size_t TcpStream::Send(OutboundDataPtr data) {
   // transferred.
   size_t result = data_blocks_sent_ + sending_.size();
 
+  DVLOG_WITH_PREFIX(6) << "TcpStream::Send queueing: " << AsString(*data);
   // Serialize the actual bytes to be put on the wire.
   sending_.emplace_back(std::move(data), mem_tracker_);
   queued_bytes_to_send_ += sending_.back().bytes_size();

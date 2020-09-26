@@ -1,8 +1,8 @@
 ---
-title: CREATE TRIGGER
+title: CREATE TRIGGER statement [YSQL]
+headerTitle: CREATE TRIGGER
 linkTitle: CREATE TRIGGER
-summary: CREATE TRIGGER
-description: CREATE TRIGGER
+description: Use the CREATE TRIGGER statement to define a new trigger.
 menu:
   latest:
     identifier: api-ysql-commands-create-trigger
@@ -47,7 +47,6 @@ Use the `CREATE TRIGGER` statement to define a new trigger.
 - multiple triggers can be defined for the same event. In that case, they will be fired in alphabetical order by name.
 
 ## Examples
-
 
 - Set up a table with triggers for tracking modification time and user (role).
     Use the pre-installed extensions `insert_username` and `moddatetime`.
@@ -107,7 +106,6 @@ Use the `CREATE TRIGGER` statement to define a new trigger.
 
   {{< /note >}}
 
-
 - Update some rows.
     For each update the triggers should set both `username`  and `moddate` accordingly.
 
@@ -133,4 +131,3 @@ Use the `CREATE TRIGGER` statement to define a new trigger.
 - [`INSERT`](../dml_insert)
 - [`UPDATE`](../dml_update)
 - [`DELETE`](../dml_delete)
-

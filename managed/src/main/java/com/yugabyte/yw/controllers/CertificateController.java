@@ -4,15 +4,21 @@ import com.google.inject.Inject;
 
 import com.yugabyte.yw.common.ApiResponse;
 import com.yugabyte.yw.common.CertificateHelper;
+import com.yugabyte.yw.models.Audit;
 import com.yugabyte.yw.models.CertificateInfo;
 import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.forms.CertificateParams;
+import com.yugabyte.yw.forms.ClientCertParams;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import play.mvc.Result;
 import play.data.Form;
 import play.data.FormFactory;
+import play.libs.Json;
 
 import java.util.Date;
 import java.util.List;
@@ -37,19 +43,72 @@ public class CertificateController extends AuthenticatedController {
     if (formData.hasErrors()) {
       return ApiResponse.error(BAD_REQUEST, formData.errorsAsJson());
     }
+
     Date certStart = new Date(formData.get().certStart);
     Date certExpiry = new Date(formData.get().certExpiry);
     String label = formData.get().label;
     String certContent = formData.get().certContent;
     String keyContent = formData.get().keyContent;
+    CertificateInfo.Type certType = formData.get().certType;
+    LOG.info("CertificateController: upload cert label {}, type {}", label, certType);
     try {
-      UUID certUUID = CertificateHelper.uploadRootCA(label, customerUUID, appConfig.getString("yb.storage.path"),
-          certContent, keyContent, certStart, certExpiry);
+      UUID certUUID = CertificateHelper.uploadRootCA(
+                        label, customerUUID, appConfig.getString("yb.storage.path"),
+                        certContent, keyContent, certStart, certExpiry, certType
+                      );
+      Audit.createAuditEntry(ctx(), request(), Json.toJson(formData.data()));
       return ApiResponse.success(certUUID);
     } catch (Exception e) {
+      LOG.error("Could not upload certs for customer {}", customerUUID, e);
       return ApiResponse.error(BAD_REQUEST, "Couldn't upload certfiles");
     }
+  }
 
+  public Result getClientCert(UUID customerUUID, UUID rootCA) {
+    Form<ClientCertParams> formData = formFactory.form(ClientCertParams.class)
+                                                 .bindFromRequest();
+    if (Customer.get(customerUUID) == null) {
+      return ApiResponse.error(BAD_REQUEST, "Invalid Customer UUID: " + customerUUID);
+    }
+    if (formData.hasErrors()) {
+      return ApiResponse.error(BAD_REQUEST, formData.errorsAsJson());
+    }
+    Date certStart = new Date(formData.get().certStart);
+    Date certExpiry = new Date(formData.get().certExpiry);
+    try {
+      JsonNode result = CertificateHelper.createClientCertificate(
+          rootCA, null, formData.get().username, certStart, certExpiry);
+      Audit.createAuditEntry(ctx(), request(), Json.toJson(formData.data()));
+      return ApiResponse.success(result);
+    } catch (Exception e) {
+      LOG.error(
+        "Error generating client cert for customer {} rootCA {}",
+        customerUUID, rootCA, e
+      );
+      return ApiResponse.error(INTERNAL_SERVER_ERROR, "Couldn't generate client cert.");
+    }
+  }
+
+  public Result getRootCert(UUID customerUUID, UUID rootCA) {
+    if (Customer.get(customerUUID) == null) {
+      return ApiResponse.error(BAD_REQUEST, "Invalid Customer UUID: " + customerUUID);
+    }
+    if (CertificateInfo.get(rootCA) == null) {
+      return ApiResponse.error(BAD_REQUEST, "Invalid Cert ID: " + rootCA);
+    }
+    if (!CertificateInfo.get(rootCA).customerUUID.equals(customerUUID)) {
+      return ApiResponse.error(BAD_REQUEST, "Certificate doesn't belong to customer");
+    }
+    try {
+      String certContents = CertificateHelper.getCertPEMFileContents(rootCA);
+      Audit.createAuditEntry(ctx(), request());
+      ObjectNode result = Json.newObject();
+      result.put(CertificateHelper.ROOT_CERT, certContents);
+      return ApiResponse.success(result);
+    } catch (Exception e) {
+      LOG.error("Could not get root cert {} for customer {}", rootCA, customerUUID, e);
+      return ApiResponse.error(INTERNAL_SERVER_ERROR, "Couldn't fetch root cert.");
+    }
   }
 
   public Result list(UUID customerUUID) {

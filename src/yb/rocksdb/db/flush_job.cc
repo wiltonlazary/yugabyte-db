@@ -77,7 +77,7 @@ DEFINE_int32(rocksdb_nothing_in_memtable_to_flush_sleep_ms, 10,
     "Used for a temporary workaround for http://bit.ly/ybissue437. How long to wait (ms) in case "
     "we could not flush any memtables, usually due to filters preventing us from doing so.");
 
-DEFINE_test_flag(bool, TEST_rocksdb_crash_on_flush, false,
+DEFINE_test_flag(bool, rocksdb_crash_on_flush, false,
                  "When set, memtable flush in rocksdb crashes.");
 
 namespace rocksdb {
@@ -333,7 +333,7 @@ Result<FileNumbersHolder> FlushJob::WriteLevel0Table(
     }
 
     if (!db_options_.disableDataSync && output_file_directory_ != nullptr) {
-      output_file_directory_->Fsync();
+      RETURN_NOT_OK(output_file_directory_->Fsync());
     }
     TEST_SYNC_POINT("FlushJob::WriteLevel0Table");
     db_mutex_->Lock();

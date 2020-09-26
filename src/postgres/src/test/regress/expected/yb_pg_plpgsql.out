@@ -25,7 +25,7 @@ create table Room (
     comment	text
 );
 create unique index Room_rno on Room using btree (roomno bpchar_ops);
-NOTICE:  index method "btree" was replaced with "lsm" in YugaByte DB
+NOTICE:  index method "btree" was replaced with "lsm" in YugabyteDB
 create table WSlot (
     slotname	char(20),
     roomno	char(8),
@@ -33,13 +33,13 @@ create table WSlot (
     backlink	char(20)
 );
 create unique index WSlot_name on WSlot using btree (slotname bpchar_ops);
-NOTICE:  index method "btree" was replaced with "lsm" in YugaByte DB
+NOTICE:  index method "btree" was replaced with "lsm" in YugabyteDB
 create table PField (
     name	text,
     comment	text
 );
 create unique index PField_name on PField using btree (name text_ops);
-NOTICE:  index method "btree" was replaced with "lsm" in YugaByte DB
+NOTICE:  index method "btree" was replaced with "lsm" in YugabyteDB
 create table PSlot (
     slotname	char(20),
     pfname	text,
@@ -47,7 +47,7 @@ create table PSlot (
     backlink	char(20)
 );
 create unique index PSlot_name on PSlot using btree (slotname bpchar_ops);
-NOTICE:  index method "btree" was replaced with "lsm" in YugaByte DB
+NOTICE:  index method "btree" was replaced with "lsm" in YugabyteDB
 create table PLine (
     slotname	char(20),
     phonenumber	char(20),
@@ -55,14 +55,14 @@ create table PLine (
     backlink	char(20)
 );
 create unique index PLine_name on PLine using btree (slotname bpchar_ops);
-NOTICE:  index method "btree" was replaced with "lsm" in YugaByte DB
+NOTICE:  index method "btree" was replaced with "lsm" in YugabyteDB
 create table Hub (
     name	char(14),
     comment	text,
     nslots	integer
 );
 create unique index Hub_name on Hub using btree (name bpchar_ops);
-NOTICE:  index method "btree" was replaced with "lsm" in YugaByte DB
+NOTICE:  index method "btree" was replaced with "lsm" in YugabyteDB
 create table HSlot (
     slotname	char(20),
     hubname	char(14),
@@ -70,15 +70,15 @@ create table HSlot (
     slotlink	char(20)
 );
 create unique index HSlot_name on HSlot using btree (slotname bpchar_ops);
-NOTICE:  index method "btree" was replaced with "lsm" in YugaByte DB
+NOTICE:  index method "btree" was replaced with "lsm" in YugabyteDB
 create index HSlot_hubname on HSlot using btree (hubname bpchar_ops);
-NOTICE:  index method "btree" was replaced with "lsm" in YugaByte DB
+NOTICE:  index method "btree" was replaced with "lsm" in YugabyteDB
 create table System (
     name	text,
     comment	text
 );
 create unique index System_name on System using btree (name text_ops);
-NOTICE:  index method "btree" was replaced with "lsm" in YugaByte DB
+NOTICE:  index method "btree" was replaced with "lsm" in YugabyteDB
 create table IFace (
     slotname	char(20),
     sysname	text,
@@ -86,14 +86,14 @@ create table IFace (
     slotlink	char(20)
 );
 create unique index IFace_name on IFace using btree (slotname bpchar_ops);
-NOTICE:  index method "btree" was replaced with "lsm" in YugaByte DB
+NOTICE:  index method "btree" was replaced with "lsm" in YugabyteDB
 create table PHone (
     slotname	char(20),
     comment	text,
     slotlink	char(20)
 );
 create unique index PHone_name on PHone using btree (slotname bpchar_ops);
-NOTICE:  index method "btree" was replaced with "lsm" in YugaByte DB
+NOTICE:  index method "btree" was replaced with "lsm" in YugabyteDB
 -- ************************************************************
 -- *
 -- * Trigger procedures and functions for the patchfield
@@ -2108,78 +2108,46 @@ NOTICE:  should see this only if -100 fits in smallint
 --
 create temp table master(f1 int primary key);
 create temp table slave(f1 int references master deferrable);
-ERROR:  DEFERRABLE constraint not supported yet
-LINE 1: create temp table slave(f1 int references master deferrable)...
-                                                         ^
-HINT:  See https://github.com/YugaByte/yugabyte-db/issues/1129. Click '+' on the description to raise its priority
 insert into master values(1);
 insert into slave values(1);
-ERROR:  relation "slave" does not exist
-LINE 1: insert into slave values(1);
-                    ^
 insert into slave values(2);	-- fails
-ERROR:  relation "slave" does not exist
-LINE 1: insert into slave values(2);
-                    ^
-create function trap_foreign_key(int) returns int as $$
-begin
-	begin	-- start a subtransaction
-		insert into slave values($1);
-	exception
-		when foreign_key_violation then
-			raise notice 'caught foreign_key_violation';
-			return 0;
-	end;
-	return 1;
-end$$ language plpgsql;
-create function trap_foreign_key_2() returns int as $$
-begin
-	begin	-- start a subtransaction
-		set constraints all immediate;
-	exception
-		when foreign_key_violation then
-			raise notice 'caught foreign_key_violation';
-			return 0;
-	end;
-	return 1;
-end$$ language plpgsql;
-select trap_foreign_key(1);
-ERROR:  relation "slave" does not exist
-LINE 1: insert into slave values($1)
-                    ^
-QUERY:  insert into slave values($1)
-CONTEXT:  PL/pgSQL function trap_foreign_key(integer) line 4 at SQL statement
-select trap_foreign_key(2);	-- detects FK violation
-ERROR:  relation "slave" does not exist
-LINE 1: insert into slave values($1)
-                    ^
-QUERY:  insert into slave values($1)
-CONTEXT:  PL/pgSQL function trap_foreign_key(integer) line 4 at SQL statement
-begin;
-  set constraints all deferred;
-  select trap_foreign_key(2);	-- should not detect FK violation
-ERROR:  relation "slave" does not exist
-LINE 1: insert into slave values($1)
-                    ^
-QUERY:  insert into slave values($1)
-CONTEXT:  PL/pgSQL function trap_foreign_key(integer) line 4 at SQL statement
-  savepoint x;
-ERROR:  SAVEPOINT <transaction> not supported yet
-LINE 1: savepoint x;
-        ^
-HINT:  See https://github.com/YugaByte/yugabyte-db/issues/1125. Click '+' on the description to raise its priority
-    set constraints all immediate; -- fails
-ERROR:  current transaction is aborted, commands ignored until end of transaction block
-  rollback to x;
-ERROR:  ROLLBACK <transaction> not supported yet
-LINE 1: rollback to x;
-        ^
-HINT:  See https://github.com/YugaByte/yugabyte-db/issues/1125. Click '+' on the description to raise its priority
-  select trap_foreign_key_2();  -- detects FK violation
-ERROR:  current transaction is aborted, commands ignored until end of transaction block
-commit;				-- still fails
-drop function trap_foreign_key(int);
-drop function trap_foreign_key_2();
+ERROR:  insert or update on table "slave" violates foreign key constraint "slave_f1_fkey"
+DETAIL:  Key (f1)=(2) is not present in table "master".
+-- TODO(dmitry) Subtransactions are not yet supported.
+-- create function trap_foreign_key(int) returns int as $$
+-- begin
+-- 	begin	-- start a subtransaction
+-- 		insert into slave values($1);
+-- 	exception
+-- 		when foreign_key_violation then
+-- 			raise notice 'caught foreign_key_violation';
+-- 			return 0;
+-- 	end;
+-- 	return 1;
+-- end$$ language plpgsql;
+-- create function trap_foreign_key_2() returns int as $$
+-- begin
+-- 	begin	-- start a subtransaction
+-- 		set constraints all immediate;
+-- 	exception
+-- 		when foreign_key_violation then
+-- 			raise notice 'caught foreign_key_violation';
+-- 			return 0;
+-- 	end;
+-- 	return 1;
+-- end$$ language plpgsql;
+-- select trap_foreign_key(1);
+-- select trap_foreign_key(2);	-- detects FK violation
+-- begin;
+--  set constraints all deferred;
+--  select trap_foreign_key(2);	-- should not detect FK violation
+--  savepoint x;
+--    set constraints all immediate; -- fails
+--  rollback to x;
+--  select trap_foreign_key_2();  -- detects FK violation
+-- commit;				-- still fails
+-- drop function trap_foreign_key(int);
+-- drop function trap_foreign_key_2();
 --
 -- Test proper snapshot handling in simple expressions
 --
@@ -5369,8 +5337,6 @@ DELETE FROM transition_table_level1
   WHERE level1_no = 25;
 UPDATE transition_table_level1 SET level1_no = -1
   WHERE level1_no = 30;
-ERROR:  Update PRIMARY KEY columns are not yet supported
-HINT:  See https://github.com/YugaByte/yugabyte-db/issues/659. Click '+' on the description to raise its priority
 INSERT INTO transition_table_level2 (level2_no, parent_no)
   VALUES (10000, 10000);
 UPDATE transition_table_level2 SET parent_no = 2000
@@ -5438,10 +5404,7 @@ UPDATE alter_table_under_transition_tables
 -- now change 'name' to an integer to see what happens...
 ALTER TABLE alter_table_under_transition_tables
   ALTER COLUMN name TYPE int USING name::integer;
-ERROR:  ALTER TABLE ALTER column not supported yet
-LINE 2:   ALTER COLUMN name TYPE int USING name::integer;
-          ^
-HINT:  See https://github.com/YugaByte/yugabyte-db/issues/1124. Click '+' on the description to raise its priority
+ERROR:  This ALTER TABLE command is not yet supported.
 UPDATE alter_table_under_transition_tables
   SET name = (name::text || name::text)::integer;
 -- now drop column 'name'
@@ -5449,8 +5412,6 @@ ALTER TABLE alter_table_under_transition_tables
   DROP column name;
 UPDATE alter_table_under_transition_tables
   SET id = id;
-ERROR:  Update PRIMARY KEY columns are not yet supported
-HINT:  See https://github.com/YugaByte/yugabyte-db/issues/659. Click '+' on the description to raise its priority
 --
 -- Test multiple reference to a transition table
 --
@@ -5479,28 +5440,10 @@ DROP FUNCTION multi_test_trig();
 -- Check type parsing and record fetching from partitioned tables
 --
 CREATE TABLE partitioned_table (a int, b text) PARTITION BY LIST (a);
-ERROR:  PARTITION BY not supported yet
-LINE 1: CREATE TABLE partitioned_table (a int, b text) PARTITION BY ...
-                                                       ^
-HINT:  See https://github.com/YugaByte/yugabyte-db/issues/1126. Click '+' on the description to raise its priority
 CREATE TABLE pt_part1 PARTITION OF partitioned_table FOR VALUES IN (1);
-ERROR:  LIST PARTITION not supported yet
-LINE 1: ...ATE TABLE pt_part1 PARTITION OF partitioned_table FOR VALUES...
-                                                             ^
-HINT:  See https://github.com/YugaByte/yugabyte-db/issues/1126. Click '+' on the description to raise its priority
 CREATE TABLE pt_part2 PARTITION OF partitioned_table FOR VALUES IN (2);
-ERROR:  LIST PARTITION not supported yet
-LINE 1: ...ATE TABLE pt_part2 PARTITION OF partitioned_table FOR VALUES...
-                                                             ^
-HINT:  See https://github.com/YugaByte/yugabyte-db/issues/1126. Click '+' on the description to raise its priority
 INSERT INTO partitioned_table VALUES (1, 'Row 1');
-ERROR:  relation "partitioned_table" does not exist
-LINE 1: INSERT INTO partitioned_table VALUES (1, 'Row 1');
-                    ^
 INSERT INTO partitioned_table VALUES (2, 'Row 2');
-ERROR:  relation "partitioned_table" does not exist
-LINE 1: INSERT INTO partitioned_table VALUES (2, 'Row 2');
-                    ^
 CREATE OR REPLACE FUNCTION get_from_partitioned_table(partitioned_table.a%type)
 RETURNS partitioned_table AS $$
 DECLARE
@@ -5511,12 +5454,13 @@ BEGIN
     SELECT * INTO result FROM partitioned_table WHERE a = a_val;
     RETURN result;
 END; $$ LANGUAGE plpgsql;
-ERROR:  relation "partitioned_table" does not exist
+NOTICE:  type reference partitioned_table.a%TYPE converted to integer
 SELECT * FROM get_from_partitioned_table(1) AS t;
-ERROR:  function get_from_partitioned_table(integer) does not exist
-LINE 1: SELECT * FROM get_from_partitioned_table(1) AS t;
-                      ^
-HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
+ a |   b
+---+-------
+ 1 | Row 1
+(1 row)
+
 CREATE OR REPLACE FUNCTION list_partitioned_table()
 RETURNS SETOF partitioned_table.a%TYPE AS $$
 DECLARE
@@ -5529,12 +5473,14 @@ BEGIN
     END LOOP;
     RETURN;
 END; $$ LANGUAGE plpgsql;
-ERROR:  relation "partitioned_table" does not exist
+NOTICE:  type reference partitioned_table.a%TYPE converted to integer
 SELECT * FROM list_partitioned_table() AS t;
-ERROR:  function list_partitioned_table() does not exist
-LINE 1: SELECT * FROM list_partitioned_table() AS t;
-                      ^
-HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
+ t
+---
+ 1
+ 2
+(2 rows)
+
 --
 -- Check argument name is used instead of $n in error message
 --
@@ -5546,5 +5492,3 @@ END; $$ LANGUAGE plpgsql;
 ERROR:  "x" is not a scalar variable
 LINE 3:   GET DIAGNOSTICS x = ROW_COUNT;
                           ^
--- Workaround for #1721
-DISCARD TEMP;

@@ -7,11 +7,15 @@
 ###################################################################################################
 
 # Session specific API
++ nocsrf
 POST    /login                                                                 com.yugabyte.yw.controllers.SessionController.login()
+GET     /platform_config                                                       com.yugabyte.yw.controllers.SessionController.getPlatformConfig()
+GET     /third_party_login                                                     com.yugabyte.yw.controllers.SessionController.thirdPartyLogin()
 GET     /insecure_login                                                        com.yugabyte.yw.controllers.SessionController.insecure_login()
 PUT     /customers/:cUUID/security                                             com.yugabyte.yw.controllers.SessionController.set_security(cUUID: java.util.UUID)
 PUT     /customers/:cUUID/api_token                                            com.yugabyte.yw.controllers.SessionController.api_token(cUUID: java.util.UUID)
 GET     /logout                                                                com.yugabyte.yw.controllers.SessionController.logout()
++ nocsrf
 POST    /register                                                              com.yugabyte.yw.controllers.SessionController.register()
 GET     /customer_count                                                        com.yugabyte.yw.controllers.SessionController.customerCount()
 GET     /customers/:cUUID/host_info                                            com.yugabyte.yw.controllers.CustomerController.getHostInfo(cUUID: java.util.UUID)
@@ -27,7 +31,7 @@ GET     /customers/:cUUID/regions                                              c
 GET     /customers/:cUUID/providers                                            com.yugabyte.yw.controllers.CloudProviderController.list(cUUID: java.util.UUID)
 GET     /customers/:cUUID/providers/:pUUID/initialize                          com.yugabyte.yw.controllers.CloudProviderController.initialize(cUUID: java.util.UUID, pUUID: java.util.UUID)
 POST    /customers/:cUUID/providers                                            com.yugabyte.yw.controllers.CloudProviderController.create(cUUID: java.util.UUID)
-POST    /customers/:cUUID/providers/kubernetes               	               com.yugabyte.yw.controllers.CloudProviderController.createKubernetes(cUUID: java.util.UUID)
+POST    /customers/:cUUID/providers/kubernetes                                 com.yugabyte.yw.controllers.CloudProviderController.createKubernetes(cUUID: java.util.UUID)
 DELETE  /customers/:cUUID/providers/:pUUID                                     com.yugabyte.yw.controllers.CloudProviderController.delete(cUUID: java.util.UUID, pUUID: java.util.UUID)
 POST    /customers/:cUUID/providers/:pUUID/bootstrap                           com.yugabyte.yw.controllers.CloudProviderController.bootstrap(cUUID: java.util.UUID, pUUID: java.util.UUID)
 POST    /customers/:cUUID/providers/:pUUID/cleanup                             com.yugabyte.yw.controllers.CloudProviderController.cleanup(cUUID: java.util.UUID, pUUID: java.util.UUID)
@@ -78,6 +82,8 @@ PUT     /customers/:cUUID/releases/:name                                       c
 POST    /customers/:cUUID/certificates                                         com.yugabyte.yw.controllers.CertificateController.upload(cUUID: java.util.UUID)
 GET     /customers/:cUUID/certificates                                         com.yugabyte.yw.controllers.CertificateController.list(cUUID: java.util.UUID)
 GET     /customers/:cUUID/certificates/:name                                   com.yugabyte.yw.controllers.CertificateController.get(cUUID: java.util.UUID, name: String)
+GET     /customers/:cUUID/certificates/:rUUID/download                         com.yugabyte.yw.controllers.CertificateController.getRootCert(cUUID: java.util.UUID, rUUID: java.util.UUID)
+POST    /customers/:cUUID/certificates/:rUUID                                  com.yugabyte.yw.controllers.CertificateController.getClientCert(cUUID: java.util.UUID, rUUID: java.util.UUID)
 
 # Alerts API
 GET     /customers/:cUUID/alerts                                               com.yugabyte.yw.controllers.AlertController.list(cUUID: java.util.UUID)
@@ -106,14 +112,19 @@ GET     /customers/:cUUID/universes/:uniUUID/ysqlservers                       c
 GET     /customers/:cUUID/universes/:uniUUID/redisservers                      com.yugabyte.yw.controllers.MetaMasterController.getRedisServerAddresses(cUUID: java.util.UUID, uniUUID: java.util.UUID)
 GET     /customers/:cUUID/universes/:uniUUID/leader                            com.yugabyte.yw.controllers.UniverseController.getMasterLeaderIP(cUUID: java.util.UUID, uniUUID: java.util.UUID)
 POST    /customers/:cUUID/universes/:uniUUID/upgrade                           com.yugabyte.yw.controllers.UniverseController.upgrade(cUUID: java.util.UUID, uniUUID: java.util.UUID)
+POST    /customers/:cUUID/universes/:uniUUID/disk_update                       com.yugabyte.yw.controllers.UniverseController.updateDiskSize(cUUID: java.util.UUID, uniUUID: java.util.UUID)
 GET     /customers/:cUUID/universes/:uniUUID/status                            com.yugabyte.yw.controllers.UniverseController.status(cUUID: java.util.UUID, uniUUID: java.util.UUID)
 GET     /customers/:cUUID/universes/:uniUUID/health_check                      com.yugabyte.yw.controllers.UniverseController.healthCheck(cUUID: java.util.UUID, uniUUID: java.util.UUID)
 GET     /customers/:cUUID/universes/find/:universeName                         com.yugabyte.yw.controllers.UniverseController.findByName(cUUID: java.util.UUID, universeName: String)
 GET     /customers/:cUUID/cost                                                 com.yugabyte.yw.controllers.UniverseController.universeListCost(cUUID: java.util.UUID)
 PUT     /customers/:cUUID/universes/:uniUUID/update_backup_state               com.yugabyte.yw.controllers.UniverseController.setBackupFlag(cUUID: java.util.UUID, uniUUID: java.util.UUID)
+POST    /customers/:cUUID/universes/:uniUUID/config_alerts                     com.yugabyte.yw.controllers.UniverseController.configureAlerts(cUUID: java.util.UUID, uniUUID: java.util.UUID)
 POST    /customers/:cUUID/universes/:uniUUID/set_key                           com.yugabyte.yw.controllers.UniverseController.setUniverseKey(cUUID: java.util.UUID, uniUUID: java.util.UUID)
 POST    /customers/:cUUID/universes/:uniUUID/run_query                         com.yugabyte.yw.controllers.UniverseController.runQuery(cUUID: java.util.UUID, uniUUID: java.util.UUID)
-POST    /customers/:cUUID/universes/:uniUUID/run_in_shell      				   com.yugabyte.yw.controllers.UniverseController.runInShell(cUUID: java.util.UUID, uniUUID: java.util.UUID)
+POST    /customers/:cUUID/universes/:uniUUID/run_in_shell                      com.yugabyte.yw.controllers.UniverseController.runInShell(cUUID: java.util.UUID, uniUUID: java.util.UUID)
+POST    /customers/:cUUID/universes/:uniUUID/update_db_credentials             com.yugabyte.yw.controllers.UniverseController.setDatabaseCredentials(cUUID: java.util.UUID, uniUUID: java.util.UUID)
+POST    /customers/:cUUID/universes/:uniUUID/create_db_credentials             com.yugabyte.yw.controllers.UniverseController.createUserInDB(cUUID: java.util.UUID, uniUUID: java.util.UUID)
+PUT    /customers/:cUUID/universes/:uniUUID/mark_helm3_compatible              com.yugabyte.yw.controllers.UniverseController.setHelm3Compatible(cUUID: java.util.UUID, uniUUID: java.util.UUID)
 
 # Cluster under universe
 POST    /customers/:cUUID/universes/:uniUUID/cluster                           com.yugabyte.yw.controllers.UniverseController.clusterCreate(cUUID: java.util.UUID, uniUUID: java.util.UUID)
@@ -130,6 +141,7 @@ PUT     /customers/:cUUID/universes/:uniUUID/tables/:tableUUID/create_backup   c
 PUT     /customers/:cUUID/universes/:uniUUID/multi_table_backup                com.yugabyte.yw.controllers.TablesController.createMultiTableBackup(cUUID: java.util.UUID, uniUUID: java.util.UUID)
 GET     /customers/:cUUID/universes/:uniUUID/backups                           com.yugabyte.yw.controllers.BackupsController.list(cUUID: java.util.UUID, uniUUID: java.util.UUID)
 POST    /customers/:cUUID/universes/:uniUUID/backups/restore                   com.yugabyte.yw.controllers.BackupsController.restore(cUUID: java.util.UUID, uniUUID: java.util.UUID)
+DELETE  /customers/:cUUID/backups/:backupUUID                                  com.yugabyte.yw.controllers.BackupsController.delete(cUUID: java.util.UUID, backupUUID: java.util.UUID)
 
 # Task History API
 GET    /customers/:cUUID/tasks                                                 com.yugabyte.yw.controllers.CustomerTaskController.list(cUUID: java.util.UUID)
@@ -149,6 +161,7 @@ PUT    /customers/:cUUID/universes/:universeUUID/nodes/:nodeName               c
 GET    /metadata/column_types                                                  com.yugabyte.yw.controllers.TablesController.getColumnTypes()
 GET    /metadata/ebs_types                                                     com.yugabyte.yw.controllers.InstanceTypeController.getEBSTypes()
 GET    /metadata/gcp_types                                                     com.yugabyte.yw.controllers.InstanceTypeController.getGCPTypes()
+GET    /metadata/azu_types                                                     com.yugabyte.yw.controllers.InstanceTypeController.getAZUTypes()
 
 # Schedule Management API
 GET    /customers/:cUUID/schedules                                             com.yugabyte.yw.controllers.ScheduleController.list(cUUID: java.util.UUID)
@@ -158,6 +171,17 @@ GET    /customers/:cUUID/universes/:uniUUID/tablet-servers                     c
 
 # User Management API
 GET    /customers/:cUUID/users                                                 com.yugabyte.yw.controllers.UsersController.list(cUUID: java.util.UUID)
+GET    /customers/:cUUID/users/:uUUID                                          com.yugabyte.yw.controllers.UsersController.index(cUUID: java.util.UUID, uUUID: java.util.UUID)
 POST   /customers/:cUUID/users                                                 com.yugabyte.yw.controllers.UsersController.create(cUUID: java.util.UUID)
 PUT    /customers/:cUUID/users/:uUUID                                          com.yugabyte.yw.controllers.UsersController.changeRole(cUUID: java.util.UUID, uUUID: java.util.UUID)
+PUT    /customers/:cUUID/users/:uUUID/change_password                          com.yugabyte.yw.controllers.UsersController.changePassword(cUUID: java.util.UUID, uUUID: java.util.UUID)
 DELETE /customers/:cUUID/users/:uUUID                                          com.yugabyte.yw.controllers.UsersController.delete(cUUID: java.util.UUID, uUUID: java.util.UUID)
+
+# Audit Info API
+GET    /customers/:cUUID/users/:uUUID/audit_trail                              com.yugabyte.yw.controllers.AuditController.list(cUUID: java.util.UUID, uUUID: java.util.UUID)
+GET    /customers/:cUUID/tasks/:tUUID/audit_info                               com.yugabyte.yw.controllers.AuditController.getTaskAudit(cUUID: java.util.UUID, tUUID: java.util.UUID)
+GET    /customers/:cUUID/tasks/:tUUID/audit_user                               com.yugabyte.yw.controllers.AuditController.getUserFromTask(cUUID: java.util.UUID, tUUID: java.util.UUID)
+
+GET    /callback                                                               @org.pac4j.play.CallbackController.callback()
+POST   /callback                                                               @org.pac4j.play.CallbackController.callback()
+GET    /third_party_logout                                                     @org.pac4j.play.LogoutController.logout()

@@ -37,8 +37,10 @@
 #include <algorithm>
 #include <mutex>
 
+#include "yb/consensus/consensus_util.h"
 #include "yb/consensus/log_index.h"
 #include "yb/consensus/opid_util.h"
+
 #include "yb/gutil/map-util.h"
 #include "yb/gutil/stl_util.h"
 #include "yb/gutil/strings/util.h"
@@ -78,11 +80,11 @@ METRIC_DEFINE_histogram(tablet, log_reader_read_batch_latency, "Log Read Latency
                         "Microseconds spent reading log entry batches",
                         60000000LU, 2);
 
-DEFINE_test_flag(bool, TEST_record_segments_violate_max_time_policy, false,
+DEFINE_test_flag(bool, record_segments_violate_max_time_policy, false,
     "If set, everytime GetSegmentPrefixNotIncluding runs, segments that violate the max time "
     "policy will be appended to LogReader::segments_violate_max_time_policy_.");
 
-DEFINE_test_flag(bool, TEST_record_segments_violate_min_space_policy, false,
+DEFINE_test_flag(bool, record_segments_violate_min_space_policy, false,
     "If set, everytime GetSegmentPrefixNotIncluding runs, segments that violate the max time "
     "policy will be appended to LogReader::segments_violate_min_space_policy_.");
 
@@ -98,7 +100,6 @@ struct LogSegmentSeqnoComparator {
 };
 }
 
-using consensus::OpId;
 using consensus::ReplicateMsg;
 using env_util::ReadFully;
 using strings::Substitute;
@@ -128,7 +129,7 @@ LogReader::LogReader(Env* env,
     : env_(env),
       log_index_(index),
       tablet_id_(std::move(tablet_id)),
-      log_prefix_(Format("T $0 P $1: ", tablet_id_, peer_uuid)),
+      log_prefix_(consensus::MakeTabletLogPrefix(tablet_id_, peer_uuid)),
       state_(kLogReaderInitialized) {
   if (metric_entity) {
     bytes_read_ = METRIC_log_reader_bytes_read.Instantiate(metric_entity);

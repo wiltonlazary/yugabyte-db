@@ -1,8 +1,9 @@
 ---
-title: CDC to Kafka
+title: Use change data capture (CDC) to Kafka
+headerTitle: Change data capture (CDC) to Kafka
 linkTitle: CDC to Kafka
-description: Change data capture (CDC) to Kafka
-beta: /faq/product/#what-is-the-definition-of-the-beta-feature-tag
+description: Learn how to use change data capture (CDC) API to send data changes to Apache Kafka.
+beta: /latest/faq/general/#what-is-the-definition-of-the-beta-feature-tag
 menu:
   latest:
     parent: cdc
@@ -13,17 +14,17 @@ isTocNested: true
 showAsideToc: true
 ---
 
-Follow the steps below to connect a local YugabyteDB cluster to use the Change Data Capture (CDC) API to send data changes to Apache Kafka. To learn about the change data capture (CDC) architecture, see [Change data capture (CDC)](../architecture/cdc-architecture).
+Follow the steps below to connect a YugabyteDB cluster to use the Change Data Capture (CDC) API to send data changes to Apache Kafka. To learn about the change data capture (CDC) architecture, see [Change data capture (CDC)](../../../architecture/cdc-architecture).
 
 ## Prerequisites
 
 ### YugabyteDB
 
-A 1-node YugabyteDB cluster with RF of 1 is up and running locally (the `yb-ctl create` command create this by default). If you are new to YugabyteDB, you can create a local YugabyteDB cluster in under five minutes by following the steps in the [Quick start](/quick-start/install/).
+Create a YugabyteDB cluster using the steps outlined in [Manual Deployment](../../manual-deployment/).
 
 ### Java
 
-A JRE (or JDK), for Java 8 or 11, is installed. JDK and JRE installers for Linux, macOS, and Windows can be downloaded from [OpenJDK](http://jdk.java.net/), [AdoptOpenJDK](https://adoptopenjdk.net/), or [Azul Systems](https://www.azul.com/downloads/zulu-community/).
+A JRE (or JDK), for Java 8 or 11, is installed. 
 
 {{< note title="Note" >}}
 
@@ -37,7 +38,7 @@ A local install of the Confluent Platform should be up and running. The [Conflue
 
 To get a local Confluent Platform (with Apache Kafka) up and running quickly, follow the steps in the [Confluent Platform Quick Start (Local)](https://docs.confluent.io/current/quickstart/ce-quickstart.html#ce-quickstart).
 
-## 1. Add the "users" table
+## 1. Create the source table
 
 With your local YugabyteDB cluster running, create a table, called `users`, in the default database (`yugabyte`).
 
@@ -109,10 +110,10 @@ $ wget -O yb-cdc-connector.jar https://github.com/yugabyte/yb-kafka-connector/bl
 Run the following command to start logging an output stream of data changes from the YugabyteDB `cdc` table to Apache Kafka.
 
 ```sh
-java -jar yb-cdc-connector.jar
---table_name yugabyte.cdc
---topic_name cdc-test
---table_schema_path table_schema_path.avsc
+java -jar yb-cdc-connector.jar \
+--table_name yugabyte.cdc \
+--topic_name cdc-test \
+--table_schema_path table_schema_path.avsc \
 --primary_key_schema_path primary_key_schema_path.avsc
 ```
 

@@ -85,8 +85,10 @@ TEST_F(SysCatalogTest, TestPrepareDefaultClusterConfig) {
   FLAGS_cluster_uuid = "invalid_uuid";
 
   CatalogManager catalog_manager(nullptr);
-
-  ASSERT_NOK(catalog_manager.PrepareDefaultClusterConfig(0));
+  {
+    std::lock_guard<CatalogManager::LockType> l(catalog_manager.lock_);
+    ASSERT_NOK(catalog_manager.PrepareDefaultClusterConfig(0));
+  }
 
   auto dir = GetTestPath("Master") + "valid_cluster_uuid_test";
   ASSERT_OK(Env::Default()->CreateDir(dir));
@@ -1037,8 +1039,8 @@ TEST_F(SysCatalogTest, TestCatalogManagerTasksTracker) {
   // Add tasks to the table (more than can fit in the cbuf).
   for (int task_id = 0; task_id < FLAGS_tasks_tracker_num_tasks + 10; ++task_id) {
     scoped_refptr<TabletInfo> tablet(new TabletInfo(table, kSysCatalogTableId));
-    auto task = std::make_shared<AsyncTruncate>(master_, master_->catalog_manager()->WorkerPool(),
-                                                tablet);
+    auto task = std::make_shared<AsyncTruncate>(
+        master_, master_->catalog_manager()->AsyncTaskPool(), tablet);
     table->AddTask(task);
   }
 

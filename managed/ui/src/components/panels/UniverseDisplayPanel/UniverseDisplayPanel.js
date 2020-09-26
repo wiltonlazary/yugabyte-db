@@ -5,16 +5,15 @@ import { Link } from 'react-router';
 import { Row, Col } from 'react-bootstrap';
 import { isFinite } from 'lodash';
 import { YBLoading } from '../../common/indicators';
-import { getPromiseState } from 'utils/PromiseUtils';
-import { YBCost, DescriptionItem } from 'components/common/descriptors';
-import { UniverseStatusContainer } from 'components/universes';
+import { getPromiseState } from '../../../utils/PromiseUtils';
+import { YBCost, DescriptionItem } from '../../../components/common/descriptors';
+import { UniverseStatusContainer } from '../../../components/universes';
 import './UniverseDisplayPanel.scss';
 import { isNonEmptyObject } from "../../../utils/ObjectUtils";
-import { YBModal, YBButton } from '../../common/forms/fields';
+import { YBButton } from '../../common/forms/fields';
 import { getPrimaryCluster, getReadOnlyCluster, getClusterProviderUUIDs, getProviderMetadata } from "../../../utils/UniverseUtils";
-import { isNotHidden, isDisabled } from 'utils/LayoutUtils';
-
-const moment = require('moment');
+import { isNotHidden, isDisabled } from '../../../utils/LayoutUtils';
+import moment from 'moment';
 
 class CTAButton extends Component {
   render() {
@@ -98,21 +97,7 @@ class UniverseDisplayItem extends Component {
 }
 
 export default class UniverseDisplayPanel extends Component {
-  constructor(props) {
-    super(props);
-    this.state = {
-      addUniverseModal: false
-    };
-  }
 
-
-
-  toggleUniverseModal = () => {
-    if (!this.state.addUniverseModal) {
-
-    }
-    this.setState({addUniverseModal: !this.state.addUniverseModal});
-  }
   render() {
     const self = this;
     const { universe: {universeList}, cloud: {providers}, customer: { currentCustomer } } = this.props;
@@ -152,11 +137,6 @@ export default class UniverseDisplayPanel extends Component {
           <Row className="list-group">
             {universeDisplayList}
           </Row>
-          <YBModal
-            className="mymodal"
-            visible={self.state.addUniverseModal}
-            onHide={() => this.toggleUniverseModal()}
-            title={''}></YBModal>
         </div>
       );
     } else if (getPromiseState(providers).isEmpty()) {

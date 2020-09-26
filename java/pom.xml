@@ -84,8 +84,8 @@
 
     <!-- Library dependencies -->
     <async.version>1.4.1</async.version>
-    <cassandra-driver-core.version>3.2.0-yb-19</cassandra-driver-core.version>
-    <spark-cassandra-connector.version>2.0.5-yb-7</spark-cassandra-connector.version>
+    <cassandra-driver-core.version>3.8.0-yb-5</cassandra-driver-core.version>
+    <spark-cassandra-connector.version>2.4-yb-2</spark-cassandra-connector.version>
     <lz4.version>1.3.0</lz4.version>
     <snappy.version>1.1.4</snappy.version>
     <commons-cli.version>1.2</commons-cli.version>
@@ -93,7 +93,7 @@
     <commons-lang3.version>3.6</commons-lang3.version>
     <commons-math3.version>3.5</commons-math3.version>
     <commons-text.version>1.3</commons-text.version>
-    <guava.version>16.0.1</guava.version>
+    <guava.version>23.0</guava.version>
     <hadoop.version>2.7.3</hadoop.version>
     <jedis.version>2.9.0-yb-16</jedis.version>
     <jsr305.version>3.0.1</jsr305.version>
@@ -222,6 +222,25 @@
           <artifactId>protobuf-maven-plugin</artifactId>
           <version>${protobuf-maven-plugin.version}</version>
         </plugin>
+        <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-antrun-plugin</artifactId>
+        <version>${maven-antrun-plugin.version}</version>
+        <executions>
+          <execution>
+            <phase>test-compile</phase>
+            <configuration>
+              <target>
+                <delete dir="${testdata.dir}"/>
+                <mkdir dir="${testdata.dir}"/>
+              </target>
+            </configuration>
+            <goals>
+              <goal>run</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
       </plugins>
     </pluginManagement>
 
@@ -278,25 +297,6 @@
       </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-antrun-plugin</artifactId>
-        <version>${maven-antrun-plugin.version}</version>
-        <executions>
-          <execution>
-            <phase>test-compile</phase>
-            <configuration>
-              <target>
-                <delete dir="${testdata.dir}"/>
-                <mkdir dir="${testdata.dir}"/>
-              </target>
-            </configuration>
-            <goals>
-              <goal>run</goal>
-            </goals>
-          </execution>
-        </executions>
-      </plugin>
-      <plugin>
-        <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-javadoc-plugin</artifactId>
         <configuration>
           <maxmemory>2048m</maxmemory>
@@ -315,13 +315,6 @@
         </configuration>
       </plugin>
     </plugins>
-    <extensions>
-      <extension>
-        <groupId>org.kuali.maven.wagons</groupId>
-        <artifactId>maven-s3-wagon</artifactId>
-        <version>1.1.9</version>
-      </extension>
-    </extensions>
   </build>
 
   <!--
@@ -332,12 +325,12 @@
     <dependencies>
       <dependency>
         <groupId>org.apache.spark</groupId>
-        <artifactId>spark-core_2.10</artifactId>
+        <artifactId>spark-core_2.11</artifactId>
         <version>${spark.version}</version>
       </dependency>
       <dependency>
         <groupId>org.apache.spark</groupId>
-        <artifactId>spark-sql_2.10</artifactId>
+        <artifactId>spark-sql_2.11</artifactId>
         <version>${spark.version}</version>
       </dependency>
       <dependency>
@@ -348,7 +341,7 @@
       <dependency>
         <groupId>org.yb</groupId>
         <artifactId>yb-client</artifactId>
-        <version>${project.version}</version>
+        <version>0.8.1-SNAPSHOT</version>
       </dependency>
       <dependency>
         <groupId>org.yb</groupId>
@@ -467,7 +460,7 @@
       </dependency>
       <dependency>
         <groupId>com.yugabyte.spark</groupId>
-        <artifactId>spark-cassandra-connector_2.10</artifactId>
+        <artifactId>spark-cassandra-connector_2.11</artifactId>
         <version>${spark-cassandra-connector.version}</version>
       </dependency>
       <dependency>
@@ -495,7 +488,7 @@
       <dependency>
         <groupId>org.yb</groupId>
         <artifactId>yb-client</artifactId>
-        <version>${project.version}</version>
+        <version>0.8.1-SNAPSHOT</version>
         <type>test-jar</type>
       </dependency>
       <dependency>

@@ -16,6 +16,7 @@
 #include "yb/rocksdb/util/statistics.h"
 
 #include "yb/docdb/consensus_frontier.h"
+#include "yb/docdb/docdb_debug.h"
 #include "yb/docdb/docdb_rocksdb_util.h"
 #include "yb/docdb/docdb_util.h"
 
@@ -38,7 +39,7 @@ namespace yb {
 namespace docdb {
 
 rocksdb::DB* DocDBRocksDBUtil::rocksdb() {
-  return DCHECK_NOTNULL(rocksdb_.get());
+  return DCHECK_NOTNULL(regular_db_.get());
 }
 
 rocksdb::DB* DocDBRocksDBUtil::intents_db() {
@@ -56,29 +57,32 @@ Status DocDBRocksDBUtil::OpenRocksDB() {
   }
 
   rocksdb::DB* rocksdb = nullptr;
-  RETURN_NOT_OK(rocksdb::DB::Open(rocksdb_options_, rocksdb_dir_, &rocksdb));
+  RETURN_NOT_OK(rocksdb::DB::Open(regular_db_options_, rocksdb_dir_, &rocksdb));
   LOG(INFO) << "Opened RocksDB at " << rocksdb_dir_;
-  rocksdb_.reset(rocksdb);
+  regular_db_.reset(rocksdb);
 
   rocksdb = nullptr;
-  RETURN_NOT_OK(rocksdb::DB::Open(rocksdb_options_, IntentsDBDir(), &rocksdb));
+  RETURN_NOT_OK(rocksdb::DB::Open(intents_db_options_, IntentsDBDir(), &rocksdb));
   intents_db_.reset(rocksdb);
 
   return Status::OK();
 }
 
-Status DocDBRocksDBUtil::ReopenRocksDB() {
+void DocDBRocksDBUtil::CloseRocksDB() {
   intents_db_.reset();
-  rocksdb_.reset();
+  regular_db_.reset();
+}
+
+Status DocDBRocksDBUtil::ReopenRocksDB() {
+  CloseRocksDB();
   return OpenRocksDB();
 }
 
 Status DocDBRocksDBUtil::DestroyRocksDB() {
-  intents_db_.reset();
-  rocksdb_.reset();
+  CloseRocksDB();
   LOG(INFO) << "Destroying RocksDB database at " << rocksdb_dir_;
-  RETURN_NOT_OK(rocksdb::DestroyDB(rocksdb_dir_, rocksdb_options_));
-  RETURN_NOT_OK(rocksdb::DestroyDB(IntentsDBDir(), rocksdb_options_));
+  RETURN_NOT_OK(rocksdb::DestroyDB(rocksdb_dir_, regular_db_options_));
+  RETURN_NOT_OK(rocksdb::DestroyDB(IntentsDBDir(), intents_db_options_));
   return Status::OK();
 }
 
@@ -93,8 +97,8 @@ Status DocDBRocksDBUtil::PopulateRocksDBWriteBatch(
     bool decode_dockey,
     bool increment_write_id,
     PartialRangeKeyIntents partial_range_key_intents) const {
-  for (const auto& entry : dwb.key_value_pairs()) {
-    if (decode_dockey) {
+  if (decode_dockey) {
+    for (const auto& entry : dwb.key_value_pairs()) {
       SubDocKey subdoc_key;
       // We don't expect any invalid encoded keys in the write batch. However, these encoded keys
       // don't contain the HybridTime.
@@ -112,7 +116,7 @@ Status DocDBRocksDBUtil::PopulateRocksDBWriteBatch(
     dwb.TEST_CopyToWriteBatchPB(&kv_write_batch);
     PrepareTransactionWriteBatch(
         kv_write_batch, hybrid_time, rocksdb_write_batch, *current_txn_id_, txn_isolation_level_,
-        partial_range_key_intents, &intra_txn_write_id_);
+        partial_range_key_intents, /* replicated_batches_state= */ Slice(), &intra_txn_write_id_);
   } else {
     // TODO: this block has common code with docdb::PrepareNonTransactionWriteBatch and probably
     // can be refactored, so common code is reused.
@@ -123,7 +127,7 @@ Status DocDBRocksDBUtil::PopulateRocksDBWriteBatch(
         // HybridTime provided. Append a PrimitiveValue with the HybridTime to the key.
         const KeyBytes encoded_ht =
             PrimitiveValue(DocHybridTime(hybrid_time, write_id)).ToKeyBytes();
-        rocksdb_key = entry.first + encoded_ht.data();
+        rocksdb_key = entry.first + encoded_ht.ToStringBuffer();
       } else {
         // Useful when printing out a write batch that does not yet know the HybridTime it will be
         // committed with.
@@ -165,7 +169,7 @@ Status DocDBRocksDBUtil::WriteToRocksDB(
       doc_write_batch, &rocksdb_write_batch, hybrid_time, decode_dockey, increment_write_id,
       partial_range_key_intents));
 
-  rocksdb::DB* db = current_txn_id_ ? intents_db_.get() : rocksdb_.get();
+  rocksdb::DB* db = current_txn_id_ ? intents_db_.get() : regular_db_.get();
   rocksdb::Status rocksdb_write_status = db->Write(write_options(), &rocksdb_write_batch);
 
   if (!rocksdb_write_status.ok()) {
@@ -183,14 +187,10 @@ Status DocDBRocksDBUtil::InitCommonRocksDBOptions() {
     block_cache_ = rocksdb::NewLRUCache(cache_size);
   }
 
-  tablet::TabletOptions tablet_options;
-  tablet_options.block_cache = block_cache_;
-  docdb::InitRocksDBOptions(&rocksdb_options_, "" /* log_prefix */, rocksdb::CreateDBStatistics(),
-                            tablet_options);
+  regular_db_options_.statistics = rocksdb::CreateDBStatistics();
+  intents_db_options_.statistics = rocksdb::CreateDBStatistics();
+  RETURN_NOT_OK(ReinitDBOptions());
   InitRocksDBWriteOptions(&write_options_);
-  rocksdb_options_.compaction_filter_factory =
-      std::make_shared<docdb::DocDBCompactionFilterFactory>(
-          retention_policy_, &KeyBounds::kNoBounds);
   return Status::OK();
 }
 
@@ -201,6 +201,16 @@ Status DocDBRocksDBUtil::WriteToRocksDBAndClear(
   RETURN_NOT_OK(WriteToRocksDB(*dwb, hybrid_time, decode_dockey, increment_write_id));
   dwb->Clear();
   return Status::OK();
+}
+
+Status DocDBRocksDBUtil::WriteSimple(int index) {
+  auto encoded_doc_key = DocKey(PrimitiveValues(Format("row$0", index), 11111 * index)).Encode();
+  op_id_.term = index / 2;
+  op_id_.index = index;
+  auto& dwb = DefaultDocWriteBatch();
+  RETURN_NOT_OK(dwb.SetPrimitive(
+      DocPath(encoded_doc_key, PrimitiveValue(ColumnId(10))), PrimitiveValue(index)));
+  return WriteToRocksDBAndClear(&dwb, HybridTime::FromMicros(1000 * index));
 }
 
 void DocDBRocksDBUtil::SetHistoryCutoffHybridTime(HybridTime history_cutoff) {
@@ -295,7 +305,7 @@ Status DocDBRocksDBUtil::DeleteSubDoc(
 }
 
 void DocDBRocksDBUtil::DocDBDebugDumpToConsole() {
-  DocDBDebugDump(rocksdb_.get(), std::cerr, StorageDbType::kRegular);
+  DocDBDebugDump(regular_db_.get(), std::cerr, StorageDbType::kRegular);
 }
 
 Status DocDBRocksDBUtil::FlushRocksDbAndWait() {
@@ -306,19 +316,38 @@ Status DocDBRocksDBUtil::FlushRocksDbAndWait() {
 
 Status DocDBRocksDBUtil::ReinitDBOptions() {
   tablet::TabletOptions tablet_options;
-  docdb::InitRocksDBOptions(&rocksdb_options_, "" /* log_prefix */, rocksdb_options_.statistics,
-                            tablet_options);
+  tablet_options.block_cache = block_cache_;
+  docdb::InitRocksDBOptions(
+      &regular_db_options_, "[R] " /* log_prefix */, regular_db_options_.statistics,
+      tablet_options);
+  docdb::InitRocksDBOptions(
+      &intents_db_options_, "[I] " /* log_prefix */, intents_db_options_.statistics,
+      tablet_options);
+  regular_db_options_.compaction_filter_factory =
+      std::make_shared<docdb::DocDBCompactionFilterFactory>(
+          retention_policy_, &KeyBounds::kNoBounds);
+  if (!regular_db_) {
+    return Status::OK();
+  }
   return ReopenRocksDB();
 }
 
 DocWriteBatch DocDBRocksDBUtil::MakeDocWriteBatch() {
   return DocWriteBatch(
-      DocDB::FromRegularUnbounded(rocksdb_.get()), init_marker_behavior_, &monotonic_counter_);
+      DocDB::FromRegularUnbounded(regular_db_.get()), init_marker_behavior_, &monotonic_counter_);
 }
 
 DocWriteBatch DocDBRocksDBUtil::MakeDocWriteBatch(InitMarkerBehavior init_marker_behavior) {
   return DocWriteBatch(
-      DocDB::FromRegularUnbounded(rocksdb_.get()), init_marker_behavior, &monotonic_counter_);
+      DocDB::FromRegularUnbounded(regular_db_.get()), init_marker_behavior, &monotonic_counter_);
+}
+
+DocWriteBatch& DocDBRocksDBUtil::DefaultDocWriteBatch() {
+  if (!doc_write_batch_) {
+    doc_write_batch_ = MakeDocWriteBatch();
+  }
+
+  return *doc_write_batch_;
 }
 
 void DocDBRocksDBUtil::SetInitMarkerBehavior(InitMarkerBehavior init_marker_behavior) {
@@ -327,41 +356,6 @@ void DocDBRocksDBUtil::SetInitMarkerBehavior(InitMarkerBehavior init_marker_beha
     init_marker_behavior_ = init_marker_behavior;
   }
 }
-
-// ------------------------------------------------------------------------------------------------
-
-DebugDocVisitor::DebugDocVisitor() {
-}
-
-DebugDocVisitor::~DebugDocVisitor() {
-}
-
-#define SIMPLE_DEBUG_DOC_VISITOR_METHOD(method_name) \
-  Status DebugDocVisitor::method_name() { \
-    out_ << BOOST_PP_STRINGIZE(method_name) << endl; \
-    return Status::OK(); \
-  }
-
-#define SIMPLE_DEBUG_DOC_VISITOR_METHOD_ARGUMENT(method_name, argument_type) \
-  Status DebugDocVisitor::method_name(const argument_type& arg) { \
-    out_ << BOOST_PP_STRINGIZE(method_name) << "(" << arg << ")" << std::endl; \
-    return Status::OK(); \
-  }
-
-SIMPLE_DEBUG_DOC_VISITOR_METHOD_ARGUMENT(StartSubDocument, SubDocKey);
-SIMPLE_DEBUG_DOC_VISITOR_METHOD_ARGUMENT(VisitKey, PrimitiveValue);
-SIMPLE_DEBUG_DOC_VISITOR_METHOD_ARGUMENT(VisitValue, PrimitiveValue);
-SIMPLE_DEBUG_DOC_VISITOR_METHOD(EndSubDocument)
-SIMPLE_DEBUG_DOC_VISITOR_METHOD(StartObject)
-SIMPLE_DEBUG_DOC_VISITOR_METHOD(EndObject)
-SIMPLE_DEBUG_DOC_VISITOR_METHOD(StartArray)
-SIMPLE_DEBUG_DOC_VISITOR_METHOD(EndArray)
-
-string DebugDocVisitor::ToString() {
-  return out_.str();
-}
-
-#undef SIMPLE_DEBUG_DOC_VISITOR_METHOD
 
 }  // namespace docdb
 }  // namespace yb

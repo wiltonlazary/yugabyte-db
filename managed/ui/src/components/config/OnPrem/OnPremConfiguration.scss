@@ -1,6 +1,6 @@
 /* Copyright (c) YugaByte, Inc. */
-@import "_style/colors.scss";
-@import "_style/mixins.scss";
+@import "../../../_style/colors.scss";
+@import "../../../_style/mixins.scss";
 
 .form-action-button-container {
   position: absolute;
@@ -22,7 +22,7 @@
 .node-link-container {
   cursor: pointer;
   margin-left: 8px;
-  font-weight: 600;
+  font-weight: 500;
   color: $YB_ORANGE;
 }
 
@@ -36,7 +36,7 @@
 }
 
 .form-item-custom-label {
-  font-weight: bold;
+  font-weight: 500;
   text-align: left;
   padding: 8px 0px;
 }
@@ -112,7 +112,6 @@
 }
 
 .provider-task-progress-container {
-  border: 1px solid #d3d3d3;
   padding: 6px 8px;
   width: 100%;
 }
@@ -124,4 +123,24 @@
 .pre-provision-message .yb-code-block {
   margin-top: 5px;
   margin-bottom: -5px;
+}
+
+
+.onprem-nodes-table.react-bs-table-container {
+  margin-top: 90px;
+
+  .form-group.react-bs-table-search-form {
+    margin-right: 50px;
+    margin-top: -72px;
+
+    .input-group-btn {
+      button.react-bs-table-search-clear-btn {
+        height: 42px;
+        padding: 5px 15px;
+        border-top-right-radius: 5px;
+        border-bottom-right-radius: 5px;
+      }
+    }
+  }
+ 
 }

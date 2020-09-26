@@ -12,7 +12,7 @@ package com.yugabyte.yw.commissioner.tasks.subtasks;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import com.google.common.annotations.VisibleForTesting;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.collect.ImmutableMap;
 import com.google.inject.Inject;
 import com.yugabyte.yw.commissioner.AbstractTaskBase;
@@ -75,8 +75,6 @@ public class KubernetesCommandExecutor extends AbstractTaskBase {
           return UserTaskDetails.SubTaskGroupType.CreateNamespace.name();
         case APPLY_SECRET:
           return UserTaskDetails.SubTaskGroupType.ApplySecret.name();
-        case HELM_INIT:
-          return UserTaskDetails.SubTaskGroupType.HelmInit.name();
         case HELM_INSTALL:
           return UserTaskDetails.SubTaskGroupType.HelmInstall.name();
         case HELM_UPGRADE:
@@ -113,9 +111,6 @@ public class KubernetesCommandExecutor extends AbstractTaskBase {
   static final double burstVal = 1.2;
 
   static final String defaultStorageClass = "standard";
-
-  @VisibleForTesting
-  static final String YSQL_PORT = "5433";
 
   @Override
   public void initialize(ITaskParams params) {
@@ -178,9 +173,6 @@ public class KubernetesCommandExecutor extends AbstractTaskBase {
         if (pullSecret != null) {
           response = kubernetesManager.applySecret(config, taskParams().nodePrefix, pullSecret);
         }
-        break;
-      case HELM_INIT:
-        response = kubernetesManager.helmInit(config, taskParams().providerUUID);
         break;
       case HELM_INSTALL:
         overridesFile = this.generateHelmOverride();
@@ -248,12 +240,42 @@ public class KubernetesCommandExecutor extends AbstractTaskBase {
       response.message = "No pods even scheduled. Previous step(s) incomplete";
     }
     else {
-      if (environment.isDev()) {
-        response.code = 0;
-      }
       response.message = "Pods are ready. Services still not running";
     }
     return response;
+  }
+
+  private Map<String, String> getClusterIpForLoadBalancer() {
+    Universe u = Universe.get(taskParams().universeUUID);
+    PlacementInfo pi = taskParams().placementInfo;
+
+    Map<UUID, Map<String, String>> azToConfig = PlacementInfoUtil.getConfigPerAZ(pi);
+    Map<UUID, String> azToDomain = PlacementInfoUtil.getDomainPerAZ(pi);
+    boolean isMultiAz = PlacementInfoUtil.isMultiAZ(Provider.get(taskParams().providerUUID));
+
+    Map<String, String> serviceToIP = new HashMap<String, String>();
+
+    for (Entry<UUID, Map<String, String>> entry : azToConfig.entrySet()) {
+      UUID azUUID = entry.getKey();
+      String azName = AvailabilityZone.get(azUUID).code;
+      String regionName = AvailabilityZone.get(azUUID).region.code;
+      Map<String, String> config = entry.getValue();
+
+      String namespace = taskParams().nodePrefix;
+
+      ShellProcessHandler.ShellResponse svcResponse =
+          kubernetesManager.getServices(config, namespace);
+      JsonNode svcInfos = parseShellResponseAsJson(svcResponse);
+
+      for (JsonNode svcInfo: svcInfos.path("items")) {
+        JsonNode serviceMetadata =  svcInfo.path("metadata");
+        JsonNode serviceSpec = svcInfo.path("spec");
+        String serviceType = serviceSpec.path("type").asText();
+        serviceToIP.put(serviceMetadata.path("name").asText(),
+                        serviceSpec.path("clusterIP").asText());
+      }
+    }
+    return serviceToIP;
   }
 
   private void processNodeInfo() {
@@ -386,10 +408,6 @@ public class KubernetesCommandExecutor extends AbstractTaskBase {
         application.resourceAsStream("k8s-expose-all.yml")
     );
 
-    if (environment.isDev()) {
-        overrides.put("enableLoadBalancer", false);
-    }
-
     Provider provider = Provider.get(taskParams().providerUUID);
     Map<String, String> config = provider.getConfig();
     Map<String, String> azConfig = new HashMap<String, String>();
@@ -480,6 +498,9 @@ public class KubernetesCommandExecutor extends AbstractTaskBase {
     if (!tserverDiskSpecs.isEmpty()) {
       storageOverrides.put("tserver", tserverDiskSpecs);
     }
+    if (instanceType.getInstanceTypeCode().equals("cloud")) {
+      masterDiskSpecs.put("size", String.format("%dGi", 3));
+    }
     if (!masterDiskSpecs.isEmpty()) {
       storageOverrides.put("master", masterDiskSpecs);
     }
@@ -487,15 +508,13 @@ public class KubernetesCommandExecutor extends AbstractTaskBase {
     // Override resource request and limit based on instance type.
     Map<String, Object> tserverResource = new HashMap<>();
     Map<String, Object> tserverLimit = new HashMap<>();
+    Map<String, Object> masterResource = new HashMap<>();
+    Map<String, Object> masterLimit = new HashMap<>();
+
     tserverResource.put("cpu", instanceType.numCores);
     tserverResource.put("memory", String.format("%.2fGi", instanceType.memSizeGB));
     tserverLimit.put("cpu", instanceType.numCores * burstVal);
     tserverLimit.put("memory", String.format("%.2fGi", instanceType.memSizeGB));
-    Map<String, Object> resourceOverrides = new HashMap();
-    resourceOverrides.put("tserver", ImmutableMap.of("requests", tserverResource, "limits", tserverLimit));
-
-    Map<String, Object> masterResource = new HashMap<>();
-    Map<String, Object> masterLimit = new HashMap<>();
 
     // If the instance type is not xsmall or dev, we would bump the master resource.
     if (!instanceType.getInstanceTypeCode().equals("xsmall") &&
@@ -504,17 +523,32 @@ public class KubernetesCommandExecutor extends AbstractTaskBase {
       masterResource.put("memory", "4Gi");
       masterLimit.put("cpu", 2 * burstVal);
       masterLimit.put("memory", "4Gi");
-      resourceOverrides.put("master", ImmutableMap.of("requests", masterResource, "limits", masterLimit));
     }
-
     // For testing with multiple deployments locally.
     if (instanceType.getInstanceTypeCode().equals("dev")) {
       masterResource.put("cpu", 0.5);
       masterResource.put("memory", "0.5Gi");
       masterLimit.put("cpu", 0.5);
       masterLimit.put("memory", "0.5Gi");
-      resourceOverrides.put("master", ImmutableMap.of("requests", masterResource, "limits", masterLimit));
     }
+    // For cloud deployments, we want bigger bursts in CPU if available for better performance.
+    // Memory should not be burstable as memory consumption above requests can lead to pods being
+    // killed if the nodes is running out of resources.
+    if (instanceType.getInstanceTypeCode().equals("cloud")) {
+      tserverLimit.put("cpu", instanceType.numCores * 2);
+      masterResource.put("cpu", 0.3);
+      masterResource.put("memory", "1Gi");
+      masterLimit.put("cpu", 0.6);
+      masterLimit.put("memory", "1Gi");
+    }
+
+    Map<String, Object> resourceOverrides = new HashMap();
+    if (!masterResource.isEmpty() && !masterLimit.isEmpty()) {
+      resourceOverrides.put("master", ImmutableMap.of("requests", masterResource,
+                                                      "limits", masterLimit));
+    }
+    resourceOverrides.put("tserver", ImmutableMap.of("requests", tserverResource,
+                                                     "limits", tserverLimit));
 
     overrides.put("resource", resourceOverrides);
 
@@ -536,6 +570,7 @@ public class KubernetesCommandExecutor extends AbstractTaskBase {
     if (taskParams().rootCA != null) {
       Map<String, Object> tlsInfo = new HashMap<>();
       tlsInfo.put("enabled", true);
+      tlsInfo.put("insecure", u.getUniverseDetails().allowInsecure);
       Map<String, Object> rootCA = new HashMap<>();
       rootCA.put("cert", CertificateHelper.getCertPEM(taskParams().rootCA));
       rootCA.put("key", CertificateHelper.getKeyPEM(taskParams().rootCA));
@@ -571,10 +606,6 @@ public class KubernetesCommandExecutor extends AbstractTaskBase {
     if (placementUuid != null && masterOverrides.get("placement_uuid") == null) {
       masterOverrides.put("placement_uuid", placementUuid.toString());
     }
-    if (taskParams().rootCA != null) {
-      masterOverrides.put("use_node_to_node_encryption", userIntent.enableNodeToNodeEncrypt);
-      masterOverrides.put("allow_insecure_connections", u.getUniverseDetails().allowInsecure);
-    }
     if (!masterOverrides.isEmpty()) {
       gflagOverrides.put("master", masterOverrides);
     }
@@ -591,11 +622,6 @@ public class KubernetesCommandExecutor extends AbstractTaskBase {
     }
     if (placementUuid != null && tserverOverrides.get("placement_uuid") == null) {
       tserverOverrides.put("placement_uuid", placementUuid.toString());
-    }
-    if (taskParams().rootCA != null) {
-      tserverOverrides.put("use_node_to_node_encryption", userIntent.enableNodeToNodeEncrypt);
-      tserverOverrides.put("use_client_to_server_encryption", userIntent.enableClientToNodeEncrypt);
-      tserverOverrides.put("allow_insecure_connections", u.getUniverseDetails().allowInsecure);
     }
     if (!tserverOverrides.isEmpty()) {
       gflagOverrides.put("tserver", tserverOverrides);
@@ -633,6 +659,25 @@ public class KubernetesCommandExecutor extends AbstractTaskBase {
       annotations =(HashMap<String, Object>) yaml.load(overridesYAML);
       if (annotations != null ) {
         overrides.putAll(annotations);
+      }
+    }
+
+
+    Map<String, String> universeConfig = u.getConfig();
+    boolean helmLegacy = Universe.HelmLegacy.valueOf(universeConfig.get(Universe.HELM2_LEGACY))
+        == Universe.HelmLegacy.V2TO3;
+
+    if (helmLegacy) {
+      overrides.put("helm2Legacy", helmLegacy);
+      Map<String, String> serviceToIP = getClusterIpForLoadBalancer();
+      ObjectMapper mapper = new ObjectMapper();
+      ArrayList<Object> serviceEndpoints = (ArrayList) overrides.get("serviceEndpoints");
+      for (Object serviceEndpoint: serviceEndpoints) {
+        Map<String, Object> endpoint = mapper.convertValue(serviceEndpoint, Map.class);
+        String endpointName = (String) endpoint.get("name");
+        if (serviceToIP.containsKey(endpointName)) {
+          endpoint.put("clusterIP", serviceToIP.get(endpointName));
+        }
       }
     }
 

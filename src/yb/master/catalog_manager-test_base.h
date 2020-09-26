@@ -30,6 +30,8 @@ namespace master {
 const string default_cloud = "aws";
 const string default_region = "us-west-1";
 const int kNumReplicas = 3;
+const string kLivePlacementUuid = "live";
+const string kReadReplicaPlacementUuidPrefix = "rr_$0";
 
 void CreateTable(const vector<string> split_keys, const int num_replicas, bool setup_placement,
                  TableInfo* table, vector<scoped_refptr<TabletInfo>>* tablets) {
@@ -62,6 +64,16 @@ void CreateTable(const vector<string> split_keys, const int num_replicas, bool s
   ASSERT_EQ(tablets->size(), split_keys.size() + 1);
 }
 
+void SetupRaftPeer(consensus::RaftPeerPB::MemberType member_type, std::string az,
+                   consensus::RaftPeerPB* raft_peer) {
+  raft_peer->Clear();
+  raft_peer->set_member_type(member_type);
+  auto* cloud_info = raft_peer->mutable_cloud_info();
+  cloud_info->set_placement_cloud(default_cloud);
+  cloud_info->set_placement_region(default_region);
+  cloud_info->set_placement_zone(az);
+}
+
 void SetupClusterConfig(vector<string> azs, ReplicationInfoPB* replication_info) {
 
   PlacementInfoPB* placement_info = replication_info->mutable_live_replicas();
@@ -72,6 +84,27 @@ void SetupClusterConfig(vector<string> azs, ReplicationInfoPB* replication_info)
     pb->mutable_cloud_info()->set_placement_region(default_region);
     pb->mutable_cloud_info()->set_placement_zone(az);
     pb->set_min_num_replicas(1);
+  }
+}
+
+void SetupClusterConfigWithReadReplicas(vector<string> live_azs,
+                                        vector<vector<string>> read_replica_azs,
+                                        ReplicationInfoPB* replication_info) {
+  replication_info->Clear();
+  SetupClusterConfig(live_azs, replication_info);
+  replication_info->mutable_live_replicas()->set_placement_uuid(kLivePlacementUuid);
+  int i = 0;
+  for (const auto& placement : read_replica_azs) {
+    auto* placement_info = replication_info->add_read_replicas();
+    placement_info->set_placement_uuid(Format(kReadReplicaPlacementUuidPrefix, i));
+    for (const auto& az : placement) {
+      auto pb = placement_info->add_placement_blocks();
+      pb->mutable_cloud_info()->set_placement_cloud(default_cloud);
+      pb->mutable_cloud_info()->set_placement_region(default_region);
+      pb->mutable_cloud_info()->set_placement_zone(az);
+      pb->set_min_num_replicas(1);
+    }
+    i++;
   }
 }
 
@@ -187,16 +220,18 @@ class TestLoadBalancerBase {
   }
 
  protected:
-  Status AnalyzeTablets() {
-    return cb_->AnalyzeTablets(cur_table_uuid_);
+  Status AnalyzeTablets() NO_THREAD_SAFETY_ANALYSIS /* don't need locks for mock class  */ {
+    return cb_->AnalyzeTabletsUnlocked(cur_table_uuid_);
   }
 
   void ResetState() {
-    cb_->ResetState();
+    cb_->global_state_ = std::make_unique<GlobalLoadState>();
+    cb_->ResetTableStatePtr(cur_table_uuid_, nullptr);
   }
 
   Result<bool> HandleLeaderMoves(
-      TabletId* out_tablet_id, TabletServerId* out_from_ts, TabletServerId* out_to_ts) {
+      TabletId* out_tablet_id, TabletServerId* out_from_ts, TabletServerId* out_to_ts)
+      NO_THREAD_SAFETY_ANALYSIS /* disabling for controlled test */ {
     return cb_->HandleLeaderMoves(out_tablet_id, out_from_ts, out_to_ts);
   }
 
@@ -204,7 +239,7 @@ class TestLoadBalancerBase {
     LOG(INFO) << "Testing moving overloaded leaders";
     // Move leaders of tablet i to ts i%3.
     int i = 0;
-    for (const auto tablet : tablets_) {
+    for (const auto& tablet : tablets_) {
       MoveTabletLeader(tablet.get(), ts_descs_[i%3]);
       i++;
     }
@@ -238,7 +273,6 @@ class TestLoadBalancerBase {
     cb_->state_->leader_blacklisted_servers_.clear();
     LOG(INFO) << "Leader distribution: 2 2 0. Leader Blacklist cleared.";
 
-    // ResetState();
     ASSERT_OK(AnalyzeTablets());
 
     // With ts2 no more leader blacklisted, a leader on ts0 or ts1 should be moved to ts2.
@@ -248,7 +282,7 @@ class TestLoadBalancerBase {
     ASSERT_FALSE(ASSERT_RESULT(HandleLeaderMoves(&placeholder, &placeholder, &placeholder)));
 
     // Move 1 leader to ts2.
-    for (const auto tablet : tablets_) {
+    for (const auto& tablet : tablets_) {
       if (tablet.get()->id() == placeholder) {
         MoveTabletLeader(tablet.get(), ts_descs_[2]);
         break;
@@ -311,7 +345,7 @@ class TestLoadBalancerBase {
     ASSERT_FALSE(ASSERT_RESULT(HandleAddReplicas(&placeholder, &placeholder, &placeholder)));
   }
 
-  void TestOverReplication() {
+  void TestOverReplication() NO_THREAD_SAFETY_ANALYSIS /* disabling for controlled test */ {
     LOG(INFO) << "Testing with tablet servers with over-replication";
     // Setup cluster config.
     SetupClusterConfig({"a"}, &replication_info_);
@@ -367,7 +401,7 @@ class TestLoadBalancerBase {
     }
     int count = 0;
     int pending_add_count = 0;
-    cb_->CountPendingTasks(cur_table_uuid_, &pending_add_count, &count, &count);
+    cb_->CountPendingTasksUnlocked(cur_table_uuid_, &pending_add_count, &count, &count);
     ASSERT_EQ(pending_add_count, pending_add_replica_tasks_.size());
     ASSERT_OK(AnalyzeTablets());
     string placeholder, tablet_id;
@@ -392,7 +426,7 @@ class TestLoadBalancerBase {
       pending_remove_replica_tasks_.push_back(tablet->id());
     }
     int pending_remove_count = 0;
-    cb_->CountPendingTasks(cur_table_uuid_, &count, &pending_remove_count, &count);
+    cb_->CountPendingTasksUnlocked(cur_table_uuid_, &count, &pending_remove_count, &count);
     ASSERT_EQ(pending_remove_count, pending_remove_replica_tasks_.size());
     ASSERT_OK(AnalyzeTablets());
     ASSERT_FALSE(ASSERT_RESULT(cb_->HandleRemoveReplicas(&tablet_id, &placeholder)));
@@ -437,13 +471,13 @@ class TestLoadBalancerBase {
     TestRemoveLoad(tablets_[0]->tablet_id(), "");
   }
 
-  void TestWithMissingPlacement() {
+  void TestWithMissingPlacement() NO_THREAD_SAFETY_ANALYSIS /* disabling for controlled test */ {
     LOG(INFO) << "Testing with tablet servers missing placement information";
     // Setup cluster level placement to multiple AZs.
     SetupClusterConfig({"a", "b", "c"}, &replication_info_);
 
     // Remove the only tablet peer from AZ "c".
-    for (const auto tablet : tablets_) {
+    for (const auto& tablet : tablets_) {
       TabletInfo::ReplicaMap replica_map;
       tablet->GetReplicaLocations(&replica_map);
       replica_map.erase(ts_descs_[2]->permanent_uuid());
@@ -599,7 +633,7 @@ class TestLoadBalancerBase {
     SetupClusterConfig({"a", "b", "c"}, &replication_info_);
 
     // Remove the only tablet peer from AZ "c".
-    for (const auto tablet : tablets_) {
+    for (const auto& tablet : tablets_) {
       TabletInfo::ReplicaMap replica_map;
       tablet->GetReplicaLocations(&replica_map);
       replica_map.erase(ts_descs_[2]->permanent_uuid());
@@ -651,10 +685,10 @@ class TestLoadBalancerBase {
     ASSERT_FALSE(ASSERT_RESULT(HandleAddReplicas(&placeholder, &placeholder, &placeholder)));
   }
 
-  void TestBalancingLeaders() {
+  void TestBalancingLeaders() NO_THREAD_SAFETY_ANALYSIS /* disabling for controlled test */ {
     LOG(INFO) << "Testing moving overloaded leaders";
     // Move all leaders to ts0.
-    for (const auto tablet : tablets_) {
+    for (const auto& tablet : tablets_) {
       MoveTabletLeader(tablet.get(), ts_descs_[0]);
     }
     LOG(INFO) << "Leader distribution: 4 0 0";
@@ -733,7 +767,7 @@ class TestLoadBalancerBase {
   void TestBalancingLeadersWithThreshold() {
     LOG(INFO) << "Testing moving overloaded leaders with threshold = 2";
     // Move all leaders to ts0.
-    for (const auto tablet : tablets_) {
+    for (const auto& tablet : tablets_) {
       MoveTabletLeader(tablet.get(), ts_descs_[0]);
     }
     LOG(INFO) << "Leader distribution: 4 0 0";
@@ -852,7 +886,7 @@ class TestLoadBalancerBase {
     ts_descs_ = ts_descs;
 
     // Reset the tablet map tablets.
-    for (const auto tablet : tablets_) {
+    for (const auto& tablet : tablets_) {
       tablet_map_[tablet->tablet_id()] = tablet;
     }
 
@@ -876,7 +910,8 @@ class TestLoadBalancerBase {
   }
 
   // Tester methods that actually do the calls and asserts.
-  void TestRemoveLoad(const string& expected_tablet_id, const string& expected_from_ts) {
+  void TestRemoveLoad(const string& expected_tablet_id, const string& expected_from_ts)
+    NO_THREAD_SAFETY_ANALYSIS /* disabling for controlled test */ {
     string tablet_id, from_ts;
     ASSERT_TRUE(ASSERT_RESULT(cb_->HandleRemoveReplicas(&tablet_id, &from_ts)));
     if (!expected_tablet_id.empty()) {
@@ -956,7 +991,8 @@ class TestLoadBalancerBase {
   }
 
   Result<bool> HandleAddReplicas(
-      TabletId* out_tablet_id, TabletServerId* out_from_ts, TabletServerId* out_to_ts) {
+      TabletId* out_tablet_id, TabletServerId* out_from_ts, TabletServerId* out_to_ts)
+      NO_THREAD_SAFETY_ANALYSIS /* disabling for controlled test */ {
     return cb_->HandleAddReplicas(out_tablet_id, out_from_ts, out_to_ts);
   }
 

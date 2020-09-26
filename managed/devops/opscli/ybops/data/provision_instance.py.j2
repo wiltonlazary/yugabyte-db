@@ -9,20 +9,25 @@
 # https://github.com/YugaByte/yugabyte-db/blob/master/licenses/POLYFORM-FREE-TRIAL-LICENSE-1.0.0.txt
 
 import argparse
+import os
 import subprocess
 
 
 def construct_command(args):
     return '{{devops_home}}/bin/ybcloud.sh {{cloud}} '\
         '--node_metadata '\
-        '\'{"ip":"%s","sshPort":{{ssh_port}},"sshUser":"{{ssh_user}}","nodeName":"@@DEFAULT_NODE_NAME@@"}\' '\
+        '\'{"ip":"%s","sshPort":{{custom_ssh_port}},"sshUser":"{{ssh_user}}","nodeName":"@@DEFAULT_NODE_NAME@@"}\' '\
         'instance provision '\
         '--vars_file {{vars_file}} ' \
         '--vault_password_file {{vault_password_file}} '\
         '--private_key_file {{private_key_file}} '\
+        '--ssh_user {{ssh_user}} '\
         '--mount_points %s '\
         {%- if not passwordless_sudo %}
         '--ask_sudo_pass ' \
+        {%- endif %}
+        {%- if air_gap %}
+        '--air_gap ' \
         {%- endif %}
         '--local_package_path {{local_package_path}} '\
         '@@DEFAULT_NODE_NAME@@' % (args.ip, args.mount_points)
@@ -30,7 +35,8 @@ def construct_command(args):
 
 def execute_command(cmd):
     try:
-        subprocess.check_output(cmd, stderr=subprocess.STDOUT, shell=True)
+        new_env = dict(os.environ, YB_HOME_DIR="{{ yb_home_dir }}")
+        subprocess.check_output(cmd, stderr=subprocess.STDOUT, shell=True, env=new_env)
         print "Success!"
     except subprocess.CalledProcessError as e:
         print "Failed!"

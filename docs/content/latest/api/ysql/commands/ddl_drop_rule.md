@@ -1,8 +1,8 @@
 ---
-title: DROP RULE
+title: DROP RULE statement [YSQL]
+headerTitle: DROP RULE
 linkTitle: DROP RULE
-summary: Remove a rule
-description: DROP RULE
+description: Use the DROP RULE statement to remove a rule.
 menu:
   latest:
     identifier: api-ysql-commands-drop-rule
@@ -62,5 +62,4 @@ yugabyte=# DROP RULE t1_to_t2 ON t1;
 ## See also
 
 - [`CREATE RULE`](../ddl_create_rule)
-
-[postgresql-docs-drop-rule]: https://www.postgresql.org/docs/current/sql-droprule.html
+- [postgresql-docs-drop-rule](https://www.postgresql.org/docs/current/sql-droprule.html)

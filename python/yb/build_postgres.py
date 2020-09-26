@@ -1,4 +1,4 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python3
 
 # Copyright (c) YugaByte, Inc.
 #
@@ -37,10 +37,11 @@ from yb import common_util
 from yb.common_util import YB_SRC_ROOT, get_build_type_from_build_root, get_bool_env_var
 
 
-REMOVE_CONFIG_CACHE_MSG_RE = re.compile(r'error: run.*\brm config[.]cache\b.*and start over')
-
 ALLOW_REMOTE_COMPILATION = True
-
+BUILD_STEPS = (
+    'configure',
+    'make',
+)
 CONFIG_ENV_VARS = [
     'CFLAGS',
     'CXXFLAGS',
@@ -51,6 +52,7 @@ CONFIG_ENV_VARS = [
     'YB_SRC_ROOT',
     'YB_THIRDPARTY_DIR'
 ]
+REMOVE_CONFIG_CACHE_MSG_RE = re.compile(r'error: run.*\brm config[.]cache\b.*and start over')
 
 
 def sha256(s):
@@ -59,10 +61,10 @@ def sha256(s):
 
 def adjust_error_on_warning_flag(flag, step, language):
     """
-    Adjust a given compiler flag according to whether this is for configure or make.
+    Adjust a given compiler flag according to the build step and language.
     """
     assert language in ('c', 'c++')
-    assert step in ('configure', 'make')
+    assert step in BUILD_STEPS
     if language == 'c' and flag in ('-Wreorder', '-Wnon-virtual-dtor'):
         # Skip C++-only flags.
         return None
@@ -94,7 +96,7 @@ def filter_compiler_flags(compiler_flags, step, language):
     This function optionaly removes flags that turn warnings into errors.
     """
     assert language in ('c', 'c++')
-    assert step in ('configure', 'make')
+    assert step in BUILD_STEPS
     adjusted_flags = [
         adjust_error_on_warning_flag(flag, step, language)
         for flag in compiler_flags.split()
@@ -149,30 +151,30 @@ class PostgresBuilder:
 
     def parse_args(self):
         parser = argparse.ArgumentParser(
-            description='A tool for building the PostgreSQL code subtree in YugaByte DB codebase')
+            description='A tool for building the PostgreSQL code subtree in YugabyteDB codebase')
         parser.add_argument('--build_root',
                             default=os.environ.get('BUILD_ROOT'),
                             help='YugaByte build root directory. The PostgreSQL build/install '
                                  'directories will be created under here.')
-
-        parser.add_argument('--run_tests',
-                            action='store_true',
-                            help='Run PostgreSQL tests after building it.')
-
+        parser.add_argument('--cflags', help='C compiler flags')
         parser.add_argument('--clean',
                             action='store_true',
                             help='Clean PostgreSQL build and installation directories.')
-
-        parser.add_argument('--cflags', help='C compiler flags')
+        parser.add_argument('--compiler_type', help='Compiler type, e.g. gcc or clang')
         parser.add_argument('--cxxflags', help='C++ compiler flags')
         parser.add_argument('--ldflags', help='Linker flags for all binaries')
         parser.add_argument('--ldflags_ex', help='Linker flags for executables')
-        parser.add_argument('--compiler_type', help='Compiler type, e.g. gcc or clang')
         parser.add_argument('--openssl_include_dir', help='OpenSSL include dir')
         parser.add_argument('--openssl_lib_dir', help='OpenSSL lib dir')
-        parser.add_argument(
-            '--step', choices=['configure', 'make'],
-            help='Run a specific step of the build process (configure or make)')
+        parser.add_argument('--run_tests',
+                            action='store_true',
+                            help='Run PostgreSQL tests after building it.')
+        parser.add_argument('--step',
+                            choices=BUILD_STEPS,
+                            help='Run a specific step of the build process')
+        parser.add_argument('--thirdparty-dir',
+                            required=True,
+                            help='Yugabyte third-party dependencies directory')
 
         self.args = parser.parse_args()
         if not self.args.build_root:
@@ -186,7 +188,6 @@ class PostgresBuilder:
         self.pg_build_root = os.path.join(self.build_root, 'postgres_build')
         self.build_stamp_path = os.path.join(self.pg_build_root, 'build_stamp')
         self.pg_prefix = os.path.join(self.build_root, 'postgres')
-        self.build_type = get_build_type_from_build_root(self.build_root)
         self.postgres_src_dir = os.path.join(YB_SRC_ROOT, 'src', 'postgres')
         self.compiler_type = self.args.compiler_type or os.getenv('YB_COMPILER_TYPE')
         self.openssl_include_dir = self.args.openssl_include_dir
@@ -199,13 +200,14 @@ class PostgresBuilder:
         self.export_compile_commands = os.environ.get('YB_EXPORT_COMPILE_COMMANDS') == '1'
         self.should_configure = self.args.step is None or self.args.step == 'configure'
         self.should_make = self.args.step is None or self.args.step == 'make'
+        self.thirdparty_dir = self.args.thirdparty_dir
+        self.original_path = os.getenv('PATH').split(':')
 
     def adjust_cflags_in_makefile(self):
         makefile_global_path = os.path.join(self.pg_build_root, 'src/Makefile.global')
         new_makefile_lines = []
         new_cflags = os.environ['CFLAGS'].strip()
         found_cflags = False
-        repalced_cflags = False
         with open(makefile_global_path) as makefile_global_input_f:
             for line in makefile_global_input_f:
                 line = line.rstrip("\n")
@@ -227,15 +229,15 @@ class PostgresBuilder:
                 makefile_global_out_f.write("\n".join(new_makefile_lines) + "\n")
 
     def set_env_vars(self, step):
-        if step not in ['configure', 'make']:
+        if step not in BUILD_STEPS:
             raise RuntimeError(
-                    ("Invalid step specified for setting env vars, must be either 'configure' "
-                     "or 'make'").format(step))
-        is_configure_step = step == 'configure'
+                ("Invalid step specified for setting env vars: must be in {}")
+                .format(BUILD_STEPS))
         is_make_step = step == 'make'
 
         self.set_env_var('YB_PG_BUILD_STEP', step)
         self.set_env_var('YB_BUILD_ROOT', self.build_root)
+        self.set_env_var('YB_THIRDPARTY_DIR', self.thirdparty_dir)
         self.set_env_var('YB_SRC_ROOT', YB_SRC_ROOT)
 
         for var_name in ['CFLAGS', 'CXXFLAGS', 'LDFLAGS', 'LDFLAGS_EX']:
@@ -254,7 +256,7 @@ class PostgresBuilder:
 
         if self.compiler_type == 'clang':
             additional_c_cxx_flags += [
-                '-Wno-error=builtin-requires-header'
+                '-Wno-builtin-requires-header'
             ]
 
         if is_make_step:
@@ -330,7 +332,9 @@ class PostgresBuilder:
 
         self.set_env_var(
             'YB_REMOTE_COMPILATION',
-            '1' if self.remote_compilation_allowed and self.build_uses_remote_compilation else '0'
+            '1' if (self.remote_compilation_allowed and
+                    self.build_uses_remote_compilation and
+                    step == 'make') else '0'
         )
 
         self.set_env_var('YB_BUILD_TYPE', self.build_type)
@@ -338,7 +342,13 @@ class PostgresBuilder:
         # Do not try to make rpaths relative during the configure step, as that may slow it down.
         self.set_env_var('YB_DISABLE_RELATIVE_RPATH', '1' if step == 'configure' else '0')
         if self.build_type == 'compilecmds':
-            os.environ['YB_SKIP_LINKING'] = '1'
+            self.set_env_var('YB_SKIP_LINKING', '1')
+
+        # We need to add this directory to PATH so Postgres build could find Bison.
+        thirdparty_installed_common_bin_path = os.path.join(
+            self.thirdparty_dir, 'installed', 'common', 'bin')
+        new_path_str = ':'.join([thirdparty_installed_common_bin_path] + self.original_path)
+        self.set_env_var('PATH', new_path_str)
 
     def sync_postgres_source(self):
         logging.info("Syncing postgres source code")
@@ -387,6 +397,7 @@ class PostgresBuilder:
                 '--with-extra-version=-YB-' + self.get_yb_version(),
                 '--enable-depend',
                 '--with-openssl',
+                '--with-libedit-preferred',
                 '--with-includes=' + self.openssl_include_dir,
                 '--with-libraries=' + self.openssl_lib_dir,
                 # We're enabling debug symbols for all types of builds.
@@ -460,7 +471,8 @@ class PostgresBuilder:
             ])
 
         if include_env_vars:
-            build_stamp += "\nenv_vars_sha256=%s" % hashlib.sha256(env_vars_str).hexdigest()
+            build_stamp += "\nenv_vars_sha256=%s" % hashlib.sha256(
+                env_vars_str.encode('utf-8')).hexdigest()
 
         return build_stamp.strip()
 
@@ -486,7 +498,7 @@ class PostgresBuilder:
             if make_parallelism:
                 make_parallelism = min(parallelism_cap, make_parallelism)
             else:
-                make_parallelism = cpu_count
+                make_parallelism = parallelism_cap
 
         if make_parallelism:
             make_cmd += ['-j', str(int(make_parallelism))]
@@ -646,7 +658,6 @@ class PostgresBuilder:
                 ])
 
         for arg in arguments:
-            added = False
             if arg.startswith('-I'):
                 include_path = arg[2:]
                 if os.path.isabs(include_path):
@@ -715,7 +726,7 @@ class PostgresBuilder:
 
     def steps_description(self):
         if self.args.step is None:
-            return "both 'configure' and 'make' steps"
+            return "all steps in {}".format(BUILD_STEPS)
         return "the '%s' step" % (self.args.step)
 
     def build_postgres(self):

@@ -78,14 +78,15 @@ using yb::rpc::RpcController;
 
 DECLARE_int32(heartbeat_interval_ms);
 DECLARE_bool(log_preallocate_segments);
-DECLARE_bool(enable_remote_bootstrap);
+DECLARE_bool(TEST_enable_remote_bootstrap);
 DECLARE_int32(tserver_unresponsive_timeout_ms);
 DECLARE_int32(max_create_tablets_per_ts);
 
 DEFINE_int32(num_test_tablets, 60, "Number of tablets for stress test");
 DEFINE_int32(benchmark_runtime_secs, 5, "Number of seconds to run the benchmark");
 DEFINE_int32(benchmark_num_threads, 16, "Number of threads to run the benchmark");
-DEFINE_int32(benchmark_num_tablets, 60, "Number of tablets to create");
+// Increase this for actually using this as a benchmark test.
+DEFINE_int32(benchmark_num_tablets, 8, "Number of tablets to create");
 
 METRIC_DECLARE_histogram(handler_latency_yb_master_MasterService_GetTableLocations);
 
@@ -121,7 +122,7 @@ class CreateTableStressTest : public YBMiniClusterTestBase<MiniCluster> {
 
     // Workaround KUDU-941: without this, it's likely that while shutting
     // down tablets, they'll get resuscitated by their existing leaders.
-    FLAGS_enable_remote_bootstrap = false;
+    FLAGS_TEST_enable_remote_bootstrap = false;
 
     YBMiniClusterTestBase::SetUp();
     MiniClusterOptions opts;
@@ -161,7 +162,7 @@ class CreateTableStressTest : public YBMiniClusterTestBase<MiniCluster> {
 void CreateTableStressTest::CreateBigTable(const YBTableName& table_name, int num_tablets) {
   ASSERT_OK(client_->CreateNamespaceIfNotExists(table_name.namespace_name(),
                                                 table_name.namespace_type()));
-  gscoped_ptr<YBTableCreator> table_creator(client_->NewTableCreator());
+  std::unique_ptr<YBTableCreator> table_creator(client_->NewTableCreator());
   ASSERT_OK(table_creator->table_name(table_name)
             .schema(&schema_)
             .num_tablets(num_tablets)

@@ -49,7 +49,7 @@
 #include "yb/server/rpc_server.h"
 #include "yb/server/webserver.h"
 #include "yb/tablet/maintenance_manager.h"
-#include "yb/tserver/heartbeater.h"
+#include "yb/tserver/heartbeater_factory.h"
 #include "yb/tserver/metrics_snapshotter.h"
 #include "yb/tserver/tablet_service.h"
 #include "yb/tserver/ts_tablet_manager.h"
@@ -236,7 +236,9 @@ Status TabletServer::Init() {
   RETURN_NOT_OK(RpcAndWebServerBase::Init());
   RETURN_NOT_OK(path_handlers_->Register(web_server_.get()));
 
-  heartbeater_.reset(new Heartbeater(opts_, this));
+  log_prefix_ = Format("P $0: ", permanent_uuid());
+
+  heartbeater_ = CreateHeartbeater(opts_, this);
 
   if (FLAGS_tserver_enable_metrics_snapshotter) {
     metrics_snapshotter_.reset(new MetricsSnapshotter(opts_, this));
@@ -251,6 +253,9 @@ Status TabletServer::Init() {
   if (!bound_addresses.empty()) {
     shared_object_->SetEndpoint(bound_addresses.front());
   }
+
+  // 5433 is kDefaultPort in src/yb/yql/pgwrapper/pg_wrapper.h.
+  RETURN_NOT_OK(pgsql_proxy_bind_address_.ParseString(FLAGS_pgsql_proxy_bind_address, 5433));
 
   return Status::OK();
 }
@@ -301,9 +306,8 @@ Status TabletServer::RegisterServices() {
                                                      rpc::ServicePriority::kHigh));
 
   std::unique_ptr<ServiceIf> remote_bootstrap_service =
-      std::make_unique<enterprise::RemoteBootstrapServiceImpl>(fs_manager_.get(),
-                                                                        tablet_manager_.get(),
-                                                                        metric_entity());
+      std::make_unique<RemoteBootstrapServiceImpl>(
+          fs_manager_.get(), tablet_manager_.get(), metric_entity());
   LOG(INFO) << "yb::tserver::RemoteBootstrapServiceImpl created at " <<
     remote_bootstrap_service.get();
   RETURN_NOT_OK(RpcAndWebServerBase::RegisterService(FLAGS_ts_remote_bootstrap_svc_queue_length,
@@ -316,7 +320,6 @@ Status TabletServer::Start() {
 
   AutoInitServiceFlags();
 
-  RETURN_NOT_OK(tablet_manager_->Start());
   RETURN_NOT_OK(RegisterServices());
   RETURN_NOT_OK(RpcAndWebServerBase::Start());
 
@@ -324,6 +327,8 @@ Status TabletServer::Start() {
   if (FLAGS_enable_direct_local_tablet_server_call) {
     proxy_ = std::make_shared<TabletServerServiceProxy>(proxy_cache_.get(), HostPort());
   }
+
+  RETURN_NOT_OK(tablet_manager_->Start());
 
   RETURN_NOT_OK(heartbeater_->Start());
 
@@ -412,32 +417,59 @@ TabletServiceImpl* TabletServer::tablet_server_service() {
   return tablet_server_service_;
 }
 
-string GetDynamicUrlTile(const string path, const string host, const int port) {
+Status GetDynamicUrlTile(
+  const string& path, const string& hostport, const int port,
+  const string& http_addr_host, string* url) {
+  // We get an incoming hostport string like '127.0.0.1:5433' or '[::1]:5433' or [::1]
+  // and a port 13000 which has to be converted to '127.0.0.1:13000'. If the hostport is
+  // a wildcard - 0.0.0.0 - the URLs are formed based on the http address for web instead
+  HostPort hp;
+  RETURN_NOT_OK(hp.ParseString(hostport, port));
+  if (IsWildcardAddress(hp.host())) {
+    hp.set_host(http_addr_host);
+  }
+  hp.set_port(port);
 
-  vector<std::string> parsed_hostname = strings::Split(host, ":");
-  std::string link = strings::Substitute("http://$0:$1$2",
-                                         parsed_hostname[0], yb::ToString(port), path);
-  return link;
+  *url = strings::Substitute("http://$0$1", hp.ToString(), path);
+  return Status::OK();
 }
 
-void TabletServer::DisplayRpcIcons(std::stringstream* output) {
+Status TabletServer::DisplayRpcIcons(std::stringstream* output) {
+
+  ServerRegistrationPB reg;
+  RETURN_NOT_OK(GetRegistration(&reg));
+  string http_addr_host = reg.http_addresses(0).host();
+
   // RPCs in Progress.
-  DisplayIconTile(output, "fa-tasks", "TServer RPCs", "/rpcz");
+  DisplayIconTile(output, "fa-tasks", "TServer Live Ops", "/rpcz");
   // YCQL RPCs in Progress.
-  string cass_url = GetDynamicUrlTile("/rpcz", FLAGS_cql_proxy_bind_address,
-                                      FLAGS_cql_proxy_webserver_port);
-  DisplayIconTile(output, "fa-tasks", "YCQL RPCs", cass_url);
+  string cass_url;
+  RETURN_NOT_OK(GetDynamicUrlTile(
+      "/rpcz", FLAGS_cql_proxy_bind_address, FLAGS_cql_proxy_webserver_port,
+      http_addr_host, &cass_url));
+  DisplayIconTile(output, "fa-tasks", "YCQL Live Ops", cass_url);
 
   // YEDIS RPCs in Progress.
-  string redis_url = GetDynamicUrlTile("/rpcz", FLAGS_redis_proxy_bind_address,
-                                       FLAGS_redis_proxy_webserver_port);
-  DisplayIconTile(output, "fa-tasks", "YEDIS RPCs", redis_url);
+  string redis_url;
+  RETURN_NOT_OK(GetDynamicUrlTile(
+      "/rpcz", FLAGS_redis_proxy_bind_address, FLAGS_redis_proxy_webserver_port,
+      http_addr_host,  &redis_url));
+  DisplayIconTile(output, "fa-tasks", "YEDIS Live Ops", redis_url);
 
   // YSQL RPCs in Progress.
-  string sql_url = GetDynamicUrlTile("/rpcz", FLAGS_pgsql_proxy_bind_address,
-                                     FLAGS_pgsql_proxy_webserver_port);
-  DisplayIconTile(output, "fa-tasks", "YSQL RPCs", sql_url);
+  string sql_url;
+  RETURN_NOT_OK(GetDynamicUrlTile(
+      "/rpcz", FLAGS_pgsql_proxy_bind_address, FLAGS_pgsql_proxy_webserver_port,
+      http_addr_host, &sql_url));
+  DisplayIconTile(output, "fa-tasks", "YSQL Live Ops", sql_url);
 
+  // YSQL All Ops
+  string sql_all_url;
+  RETURN_NOT_OK(GetDynamicUrlTile(
+      "/statements", FLAGS_pgsql_proxy_bind_address, FLAGS_pgsql_proxy_webserver_port,
+      http_addr_host, &sql_all_url));
+  DisplayIconTile(output, "fa-tasks", "YSQL All Ops", sql_all_url);
+  return Status::OK();
 }
 
 Env* TabletServer::GetEnv() {
@@ -465,6 +497,10 @@ void TabletServer::SetYSQLCatalogVersion(uint64_t new_version) {
 
 TabletPeerLookupIf* TabletServer::tablet_peer_lookup() {
   return tablet_manager_.get();
+}
+
+client::YBClient* TabletServer::client() {
+  return &tablet_manager_->client();
 }
 
 client::TransactionPool* TabletServer::TransactionPool() {

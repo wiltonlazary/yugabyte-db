@@ -584,7 +584,7 @@ prune_append_rel_partitions(RelOptInfo *rel)
 	context.stepcmpfuncs = (FmgrInfo *) palloc0(sizeof(FmgrInfo) *
 												context.partnatts *
 												list_length(pruning_steps));
-	context.ppccontext = CurrentMemoryContext;
+	context.ppccontext = GetCurrentMemoryContext();
 
 	/* These are not valid when being called from the planner */
 	context.partrel = NULL;
@@ -1229,7 +1229,7 @@ gen_prune_steps_from_opexps(PartitionScheme part_scheme,
 						{
 							case BTLessEqualStrategyNumber:
 								inclusive = true;
-								/* fall through */
+								switch_fallthrough();
 							case BTLessStrategyNumber:
 								if (!inclusive)
 									need_next_eq = need_next_less = false;
@@ -1239,7 +1239,7 @@ gen_prune_steps_from_opexps(PartitionScheme part_scheme,
 								break;
 							case BTGreaterEqualStrategyNumber:
 								inclusive = true;
-								/* fall through */
+								switch_fallthrough();
 							case BTGreaterStrategyNumber:
 								if (!inclusive)
 									need_next_eq = need_next_greater = false;
@@ -2336,7 +2336,7 @@ get_matching_list_bounds(PartitionPruneContext *context,
 
 		case BTGreaterEqualStrategyNumber:
 			inclusive = true;
-			/* fall through */
+			switch_fallthrough();
 		case BTGreaterStrategyNumber:
 			off = partition_list_bsearch(partsupfunc,
 										 partcollation,
@@ -2371,7 +2371,7 @@ get_matching_list_bounds(PartitionPruneContext *context,
 
 		case BTLessEqualStrategyNumber:
 			inclusive = true;
-			/* fall through */
+			switch_fallthrough();
 		case BTLessStrategyNumber:
 			off = partition_list_bsearch(partsupfunc,
 										 partcollation,
@@ -2652,7 +2652,7 @@ get_matching_range_bounds(PartitionPruneContext *context,
 
 		case BTGreaterEqualStrategyNumber:
 			inclusive = true;
-			/* fall through */
+			switch_fallthrough();
 		case BTGreaterStrategyNumber:
 
 			/*
@@ -2731,7 +2731,7 @@ get_matching_range_bounds(PartitionPruneContext *context,
 
 		case BTLessEqualStrategyNumber:
 			inclusive = true;
-			/* fall through */
+			switch_fallthrough();
 		case BTLessStrategyNumber:
 
 			/*

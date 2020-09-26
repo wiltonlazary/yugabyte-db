@@ -1,7 +1,8 @@
 ---
-title: BLOB
-summary: Binary strings of variable length
-description: BLOB Type
+title: BLOB data type [YCQL]
+headerTitle: BLOB data type
+linkTitle: BLOB
+description: Use the BLOB data type to represent arbitrary binary data of variable length.
 menu:
   latest:
     parent: api-cassandra
@@ -15,7 +16,7 @@ showAsideToc: true
 
 ## Synopsis
 
-`BLOB` data type is used to represent arbitrary binary data of variable length.
+Use the `BLOB` data type to represent arbitrary binary data of variable length.
 
 ## Syntax
 
@@ -39,23 +40,23 @@ Where
 ## Examples
 
 ```sql
-cqlsh:example> CREATE TABLE messages(id INT PRIMARY KEY, content BLOB);
+ycqlsh:example> CREATE TABLE messages(id INT PRIMARY KEY, content BLOB);
 ```
 
 ```sql
-cqlsh:example> INSERT INTO messages (id, content) VALUES (1, 0xab00ff);
+ycqlsh:example> INSERT INTO messages (id, content) VALUES (1, 0xab00ff);
 ```
 
 ```sql
-cqlsh:example> INSERT INTO messages (id, content) VALUES (2, 0x);
+ycqlsh:example> INSERT INTO messages (id, content) VALUES (2, 0x);
 ```
 
 ```sql
-cqlsh:example> UPDATE messages SET content = 0x0f0f WHERE id = 2;
+ycqlsh:example> UPDATE messages SET content = 0x0f0f WHERE id = 2;
 ```
 
 ```sql
-cqlsh:example> SELECT * FROM messages;
+ycqlsh:example> SELECT * FROM messages;
 ```
 
 ```
@@ -67,4 +68,4 @@ cqlsh:example> SELECT * FROM messages;
 
 ## See also
 
-[Data Types](..#data-types)
+- [Data types](..#data-types)

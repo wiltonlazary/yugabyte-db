@@ -34,7 +34,8 @@ TEST_F(PggateTestSelectInequality, TestSelectInequality) {
   CHECK_YBC_STATUS(YBCPgNewCreateTable(kDefaultDatabase, kDefaultSchema, tabname,
                                        kDefaultDatabaseOid, tab_oid,
                                        false /* is_shared_table */, true /* if_not_exist */,
-                                       false /* add_primary_key */, &pg_stmt));
+                                       false /* add_primary_key */, true /* colocated */,
+                                       kInvalidOid /*tablegroup_id*/, &pg_stmt));
   CHECK_YBC_STATUS(YBCTestCreateTableAddColumn(pg_stmt, "h", ++col_count,
                                                DataType::STRING, true, false));
   CHECK_YBC_STATUS(YBCTestCreateTableAddColumn(pg_stmt, "r1", ++col_count,
@@ -42,7 +43,6 @@ TEST_F(PggateTestSelectInequality, TestSelectInequality) {
   CHECK_YBC_STATUS(YBCTestCreateTableAddColumn(pg_stmt, "val", ++col_count,
                                                DataType::STRING, false, false));
   CHECK_YBC_STATUS(YBCPgExecCreateTable(pg_stmt));
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
   CommitTransaction();
   pg_stmt = nullptr;
 
@@ -97,12 +97,12 @@ TEST_F(PggateTestSelectInequality, TestSelectInequality) {
   CHECK_YBC_STATUS(YBCPgExecInsert(pg_stmt));
   CommitTransaction();
 
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
   pg_stmt = nullptr;
 
   // SELECT --------------------------------- A < r1 < B -------------------------------------------
   LOG(INFO) << "Test SELECTing from table WITH RANGE values";
-  CHECK_YBC_STATUS(YBCPgNewSelect(kDefaultDatabaseOid, tab_oid, kInvalidOid, &pg_stmt));
+  CHECK_YBC_STATUS(YBCPgNewSelect(kDefaultDatabaseOid, tab_oid,
+                                  NULL /* prepare_params */, &pg_stmt));
 
   // Specify the selected expressions.
   YBCPgExpr colref;
@@ -165,12 +165,12 @@ TEST_F(PggateTestSelectInequality, TestSelectInequality) {
   }
   CHECK_EQ(select_row_count, B - A + 1) << "Unexpected row count";
 
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
   pg_stmt = nullptr;
 
   // SELECT --------------------------------- A < r1 -----------------------------------------------
   LOG(INFO) << "Test SELECTing from table WITH RANGE values: A < r1";
-  CHECK_YBC_STATUS(YBCPgNewSelect(kDefaultDatabaseOid, tab_oid, kInvalidOid, &pg_stmt));
+  CHECK_YBC_STATUS(YBCPgNewSelect(kDefaultDatabaseOid, tab_oid,
+                                  NULL /* prepare_params */, &pg_stmt));
 
   // Specify the selected expressions.
   YBCTestNewColumnRef(pg_stmt, 1, DataType::STRING, &colref);
@@ -230,12 +230,12 @@ TEST_F(PggateTestSelectInequality, TestSelectInequality) {
   }
   CHECK_EQ(select_row_count, B - A + 1) << "Unexpected row count";
 
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
   pg_stmt = nullptr;
 
   // SELECT --------------------------------- r1 < B -----------------------------------------------
   LOG(INFO) << "Test SELECTing from table WITH RANGE values: r1 < B";
-  CHECK_YBC_STATUS(YBCPgNewSelect(kDefaultDatabaseOid, tab_oid, kInvalidOid, &pg_stmt));
+  CHECK_YBC_STATUS(YBCPgNewSelect(kDefaultDatabaseOid, tab_oid,
+                                  NULL /* prepare_params */, &pg_stmt));
 
   // Specify the selected expressions.
   YBCTestNewColumnRef(pg_stmt, 1, DataType::STRING, &colref);
@@ -295,12 +295,12 @@ TEST_F(PggateTestSelectInequality, TestSelectInequality) {
   }
   CHECK_EQ(select_row_count, B - A + 1) << "Unexpected row count";
 
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
   pg_stmt = nullptr;
 
   // SELECT --------------------------------- A < r1 < A -------------------------------------------
   LOG(INFO) << "Test SELECTing from table WITH RANGE values: A < r1 < A";
-  CHECK_YBC_STATUS(YBCPgNewSelect(kDefaultDatabaseOid, tab_oid, kInvalidOid, &pg_stmt));
+  CHECK_YBC_STATUS(YBCPgNewSelect(kDefaultDatabaseOid, tab_oid,
+                                  NULL /* prepare_params */, &pg_stmt));
 
   // Specify the selected expressions.
   YBCTestNewColumnRef(pg_stmt, 1, DataType::STRING, &colref);
@@ -362,7 +362,6 @@ TEST_F(PggateTestSelectInequality, TestSelectInequality) {
   }
   CHECK_EQ(select_row_count, B - A + 1) << "Unexpected row count";
 
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
   pg_stmt = nullptr;
 }
 

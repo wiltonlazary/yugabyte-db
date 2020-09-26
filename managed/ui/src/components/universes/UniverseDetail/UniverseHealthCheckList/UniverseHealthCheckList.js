@@ -5,46 +5,58 @@ import { BootstrapTable, TableHeaderColumn } from 'react-bootstrap-table';
 import * as moment from 'moment';
 import { sortBy, values } from 'lodash';
 
-import { YBLoading } from 'components/common/indicators';
-import TreeNode from 'components/common/TreeNode';
-import { YBPanelItem } from 'components/panels';
+import { YBLoading } from '../../../../components/common/indicators';
+import TreeNode from '../../../../components/common/TreeNode';
+import { YBPanelItem } from '../../../../components/panels';
 import { Panel } from 'react-bootstrap';
-import { isNonEmptyArray, isEmptyArray } from 'utils/ObjectUtils';
-import { getPromiseState } from 'utils/PromiseUtils';
+import { isNonEmptyArray, isEmptyArray } from '../../../../utils/ObjectUtils';
+import { getPromiseState } from '../../../../utils/PromiseUtils';
+import { UniverseAction } from '../../../universes';
+import { isDisabled } from '../../../../utils/LayoutUtils';
 
 import './UniverseHealthCheckList.scss';
 
 const UniverseHealthCheckList = props => {
-  const {universe: {healthCheck}} = props;
+  const {universe: {healthCheck, currentUniverse}, currentCustomer} = props;
   let content = <span/>;
   if (getPromiseState(healthCheck).isLoading()) {
     content = <YBLoading />;
   } else if (getPromiseState(healthCheck).isEmpty() || getPromiseState(healthCheck).isError() || (getPromiseState(healthCheck).isSuccess() && isEmptyArray(healthCheck.data))) {
     content = (
       <div>
-        <h2 className="health-check-header content-title">Health Checks</h2>
-
-        There're no finished Health checks available at the moment. 
+        There're no finished Health checks available at the moment.
       </div>
     );
   } else if (getPromiseState(healthCheck).isSuccess() && isNonEmptyArray(healthCheck.data)) {
     const data = [...healthCheck.data].reverse();
     const timestamps = prepareData(data);
-    content = (
-      <div>
-        <h2 className="health-check-header content-title">Health Checks</h2>
-
-        {timestamps.map((timestamp, index) => (
-          <Timestamp id={'healthcheck'+timestamp.timestampMoment.unix()} key={timestamp.timestampMoment.unix()} timestamp={timestamp} index={index}/>
-        ))}
-      </div>
-    );
+    content = timestamps.map((timestamp, index) => (
+      <Timestamp id={'healthcheck'+timestamp.timestampMoment.unix()} key={timestamp.timestampMoment.unix()} timestamp={timestamp} index={index}/>
+    ));
   }
 
+  const actions_disabled = isDisabled(currentCustomer.data.features, "universes.actions");
+
   return (
-    <div className="universe-detail-content-container UniverseHealthCheckList">
-      {content}
-    </div>
+    <YBPanelItem
+      className=" UniverseHealthCheckList"
+      header={
+        <div className="clearfix">
+          <div className="pull-left">
+            <h2>Health Checks</h2>
+          </div>
+          <div className="pull-right">
+            <div className="backup-action-btn-group">
+              <UniverseAction className="table-action" universe={currentUniverse.data}
+                actionType="alert-config" btnClass={"btn-orange"} disabled={actions_disabled} />
+            </div>
+          </div>
+        </div>
+      }
+      body={
+        content
+      }
+      />
   );
 };
 
@@ -85,7 +97,7 @@ const NodeList = props => {
           header={
             <span>
               <span className="tree-node-main-heading">{node.ipAddress}</span>
-              – 
+              -
               {node.passingChecks.length > 0 && countFormatter(node.passingChecks, 'check', 'checks', false, 'OK')}
               {node.failedChecks.length > 0 && countFormatter(node.failedChecks, 'check', 'checks', true, 'failed')}
             </span>

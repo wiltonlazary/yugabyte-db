@@ -134,6 +134,7 @@ clean_data_paths() {
   for (( i=0; i<NUM_MOUNTS; ++i ))
   do
     rm -rf "${MOUNT_PATHS[i]}"/yb-data/$daemon
+    rm -rf "${MOUNT_PATHS[i]}"/pg_data
   done
 
   print_err_out "Cleaning core files on `hostname`"
@@ -192,7 +193,7 @@ case "$daemon" in
     exit 1
 esac
 
-daemon_home="/home/yugabyte/$daemon"
+daemon_home="{{ yb_home_dir }}/$daemon"
 daemon_logs_dir="$daemon_home/logs"
 daemon_binary="$daemon_home/bin/yb-$daemon"
 daemon_conf="$daemon_home/conf/server.conf"

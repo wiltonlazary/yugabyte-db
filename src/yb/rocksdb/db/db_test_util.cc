@@ -23,6 +23,12 @@
 
 #include "yb/rocksdb/db/db_test_util.h"
 
+#include "yb/util/encryption_util.h"
+#include "yb/util/random_util.h"
+#include "yb/util/header_manager_impl.h"
+#include "yb/util/universe_key_manager.h"
+#include "yb/rocksutil/rocksdb_encrypted_file_factory.h"
+
 namespace rocksdb {
 
 // Special Env used to delay background operations
@@ -53,10 +59,16 @@ SpecialEnv::SpecialEnv(Env* base)
   table_write_callback_ = nullptr;
 }
 
-DBTestBase::DBTestBase(const std::string path)
+const string DBTestBase::kKeyId = "key_id";
+const string DBTestBase::kKeyFile = "universe_key_file";
+
+DBTestBase::DBTestBase(const std::string path, bool encryption_enabled)
     : option_config_(kDefault),
       mem_env_(!getenv("MEM_ENV") ? nullptr : new MockEnv(Env::Default())),
       env_(new SpecialEnv(mem_env_ ? mem_env_ : Env::Default())) {
+  if (encryption_enabled) {
+    CreateEncryptedEnv();
+  }
   env_->SetBackgroundThreads(1, Env::LOW);
   env_->SetBackgroundThreads(1, Env::HIGH);
   dbname_ = test::TmpDir(env_) + path;
@@ -65,15 +77,16 @@ DBTestBase::DBTestBase(const std::string path)
   auto options = CurrentOptions();
   auto delete_options = options;
   delete_options.wal_dir = alternative_wal_dir_;
-  EXPECT_OK(DestroyDB(dbname_, delete_options));
+  WARN_NOT_OK(DestroyDB(dbname_, delete_options), "Cleanup failed " + dbname_);
   // Destroy it for not alternative WAL dir is used.
-  EXPECT_OK(DestroyDB(dbname_, options));
+  WARN_NOT_OK(DestroyDB(dbname_, options), "Cleanup failed " + dbname_);
   db_ = nullptr;
   Reopen(options);
   Random::GetTLSInstance()->Reset(0xdeadbeef);
 }
 
 DBTestBase::~DBTestBase() {
+  Env::Default()->CleanupFile(kKeyFile);
   rocksdb::SyncPoint::GetInstance()->DisableProcessing();
   rocksdb::SyncPoint::GetInstance()->LoadDependency({});
   rocksdb::SyncPoint::GetInstance()->ClearAllCallBacks();
@@ -87,6 +100,25 @@ DBTestBase::~DBTestBase() {
   delete env_;
 }
 
+void DBTestBase::CreateEncryptedEnv() {
+  auto bytes = yb::RandomBytes(32);
+  yb::Slice key(bytes.data(), bytes.size());
+  auto status = yb::WriteStringToFile(yb::Env::Default(), key, kKeyFile);
+  if (!status.ok()) {
+    LOG(FATAL) << "Could not write slice to file:" << status.ToString();
+  }
+
+  auto res = yb::enterprise::UniverseKeyManager::FromKey(kKeyId, key);
+  if (!res.ok()) {
+    LOG(FATAL) << "Could not get key from bytes:" << res.status().ToString();
+  }
+  universe_key_manager_ = std::move(*res);
+  encrypted_env_ = yb::enterprise::NewRocksDBEncryptedEnv(
+      yb::enterprise::DefaultHeaderManager(universe_key_manager_.get()));
+  delete env_;
+  env_ = new rocksdb::SpecialEnv(encrypted_env_.get());
+}
+
 bool DBTestBase::ShouldSkipOptions(int option_config, int skip_mask) {
 #ifdef ROCKSDB_LITE
     // These options are not supported in ROCKSDB_LITE
@@ -96,7 +128,7 @@ bool DBTestBase::ShouldSkipOptions(int option_config, int skip_mask) {
       option_config == kPlainTableCappedPrefixNonMmap ||
       option_config == kPlainTableAllBytesPrefix ||
       option_config == kVectorRep || option_config == kHashLinkList ||
-      option_config == kHashCuckoo || option_config == kUniversalCompaction ||
+      option_config == kUniversalCompaction ||
       option_config == kUniversalCompactionMultiLevel ||
       option_config == kUniversalSubcompactions ||
       option_config == kFIFOCompaction ||
@@ -131,9 +163,6 @@ bool DBTestBase::ShouldSkipOptions(int option_config, int skip_mask) {
     if ((skip_mask & kSkipHashIndex) &&
         (option_config == kBlockBasedTableWithPrefixHashIndex ||
          option_config == kBlockBasedTableWithWholeKeyHashIndex)) {
-      return true;
-    }
-    if ((skip_mask & kSkipHashCuckoo) && (option_config == kHashCuckoo)) {
       return true;
     }
     if ((skip_mask & kSkipFIFOCompaction) && option_config == kFIFOCompaction) {
@@ -173,28 +202,28 @@ bool DBTestBase::ChangeCompactOptions() {
     Destroy(last_options_);
     auto options = CurrentOptions();
     options.create_if_missing = true;
-    TryReopen(options);
+    CHECK_OK(TryReopen(options));
     return true;
   } else if (option_config_ == kUniversalCompaction) {
     option_config_ = kUniversalCompactionMultiLevel;
     Destroy(last_options_);
     auto options = CurrentOptions();
     options.create_if_missing = true;
-    TryReopen(options);
+    CHECK_OK(TryReopen(options));
     return true;
   } else if (option_config_ == kUniversalCompactionMultiLevel) {
     option_config_ = kLevelSubcompactions;
     Destroy(last_options_);
     auto options = CurrentOptions();
     assert(options.max_subcompactions > 1);
-    TryReopen(options);
+    CHECK_OK(TryReopen(options));
     return true;
   } else if (option_config_ == kLevelSubcompactions) {
     option_config_ = kUniversalSubcompactions;
     Destroy(last_options_);
     auto options = CurrentOptions();
     assert(options.max_subcompactions > 1);
-    TryReopen(options);
+    CHECK_OK(TryReopen(options));
     return true;
   } else {
     return false;
@@ -215,7 +244,7 @@ bool DBTestBase::ChangeFilterOptions() {
 
   auto options = CurrentOptions();
   options.create_if_missing = true;
-  TryReopen(options);
+  CHECK_OK(TryReopen(options));
   return true;
 }
 
@@ -278,10 +307,6 @@ Options DBTestBase::CurrentOptions(
       options.prefix_extractor.reset(NewFixedPrefixTransform(1));
       options.memtable_factory.reset(
           NewHashLinkListRepFactory(4, 0, 3, true, 4));
-      break;
-    case kHashCuckoo:
-      options.memtable_factory.reset(
-          NewHashCuckooRepFactory(options.write_buffer_size));
       break;
 #endif  // ROCKSDB_LITE
     case kMergePut:
@@ -400,6 +425,7 @@ Options DBTestBase::CurrentOptions(
     options.table_factory.reset(NewBlockBasedTableFactory(table_options));
   }
   options.env = env_;
+  options.checkpoint_env = env_->IsPlainText() ? env_ : Env::Default();
   options.create_if_missing = true;
   options.fail_if_options_file_error = true;
   return options;
@@ -761,11 +787,11 @@ std::string DBTestBase::FilesPerLevel(int cf) {
 
 size_t DBTestBase::CountFiles() {
   std::vector<std::string> files;
-  env_->GetChildren(dbname_, &files);
+  env_->GetChildrenWarnNotOk(dbname_, &files);
 
   std::vector<std::string> logfiles;
   if (dbname_ != last_options_.wal_dir) {
-    env_->GetChildren(last_options_.wal_dir, &logfiles);
+    env_->GetChildrenWarnNotOk(last_options_.wal_dir, &logfiles);
   }
 
   return files.size() + logfiles.size();
@@ -820,9 +846,9 @@ void DBTestBase::FillLevels(const std::string& smallest,
 void DBTestBase::MoveFilesToLevel(int level, int cf) {
   for (int l = 0; l < level; ++l) {
     if (cf > 0) {
-      dbfull()->TEST_CompactRange(l, nullptr, nullptr, handles_[cf]);
+      CHECK_OK(dbfull()->TEST_CompactRange(l, nullptr, nullptr, handles_[cf]));
     } else {
-      dbfull()->TEST_CompactRange(l, nullptr, nullptr);
+      CHECK_OK(dbfull()->TEST_CompactRange(l, nullptr, nullptr));
     }
   }
 }
@@ -847,7 +873,7 @@ std::string DBTestBase::DumpSSTableList() {
 
 void DBTestBase::GetSstFiles(std::string path,
                              std::vector<std::string>* files) {
-  env_->GetChildren(path, files);
+  env_->GetChildrenWarnNotOk(path, files);
 
   files->erase(
       std::remove_if(files->begin(), files->end(), [](std::string name) {
@@ -871,8 +897,8 @@ void DBTestBase::GenerateNewFile(int cf, Random* rnd, int* key_idx,
     (*key_idx)++;
   }
   if (!nowait) {
-    dbfull()->TEST_WaitForFlushMemTable();
-    dbfull()->TEST_WaitForCompact();
+    CHECK_OK(dbfull()->TEST_WaitForFlushMemTable());
+    CHECK_OK(dbfull()->TEST_WaitForCompact());
   }
 }
 
@@ -883,8 +909,8 @@ void DBTestBase::GenerateNewFile(Random* rnd, int* key_idx, bool nowait) {
     (*key_idx)++;
   }
   if (!nowait) {
-    dbfull()->TEST_WaitForFlushMemTable();
-    dbfull()->TEST_WaitForCompact();
+    CHECK_OK(dbfull()->TEST_WaitForFlushMemTable());
+    CHECK_OK(dbfull()->TEST_WaitForCompact());
   }
 }
 
@@ -896,8 +922,8 @@ void DBTestBase::GenerateNewRandomFile(Random* rnd, bool nowait) {
   }
   ASSERT_OK(Put("key" + RandomString(rnd, 7), RandomString(rnd, 200)));
   if (!nowait) {
-    dbfull()->TEST_WaitForFlushMemTable();
-    dbfull()->TEST_WaitForCompact();
+    CHECK_OK(dbfull()->TEST_WaitForFlushMemTable());
+    CHECK_OK(dbfull()->TEST_WaitForCompact());
   }
 }
 
@@ -1041,7 +1067,7 @@ std::unordered_map<std::string, uint64_t> DBTestBase::GetAllSSTFiles(
     *total_size = 0;
   }
   std::vector<std::string> files;
-  env_->GetChildren(dbname_, &files);
+  env_->GetChildrenWarnNotOk(dbname_, &files);
   for (auto& file_name : files) {
     uint64_t number;
     FileType type;
@@ -1049,7 +1075,7 @@ std::unordered_map<std::string, uint64_t> DBTestBase::GetAllSSTFiles(
     if (ParseFileName(file_name, &number, &type) &&
         (type == kTableFile || type == kTableSBlockFile)) {
       uint64_t file_size = 0;
-      env_->GetFileSize(file_path, &file_size);
+      CHECK_OK(env_->GetFileSize(file_path, &file_size));
       res[file_path] = file_size;
       if (total_size) {
         *total_size += file_size;

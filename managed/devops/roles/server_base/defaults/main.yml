@@ -10,8 +10,8 @@ air_gap: false
 install_dev_packages: false
 update_yum_cache: false
 yum_retry_count: 5
-required_packages:
-  - s3cmd
+
+linux_packages: []
 
 dev_packages:
   - emacs
@@ -54,3 +54,6 @@ redhat_packages:
   - atop
   - perf
   - python-devel
+
+azure_packages:
+  - libselinux-python

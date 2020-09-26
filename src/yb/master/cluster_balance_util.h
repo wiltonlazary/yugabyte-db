@@ -32,6 +32,8 @@ DECLARE_int32(min_leader_stepdown_retry_interval_ms);
 
 DECLARE_bool(enable_load_balancing);
 
+DECLARE_bool(transaction_tables_use_preferred_zones);
+
 DECLARE_int32(leader_balance_threshold);
 
 DECLARE_int32(leader_balance_unresponsive_timeout_ms);
@@ -40,6 +42,8 @@ DECLARE_int32(replication_factor);
 
 DECLARE_int32(load_balancer_max_concurrent_tablet_remote_bootstraps);
 
+DECLARE_int32(load_balancer_max_concurrent_tablet_remote_bootstraps_per_table);
+
 DECLARE_int32(load_balancer_max_over_replicated_tablets);
 
 DECLARE_int32(load_balancer_max_concurrent_adds);
@@ -47,6 +51,8 @@ DECLARE_int32(load_balancer_max_concurrent_adds);
 DECLARE_int32(load_balancer_max_concurrent_removals);
 
 DECLARE_int32(load_balancer_max_concurrent_moves);
+
+DECLARE_int32(load_balancer_max_concurrent_moves_per_table);
 
 namespace yb {
 namespace master {
@@ -148,11 +154,22 @@ struct CBTabletServerMetadata {
   std::set<TabletId> leaders;
 };
 
+struct CBTabletServerLoadCounts {
+  // Stores global load counts for a tablet server.
+  // See definitions of these counts in CBTabletServerMetadata.
+  int running_tablets_count = 0;
+  int starting_tablets_count = 0;
+  int leaders_count = 0;
+};
+
 struct Options {
   Options() {}
   virtual ~Options() {}
   // If variance between load on TS goes past this number, we should try to balance.
   double kMinLoadVarianceToBalance = 2.0;
+
+  // If variance between global load on TS goes past this number, we should try to balance.
+  double kMinGlobalLoadVarianceToBalance = 2.0;
 
   // If variance between leader load on TS goes past this number, we should try to balance.
   double kMinLeaderLoadVarianceToBalance = 2.0;
@@ -163,6 +180,11 @@ struct Options {
   // Max number of tablets being remote bootstrapped across the cluster, if we enable limiting
   // this.
   int kMaxTabletRemoteBootstraps = FLAGS_load_balancer_max_concurrent_tablet_remote_bootstraps;
+
+  // Max number of tablets being remote bootstrapped for a specific table, if we enable limiting
+  // this.
+  int kMaxTabletRemoteBootstrapsPerTable =
+      FLAGS_load_balancer_max_concurrent_tablet_remote_bootstraps_per_table;
 
   // Whether to limit the number of tablets that have more peers than configured at any given
   // time.
@@ -177,28 +199,56 @@ struct Options {
   // Max number of tablet peer replicas to add in any one run of the load balancer.
   int kMaxConcurrentAdds = FLAGS_load_balancer_max_concurrent_adds;
 
-  // Max number of tablet leaders on tablet servers to move in any one run of the load balancer.
+  // Max number of tablet leaders on tablet servers (across the cluster) to move in any one run of
+  // the load balancer.
   int kMaxConcurrentLeaderMoves = FLAGS_load_balancer_max_concurrent_moves;
+
+  // Max number of tablet leaders per table to move in any one run of the load balancer.
+  int kMaxConcurrentLeaderMovesPerTable = FLAGS_load_balancer_max_concurrent_moves_per_table;
 
   // TODO(bogdan): add state for leaders starting remote bootstraps, to limit on that end too.
 };
 
-class ClusterLoadState {
+// Cluster-wide state and metrics.
+// For now it's used to determine how many tablets are being remote bootstrapped across the cluster,
+// as well as keeping track of global load counts in order to do global load balancing moves.
+class GlobalLoadState {
  public:
-  ClusterLoadState()
+  // Used to determine how many tablets are being remote bootstrapped across the cluster.
+  int total_starting_tablets_ = 0;
+
+  // Map from tablet server ids to the global metadata we store for each.
+  unordered_map<TabletServerId, CBTabletServerLoadCounts> per_ts_global_meta_;
+
+  // Get the global load for a certain TS.
+  int GetGlobalLoad(const TabletServerId& ts_uuid) const {
+    const auto& ts_meta = per_ts_global_meta_.at(ts_uuid);
+    return ts_meta.starting_tablets_count + ts_meta.running_tablets_count;
+  }
+};
+
+class PerTableLoadState {
+ public:
+  TableId table_id_;
+  explicit PerTableLoadState(GlobalLoadState* global_state)
       : leader_balance_threshold_(FLAGS_leader_balance_threshold),
-        current_time_(MonoTime::Now()) {}
-  virtual ~ClusterLoadState() {}
+        current_time_(MonoTime::Now()),
+        global_state_(global_state) {}
+  virtual ~PerTableLoadState() {}
 
   // Comparators used for sorting by load.
   bool CompareByUuid(const TabletServerId& a, const TabletServerId& b) {
     int load_a = GetLoad(a);
     int load_b = GetLoad(b);
     if (load_a == load_b) {
-      return a < b;
-    } else {
-      return load_a < load_b;
+      // Use global load as a heuristic to help break ties.
+      load_a = global_state_->GetGlobalLoad(a);
+      load_b = global_state_->GetGlobalLoad(b);
+      if (load_a == load_b) {
+        return a < b;
+      }
     }
+    return load_a < load_b;
   }
 
   bool CompareByReplica(const TabletReplica& a, const TabletReplica& b) {
@@ -208,7 +258,7 @@ class ClusterLoadState {
   // Comparator functor to be able to wrap around the public but non-static compare methods that
   // end up using internal state of the class.
   struct Comparator {
-    explicit Comparator(ClusterLoadState* state) : state_(state) {}
+    explicit Comparator(PerTableLoadState* state) : state_(state) {}
     bool operator()(const TabletServerId& a, const TabletServerId& b) {
       return state_->CompareByUuid(a, b);
     }
@@ -217,12 +267,12 @@ class ClusterLoadState {
       return state_->CompareByReplica(a, b);
     }
 
-    ClusterLoadState* state_;
+    PerTableLoadState* state_;
   };
 
   // Comparator to sort tablet servers' leader load.
   struct LeaderLoadComparator {
-    explicit LeaderLoadComparator(ClusterLoadState* state) : state_(state) {}
+    explicit LeaderLoadComparator(PerTableLoadState* state) : state_(state) {}
     bool operator()(const TabletServerId& a, const TabletServerId& b) {
       // Primary criteria: whether tserver is leader blacklisted.
       auto a_leader_blacklisted =
@@ -236,7 +286,7 @@ class ClusterLoadState {
       // Secondary criteria: tserver leader load.
       return state_->GetLeaderLoad(a) < state_->GetLeaderLoad(b);
     }
-    ClusterLoadState* state_;
+    PerTableLoadState* state_;
   };
 
   // Get the load for a certain TS.
@@ -279,8 +329,7 @@ class ClusterLoadState {
       // getting the heartbeats from a certain tablet server, but we anticipate that to be a
       // temporary matter. We should monitor error logs for this and see that it never actually
       // becomes a problem!
-      auto ts_meta_it = per_ts_meta_.find(ts_uuid);
-      if (ts_meta_it == per_ts_meta_.end()) {
+      if (per_ts_meta_.find(ts_uuid) == per_ts_meta_.end()) {
         return STATUS_SUBSTITUTE(LeaderNotReadyToServe, "Master leader has not yet received "
             "heartbeat from ts $0, either master just became leader or a network partition.",
                                  ts_uuid);
@@ -289,21 +338,23 @@ class ClusterLoadState {
       // Fill leader info.
       if (replica.second.role == consensus::RaftPeerPB::LEADER) {
         tablet_meta.leader_uuid = ts_uuid;
-        ts_meta_it->second.leaders.insert(tablet_id);
+        AddLeaderTablet(tablet_id, ts_uuid);
       }
 
       const tablet::RaftGroupStatePB& tablet_state = replica.second.state;
       const bool replica_is_stale = replica.second.IsStale();
+      VLOG(2) << "Tablet " << tablet_id << " for table " << table_id_
+                << " is in state " << RaftGroupStatePB_Name(tablet_state);
       if (tablet_state == tablet::RUNNING) {
-        ts_meta_it->second.running_tablets.insert(tablet_id);
-        ++tablet_meta.running;
-        ++total_running_;
+        AddRunningTablet(tablet_id, ts_uuid);
       } else if (!replica_is_stale &&
                  (tablet_state == tablet::BOOTSTRAPPING || tablet_state == tablet::NOT_STARTED)) {
         // Keep track of transitioning state (not running, but not in a stopped or failed state).
-        ts_meta_it->second.starting_tablets.insert(tablet_id);
-        ++tablet_meta.starting;
-        ++total_starting_;
+        AddStartingTablet(tablet_id, ts_uuid);
+        VLOG(1) << "Increased total_starting to "
+                   << total_starting_ << " for tablet " << tablet_id << " and table " << table_id_;
+      } else if (replica_is_stale) {
+        VLOG(1) << "Replica is stale: " << replica.second.ToString();
       }
 
       // If this replica is blacklisted, we want to keep track of these specially, so we can
@@ -402,6 +453,9 @@ class ClusterLoadState {
     // tablet servers that happen to not be serving any tablets, so were not in the map yet.
     auto& ts_meta = per_ts_meta_[ts_uuid];
     ts_meta.descriptor = ts_desc;
+
+    // Also insert into per_ts_global_meta_ if we have yet to.
+    global_state_->per_ts_global_meta_.emplace(ts_uuid, CBTabletServerLoadCounts());
 
     sorted_load_.push_back(ts_uuid);
 
@@ -550,24 +604,17 @@ class ClusterLoadState {
   }
 
   Status AddReplica(const TabletId& tablet_id, const TabletServerId& to_ts) {
-    per_ts_meta_[to_ts].starting_tablets.insert(tablet_id);
-    ++per_tablet_meta_[tablet_id].starting;
-    ++total_starting_;
+    AddStartingTablet(tablet_id, to_ts);
     tablets_added_.insert(tablet_id);
     SortLoad();
     return Status::OK();
   }
 
   Status RemoveReplica(const TabletId& tablet_id, const TabletServerId& from_ts) {
-    if (per_ts_meta_[from_ts].running_tablets.count(tablet_id)) {
-      per_ts_meta_[from_ts].running_tablets.erase(tablet_id);
-      --per_tablet_meta_[tablet_id].running;
-      --total_running_;
-    }
+    RemoveRunningTablet(tablet_id, from_ts);
     if (per_ts_meta_[from_ts].starting_tablets.count(tablet_id)) {
-      per_ts_meta_[from_ts].starting_tablets.erase(tablet_id);
-      --per_tablet_meta_[tablet_id].starting;
-      --total_starting_;
+      LOG(DFATAL) << "Invalid request: remove starting tablet " << tablet_id
+                  << " from ts " << from_ts;
     }
     if (per_tablet_meta_[tablet_id].leader_uuid == from_ts) {
       RETURN_NOT_OK(MoveLeader(tablet_id, from_ts));
@@ -596,9 +643,9 @@ class ClusterLoadState {
                                tablet_id, per_tablet_meta_[tablet_id].leader_uuid, from_ts);
     }
     per_tablet_meta_[tablet_id].leader_uuid = to_ts;
-    per_ts_meta_[from_ts].leaders.erase(tablet_id);
+    RemoveLeaderTablet(tablet_id, from_ts);
     if (!to_ts.empty()) {
-      per_ts_meta_[to_ts].leaders.insert(tablet_id);
+      AddLeaderTablet(tablet_id, to_ts);
     }
     SortLeaderLoad();
     return Status::OK();
@@ -657,7 +704,46 @@ class ClusterLoadState {
     tablet->GetReplicaLocations(replica_locations);
   }
 
-  // ClusterLoadState member fields
+  void AddRunningTablet(TabletId tablet_id, TabletServerId ts_uuid) {
+    // Set::Insert returns a pair where the second value is whether or not an item was inserted.
+    auto ret = per_ts_meta_[ts_uuid].running_tablets.insert(tablet_id);
+    if (ret.second) {
+      ++global_state_->per_ts_global_meta_[ts_uuid].running_tablets_count;
+      ++total_running_;
+      ++per_tablet_meta_[tablet_id].running;
+    }
+  }
+
+  void RemoveRunningTablet(TabletId tablet_id, TabletServerId ts_uuid) {
+    int num_erased = per_ts_meta_[ts_uuid].running_tablets.erase(tablet_id);
+    global_state_->per_ts_global_meta_[ts_uuid].running_tablets_count -= num_erased;
+    total_running_ -= num_erased;
+    per_tablet_meta_[tablet_id].running -= num_erased;
+  }
+
+  void AddStartingTablet(TabletId tablet_id, TabletServerId ts_uuid) {
+    auto ret = per_ts_meta_[ts_uuid].starting_tablets.insert(tablet_id);
+    if (ret.second) {
+      ++global_state_->per_ts_global_meta_[ts_uuid].starting_tablets_count;
+      ++total_starting_;
+      ++global_state_->total_starting_tablets_;
+      ++per_tablet_meta_[tablet_id].starting;
+    }
+  }
+
+  void AddLeaderTablet(TabletId tablet_id, TabletServerId ts_uuid) {
+    auto ret = per_ts_meta_[ts_uuid].leaders.insert(tablet_id);
+    if (ret.second) {
+      ++global_state_->per_ts_global_meta_[ts_uuid].leaders_count;
+    }
+  }
+
+  void RemoveLeaderTablet(TabletId tablet_id, TabletServerId ts_uuid) {
+    int num_erased = per_ts_meta_[ts_uuid].leaders.erase(tablet_id);
+    global_state_->per_ts_global_meta_[ts_uuid].leaders_count -= num_erased;
+  }
+
+  // PerTableLoadState member fields
 
   // Map from tablet ids to the metadata we store for each.
   unordered_map<TabletId, CBTabletMetadata> per_tablet_meta_;
@@ -679,7 +765,7 @@ class ClusterLoadState {
   // Set of ts_uuid sorted ascending by load. This is the actual raw data of TS load.
   vector<TabletServerId> sorted_load_;
 
-  // Set ot tablet ids that have been determined to have missing replicas. This can mean they are
+  // Set of tablet ids that have been determined to have missing replicas. This can mean they are
   // generically under-replicated (2 replicas active, but 3 configured), or missing replicas in
   // certain placements (3 replicas active out of 3 configured, but no replicas in one of the AZs
   // listed in the placement blocks).
@@ -725,9 +811,16 @@ class ClusterLoadState {
   // The knobs we use for tweaking the flow of the algorithm.
   Options* options_;
 
+  // Pointer to the cluster global state so that it can be updated when operations like add or
+  // remove are executed.
+  GlobalLoadState* global_state_;
+
+  // Boolean whether tablets for this table should respect the affinited zones.
+  bool use_preferred_zones_ = true;
+
  private:
-  DISALLOW_COPY_AND_ASSIGN(ClusterLoadState);
-}; // ClusterLoadState
+  DISALLOW_COPY_AND_ASSIGN(PerTableLoadState);
+}; // PerTableLoadState
 
 } // namespace master
 } // namespace yb

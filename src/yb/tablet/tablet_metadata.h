@@ -63,11 +63,15 @@ namespace yb {
 namespace tablet {
 
 extern const int64 kNoDurableMemStore;
+extern const std::string kIntentsSubdir;
+extern const std::string kIntentsDBSuffix;
+extern const std::string kSnapshotsDirSuffix;
 
   // Table info.
 struct TableInfo {
   // Table id, name and type.
   std::string table_id;
+  std::string namespace_name;
   std::string table_name;
   TableType table_type;
 
@@ -91,6 +95,7 @@ struct TableInfo {
 
   TableInfo() = default;
   TableInfo(std::string table_id,
+            std::string namespace_name,
             std::string table_name,
             TableType table_type,
             const Schema& schema,
@@ -143,18 +148,13 @@ struct KvStoreInfo {
   std::string lower_bound_key;
   std::string upper_bound_key;
 
+  // See KvStoreInfoPB field with the same name.
+  bool has_been_fully_compacted = false;
+
   // Map of tables sharing this KV-store indexed by the table id.
   // If pieces of the same table live in the same Raft group they should be located in different
   // KV-stores.
-  std::unordered_map<TableId, std::unique_ptr<TableInfo>> tables;
-
-  // Old versions of TableInfo that have since been altered. They are kept alive so that callers of
-  // schema() and index_map(), etc don't need to worry about reference counting or locking.
-  //
-  // TODO: These TableInfo's are currently kept alive forever, under the assumption that a given
-  // tablet won't have thousands of "alter table" calls. Replace the raw pointer with shared_ptr and
-  // modify the callers to hold the shared_ptr at the top of the calls (e.g. tserver rpc calls).
-  std::vector<std::unique_ptr<TableInfo>> old_tables;
+  std::unordered_map<TableId, TableInfoPtr> tables;
 };
 
 // At startup, the TSTabletManager will load a RaftGroupMetadata for each
@@ -171,6 +171,7 @@ class RaftGroupMetadata : public RefCountedThreadSafe<RaftGroupMetadata> {
   static CHECKED_STATUS CreateNew(FsManager* fs_manager,
                                   const std::string& table_id,
                                   const RaftGroupId& raft_group_id,
+                                  const std::string& namespace_name,
                                   const std::string& table_name,
                                   const TableType table_type,
                                   const Schema& schema,
@@ -198,6 +199,7 @@ class RaftGroupMetadata : public RefCountedThreadSafe<RaftGroupMetadata> {
   static CHECKED_STATUS LoadOrCreate(FsManager* fs_manager,
                                      const std::string& table_id,
                                      const RaftGroupId& raft_group_id,
+                                     const std::string& namespace_name,
                                      const std::string& table_name,
                                      const TableType table_type,
                                      const Schema& schema,
@@ -207,9 +209,8 @@ class RaftGroupMetadata : public RefCountedThreadSafe<RaftGroupMetadata> {
                                      const TabletDataState& initial_tablet_data_state,
                                      RaftGroupMetadataPtr* metadata);
 
-  Result<const TableInfo*> GetTableInfo(const TableId& table_id) const;
-
-  Result<TableInfo*> GetTableInfo(const TableId& table_id);
+  Result<TableInfoPtr> GetTableInfo(const TableId& table_id) const;
+  Result<TableInfoPtr> GetTableInfoUnlocked(const TableId& table_id) const;
 
   const RaftGroupId& raft_group_id() const {
     DCHECK_NE(state_, kNotLoadedYet);
@@ -217,85 +218,124 @@ class RaftGroupMetadata : public RefCountedThreadSafe<RaftGroupMetadata> {
   }
 
   // Returns the partition of the Raft group.
-  const Partition& partition() const {
+  std::shared_ptr<Partition> partition() const {
     DCHECK_NE(state_, kNotLoadedYet);
+    std::lock_guard<MutexType> lock(data_mutex_);
     return partition_;
   }
 
   // Returns the primary table id. For co-located tables, the primary table is the table this Raft
   // group was first created for. For single-tenant table, it is the primary table.
-  const TableId& table_id() const {
+  TableId table_id() const {
     DCHECK_NE(state_, kNotLoadedYet);
+    std::lock_guard<MutexType> lock(data_mutex_);
     return primary_table_id_;
   }
 
-  // Returns the name, type, schema, index map, schema, etc of the primary table.
-  std::string table_name() const {
+  // Returns the name, type, schema, index map, schema, etc of the table.
+  std::string namespace_name(const TableId& table_id = "") const {
     DCHECK_NE(state_, kNotLoadedYet);
-    return primary_table_info_guarded().first->table_name;
+    if (table_id.empty()) {
+      return primary_table_info()->namespace_name;
+    }
+    const auto& table_info = CHECK_RESULT(GetTableInfo(table_id));
+    return table_info->namespace_name;
   }
 
-  TableType table_type() const {
+  std::string table_name(const TableId& table_id = "") const {
     DCHECK_NE(state_, kNotLoadedYet);
-    return primary_table_info_guarded().first->table_type;
+    if (table_id.empty()) {
+      return primary_table_info()->table_name;
+    }
+    const auto& table_info = CHECK_RESULT(GetTableInfo(table_id));
+    return table_info->table_name;
   }
 
-  const Schema& schema() const {
+  TableType table_type(const TableId& table_id = "") const {
     DCHECK_NE(state_, kNotLoadedYet);
-    return primary_table_info_guarded().first->schema;
+    if (table_id.empty()) {
+      return primary_table_info()->table_type;
+    }
+    const auto& table_info = CHECK_RESULT(GetTableInfo(table_id));
+    return table_info->table_type;
   }
 
-  const IndexMap& index_map() const {
+  yb::SchemaPtr schema(const TableId& table_id = "") const {
     DCHECK_NE(state_, kNotLoadedYet);
-    return primary_table_info_guarded().first->index_map;
+    const TableInfoPtr table_info =
+        table_id.empty() ? primary_table_info() : CHECK_RESULT(GetTableInfo(table_id));
+    return yb::SchemaPtr(table_info, &table_info->schema);
   }
 
-  uint32_t schema_version() const {
+  std::shared_ptr<IndexMap> index_map(const TableId& table_id = "") const {
     DCHECK_NE(state_, kNotLoadedYet);
-    return primary_table_info_guarded().first->schema_version;
+    const TableInfoPtr table_info =
+        table_id.empty() ? primary_table_info() : CHECK_RESULT(GetTableInfo(table_id));
+    return std::shared_ptr<IndexMap>(table_info, &table_info->index_map);
   }
 
-  const std::string& indexed_tablet_id() const {
+  uint32_t schema_version(const TableId& table_id = "") const {
+    DCHECK_NE(state_, kNotLoadedYet);
+    const TableInfoPtr table_info =
+        table_id.empty() ? primary_table_info() : CHECK_RESULT(GetTableInfo(table_id));
+    return table_info->schema_version;
+  }
+
+  const std::string& indexed_tablet_id(const TableId& table_id = "") const {
     DCHECK_NE(state_, kNotLoadedYet);
     static const std::string kEmptyString = "";
     std::lock_guard<MutexType> lock(data_mutex_);
-    const auto* index_info = primary_table_info_unlocked()->index_info.get();
+    const TableInfoPtr table_info = table_id.empty() ?
+        primary_table_info_unlocked() : CHECK_RESULT(GetTableInfoUnlocked(table_id));
+    const auto* index_info = table_info->index_info.get();
     return index_info ? index_info->indexed_table_id() : kEmptyString;
   }
 
-  bool is_local_index() const {
+  bool is_local_index(const TableId& table_id = "") const {
     DCHECK_NE(state_, kNotLoadedYet);
     std::lock_guard<MutexType> lock(data_mutex_);
-    const auto* index_info = primary_table_info_unlocked()->index_info.get();
+    const TableInfoPtr table_info = table_id.empty() ?
+        primary_table_info_unlocked() : CHECK_RESULT(GetTableInfoUnlocked(table_id));
+    const auto* index_info = table_info->index_info.get();
     return index_info && index_info->is_local();
   }
 
-  bool is_unique_index() const {
+  bool is_unique_index(const TableId& table_id = "") const {
     DCHECK_NE(state_, kNotLoadedYet);
     std::lock_guard<MutexType> lock(data_mutex_);
-    const auto* index_info = primary_table_info_unlocked()->index_info.get();
+    const TableInfoPtr table_info = table_id.empty() ?
+        primary_table_info_unlocked() : CHECK_RESULT(GetTableInfoUnlocked(table_id));
+    const auto* index_info = table_info->index_info.get();
     return index_info && index_info->is_unique();
   }
 
-  std::vector<ColumnId> index_key_column_ids() const {
+  std::vector<ColumnId> index_key_column_ids(const TableId& table_id = "") const {
     DCHECK_NE(state_, kNotLoadedYet);
     std::lock_guard<MutexType> lock(data_mutex_);
-    const auto* index_info = primary_table_info_unlocked()->index_info.get();
+    const TableInfoPtr table_info = table_id.empty() ?
+        primary_table_info_unlocked() : CHECK_RESULT(GetTableInfoUnlocked(table_id));
+    const auto* index_info = table_info->index_info.get();
     return index_info ? index_info->index_key_column_ids() : std::vector<ColumnId>();
   }
 
   // Returns the partition schema of the Raft group's tables.
-  const PartitionSchema& partition_schema() const {
+  const std::shared_ptr<PartitionSchema> partition_schema() const {
     DCHECK_NE(state_, kNotLoadedYet);
-    return primary_table_info_guarded().first->partition_schema;
+    const TableInfoPtr table_info = primary_table_info();
+    return std::shared_ptr<PartitionSchema>(table_info, &table_info->partition_schema);
   }
 
-  const std::vector<DeletedColumn>& deleted_cols() const {
+  const std::shared_ptr<std::vector<DeletedColumn>> deleted_cols(
+      const TableId& table_id = "") const {
     DCHECK_NE(state_, kNotLoadedYet);
-    return primary_table_info_guarded().first->deleted_cols;
+    const TableInfoPtr table_info =
+        table_id.empty() ? primary_table_info() : CHECK_RESULT(GetTableInfo(table_id));
+    return std::shared_ptr<std::vector<DeletedColumn>>(table_info, &table_info->deleted_cols);
   }
 
   std::string rocksdb_dir() const { return kv_store_.rocksdb_dir; }
+  std::string intents_rocksdb_dir() const { return kv_store_.rocksdb_dir + kIntentsDBSuffix; }
+  std::string snapshots_dir() const { return kv_store_.rocksdb_dir + kSnapshotsDirSuffix; }
 
   std::string lower_bound_key() const { return kv_store_.lower_bound_key; }
   std::string upper_bound_key() const { return kv_store_.upper_bound_key; }
@@ -308,6 +348,20 @@ class RaftGroupMetadata : public RefCountedThreadSafe<RaftGroupMetadata> {
   // Returns the wal retention time for the primary table.
   uint32_t wal_retention_secs() const;
 
+  CHECKED_STATUS set_cdc_min_replicated_index(int64 cdc_min_replicated_index);
+
+  int64_t cdc_min_replicated_index() const;
+
+  bool has_been_fully_compacted() const {
+    std::lock_guard<MutexType> lock(data_mutex_);
+    return kv_store_.has_been_fully_compacted;
+  }
+
+  void set_has_been_fully_compacted(const bool& value) {
+    std::lock_guard<MutexType> lock(data_mutex_);
+    kv_store_.has_been_fully_compacted = value;
+  }
+
   // Returns the data root dir for this Raft group, for example:
   // /mnt/d0/yb-data/tserver/data
   // TODO(#79): rework when we have more than one KV-store (and data roots) per Raft group.
@@ -317,16 +371,21 @@ class RaftGroupMetadata : public RefCountedThreadSafe<RaftGroupMetadata> {
   // /mnt/d0/yb-data/tserver/wals
   std::string wal_root_dir() const;
 
+  // Set table_id for altering the schema of a colocated user table.
   void SetSchema(const Schema& schema,
                  const IndexMap& index_map,
                  const std::vector<DeletedColumn>& deleted_cols,
-                 const uint32_t version);
+                 const uint32_t version,
+                 const TableId& table_id = "");
 
   void SetPartitionSchema(const PartitionSchema& partition_schema);
 
-  void SetTableName(const std::string& table_name);
+  void SetTableName(
+      const std::string& namespace_name, const std::string& table_name,
+      const TableId& table_id = "");
 
   void AddTable(const std::string& table_id,
+                const std::string& namespace_name,
                 const std::string& table_name,
                 const TableType table_type,
                 const Schema& schema,
@@ -335,7 +394,7 @@ class RaftGroupMetadata : public RefCountedThreadSafe<RaftGroupMetadata> {
                 const boost::optional<IndexInfo>& index_info,
                 const uint32_t schema_version);
 
-  void RemoveTable(const std::string& table_id);
+  void RemoveTable(const TableId& table_id);
 
   // Set / get the remote bootstrap / tablet data state.
   void set_tablet_data_state(TabletDataState state);
@@ -360,6 +419,11 @@ class RaftGroupMetadata : public RefCountedThreadSafe<RaftGroupMetadata> {
   // in such a case, 'was_deleted' will be set to FALSE.
   CHECKED_STATUS DeleteTabletData(TabletDataState delete_type, const yb::OpId& last_logged_opid);
 
+  // Return true if this metadata references no regular data DB nor intents DB and is
+  // already marked as tombstoned. If this is the case, then calling DeleteTabletData
+  // would be a no-op.
+  bool IsTombstonedWithNoRocksDBData() const;
+
   // Permanently deletes the superblock from the disk.
   // DeleteTabletData() must first be called and the tablet data state must be
   // TABLET_DATA_DELETED.
@@ -380,11 +444,31 @@ class RaftGroupMetadata : public RefCountedThreadSafe<RaftGroupMetadata> {
   // Fully replace a superblock (used for bootstrap).
   CHECKED_STATUS ReplaceSuperBlock(const RaftGroupReplicaSuperBlockPB &pb);
 
+  // Returns a new WAL dir path to be used for new Raft group `raft_group_id` which will be created
+  // as a result of this Raft group splitting.
+  // Uses the same root dir as for `this` Raft group.
+  std::string GetSubRaftGroupWalDir(const RaftGroupId& raft_group_id) const;
+
+  // Returns a new Data dir path to be used for new Raft group `raft_group_id` which will be created
+  // as a result of this Raft group splitting.
+  // Uses the same root dir as for `this` Raft group.
+  std::string GetSubRaftGroupDataDir(const RaftGroupId& raft_group_id) const;
+
   // Creates a new Raft group metadata for the part of existing tablet contained in this Raft group.
   // Assigns specified Raft group ID, partition and key bounds for a new tablet.
   Result<RaftGroupMetadataPtr> CreateSubtabletMetadata(
       const RaftGroupId& raft_group_id, const Partition& partition,
       const std::string& lower_bound_key, const std::string& upper_bound_key) const;
+
+  TableInfoPtr primary_table_info() const {
+    std::lock_guard<MutexType> lock(data_mutex_);
+    return primary_table_info_unlocked();
+  }
+
+  bool colocated() const { return colocated_; }
+
+  // Return standard "T xxx P yyy" log prefix.
+  std::string LogPrefix() const;
 
  private:
   typedef simple_spinlock MutexType;
@@ -402,6 +486,7 @@ class RaftGroupMetadata : public RefCountedThreadSafe<RaftGroupMetadata> {
   RaftGroupMetadata(FsManager* fs_manager,
                     TableId table_id,
                     RaftGroupId raft_group_id,
+                    std::string namespace_name,
                     std::string table_name,
                     TableType table_type,
                     const std::string rocksdb_dir,
@@ -432,23 +517,11 @@ class RaftGroupMetadata : public RefCountedThreadSafe<RaftGroupMetadata> {
   // Requires 'data_mutex_'.
   void ToSuperBlockUnlocked(RaftGroupReplicaSuperBlockPB* superblock) const;
 
-  // Return standard "T xxx P yyy" log prefix.
-  std::string LogPrefix() const;
-
-  // Return a pointer to the primary table info. This pointer will be valid until the
-  // RaftGroupMetadata is destructed, even if the schema is changed.
-  const TableInfo* primary_table_info_unlocked() const {
+  const TableInfoPtr primary_table_info_unlocked() const {
     const auto& tables = kv_store_.tables;
     const auto itr = tables.find(primary_table_id_);
-    DCHECK(itr != tables.end());
-    return itr->second.get();
-  }
-
-  // Return a pair of a pointer to the primary table info and lock guard. The pointer will be valid
-  // until the RaftGroupMetadata is destructed, even if the schema is changed.
-  std::pair<const TableInfo*, std::unique_lock<MutexType>> primary_table_info_guarded() const {
-    std::unique_lock<MutexType> lock(data_mutex_);
-    return { primary_table_info_unlocked(), std::move(lock) };
+    CHECK(itr != tables.end());
+    return itr->second;
   }
 
   enum State {
@@ -459,6 +532,7 @@ class RaftGroupMetadata : public RefCountedThreadSafe<RaftGroupMetadata> {
   State state_;
 
   // Lock protecting the underlying data.
+  // TODO: consider switching to RW mutex.
   mutable MutexType data_mutex_;
 
   // Lock protecting flushing the data to disk.
@@ -466,7 +540,7 @@ class RaftGroupMetadata : public RefCountedThreadSafe<RaftGroupMetadata> {
   mutable Mutex flush_lock_;
 
   RaftGroupId raft_group_id_;
-  Partition partition_;
+  std::shared_ptr<Partition> partition_;
 
   // The primary table id. Primary table is the first table this Raft group is created for.
   // Additional tables can be added to this Raft group to co-locate with this table.
@@ -481,22 +555,29 @@ class RaftGroupMetadata : public RefCountedThreadSafe<RaftGroupMetadata> {
   std::string wal_dir_;
 
   // The current state of remote bootstrap for the tablet.
-  TabletDataState tablet_data_state_;
+  TabletDataState tablet_data_state_ = TABLET_DATA_UNKNOWN;
 
   // Record of the last opid logged by the tablet before it was last tombstoned. Has no meaning for
   // non-tombstoned tablets.
   yb::OpId tombstone_last_logged_opid_;
 
   // True if the raft group is for a colocated tablet.
-  bool colocated_;
+  bool colocated_ = false;
+
+  // The minimum index that has been replicated by the cdc service.
+  int64_t cdc_min_replicated_index_ = std::numeric_limits<int64_t>::max();
 
   DISALLOW_COPY_AND_ASSIGN(RaftGroupMetadata);
 };
 
 CHECKED_STATUS MigrateSuperblock(RaftGroupReplicaSuperBlockPB* superblock);
 
-extern const std::string kIntentsSubdir;
-extern const std::string kIntentsDBSuffix;
+// Checks whether tablet data storage is ready for function, i.e. its creation or bootstrap process
+// has been completed and tablet is not deleted and not in process of being deleted.
+inline bool CanServeTabletData(TabletDataState state) {
+  return state == TabletDataState::TABLET_DATA_READY ||
+         state == TabletDataState::TABLET_DATA_SPLIT_COMPLETED;
+}
 
 } // namespace tablet
 } // namespace yb

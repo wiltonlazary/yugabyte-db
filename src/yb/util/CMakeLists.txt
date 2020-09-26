@@ -161,6 +161,7 @@ set(UTIL_SRCS
   debug/trace_event_impl_constants.cc
   debug/trace_event_synthetic_delay.cc
   decimal.cc
+  delayer.cc
   encrypted_file.cc
   encrypted_file_factory.cc
   encryption_util.cc
@@ -177,14 +178,13 @@ set(UTIL_SRCS
   flag_tags.cc
   flags.cc
   hdr_histogram.cc
+  header_manager_impl.cc
   hexdump.cc
   init.cc
   jsonreader.cc
   jsonwriter.cc
-  kernel_stack_watchdog.cc
   locks.cc
   logging.cc
-  main_util.cc
   malloc.cc
   math_util.cc
   mem_tracker.cc
@@ -206,12 +206,13 @@ set(UTIL_SRCS
   ntp_clock.cc
   oid_generator.cc
   once.cc
+  operation_counter.cc
   opid.cc
   os-util.cc
   path_util.cc
   pb_util-internal.cc
   pb_util.cc
-  pending_op_counter.cc
+  pg_connstr.cc
   physical_time.cc
   port_picker.cc
   priority_thread_pool.cc
@@ -223,6 +224,7 @@ set(UTIL_SRCS
   rw_mutex.cc
   rwc_lock.cc
   shared_mem.cc
+  signal_util.cc
   slice.cc
   spinlock_profiling.cc
   split.cc
@@ -235,6 +237,7 @@ set(UTIL_SRCS
   string_trim.cc
   string_util.cc
   striped64.cc
+  strongly_typed_uuid.cc
   subprocess.cc
   sync_point.cc
   test_graph.cc
@@ -245,6 +248,7 @@ set(UTIL_SRCS
   timestamp.cc
   trace.cc
   trilean.cc
+  ulimit_util.cc
   universe_key_manager.cc
   url-coding.cc
   user.cc
@@ -274,6 +278,7 @@ set(UTIL_LIBS
   encryption_proto
   zlib
   ${OPENSSL_CRYPTO_LIBRARY}
+  ${OPENSSL_SSL_LIBRARY}
   ${UTIL_LIBS_EXTENSIONS})
 
 if (NOT APPLE AND NOT USING_LINUXBREW)
@@ -346,6 +351,7 @@ ADD_YB_TEST(bit-util-test)
 ADD_YB_TEST(bitmap-test)
 ADD_YB_TEST(blocking_queue-test)
 ADD_YB_TEST(bloom_filter-test)
+ADD_YB_TEST(byte_buffer-test)
 ADD_YB_TEST(callback_bind-test)
 ADD_YB_TEST(countdown_latch-test)
 ADD_YB_TEST(crc-test RUN_SERIAL true) # has a benchmark
@@ -362,6 +368,7 @@ ADD_YB_TEST(hdr_histogram-test)
 ADD_YB_TEST(inline_slice-test)
 ADD_YB_TEST(jsonreader-test)
 ADD_YB_TEST(lockfree-test)
+ADD_YB_TEST(lru_cache-test)
 ADD_YB_TEST(map-util-test)
 ADD_YB_TEST(memcmpable_varint-test LABELS no_tsan)
 ADD_YB_TEST(memenv/memenv-test)
@@ -401,7 +408,6 @@ endif()
 ADD_YB_TEST(slice-test)
 ADD_YB_TEST(spinlock_profiling-test)
 ADD_YB_TEST(split-test)
-ADD_YB_TEST(stack_watchdog-test)
 ADD_YB_TEST(stats/iostats_context_test)
 ADD_YB_TEST(status-test)
 ADD_YB_TEST(stol_utils-test)
@@ -444,10 +450,7 @@ target_link_libraries(jsonwriter_test_proto
 #######################################
 
 ADD_YB_TEST(jsonwriter-test)
-if(NOT "${NO_TESTS}")
-  target_link_libraries(jsonwriter-test
-    jsonwriter_test_proto)
-endif()
+YB_TEST_TARGET_LINK_LIBRARIES(jsonwriter-test jsonwriter_test_proto)
 
 #######################################
 # proto_container_test_proto
@@ -477,10 +480,10 @@ target_link_libraries(proto_container_test_proto
 #######################################
 
 ADD_YB_TEST(pb_util-test)
-if(NOT "${NO_TESTS}")
-  target_link_libraries(pb_util-test
-    proto_container_test_proto)
-endif()
+YB_TEST_TARGET_LINK_LIBRARIES(pb_util-test proto_container_test_proto)
 
 ADD_YB_TEST(encrypted_env-test)
-target_link_libraries(encrypted_env-test encryption_test_util)
+YB_TEST_TARGET_LINK_LIBRARIES(encrypted_env-test encryption_test_util)
+
+ADD_YB_TEST(ctr_cipher_stream-test)
+YB_TEST_TARGET_LINK_LIBRARIES(ctr_cipher_stream-test encryption_test_util)

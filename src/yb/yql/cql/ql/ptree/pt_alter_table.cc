@@ -89,10 +89,12 @@ CHECKED_STATUS PTAlterTable::AppendModColumn(SemContext *sem_context,
     }
 
     if (column->mod_type() == ALTER_DROP) {
+      // Check column dependencies.
       const ColumnId column_id(desc->id());
       for (const auto& index_item : table_->index_map()) {
         const auto& index = index_item.second;
-        if (index.IsColumnCovered(column_id)) {
+        // Check if this "index" is dependent on the column being dropped.
+        if (index.CheckColumnDependency(column_id)) {
           auto index_table = sem_context->GetTableDesc(index.table_id());
           return sem_context->Error(this,
               Format("Can't drop indexed column. Remove '$0' index first and try again",
@@ -108,7 +110,12 @@ CHECKED_STATUS PTAlterTable::AppendModColumn(SemContext *sem_context,
     MCString name = *column->new_name();
     const ColumnDesc* desc = sem_context->GetColumnDesc(name);
     if (desc != nullptr) {
-      return sem_context->Error(this, "Duplicate column name", ErrorCode::DUPLICATE_COLUMN);
+      // Expecting the error message matching to the reg-exp: "[Ii]nvalid column name"
+      // for the error correct handling in tools (like Kong).
+      return sem_context->Error(this,
+          Format("Invalid column name because it conflicts with the existing column: $0",
+              name.c_str()),
+          ErrorCode::DUPLICATE_COLUMN);
     }
   }
 

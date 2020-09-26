@@ -94,6 +94,7 @@ enum SysCacheIdentifier
 	SUBSCRIPTIONNAME,
 	SUBSCRIPTIONOID,
 	SUBSCRIPTIONRELMAP,
+	TABLEGROUPOID,
 	TABLESPACEOID,
 	TRFOID,
 	TRFTYPELANG,
@@ -119,6 +120,11 @@ extern Bitmapset *YBSysTablePrimaryKey(Oid relid);
 /* Used in IsYugaByteEnabled() mode only */
 extern void YBSetSysCacheTuple(Relation rel, HeapTuple tup);
 extern void YBPreloadCatalogCaches(void);
+extern void YBPreloadCatalogCache(int cache_id, int idx_cache_id);
+extern void YBLoadPinnedObjectsCache();
+extern bool YBHasPinnedObjectsCache();
+extern bool YBIsObjectPinned(Oid classId, Oid objectId);
+extern bool YBIsSharedObjectPinned(Oid classId, Oid objectId);
 
 extern void InitCatalogCache(void);
 extern void InitCatalogCachePhase2(void);

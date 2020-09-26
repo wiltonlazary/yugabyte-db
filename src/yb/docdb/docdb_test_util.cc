@@ -22,6 +22,7 @@
 
 #include "yb/common/hybrid_time.h"
 #include "yb/docdb/doc_key.h"
+#include "yb/docdb/doc_reader.h"
 #include "yb/docdb/docdb-internal.h"
 #include "yb/docdb/docdb.h"
 #include "yb/docdb/docdb_compaction_filter.h"
@@ -101,6 +102,10 @@ class NonTransactionalStatusProvider: public TransactionStatusManager {
     Fail();
   }
 
+  HybridTime MinRunningHybridTime() const override {
+    return HybridTime::kMax;
+  }
+
  private:
   static void Fail() {
     LOG(FATAL) << "Internal error: trying to get transaction status for non transactional table";
@@ -112,7 +117,7 @@ NonTransactionalStatusProvider kNonTransactionalStatusProvider;
 } // namespace
 
 const TransactionOperationContext kNonTransactionalOperationContext = {
-    boost::uuids::nil_uuid(), &kNonTransactionalStatusProvider
+    TransactionId::Nil(), &kNonTransactionalStatusProvider
 };
 
 PrimitiveValue GenRandomPrimitiveValue(RandomNumberGenerator* rng) {
@@ -238,7 +243,8 @@ vector<PrimitiveValue> GenRandomPrimitiveValues(RandomNumberGenerator* rng, int 
 }
 
 DocKey CreateMinimalDocKey(RandomNumberGenerator* rng, UseHash use_hash) {
-  return use_hash ? DocKey(static_cast<DocKeyHash>((*rng)()), {}, {}) : DocKey();
+  return use_hash ? DocKey(static_cast<DocKeyHash>((*rng)()), std::vector<PrimitiveValue>(),
+      std::vector<PrimitiveValue>()) : DocKey();
 }
 
 DocKey GenRandomDocKey(RandomNumberGenerator* rng, UseHash use_hash) {
@@ -610,7 +616,7 @@ void DocDBRocksDBFixture::FullyCompactHistoryBefore(HybridTime history_cutoff) {
   });
 
   ASSERT_OK(FlushRocksDbAndWait());
-  ASSERT_OK(FullyCompactDB(rocksdb_.get()));
+  ASSERT_OK(FullyCompactDB(regular_db_.get()));
 }
 
 void DocDBRocksDBFixture::MinorCompaction(
@@ -625,7 +631,7 @@ void DocDBRocksDBFixture::MinorCompaction(
   });
 
   rocksdb::ColumnFamilyMetaData cf_meta;
-  rocksdb_->GetColumnFamilyMetaData(&cf_meta);
+  regular_db_->GetColumnFamilyMetaData(&cf_meta);
 
   vector<string> compaction_input_file_names;
   vector<string> remaining_file_names;
@@ -662,7 +668,7 @@ void DocDBRocksDBFixture::MinorCompaction(
               << "  files being compacted: " << yb::ToString(compaction_input_file_names) << "\n"
               << "  other files: " << yb::ToString(remaining_file_names);
 
-    ASSERT_OK(rocksdb_->CompactFiles(
+    ASSERT_OK(regular_db_->CompactFiles(
         rocksdb::CompactionOptions(),
         compaction_input_file_names,
         /* output_level */ 0));
@@ -679,7 +685,7 @@ void DocDBRocksDBFixture::MinorCompaction(
     }
   }
 
-  rocksdb_->GetColumnFamilyMetaData(&cf_meta);
+  regular_db_->GetColumnFamilyMetaData(&cf_meta);
   vector<string> files_after_compaction;
   for (const auto& sst_meta : cf_meta.levels[0].files) {
     files_after_compaction.push_back(sst_meta.name);
@@ -692,13 +698,13 @@ void DocDBRocksDBFixture::MinorCompaction(
 
 int DocDBRocksDBFixture::NumSSTableFiles() {
   rocksdb::ColumnFamilyMetaData cf_meta;
-  rocksdb_->GetColumnFamilyMetaData(&cf_meta);
+  regular_db_->GetColumnFamilyMetaData(&cf_meta);
   return cf_meta.levels[0].files.size();
 }
 
 StringVector DocDBRocksDBFixture::SSTableFileNames() {
   rocksdb::ColumnFamilyMetaData cf_meta;
-  rocksdb_->GetColumnFamilyMetaData(&cf_meta);
+  regular_db_->GetColumnFamilyMetaData(&cf_meta);
   StringVector files;
   for (const auto& sstable_meta : cf_meta.levels[0].files) {
     files.push_back(sstable_meta.name);

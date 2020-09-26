@@ -8,8 +8,8 @@
 #
 # Unless required by applicable law or agreed to in writing, software distributed under the License
 # is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
-# or implied.  See the License for the specific language governing permissions and limitations
-# under the License.
+# or implied.  See the License for the specific language governing permissions and limitations under
+# the License.
 #
 
 # Common bash code for test scripts/
@@ -31,14 +31,14 @@ NON_GTEST_TESTS=(
   db_sanity_test
   merge_test
 )
+make_regex_from_list NON_GTEST_TESTS "${NON_GTEST_TESTS[@]}"
 
 # There gtest suites have internal dependencies between tests, so those tests can't be run
 # separately.
 TEST_BINARIES_TO_RUN_AT_ONCE=(
   tests-rocksdb/thread_local_test
 )
-
-make_regexes_from_lists NON_GTEST_TESTS TEST_BINARIES_TO_RUN_AT_ONCE
+make_regex_from_list TEST_BINARIES_TO_RUN_AT_ONCE "${TEST_BINARIES_TO_RUN_AT_ONCE[@]}"
 
 VALID_TEST_BINARY_DIRS_PREFIX="tests"
 VALID_TEST_BINARY_DIRS_RE="^${VALID_TEST_BINARY_DIRS_PREFIX}-[0-9a-zA-Z\-]+"
@@ -66,8 +66,6 @@ pthread .*: Device or resource busy|\
 FATAL: could not create shared memory segment: No space left on device"
 
 # We use this to submit test jobs for execution on Spark.
-readonly SPARK_SUBMIT_CMD_PATH_NON_ASAN_TSAN=/n/tools/spark/current/bin/spark-submit
-readonly SPARK_SUBMIT_CMD_PATH_ASAN_TSAN=/n/tools/spark/current-tsan/bin/spark-submit
 readonly INITIAL_SPARK_DRIVER_CORES=8
 
 # This is used to separate relative binary path from gtest_filter for C++ tests in what we call
@@ -473,6 +471,9 @@ prepare_for_running_cxx_test() {
   test_cmd_line=( "$abs_test_binary_path" ${YB_EXTRA_GTEST_FLAGS:-} )
 
   test_log_path_prefix="$YB_TEST_LOG_ROOT_DIR/$rel_test_log_path_prefix"
+  register_test_artifact_files \
+      "$test_log_path_prefix.*" \
+      "${test_log_path_prefix}_test_report.json"
   xml_output_file="$test_log_path_prefix.xml"
   if is_known_non_gtest_test_by_rel_path "$rel_test_binary"; then
     is_gtest_test=false
@@ -564,7 +565,7 @@ analyze_existing_core_file() {
     set -x
     echo "$debugger_input" |
       "${debugger_cmd[@]}" 2>&1 |
-      egrep -v "^\[New LWP [0-9]+\]$" |
+      grep -Ev "^\[New LWP [0-9]+\]$" |
       "$YB_SRC_ROOT"/build-support/dedup_thread_stacks.py |
       tee -a "$append_output_to"
   ) >&2
@@ -755,23 +756,6 @@ handle_cxx_test_xml_output() {
         "$junit_test_case_id" "$test_log_path" >"$xml_output_file"
   fi
 
-  if [[ -z ${test_log_url:-} ]]; then
-    # Even if there is no test log URL available we need it, because we use
-    # update_test_result_xml.py to mark test as failed in XML in case test produced XML without
-    # errors, but just returned non-zero exit code (for example under Address/Thread Sanitizer).
-
-    # Converting path to local file URL (may be useful for local debugging purposes). However,
-    # don't fail if the "six" Python module is not available.
-    if python -c "import six" &>/dev/null; then
-      test_log_url=$(
-        python -c "import six; print six.moves.urllib_parse.urljoin(\"file://\", \
-        six.moves.urllib.request.pathname2url('$test_log_path'))"
-      )
-    else
-      test_log_url="http://i-would-put-local-file-url-here-but-could-not-import-python-six-module"
-    fi
-  fi
-
   process_tree_supervisor_append_log_to_on_error=$test_log_path
 
   stop_process_tree_supervisor
@@ -785,10 +769,15 @@ handle_cxx_test_xml_output() {
   else
     log "Test succeeded, updating $xml_output_file"
   fi
-  "$YB_SRC_ROOT"/build-support/update_test_result_xml.py \
-    --result-xml "$xml_output_file" \
-    --log-url "$test_log_url" \
+  update_test_result_xml_cmd=(
+    "$YB_SRC_ROOT"/build-support/update_test_result_xml.py
+    --result-xml "$xml_output_file"
     --mark-as-failed "$test_failed"
+  )
+  if [[ -n ${test_log_url:-} ]]; then
+    update_test_result_xml_cmd+=( --log-url "$test_log_url" )
+  fi
+  ( set -x; "${update_test_result_xml_cmd[@]}" )
 
   # Useful for distributed builds in an NFS environment.
   chmod g+w "$xml_output_file"
@@ -810,11 +799,11 @@ determine_test_timeout() {
   if [[ -n ${YB_TEST_TIMEOUT:-} ]]; then
     timeout_sec=$YB_TEST_TIMEOUT
   else
-    if [[ $rel_test_binary == "tests-pgwrapper/pg_wrapper-test" || \
+    if [[ $rel_test_binary == "tests-pgwrapper/create_initial_sys_catalog_snapshot" || \
           $rel_test_binary == "tests-pgwrapper/pg_libpq-test" || \
-          $rel_test_binary == "tests-pgwrapper/create_initial_sys_catalog_snapshot" ]]; then
-      # This test is particularly slow on TSAN, and it has to be run all at once (we cannot use
-      # --gtest_filter) because of dependencies between tests.
+          $rel_test_binary == "tests-pgwrapper/pg_libpq_err-test" || \
+          $rel_test_binary == "tests-pgwrapper/pg_mini-test" || \
+          $rel_test_binary == "tests-pgwrapper/pg_wrapper-test" ]]; then
       timeout_sec=$INCREASED_TEST_TIMEOUT_SEC
     else
       timeout_sec=$DEFAULT_TEST_TIMEOUT_SEC
@@ -1112,6 +1101,7 @@ did_test_succeed() {
   local -i -r exit_code=$1
   local -r log_path=$2
   if [[ $exit_code -ne 0 ]]; then
+    log "Test failure reason: exit code: $exit_code"
     return 1  # "false" value in bash, meaning the test failed
   fi
 
@@ -1243,18 +1233,31 @@ show_disk_usage() {
 }
 
 find_spark_submit_cmd() {
-  if [[ $build_type == "tsan" || $build_type == "asan" ]]; then
-    spark_submit_cmd_path=$SPARK_SUBMIT_CMD_PATH_ASAN_TSAN
-  else
-    spark_submit_cmd_path=$SPARK_SUBMIT_CMD_PATH_NON_ASAN_TSAN
+  if [[ -n ${YB_SPARK_SUBMIT_CMD_OVERRIDE:-} ]]; then
+    spark_submit_cmd_path=$YB_SPARK_SUBMIT_CMD_OVERRIDE
+    return
   fi
+
+  if is_mac; then
+    spark_submit_cmd_path=$YB_MACOS_PY3_SPARK_SUBMIT_CMD
+    return
+  fi
+
+  if [[ $build_type == "tsan" || $build_type == "asan" ]]; then
+    spark_submit_cmd_path=$YB_ASAN_TSAN_PY3_SPARK_SUBMIT_CMD
+    return
+  fi
+
+  spark_submit_cmd_path=$YB_LINUX_PY3_SPARK_SUBMIT_CMD
 }
 
 spark_available() {
   find_spark_submit_cmd
-  if [[ -f $spark_submit_cmd_path ]]; then
+  log "spark_submit_cmd_path=$spark_submit_cmd_path"
+  if [[ -x $spark_submit_cmd_path ]]; then
     return 0  # true
   fi
+  log "File $spark_submit_cmd_path not found or not executable, Spark is unavailable"
   return 1  # false
 }
 
@@ -1395,14 +1398,14 @@ about_to_start_running_test() {
 # - yb-client org.yb.client.TestYBClient#testAllMasterChangeConfig
 #
 # <maven_module_name> could also be the module directory relative to $YB_SRC_ROOT, e.g.
-# java/yb-cql or ent/java/<enterprise_module_name>.
+# java/yb-cql.
 run_java_test() {
   expect_num_args 2 "$@"
   local module_name_or_rel_module_dir=$1
   local test_class_and_maybe_method=${2%.java}
   test_class_and_maybe_method=${test_class_and_maybe_method%.scala}
   if [[ $module_name_or_rel_module_dir == */* ]]; then
-    # E.g. java/yb-cql or ent/java/<enterprise_module_name>.
+    # E.g. java/yb-cql.
     local module_dir=$YB_SRC_ROOT/$module_name_or_rel_module_dir
     module_name=${module_name_or_rel_module_dir##*/}
   else
@@ -1427,7 +1430,6 @@ run_java_test() {
     fatal "Running Java tests requires that BUILD_ROOT be set"
   fi
   set_mvn_parameters
-  copy_artifacts_to_non_shared_mvn_repo
 
   set_sanitizer_runtime_options
   mkdir -p "$YB_TEST_LOG_ROOT_DIR/java"
@@ -1439,7 +1441,7 @@ run_java_test() {
   local timestamp=$( get_timestamp_for_filenames )
   local surefire_rel_tmp_dir=surefire${timestamp}_${RANDOM}_${RANDOM}_${RANDOM}_$$
 
-  # This should change the directory to either "java" or "ent/java".
+  # This should change the directory to "java".
   cd "$module_dir"/..
 
   # We specify tempDir to use a separate temporary directory for each test.
@@ -1493,9 +1495,19 @@ run_java_test() {
     fatal "Maven not found on PATH. PATH: $PATH"
   fi
 
+  # Note: "$surefire_reports_dir" contains the test method name as well.
   local junit_xml_path=$surefire_reports_dir/TEST-$test_class.xml
+  local test_report_json_path=$surefire_reports_dir/TEST-${test_class}_test_report.json
   local log_files_path_prefix=$surefire_reports_dir/$test_class
   local test_log_path=$log_files_path_prefix-output.txt
+
+  # For the log file prefix, remember the pattern with a trailing "*" -- we will expand it
+  # after the test has run.
+  register_test_artifact_files \
+    "$junit_xml_path" \
+    "$test_log_path" \
+    "$test_report_json_path" \
+    "${log_files_path_prefix}*"
   log "Using surefire reports directory: $surefire_reports_dir"
   log "Test log path: $test_log_path"
 
@@ -1683,6 +1695,7 @@ collect_java_tests() {
 }
 
 run_all_java_test_methods_separately() {
+  # Create a subshell to be able to export environment variables temporarily.
   (
     export YB_RUN_JAVA_TEST_METHODS_SEPARATELY=1
     export YB_REDIRECT_MVN_OUTPUT_TO_FILE=1
@@ -1730,7 +1743,8 @@ run_python_doctest() {
     if [[ $python_file == managed/* ||
           $python_file == cloud/* ||
           $python_file == src/postgres/src/test/locale/sort-test.py ||
-          $python_file == bin/test_bsopt.py ]]; then
+          $python_file == bin/test_bsopt.py ||
+          $python_file == thirdparty/* ]]; then
       continue
     fi
     if [[ $basename == .ycm_extra_conf.py ||
@@ -1738,13 +1752,16 @@ run_python_doctest() {
           $python_file =~ managed/.* ]]; then
       continue
     fi
-    ( set -x; python -m doctest "$python_file" )
+    python3 -m doctest "$python_file"
   done
 }
 
 run_python_tests() {
   activate_virtualenv
-  run_python_doctest
+  (
+    export PYTHONPATH=$YB_SRC_ROOT/python
+    run_python_doctest
+  )
   check_python_script_syntax
 }
 
@@ -1870,6 +1887,24 @@ resolve_and_run_java_test() {
   else
     # TODO: support enterprise case by passing rel_module_dir here.
     run_repeat_unit_test "$module_name" "$java_test_name" --java
+  fi
+}
+
+# Allows remembering all the generated test log files in a file whose path is specified by the
+# YB_TEST_ARTIFACT_LIST_PATH variable.
+# Example patterns for Java test results (relative to $YB_SRC_ROOT, and broken over multiple lines):
+#
+# java/yb-jedis-tests/target/surefire-reports_redis.clients.jedis.tests.commands.
+# AllKindOfValuesCommandsTest__expireAt/TEST-redis.clients.jedis.tests.commands.
+# AllKindOfValuesCommandsTest{.xml,-output.txt,_test_report.json}
+register_test_artifact_files() {
+  if [[ -n ${YB_TEST_ARTIFACT_LIST_PATH:-} ]]; then
+    local file_path
+    (
+      for file_path in "$@"; do
+        echo "$file_path"
+      done
+    ) >>"$YB_TEST_ARTIFACT_LIST_PATH"
   fi
 }
 

@@ -1,8 +1,8 @@
 ---
-title: CREATE AGGREGATE
+title: CREATE AGGREGATE statement [YSQL]
+headerTitle: CREATE AGGREGATE
 linkTitle: CREATE AGGREGATE
-summary: Create a new aggregate
-description: CREATE AGGREGATE
+description: Use the CREATE AGGREGATE statement to create a new aggregate function.
 menu:
   latest:
     identifier: api-ysql-commands-create-aggregate
@@ -115,5 +115,4 @@ yugabyte=# SELECT newcnt(*) FROM pg_aggregate;
 ## See also
 
 - [`DROP AGGREGATE`](../ddl_drop_aggregate)
-
-[postgresql-docs-create-aggregate]: https://www.postgresql.org/docs/current/sql-createaggregate.html
+- [postgresql-docs-create-aggregate](https://www.postgresql.org/docs/current/sql-createaggregate.html)

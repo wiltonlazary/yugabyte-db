@@ -5,9 +5,9 @@ import PropTypes from 'prop-types';
 import 'react-bootstrap-table/css/react-bootstrap-table.css';
 import { YBModal, YBButton } from '../../common/forms/fields';
 import { YBCodeBlock } from '../../common/descriptors';
-import { isValidObject, isEmptyObject } from 'utils/ObjectUtils';
+import { isValidObject, isEmptyObject } from '../../../utils/ObjectUtils';
 import { Tab, Tabs } from 'react-bootstrap';
-import { isKubernetesUniverse } from 'utils/UniverseUtils';
+import { isKubernetesUniverse } from '../../../utils/UniverseUtils';
 
 import './UniverseAppsModal.scss';
 
@@ -44,9 +44,10 @@ export default class UniverseAppsModal extends Component {
       universeDetails.nodeDetailsSet.filter((nodeDetails) => nodeDetails.isTserver) :
       [];
 
-    var getHost = function(host) {
-      return host != "127.0.0.1" ? host : "host.docker.internal";
-    }
+    const getHost = function(host) {
+      return host !== "127.0.0.1" ? host : "host.docker.internal";
+    };
+
     const cassandraHosts = nodeDetails.map(function(nodeDetail) {
       if (nodeDetail.state === "Live" && nodeDetail.cloudInfo && isValidObject(nodeDetail.cloudInfo.private_ip))
         return getHost(nodeDetail.cloudInfo.private_ip) + ":" + nodeDetail.yqlServerRpcPort;

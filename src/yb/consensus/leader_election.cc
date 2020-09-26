@@ -213,12 +213,14 @@ void LeaderElection::Run() {
 
     // Send the RPC request.
     LOG_WITH_PREFIX(INFO) << "Requesting vote from peer " << voter_uuid;
+    state->rpc.set_timeout(timeout_);
 
     state->request = request_;
     state->request.set_dest_uuid(voter_uuid);
 
     LeaderElectionPtr retained_self = this;
     if (!suppress_vote_request_) {
+      state->rpc.set_invoke_callback_mode(rpc::InvokeCallbackMode::kThreadPoolHigh);
       state->proxy->RequestConsensusVoteAsync(
           &state->request, &state->response, &state->rpc,
           std::bind(&LeaderElection::VoteResponseRpcCallback, this, voter_uuid, retained_self));

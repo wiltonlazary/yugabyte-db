@@ -72,6 +72,8 @@ class AnsibleProcess(object):
                 "yb_server_ssh_user": ssh_user
             })
 
+        playbook_args["yb_home_dir"] = ybutils.YB_HOME_DIR
+
         process_args = [
             "ansible-playbook", os.path.join(ybutils.YB_DEVOPS_HOME, filename)
         ]
@@ -89,6 +91,8 @@ class AnsibleProcess(object):
         if ssh_port is None or ssh_host is None:
             connection_type = "local"
             inventory_target = "localhost,"
+            # Ansible automatically uses /usr/local/bin/python when "-i localhost," is specified.
+            process_args.extend(["-e", "ansible_python_interpreter='/usr/bin/env python'"])
         elif self.can_ssh:
             process_args.extend([
                 "--private-key", ssh_key_file,

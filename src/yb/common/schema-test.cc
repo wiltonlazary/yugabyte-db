@@ -98,7 +98,8 @@ TEST(TestSchema, TestSchema) {
             "]\nproperties: contain_counters: false is_transactional: false "
             "consistency_level: STRONG "
             "use_mangled_column_name: false "
-            "is_ysql_catalog_table: false",
+            "is_ysql_catalog_table: false "
+            "is_backfilling: false",
             schema.ToString());
   EXPECT_EQ("key[string NOT NULL NOT A PARTITION KEY]", schema.column(0).ToString());
   EXPECT_EQ("uint32 NULLABLE NOT A PARTITION KEY", schema.column(1).TypeToString());
@@ -348,7 +349,7 @@ TEST(TestSchema, TestDecodeKeys_InvalidKeys) {
             "key too short>",
             schema.DebugEncodedRowKey(Slice("foo\x00\x00", 5), Schema::START_KEY));
   EXPECT_EQ("<invalid key: Invalid argument: Error decoding composite key component 'col2': "
-            "key too short: \\xff\\xff>",
+            "key too short: FFFF>",
             schema.DebugEncodedRowKey(Slice("foo\x00\x00\xff\xff", 7), Schema::START_KEY));
 }
 
@@ -371,7 +372,8 @@ TEST(TestSchema, TestCreateProjection) {
             "]\nproperties: contain_counters: false is_transactional: false "
             "consistency_level: STRONG "
             "use_mangled_column_name: false "
-            "is_ysql_catalog_table: false",
+            "is_ysql_catalog_table: false "
+            "is_backfilling: false",
             partial_schema.ToString());
 
   // By names, with IDS
@@ -383,7 +385,8 @@ TEST(TestSchema, TestCreateProjection) {
                        "]\nproperties: contain_counters: false is_transactional: false "
                        "consistency_level: STRONG "
                        "use_mangled_column_name: false "
-                       "is_ysql_catalog_table: false",
+                       "is_ysql_catalog_table: false "
+                       "is_backfilling: false",
                        schema_with_ids.column_id(0),
                        schema_with_ids.column_id(1),
                        schema_with_ids.column_id(3)),
@@ -406,7 +409,8 @@ TEST(TestSchema, TestCreateProjection) {
                        "]\nproperties: contain_counters: false is_transactional: false "
                        "consistency_level: STRONG "
                        "use_mangled_column_name: false "
-                       "is_ysql_catalog_table: false",
+                       "is_ysql_catalog_table: false "
+                       "is_backfilling: false",
                        schema_with_ids.column_id(0),
                        schema_with_ids.column_id(1),
                        schema_with_ids.column_id(3)),

@@ -23,6 +23,7 @@
 #include "yb/common/transaction-test-util.h"
 
 #include "yb/docdb/cql_operation.h"
+#include "yb/docdb/docdb_debug.h"
 #include "yb/docdb/docdb_rocksdb_util.h"
 #include "yb/docdb/docdb_test_base.h"
 #include "yb/docdb/doc_rowwise_iterator.h"
@@ -103,8 +104,8 @@ class DocOperationTest : public DocDBTestBase {
                const HybridTime& hybrid_time = HybridTime::kMax,
                const TransactionOperationContextOpt& txn_op_context =
                    kNonTransactionalOperationContext) {
-    QLWriteOperation ql_write_op(schema, IndexMap(), nullptr /* unique_index_key_schema */,
-                                 txn_op_context);
+    QLWriteOperation ql_write_op(std::shared_ptr<const Schema>(&schema, [](const Schema*){}),
+                                 IndexMap(), nullptr /* unique_index_key_schema */, txn_op_context);
     ASSERT_OK(ql_write_op.Init(ql_writereq_pb, ql_writeresp_pb));
     auto doc_write_batch = MakeDocWriteBatch();
     ASSERT_OK(ql_write_op.Apply(
@@ -634,7 +635,7 @@ class DocOperationScanTest : public DocOperationTest {
         boost::optional<TransactionId> txn_id;
         if (txn_status_manager) {
           if (RandomActWithProbability(0.5, &rng_)) {
-            txn_id = GenerateTransactionId();
+            txn_id = TransactionId::GenerateRandom();
             SetCurrentTransactionId(*txn_id);
             txn_op_context = std::make_unique<TransactionOperationContext>(*txn_id,
                 txn_status_manager);
@@ -655,7 +656,9 @@ class DocOperationScanTest : public DocOperationTest {
 
       ASSERT_OK(FlushRocksDbAndWait());
     }
-    LOG(INFO) << "Dump:\n" << DocDBDebugDumpToStr();
+
+    DumpRocksDBToLog(rocksdb(), StorageDbType::kRegular);
+    DumpRocksDBToLog(intents_db(), StorageDbType::kIntents);
   }
 
   void PerformScans(const bool is_forward_scan,
@@ -827,7 +830,7 @@ class DocOperationTxnScanTest : public DocOperationScanTest {
     InsertRows(num_rows_per_key, &txn_status_manager);
 
     PerformScans(is_forward_scan,
-                 TransactionOperationContext(GenerateTransactionId(), &txn_status_manager),
+                 TransactionOperationContext(TransactionId::GenerateRandom(), &txn_status_manager),
                  [](size_t){});
   }
 };
@@ -1022,7 +1025,8 @@ TEST_F(DocOperationTest, MaxFileSizeWithWritesTrigger) {
   rocksdb()->GetLiveFilesMetaData(&files);
   ASSERT_GE(files.size(), 3);
 
-  auto handle_impl = down_cast<rocksdb::ColumnFamilyHandleImpl*>(rocksdb_->DefaultColumnFamily());
+  auto handle_impl = down_cast<rocksdb::ColumnFamilyHandleImpl*>(
+      regular_db_->DefaultColumnFamily());
   auto stats = handle_impl->cfd()->internal_stats();
   ASSERT_EQ(0, stats->GetCFStats(rocksdb::InternalStats::LEVEL0_NUM_FILES_TOTAL));
   ASSERT_EQ(0, stats->GetCFStats(rocksdb::InternalStats::LEVEL0_SLOWDOWN_TOTAL));

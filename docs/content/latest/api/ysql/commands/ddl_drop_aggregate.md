@@ -1,8 +1,8 @@
 ---
-title: DROP AGGREGATE
+title: DROP AGGREGATE statement [YSQL]
+headerTitle: DROP AGGREGATE
 linkTitle: DROP AGGREGATE
-summary: Remove an aggregate
-description: DROP AGGREGATE
+description: Use the DROP AGGREGATE statement to remove an aggregate.
 menu:
   latest:
     identifier: api-ysql-commands-drop-aggregate
@@ -95,5 +95,4 @@ yugabyte=# DROP AGGREGATE newcnt(*) CASCADE;
 ## See also
 
 - [`CREATE AGGREGATE`](../ddl_create_aggregate)
-
-[postgresql-docs-drop-aggregate]: https://www.postgresql.org/docs/current/sql-dropaggregate.html
+- [postgresql-docs-drop-aggregate](https://www.postgresql.org/docs/current/sql-dropaggregate.html)

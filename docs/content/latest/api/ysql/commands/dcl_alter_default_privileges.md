@@ -1,8 +1,8 @@
 ---
-title: ALTER DEFAULT PRIVILEGES
+title: ALTER DEFAULT PRIVILEGES statement [YSQL]
+headerTitle: ALTER DEFAULT PRIVILEGES
 linkTitle: ALTER DEFAULT PRIVILEGES
-description: ALTER DEFAULT PRIVILEGES
-summary: Roles (users and groups)
+description: Use the ALTER DEFAULT PRIVILEGES statement to define the default access privileges.
 menu:
   latest:
     identifier: api-ysql-commands-alter-default-privileges
@@ -65,7 +65,6 @@ yugabyte=# ALTER DEFAULT PRIVILEGES REVOKE INSERT ON TABLES FROM john;
 
 ## See also
 
-[`CREATE ROLE`](../dcl_create_role)
-[`GRANT`](../dcl_grant)
-[`REVOKE`](../dcl_revoke)
-[Other YSQL Statements](..)
+- [`CREATE ROLE`](../dcl_create_role)
+- [`GRANT`](../dcl_grant)
+- [`REVOKE`](../dcl_revoke)

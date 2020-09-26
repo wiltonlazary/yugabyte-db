@@ -1,4 +1,16 @@
-// Copyright (c) Yugabyte, Inc.
+// Copyright 2020 YugaByte, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package com.yugabyte.yw.controllers;
 
@@ -20,9 +32,12 @@ import com.yugabyte.yw.common.CloudQueryHelper;
 import com.yugabyte.yw.common.PlacementInfoUtil;
 import com.yugabyte.yw.common.ReleaseManager;
 import com.yugabyte.yw.forms.CustomerRegisterFormData;
+import com.yugabyte.yw.forms.AlertingFormData;
 import com.yugabyte.yw.forms.FeatureUpdateFormData;
 import com.yugabyte.yw.forms.MetricQueryParams;
 import com.yugabyte.yw.metrics.MetricQueryHelper;
+import com.yugabyte.yw.models.helpers.CommonUtils;
+import com.yugabyte.yw.models.Audit;
 import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.CustomerConfig;
 import com.yugabyte.yw.models.Provider;
@@ -68,9 +83,24 @@ public class CustomerController extends AuthenticatedController {
     } else {
       responseJson.set("alertingData", null);
     }
+    CustomerConfig smtpConfig = CustomerConfig.getSmtpConfig(customerUUID);
+    if (smtpConfig != null) {
+      responseJson.set("smtpData", smtpConfig.data);
+    } else {
+      responseJson.set("smtpData", null);
+    }
     responseJson.put("callhomeLevel", CustomerConfig.getOrCreateCallhomeLevel(customerUUID).toString());
 
-    responseJson.put("features", customer.getFeatures());
+    Users user = (Users) ctx().args.get("user");
+    if (customer.getFeatures().size() != 0 && user.getFeatures().size() != 0) {
+      JsonNode featureSet = user.getFeatures();
+      CommonUtils.deepMerge(featureSet, customer.getFeatures());
+      responseJson.put("features", featureSet);
+    } else if (customer.getFeatures().size() != 0) {
+      responseJson.put("features", customer.getFeatures());
+    } else {
+      responseJson.put("features", user.getFeatures());
+    }
 
     return ok(responseJson);
   }
@@ -85,19 +115,42 @@ public class CustomerController extends AuthenticatedController {
       return badRequest(responseJson);
     }
 
-    Form<CustomerRegisterFormData> formData = formFactory.form(CustomerRegisterFormData.class).bindFromRequest();
+    JsonNode request = request().body().asJson();
+    Form<AlertingFormData> formData = formFactory.form(AlertingFormData.class).bindFromRequest();
     if (formData.hasErrors()) {
       responseJson.set("error", formData.errorsAsJson());
       return badRequest(responseJson);
     }
 
-    CustomerConfig config = CustomerConfig.getAlertConfig(customerUUID);
-    if (config == null && formData.get().alertingData != null) {
-      config = CustomerConfig.createAlertConfig(
-              customerUUID, Json.toJson(formData.get().alertingData));
-    } else if (config != null && formData.get().alertingData != null) {
-      config.data = Json.toJson(formData.get().alertingData);
-      config.update();
+    if (formData.get().name != null) {
+      customer.name = formData.get().name;
+      customer.save();
+    }
+
+    if (request.has("alertingData") || request.has("smtpData")) {
+
+      CustomerConfig config = CustomerConfig.getAlertConfig(customerUUID);
+      if (config == null && formData.get().alertingData != null) {
+        config = CustomerConfig.createAlertConfig(
+                customerUUID, Json.toJson(formData.get().alertingData));
+      } else if (config != null && formData.get().alertingData != null) {
+        config.data = Json.toJson(formData.get().alertingData);
+        config.update();
+      }
+
+      CustomerConfig smtpConfig = CustomerConfig.getSmtpConfig(customerUUID);
+      if (smtpConfig == null && formData.get().smtpData != null) {
+        smtpConfig = CustomerConfig.createSmtpConfig(
+            customerUUID, Json.toJson(formData.get().smtpData));
+      } else if (smtpConfig != null && formData.get().smtpData != null) {
+        smtpConfig.data = Json.toJson(formData.get().smtpData);
+        smtpConfig.update();
+      } // In case we want to reset the smtpData and use the default mailing server.
+      else if (request.has("smtpData") && formData.get().smtpData == null) {
+        if (smtpConfig != null) {
+          smtpConfig.delete();
+        }
+      }
     }
 
     // Features would be a nested json, so we should fetch it differently.
@@ -107,9 +160,6 @@ public class CustomerController extends AuthenticatedController {
     }
 
     CustomerConfig.upsertCallhomeConfig(customerUUID, formData.get().callhomeLevel);
-
-    customer.name = formData.get().name;
-    customer.update();
 
     return ok(Json.toJson(customer));
   }
@@ -127,6 +177,7 @@ public class CustomerController extends AuthenticatedController {
 
     if (customer.delete()) {
       ObjectNode responseJson = Json.newObject();
+      Audit.createAuditEntry(ctx(), request());
       responseJson.put("success", true);
       return ApiResponse.success(responseJson);
     } else {
@@ -154,6 +205,7 @@ public class CustomerController extends AuthenticatedController {
     } catch (RuntimeException e) {
       return ApiResponse.error(BAD_REQUEST, "Failed to update features: " + e.getMessage());
     }
+    Audit.createAuditEntry(ctx(), request(), requestBody);
     return ok(customer.getFeatures());
   }
 

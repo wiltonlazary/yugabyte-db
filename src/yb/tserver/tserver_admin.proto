@@ -60,6 +60,14 @@ message ChangeMetadataRequestPB {
   optional tablet.TableInfoPB add_table = 8;
 
   optional uint32 wal_retention_secs = 9;
+
+  optional bytes remove_table_id = 10;
+
+  // Note that we don't use the value of this and just check has_mark_backfill_done.
+  optional bool mark_backfill_done = 11;
+
+  // Used for alter schema on a non-primary table (e.g. colocated user table).
+  optional bytes alter_table_id = 12;
 }
 
 // This is used to export tablet metadata changes to a protobuf file to be reloaded on a new cluster
@@ -72,6 +80,60 @@ message ChangeMetadataResponsePB {
   optional TabletServerErrorPB error = 1;
 
   optional fixed64 propagated_hybrid_time = 2;
+}
+
+message GetSafeTimeRequestPB {
+  // UUID of server this request is addressed to.
+  optional bytes dest_uuid = 1;
+
+  required bytes tablet_id = 2;
+
+  optional uint32 schema_version = 3;
+
+  optional fixed64 propagated_hybrid_time = 4;
+
+  optional fixed64 min_hybrid_time_for_backfill = 5;
+}
+
+message GetSafeTimeResponsePB {
+  optional TabletServerErrorPB error = 1;
+
+  optional fixed64 safe_time = 2;
+
+  optional fixed64 propagated_hybrid_time = 3;
+}
+
+message BackfillIndexRequestPB {
+  // UUID of server this request is addressed to.
+  optional bytes dest_uuid = 1;
+
+  required bytes tablet_id = 2;
+
+  // Indexes on the _same table_ to backfill.
+  repeated IndexInfoPB indexes = 3;
+
+  optional uint32 schema_version = 4;
+
+  optional fixed64 read_at_hybrid_time = 5;
+
+  optional bytes start_key = 6;
+  optional bytes end_key = 7;
+
+  optional fixed64 propagated_hybrid_time = 8;
+
+  // Currently only used for YSQL.
+  optional string namespace_name = 9;
+}
+
+message BackfillIndexResponsePB {
+  optional TabletServerErrorPB error = 1;
+
+  optional fixed64 propagated_hybrid_time = 2;
+
+  // If non-empty, this is used to keep track of how far along
+  // the backfill has completed, so that it can be resumed.
+  // Encoded as the DocKey for the next row to be backfilled.
+  optional bytes backfilled_until = 3;
 }
 
 message CopartitionTableRequestPB {
@@ -100,6 +162,8 @@ message CreateTabletRequestPB {
   // The partition of the tablet.
   optional PartitionPB partition = 9;
 
+  optional bytes namespace_id = 14;
+  optional bytes namespace_name = 15;
   required string table_name = 5;
   optional TableType table_type = 11;
   required SchemaPB schema = 6;
@@ -182,6 +246,9 @@ message FlushTabletsRequestPB {
 
   // Whether we want to compact the tablets instead of flushing them.
   optional bool is_compaction = 4;
+
+  // Whether we want to flush or compact all tablets in the server.
+  optional bool all_tablets = 5;
 }
 
 message FlushTabletsResponsePB {
@@ -210,6 +277,38 @@ message AddTableToTabletResponsePB {
   optional fixed64 propagated_hybrid_time = 2;
 }
 
+message RemoveTableFromTabletRequestPB {
+  required bytes tablet_id = 1;
+  required bytes remove_table_id = 2;
+}
+
+message RemoveTableFromTabletResponsePB {
+  optional TabletServerErrorPB error = 1;
+  optional fixed64 propagated_hybrid_time = 2;
+}
+
+message SplitTabletRequestPB {
+  // UUID of server this request is addressed to.
+  optional bytes dest_uuid = 1;
+
+  optional fixed64 propagated_hybrid_time = 2;
+
+  required bytes tablet_id = 3;
+
+  required bytes new_tablet1_id = 4;
+
+  required bytes new_tablet2_id = 5;
+
+  required bytes split_partition_key = 6;
+
+  required bytes split_encoded_key = 7;
+}
+
+message SplitTabletResponsePB {
+  optional TabletServerErrorPB error = 1;
+  optional fixed64 propagated_hybrid_time = 2;
+}
+
 service TabletServerAdminService {
   // Create a new, empty tablet with the specified parameters. Only used for
   // brand-new tablets, not for "moves".
@@ -221,6 +320,16 @@ service TabletServerAdminService {
   // Alter a tablet's schema.
   rpc AlterSchema(ChangeMetadataRequestPB) returns (ChangeMetadataResponsePB);
 
+  // GetSafeTime API to get the current safe time.
+  rpc GetSafeTime(GetSafeTimeRequestPB) returns (GetSafeTimeResponsePB);
+
+  // Backfill the index for the specified index tables. Addressed to the indexed
+  // table.
+  rpc BackfillIndex(BackfillIndexRequestPB) returns (BackfillIndexResponsePB);
+
+  // Marks an index table as having completed backfilling.
+  rpc BackfillDone(ChangeMetadataRequestPB) returns (ChangeMetadataResponsePB);
+
   // Create a co-partitioned table in an existing tablet
   rpc CopartitionTable(CopartitionTableRequestPB) returns (CopartitionTableResponsePB);
 
@@ -229,4 +338,9 @@ service TabletServerAdminService {
   rpc CountIntents(CountIntentsRequestPB) returns (CountIntentsResponsePB);
 
   rpc AddTableToTablet(AddTableToTabletRequestPB) returns (AddTableToTabletResponsePB);
+
+  rpc RemoveTableFromTablet(RemoveTableFromTabletRequestPB)
+      returns (RemoveTableFromTabletResponsePB);
+
+  rpc SplitTablet(SplitTabletRequestPB) returns (SplitTabletResponsePB);
 }

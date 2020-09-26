@@ -48,9 +48,10 @@ PgDmlWrite::~PgDmlWrite() {
 }
 
 Status PgDmlWrite::Prepare() {
-  RETURN_NOT_OK(LoadTable());
+  // Setup descriptors for target and bind columns.
+  target_desc_ = bind_desc_ = VERIFY_RESULT(pg_session_->LoadTable(table_id_));
 
-  // Allocate either INSERT, UPDATE, or DELETE request.
+  // Allocate either INSERT, UPDATE, DELETE, or TRUNCATE_COLOCATED request.
   AllocWriteRequest();
   PrepareColumns();
   return Status::OK();
@@ -59,7 +60,7 @@ Status PgDmlWrite::Prepare() {
 void PgDmlWrite::PrepareColumns() {
   // Because DocDB API requires that primary columns must be listed in their created-order,
   // the slots for primary column bind expressions are allocated here in correct order.
-  for (PgColumn &col : table_desc_->columns()) {
+  for (PgColumn &col : target_desc_->columns()) {
     col.AllocPrimaryBindPB(write_req_);
   }
 }
@@ -96,14 +97,16 @@ Status PgDmlWrite::DeleteEmptyPrimaryBinds() {
     write_req_->clear_range_column_values();
   }
 
-  if (missing_primary_key) {
+  // Check for missing key.  This is okay when binding the whole table (for colocated truncate).
+  if (missing_primary_key && !bind_table_) {
     return STATUS(InvalidArgument, "Primary key must be fully specified for modifying table");
   }
 
   return Status::OK();
 }
 
-Status PgDmlWrite::Exec() {
+Status PgDmlWrite::Exec(bool force_non_bufferable) {
+
   // Delete allocated binds that are not associated with a value.
   // YBClient interface enforce us to allocate binds for primary key columns in their indexing
   // order, so we have to allocate these binds before associating them with values. When the values
@@ -120,23 +123,36 @@ Status PgDmlWrite::Exec() {
       << "YBCTID must be of BINARY datatype";
   }
 
+  // Initialize doc operator.
+  doc_op_->ExecuteInit(nullptr);
+
   // Set column references in protobuf.
-  SetColumnRefIds(table_desc_, write_req_->mutable_column_refs());
+  ColumnRefsToPB(write_req_->mutable_column_refs());
 
   // Execute the statement. If the request has been sent, get the result and handle any rows
   // returned.
-  if (VERIFY_RESULT(doc_op_->Execute()) == RequestSent::kTrue) {
-     RETURN_NOT_OK(doc_op_->GetResult(&row_batch_));
-     if (!row_batch_.empty()) {
-       int64_t row_count = 0;
-       RETURN_NOT_OK(PgDocData::LoadCache(row_batch_, &row_count, &cursor_));
-       accumulated_row_count_ += row_count;
-     }
-     // Save the number of rows affected by the op.
-     rows_affected_count_ = doc_op_->GetRowsAffectedCount();
+  if (VERIFY_RESULT(doc_op_->Execute(force_non_bufferable)) == RequestSent::kTrue) {
+    RETURN_NOT_OK(doc_op_->GetResult(&rowsets_));
+
+    // Save the number of rows affected by the op.
+    rows_affected_count_ = VERIFY_RESULT(doc_op_->GetRowsAffectedCount());
   }
 
   return Status::OK();
+}
+
+Status PgDmlWrite::SetWriteTime(const HybridTime& write_time) {
+  SCHECK(doc_op_.get() != nullptr, RuntimeError, "expected doc_op_ to be initialized");
+  down_cast<PgDocWriteOp*>(doc_op_.get())->SetWriteTime(write_time);
+  return Status::OK();
+}
+
+void PgDmlWrite::AllocWriteRequest() {
+  auto wop = AllocWriteOperation();
+  DCHECK(wop);
+  wop->set_is_single_row_txn(is_single_row_txn_);
+  write_req_ = wop->mutable_request();
+  doc_op_ = make_shared<PgDocWriteOp>(pg_session_, target_desc_, table_id_, std::move(wop));
 }
 
 PgsqlExpressionPB *PgDmlWrite::AllocColumnBindPB(PgColumn *col) {

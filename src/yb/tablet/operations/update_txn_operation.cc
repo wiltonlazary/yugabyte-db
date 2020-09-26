@@ -30,13 +30,7 @@ namespace tablet {
 
 void UpdateTxnOperationState::UpdateRequestFromConsensusRound() {
   VLOG_WITH_PREFIX(2) << "UpdateRequestFromConsensusRound";
-  request_.store(consensus_round()->replicate_msg()->mutable_transaction_state(),
-                 std::memory_order_release);
-}
-
-std::string UpdateTxnOperationState::ToString() const {
-  auto req = request();
-  return Format("UpdateTxnOperationState [$0]", !req ? "(none)"s : req->ShortDebugString());
+  UseRequest(&consensus_round()->replicate_msg()->transaction_state());
 }
 
 consensus::ReplicateMsgPtr UpdateTxnOperation::NewReplicateMsg() {
@@ -76,18 +70,17 @@ Status UpdateTxnOperation::DoReplicated(int64_t leader_term, Status* complete_st
     state->tablet()->mvcc_manager()->Replicated(state->hybrid_time());
   });
 
-  // APPLYING is handled separately, because it is received for transactions not managed by
-  // this tablet as a transaction status tablet, but tablets that are involved in the data
-  // path (receive write intents) for this transaction.
-  if (state->request()->status() == TransactionStatus::APPLYING) {
+  auto transaction_participant = state->tablet()->transaction_participant();
+  if (transaction_participant) {
     TransactionParticipant::ReplicatedData data = {
-        leader_term,
-        *state->request(),
-        state->op_id(),
-        state->hybrid_time(),
-        false /* already_applied */
+        .leader_term = leader_term,
+        .state = *state->request(),
+        .op_id = state->op_id(),
+        .hybrid_time = state->hybrid_time(),
+        .sealed = state->request()->sealed(),
+        .already_applied_to_regular_db = AlreadyAppliedToRegularDB::kFalse
     };
-    return state->tablet()->transaction_participant()->ProcessReplicated(data);
+    return transaction_participant->ProcessReplicated(data);
   } else {
     TransactionCoordinator::ReplicatedData data = {
         leader_term,

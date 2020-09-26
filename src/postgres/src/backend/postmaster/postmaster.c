@@ -946,7 +946,7 @@ PostmasterMain(int argc, char *argv[])
 	YBReportIfYugaByteEnabled();
 #ifdef __APPLE__
 	if (YBIsEnabledInPostgresEnvVar()) {
-		/* 
+		/*
 		 * Resolve local hostname to initialize macOS network libraries. If we
 		 * don't do this, there might be a lot of segmentation faults in
 		 * PostgreSQL backend processes in tests on macOS (especially debug
@@ -1940,6 +1940,23 @@ ProcessStartupPacket(Port *port, bool SSLdone)
 	MemoryContext oldcontext;
 
 	pq_startmsgread();
+
+	/* Check we have no data at all. */
+	if (pq_peekbyte() == EOF)
+	{
+		/*
+		 * If we get no data at all, don't clutter the log with a complaint;
+		 * such cases often occur for legitimate reasons.  An example is that
+		 * we might be here after responding to NEGOTIATE_SSL_CODE, and if the
+		 * client didn't like our response, it'll probably just drop the
+		 * connection.  Service-monitoring software also often just opens and
+		 * closes a connection without sending anything.  (So do port
+		 * scanners, which may be less benign, but it's not really our job to
+		 * notice those.)
+		 */
+		return STATUS_ERROR;
+	}
+
 	if (pq_getbytes((char *) &len, 4) == EOF)
 	{
 		/*
@@ -5796,12 +5813,12 @@ bgworker_should_start_now(BgWorkerStartTime start_time)
 		case PM_RUN:
 			if (start_time == BgWorkerStart_RecoveryFinished)
 				return true;
-			/* fall through */
+			switch_fallthrough();
 
 		case PM_HOT_STANDBY:
 			if (start_time == BgWorkerStart_ConsistentState)
 				return true;
-			/* fall through */
+			switch_fallthrough();
 
 		case PM_RECOVERY:
 		case PM_STARTUP:

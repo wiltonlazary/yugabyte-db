@@ -34,12 +34,15 @@ public enum TaskType {
 
   BackupUniverse("BackupUniverse"),
 
+  DeleteBackup("DeleteBackup"),
+
   MultiTableBackup("MultiTableBackup"),
 
   EditUniverse("EditUniverse"),
 
   EditKubernetesUniverse("EditKubernetesUniverse"),
 
+  @Deprecated
   KubernetesProvision("KubernetesProvision"),
 
   ImportIntoTable("ImportIntoTable"),
@@ -68,6 +71,8 @@ public enum TaskType {
   CreateKMSConfig("CreateKMSConfig"),
 
   DeleteKMSConfig("DeleteKMSConfig"),
+
+  UpdateDiskSize("UpdateDiskSize"),
 
   // Tasks belonging to subtasks classpath
   AnsibleClusterServerCtl("subtasks.AnsibleClusterServerCtl"),
@@ -99,6 +104,8 @@ public enum TaskType {
   ManipulateDnsRecordTask("subtasks.ManipulateDnsRecordTask"),
 
   RemoveUniverseEntry("subtasks.RemoveUniverseEntry"),
+
+  SetFlagInMemory("subtasks.SetFlagInMemory"),
 
   SetNodeState("subtasks.SetNodeState"),
 
@@ -143,8 +150,11 @@ public enum TaskType {
 
   CloudSetup("subtasks.cloud.CloudSetup"),
 
-
   BackupTable("subtasks.BackupTable"),
+
+  BackupUniverseKeys("subtasks.BackupUniverseKeys"),
+
+  RestoreUniverseKeys("subtasks.RestoreUniverseKeys"),
 
   WaitForLeadersOnPreferredOnly("subtasks.WaitForLeadersOnPreferredOnly"),
 
@@ -157,6 +167,8 @@ public enum TaskType {
   KubernetesCommandExecutor("subtasks.KubernetesCommandExecutor"),
 
   KubernetesWaitForPod("subtasks.KubernetesWaitForPod"),
+
+  KubernetesCheckNumPod("subtasks.KubernetesCheckNumPod"),
 
   @Deprecated
   CopyEncryptionKeyFile("subtasks.CopyEncryptionKeyFile"),

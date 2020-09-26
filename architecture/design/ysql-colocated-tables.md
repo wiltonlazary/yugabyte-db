@@ -1,12 +1,20 @@
 # Colocated Tables
 
-> **Note:** This is a new feature that is still in a design phase.
+> **Note:** This is a new feature in Beta mode.
 
-Colocating tables can dramitacally increase the number of relations (tables, indexes, etc) that can be supported per node while keeping the number of tablets per node low. 
+In workloads that do very little IOPS and have a small data set, the bottleneck shifts from
+CPU/disk/network to the number of tablets one can host per node. 
+Since each table by default requires at least one tablet per node, a YugabyteDB cluster with 5000
+relations (tables, indexes) will result in 5000 tablets per node.
+There are practical limitations to the number of tablets that YugabyteDB can handle per node since each tablet
+adds some CPU, disk and network overhead. If most or all of the tables in YugabyteDB cluster are small tables,
+then having separate tablets for each table unnecessarily adds pressure on CPU, network and disk.
 
-In workloads that do very little IOPS and have a small data set, the bottleneck shifts from CPU/disk/network to the number of tablets one can host per node. There are practical limitations to the number of tablets that YugabyteDB can handle per node, even though this number could be very high, depending on the workload pattern. Although the number of tablets a node can handle keeps improving with software optimizations, as a general rule we currently recommend no more than 5000 tablets / node. Since each table by default requires at least one tablet without colocation, this implies that a YugabyteDB cluster cannot handle much more than 5000 relations (tables, indexes, etc) per node. With the default replication factor of 3, this limit is even lower in practice.
-
-Colocating various SQL tables puts all of their data into a single tablet, called the *colocation tablet*. Note that all the data in the colocation tablet is still replicated across 3 nodes (or whatever the replication factor is).
+To help accomodate such relational tables and workloads, we've added support for colocating SQL tables.
+Colocating tables puts all of their data into a single tablet, called the *colocation tablet*.
+This can dramatically increase the number of relations (tables, indexes, etc) that can
+be supported per node while keeping the number of tablets per node low.
+Note that all the data in the colocation tablet is still replicated across 3 nodes (or whatever the replication factor is).
 
 ## Motivation
 
@@ -256,4 +264,4 @@ Since colocated tablets have multiple tables with different schemas, we cannot f
 We could potentially split the tablet such that some tables are in one tablet and other tables are in the second tablet, but this will require some changes to the design.
 
 
-[![Analytics](https://yugabyte.appspot.com/UA-104956980-4/architecture/design/ysql-colocated-tables.md?pixel&useReferer)](https://github.com/YugaByte/ga-beacon)
+[![Analytics](https://yugabyte.appspot.com/UA-104956980-4/architecture/design/ysql-colocated-tables.md?pixel&useReferer)](https://github.com/yugabyte/ga-beacon)

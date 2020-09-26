@@ -2,8 +2,14 @@
 
 import React, { Component } from 'react';
 import PropTypes from 'prop-types';
-import { removeNullProperties, isNonEmptyObject, isNonEmptyArray, isNonEmptyString,
-        isYAxisGreaterThanThousand, divideYAxisByThousand } from 'utils/ObjectUtils';
+import {
+  removeNullProperties,
+  isNonEmptyObject,
+  isNonEmptyArray,
+  isNonEmptyString,
+  isYAxisGreaterThanThousand,
+  divideYAxisByThousand
+} from '../../../utils/ObjectUtils';
 import './MetricsPanel.scss';
 import { METRIC_FONT } from '../MetricsConfig';
 
@@ -20,7 +26,7 @@ export default class MetricsPanel extends Component {
     metricKey: PropTypes.string.isRequired
   }
 
-  componentDidMount() {
+  plotGraph = () => {
     const { metricKey, metric } = this.props;
     if (isNonEmptyObject(metric)) {
       // Remove Null Properties from the layout
@@ -35,6 +41,7 @@ export default class MetricsPanel extends Component {
       }
 
       metric.layout.xaxis.hoverformat = '%H:%M:%S, %b %d, %Y';
+
       // TODO: send this data from backend.
       let max = 0;
       metric.data.forEach(function (data) {
@@ -47,8 +54,8 @@ export default class MetricsPanel extends Component {
       });
       if (max === 0) max = 1.01;
       metric.layout.autosize = false;
-      metric.layout.width = this.getGraphWidth(this.props.width || 1200);
-      metric.layout.height = 360;
+      metric.layout.width = this.props.width || this.getGraphWidth(this.props.containerWidth || 1200);
+      metric.layout.height = this.props.height || 360;
       metric.layout.showlegend = true;
       metric.layout.margin = {
         l: 45,
@@ -94,10 +101,24 @@ export default class MetricsPanel extends Component {
     }
   }
 
+  componentDidMount() {
+    this.plotGraph();
+  }
+
   componentDidUpdate(prevProps) {
-    if (this.props.width !== prevProps.width) {
-      Plotly.relayout(prevProps.metricKey, {width: this.getGraphWidth(this.props.width)});
-    }
+    if (this.props.containerWidth !== prevProps.containerWidth || this.props.width !== prevProps.width) {
+      Plotly.relayout(prevProps.metricKey, {width: this.props.width || this.getGraphWidth(this.props.containerWidth)});
+    } else {
+      // All graph lines have the same x-axis, so get the first
+      // and compare unix time interval
+      const prevTime = prevProps.metric.data[0]?.x;
+      const currTime = this.props.metric.data[0]?.x;      
+      if (prevTime && currTime && (prevTime[0] !== currTime[0] ||
+        prevTime[prevTime.length - 1] !== currTime[currTime.length - 1])) {
+          // Re-plot graph
+          this.plotGraph();
+      }
+    }    
   }
 
   getGraphWidth(containerWidth) {

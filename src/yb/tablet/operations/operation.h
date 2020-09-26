@@ -45,10 +45,13 @@
 #include "yb/consensus/opid_util.h"
 #include "yb/util/auto_release_pool.h"
 #include "yb/util/locks.h"
+#include "yb/util/operation_counter.h"
 #include "yb/util/status.h"
 #include "yb/util/memory/arena.h"
 
 namespace yb {
+
+struct OpId;
 
 namespace tablet {
 
@@ -56,8 +59,10 @@ class Tablet;
 class OperationCompletionCallback;
 class OperationState;
 
-YB_DEFINE_ENUM(OperationType,
-               (kWrite)(kChangeMetadata)(kUpdateTransaction)(kSnapshot)(kTruncate)(kEmpty));
+YB_DEFINE_ENUM(
+    OperationType,
+    (kWrite)(kChangeMetadata)(kUpdateTransaction)(kSnapshot)(kTruncate)(kEmpty)(kHistoryCutoff)
+    (kSplit));
 
 // Base class for transactions.  There are different implementations for different types (Write,
 // AlterSchema, etc.) OperationDriver implementations use Operations along with Consensus to execute
@@ -109,6 +114,8 @@ class Operation {
 
   std::string LogPrefix() const;
 
+  virtual void SubmittedToPreparer() {}
+
   virtual ~Operation() {}
 
  private:
@@ -151,8 +158,18 @@ class OperationState {
     return consensus_round_.get();
   }
 
+  const consensus::ConsensusRound* consensus_round() const {
+    return consensus_round_.get();
+  }
+
+  std::string ConsensusRoundAsString() const;
+
   Tablet* tablet() const {
     return tablet_;
+  }
+
+  virtual void SetTablet(Tablet* tablet) {
+    tablet_ = tablet;
   }
 
   void set_completion_callback(std::unique_ptr<OperationCompletionCallback> completion_clbk) {
@@ -170,9 +187,6 @@ class OperationState {
   T* AddArrayToAutoReleasePool(T* t) {
     return pool_.AddArray(t);
   }
-
-  // Return the arena associated with this transaction.  NOTE: this is not a thread-safe arena!
-  Arena* arena();
 
   // Each implementation should have its own ToString() method.
   virtual std::string ToString() const = 0;
@@ -201,11 +215,15 @@ class OperationState {
     return hybrid_time_.is_valid();
   }
 
-  consensus::OpId* mutable_op_id() {
+  // Returns hybrid time that should be used for storing this operation result in RocksDB.
+  // For instance it could be different from hybrid_time() for CDC.
+  virtual HybridTime WriteHybridTime() const;
+
+  OpIdPB* mutable_op_id() {
     return &op_id_;
   }
 
-  const consensus::OpId& op_id() const {
+  const OpIdPB& op_id() const {
     return op_id_;
   }
 
@@ -216,13 +234,18 @@ class OperationState {
   void CompleteWithStatus(const Status& status) const;
   void SetError(const Status& status, tserver::TabletServerErrorPB::Code code) const;
 
+  // Initialize operation at leader side.
+  // op_id - operation id.
+  // committed_op_id - current committed operation id.
+  void LeaderInit(const OpId& op_id, const OpId& committed_op_id);
+
   virtual ~OperationState();
 
  protected:
   explicit OperationState(Tablet* tablet);
 
   // The tablet peer that is coordinating this transaction.
-  Tablet* const tablet_;
+  Tablet* tablet_;
 
   // Optional callback to be called once the transaction completes.
   std::unique_ptr<OperationCompletionCallback> completion_clbk_;
@@ -235,15 +258,93 @@ class OperationState {
   // The clock error when hybrid_time_ was read.
   uint64_t hybrid_time_error_ = 0;
 
-  boost::optional<Arena> arena_;
-
   // This OpId stores the canonical "anchor" OpId for this transaction.
-  consensus::OpId op_id_;
+  OpIdPB op_id_;
 
   scoped_refptr<consensus::ConsensusRound> consensus_round_;
 
   // Lock that protects access to operation state.
   mutable simple_spinlock mutex_;
+};
+
+template <class Request, class BaseState = OperationState>
+class OperationStateBase : public BaseState {
+ public:
+  OperationStateBase(Tablet* tablet, const Request* request)
+      : BaseState(tablet), request_(request) {}
+
+  explicit OperationStateBase(Tablet* tablet)
+      : OperationStateBase(tablet, nullptr) {}
+
+  const Request* request() const override {
+    return request_.load(std::memory_order_acquire);
+  }
+
+  Request* AllocateRequest() {
+    request_holder_ = std::make_unique<Request>();
+    request_.store(request_holder_.get(), std::memory_order_release);
+    return request_holder_.get();
+  }
+
+  tserver::TabletSnapshotOpRequestPB* ReleaseRequest() {
+    return request_holder_.release();
+  }
+
+  void TakeRequest(Request* request) {
+    request_holder_.reset(new Request);
+    request_.store(request_holder_.get(), std::memory_order_release);
+    request_holder_->Swap(request);
+  }
+
+  std::string ToString() const override {
+    return Format("{ request: $0 consensus_round: $1 }",
+                  request_.load(std::memory_order_acquire), BaseState::ConsensusRoundAsString());
+  }
+
+ protected:
+  void UseRequest(const Request* request) {
+    request_.store(request, std::memory_order_release);
+  }
+
+ private:
+  std::unique_ptr<Request> request_holder_;
+  std::atomic<const Request*> request_;
+};
+
+class ExclusiveSchemaOperationStateBase : public OperationState {
+ public:
+  template <class... Args>
+  explicit ExclusiveSchemaOperationStateBase(Args&&... args)
+      : OperationState(std::forward<Args>(args)...) {}
+
+  // Release the acquired schema lock.
+  void ReleasePermitToken();
+
+  void UsePermitToken(ScopedRWOperationPause&& token) {
+    permit_token_ = std::move(token);
+  }
+
+ private:
+  // Used to pause write operations from being accepted while alter is in progress.
+  ScopedRWOperationPause permit_token_;
+};
+
+template <class Request>
+class ExclusiveSchemaOperationState :
+    public OperationStateBase<Request, ExclusiveSchemaOperationStateBase> {
+ public:
+  template <class... Args>
+  explicit ExclusiveSchemaOperationState(Args&&... args)
+      : OperationStateBase<Request, ExclusiveSchemaOperationStateBase>(
+            std::forward<Args>(args)...) {}
+
+  void Finish() {
+    ExclusiveSchemaOperationStateBase::ReleasePermitToken();
+
+    // Make the request NULL since after this operation commits
+    // the request may be deleted at any moment.
+    OperationStateBase<Request, ExclusiveSchemaOperationStateBase>::UseRequest(nullptr);
+  }
 };
 
 // A parent class for the callback that gets called when transactions complete.
@@ -330,6 +431,22 @@ class SynchronizerOperationCompletionCallback : public OperationCompletionCallba
 
  private:
   Synchronizer* synchronizer_;
+};
+
+class WeakSynchronizerOperationCompletionCallback : public OperationCompletionCallback {
+ public:
+  explicit WeakSynchronizerOperationCompletionCallback(std::weak_ptr<Synchronizer> synchronizer)
+      : synchronizer_(std::move(synchronizer)) {}
+
+  void OperationCompleted() override {
+    auto synchronizer = synchronizer_.lock();
+    if (synchronizer) {
+      synchronizer->StatusCB(status());
+    }
+  }
+
+ private:
+  std::weak_ptr<Synchronizer> synchronizer_;
 };
 
 }  // namespace tablet

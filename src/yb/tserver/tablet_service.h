@@ -60,6 +60,8 @@ class TabletServer;
 
 struct ReadContext;
 
+YB_STRONGLY_TYPED_BOOL(AllowSplitTablet);
+
 class TabletServiceImpl : public TabletServerServiceIf {
  public:
   typedef std::vector<tablet::TabletPeerPtr> TabletPeers;
@@ -108,6 +110,10 @@ class TabletServiceImpl : public TabletServerServiceIf {
                             GetTransactionStatusResponsePB* resp,
                             rpc::RpcContext context) override;
 
+  void GetTransactionStatusAtParticipant(const GetTransactionStatusAtParticipantRequestPB* req,
+                                         GetTransactionStatusAtParticipantResponsePB* resp,
+                                         rpc::RpcContext context) override;
+
   void AbortTransaction(const AbortTransactionRequestPB* req,
                         AbortTransactionResponsePB* resp,
                         rpc::RpcContext context) override;
@@ -133,21 +139,25 @@ class TabletServiceImpl : public TabletServerServiceIf {
  private:
   friend class ReadCompletionTask;
 
-  // Check if the tablet peer is the leader and is in ready state for servicing IOs.
-  CHECKED_STATUS CheckPeerIsLeaderAndReady(const tablet::TabletPeer& tablet_peer);
-
   CHECKED_STATUS CheckPeerIsLeader(const tablet::TabletPeer& tablet_peer);
 
-  CHECKED_STATUS CheckPeerIsReady(const tablet::TabletPeer& tablet_peer);
+  // Checks if the peer is ready for servicing IOs.
+  // allow_split_tablet specifies whether to reject requests to tablets which have been already
+  // split.
+  CHECKED_STATUS CheckPeerIsReady(
+      const tablet::TabletPeer& tablet_peer, AllowSplitTablet allow_split_tablet);
 
   // If tablet_peer is already set, we assume that LookupTabletPeerOrRespond has already been
   // called, and only perform additional checks, such as readiness, leadership, bounded staleness,
   // etc.
+  // allow_split_tablet specifies whether to reject requests to tablets which have been already
+  // split.
   template <class Req, class Resp>
   bool DoGetTabletOrRespond(
       const Req* req, Resp* resp, rpc::RpcContext* context,
       std::shared_ptr<tablet::AbstractTablet>* tablet,
-      tablet::TabletPeerPtr tablet_peer = nullptr);
+      tablet::TabletPeerPtr tablet_peer = nullptr,
+      AllowSplitTablet allow_split_tablet = AllowSplitTablet::kFalse);
 
   virtual WARN_UNUSED_RESULT bool GetTabletOrRespond(
       const ReadRequestPB* req,
@@ -159,6 +169,9 @@ class TabletServiceImpl : public TabletServerServiceIf {
   template<class Resp>
   bool CheckWriteThrottlingOrRespond(
       double score, tablet::TabletPeer* tablet_peer, Resp* resp, rpc::RpcContext* context);
+
+  template <class Req, class Resp, class F>
+  void PerformAtLeader(const Req& req, Resp* resp, rpc::RpcContext* context, const F& f);
 
   // Read implementation. If restart is required returns restart time, in case of success
   // returns invalid ReadHybridTime. Otherwise returns error status.
@@ -203,8 +216,41 @@ class TabletServiceAdminImpl : public TabletServerAdminServiceIf {
                         AddTableToTabletResponsePB* resp,
                         rpc::RpcContext context) override;
 
+  void RemoveTableFromTablet(const RemoveTableFromTabletRequestPB* req,
+                             RemoveTableFromTabletResponsePB* resp,
+                             rpc::RpcContext context) override;
+
+  // Called on the Indexed table to choose time to read.
+  void GetSafeTime(
+      const GetSafeTimeRequestPB* req, GetSafeTimeResponsePB* resp,
+      rpc::RpcContext context) override;
+
+  // Called on the Indexed table to backfill the index table(s).
+  void BackfillIndex(
+      const BackfillIndexRequestPB* req, BackfillIndexResponsePB* resp,
+      rpc::RpcContext context) override;
+
+  // Called on the Index table(s) once the backfill is complete.
+  void BackfillDone(
+      const ChangeMetadataRequestPB* req, ChangeMetadataResponsePB* resp,
+      rpc::RpcContext context) override;
+
+  // Starts tablet splitting by adding split tablet Raft operation into Raft log of the source
+  // tablet.
+  void SplitTablet(
+      const SplitTabletRequestPB* req,
+      SplitTabletResponsePB* resp,
+      rpc::RpcContext context) override;
+
  private:
   TabletServer* server_;
+
+  // Used to implement wait/signal mechanism for backfill requests.
+  // Since the number of concurrently allowed backfill requests is
+  // limited.
+  mutable std::mutex backfill_lock_;
+  std::condition_variable backfill_cond_;
+  std::atomic<int32_t> num_tablets_backfilling_{0};
 };
 
 class ConsensusServiceImpl : public consensus::ConsensusServiceIf {

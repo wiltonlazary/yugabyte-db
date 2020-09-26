@@ -16,6 +16,7 @@
 #include <unordered_map>
 
 #include "yb/client/schema.h"
+#include "yb/common/pg_system_attr.h"
 #include "yb/yql/pggate/pg_expr.h"
 #include "yb/yql/pggate/pg_dml.h"
 #include "yb/util/string_util.h"
@@ -48,6 +49,7 @@ const std::unordered_map<string, PgExpr::Opcode> kOperatorNames = {
   { "count", PgExpr::Opcode::PG_EXPR_COUNT },
   { "max", PgExpr::Opcode::PG_EXPR_MAX },
   { "min", PgExpr::Opcode::PG_EXPR_MIN },
+  { "eval_expr_call", PgExpr::Opcode::PG_EXPR_EVAL_EXPR_CALL }
 };
 
 PgExpr::PgExpr(Opcode opcode, const YBCPgTypeEntity *type_entity)
@@ -104,6 +106,9 @@ bfpg::TSOpcode PgExpr::PGOpcodeToTSOpcode(const PgExpr::Opcode opcode) {
     case Opcode::PG_EXPR_MIN:
       return bfpg::TSOpcode::kMin;
 
+    case Opcode::PG_EXPR_EVAL_EXPR_CALL:
+      return bfpg::TSOpcode::kPgEvalExprCall;
+
     default:
       LOG(DFATAL) << "No supported TSOpcode for PG opcode: " << static_cast<int32_t>(opcode);
       return bfpg::TSOpcode::kNoOp;
@@ -150,6 +155,10 @@ Status PgExpr::Eval(PgDml *pg_stmt, PgsqlExpressionPB *expr_pb) {
 Status PgExpr::Eval(PgDml *pg_stmt, QLValuePB *result) {
   // Expressions that are neither bind_variable nor constant don't need to be updated.
   // Only values for bind variables and constants need to be updated in the SQL requests.
+  return Status::OK();
+}
+
+Status PgExpr::Eval(QLValuePB *result) {
   return Status::OK();
 }
 
@@ -589,6 +598,10 @@ Status PgConstant::Eval(PgDml *pg_stmt, PgsqlExpressionPB *expr_pb) {
 
 Status PgConstant::Eval(PgDml *pg_stmt, QLValuePB *result) {
   CHECK(pg_stmt != nullptr);
+  return Eval(result);
+}
+
+Status PgConstant::Eval(QLValuePB *result) {
   CHECK(result != nullptr);
   *result = ql_value_;
   return Status::OK();
@@ -641,6 +654,10 @@ PgColumnRef::PgColumnRef(int attr_num,
 PgColumnRef::~PgColumnRef() {
 }
 
+bool PgColumnRef::is_ybbasetid() const {
+  return attr_num_ == static_cast<int>(PgSystemAttrNum::kYBIdxBaseTupleId);
+}
+
 Status PgColumnRef::PrepareForRead(PgDml *pg_stmt, PgsqlExpressionPB *expr_pb) {
   const PgColumn *col;
   RETURN_NOT_OK(pg_stmt->PrepareColumnForRead(attr_num_, expr_pb, &col));
@@ -673,7 +690,9 @@ Status PgOperator::PrepareForRead(PgDml *pg_stmt, PgsqlExpressionPB *expr_pb) {
   }
   tscall->set_opcode(static_cast<int32_t>(tsopcode));
   for (const auto& arg : args_) {
-    RETURN_NOT_OK(arg->PrepareForRead(pg_stmt, tscall->add_operands()));
+    PgsqlExpressionPB *op = tscall->add_operands();
+    RETURN_NOT_OK(arg->PrepareForRead(pg_stmt, op));
+    RETURN_NOT_OK(arg->Eval(pg_stmt, op));
   }
   return Status::OK();
 }

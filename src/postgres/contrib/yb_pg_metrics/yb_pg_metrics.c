@@ -114,6 +114,21 @@ set_metric_names(void)
   strcpy(ybpgm_table[AggregatePushdown].name, YSQL_METRIC_PREFIX "AggregatePushdowns");
 }
 
+/*
+ * Function to calculate milliseconds elapsed from start_time to stop_time.
+ */
+int64
+getElapsedMs(TimestampTz start_time, TimestampTz stop_time)
+{
+  long secs;
+  int microsecs;
+
+  TimestampDifference(start_time, stop_time, &secs, &microsecs);
+
+  long millisecs = (secs * 1000) + (microsecs / 1000);
+  return millisecs;
+}
+
 void
 pullRpczEntries(void)
 {
@@ -148,6 +163,12 @@ pullRpczEntries(void)
       before_changecount = beentry->st_changecount;
 
       rpcz[i].proc_id = beentry->st_procpid;
+
+      /* avoid filling any more fields if invalid */
+      if (beentry->st_procpid <= 0) {
+        break;
+      }
+
       rpcz[i].db_oid = beentry->st_databaseid;
 
       rpcz[i].query = (char *) palloc(pgstat_track_activity_query_size);
@@ -159,46 +180,28 @@ pullRpczEntries(void)
       rpcz[i].db_name = (char *) palloc(NAMEDATALEN);
       strcpy(rpcz[i].db_name, beentry->st_databasename);
 
-      rpcz[i].process_start_timestamp = (char *) palloc(MAXDATELEN + 1);
-      strcpy(rpcz[i].process_start_timestamp, timestamptz_to_str(beentry->st_proc_start_timestamp));
-
-      if (beentry->st_xact_start_timestamp)
-      {
-        rpcz[i].transaction_start_timestamp = (char *) palloc(MAXDATELEN + 1);
-        strcpy(rpcz[i].transaction_start_timestamp,
-               timestamptz_to_str(beentry->st_xact_start_timestamp));
-      }
-      else
-      {
-        rpcz[i].transaction_start_timestamp = NULL;
-      }
-
-      if (beentry->st_activity_start_timestamp)
-      {
-        rpcz[i].query_start_timestamp = (char *) palloc(MAXDATELEN + 1);
-        strcpy(rpcz[i].query_start_timestamp,
-               timestamptz_to_str(beentry->st_activity_start_timestamp));
-      }
-      else
-      {
-        rpcz[i].query_start_timestamp = NULL;
-      }
+      rpcz[i].process_start_timestamp = beentry->st_proc_start_timestamp;
+      rpcz[i].transaction_start_timestamp = beentry->st_xact_start_timestamp;
+      rpcz[i].query_start_timestamp = beentry->st_activity_start_timestamp;
 
       rpcz[i].backend_type = (char *) palloc(40);
       strcpy(rpcz[i].backend_type, pgstat_get_backend_desc(beentry->st_backendType));
 
+      rpcz[i].backend_active = 0;
       rpcz[i].backend_status = (char *) palloc(30);
       switch (beentry->st_state) {
         case STATE_IDLE:
           strcpy(rpcz[i].backend_status, "idle");
           break;
         case STATE_RUNNING:
+          rpcz[i].backend_active = 1;
           strcpy(rpcz[i].backend_status, "active");
           break;
         case STATE_IDLEINTRANSACTION:
           strcpy(rpcz[i].backend_status, "idle in transaction");
           break;
         case STATE_FASTPATH:
+          rpcz[i].backend_active = 1;
           strcpy(rpcz[i].backend_status, "fastpath function call");
           break;
         case STATE_IDLEINTRANSACTION_ABORTED:
@@ -271,11 +274,20 @@ webserver_worker_main(Datum unused)
 
   BackgroundWorkerUnblockSignals();
 
+  HandleYBStatus(YBCInitGFlags(NULL /* argv[0] */));
+
   webserver = CreateWebserver(ListenAddresses, port);
 
   RegisterMetrics(ybpgm_table, num_entries, metric_node_name);
 
-  RegisterRpczEntries(&pullRpczEntries, &freeRpczEntries, &num_backends, &rpcz);
+  postgresCallbacks callbacks;
+  callbacks.pullRpczEntries      = pullRpczEntries;
+  callbacks.freeRpczEntries      = freeRpczEntries;
+  callbacks.getTimestampTz       = GetCurrentTimestamp;
+  callbacks.getTimestampTzDiffMs = getElapsedMs;
+  callbacks.getTimestampTzToStr  = timestamptz_to_str;
+
+  RegisterRpczEntries(&callbacks, &num_backends, &rpcz);
 
   HandleYBStatus(StartWebserver(webserver));
 
@@ -469,10 +481,21 @@ ybpgm_ExecutorEnd(QueryDesc *queryDesc)
 	  ybpgm_Store(AggregatePushdown, time);
   }
 
-  if (prev_ExecutorEnd)
-    prev_ExecutorEnd(queryDesc);
-  else
-    standard_ExecutorEnd(queryDesc);
+  statement_nesting_level++;
+  PG_TRY();
+  {
+    if (prev_ExecutorEnd)
+      prev_ExecutorEnd(queryDesc);
+    else
+      standard_ExecutorEnd(queryDesc);
+    statement_nesting_level--;
+  }
+  PG_CATCH();
+  {
+    statement_nesting_level--;
+    PG_RE_THROW();
+  }
+  PG_END_TRY();
 }
 
 /*

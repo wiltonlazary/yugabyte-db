@@ -29,7 +29,7 @@ const mapDispatchToProps = (dispatch) => {
       });
     },
 
-    createGCPProvider: (providerName, providerConfig) => {
+    createGCPProvider: (providerName, providerConfig, perRegionMetadata) => {
       Object.keys(providerConfig).forEach((key) => { if (typeof providerConfig[key] === 'string' || providerConfig[key] instanceof String) providerConfig[key] = providerConfig[key].trim(); });
       dispatch(createProvider("gcp", providerName.trim(), providerConfig)).then((response) => {
         dispatch(createProviderResponse(response.payload));
@@ -38,11 +38,28 @@ const mapDispatchToProps = (dispatch) => {
           const providerUUID = response.payload.data.uuid;
           const hostNetwork = providerConfig["network"];
           const params = {
-            "regionList": [],
             "hostVpcId": hostNetwork,
-            "destVpcId": providerConfig["use_host_vpc"] ? hostNetwork : ""
+            "destVpcId": hostNetwork,
+            "airGapInstall": providerConfig["airGapInstall"],
+            "sshPort": providerConfig["sshPort"],
+            "perRegionMetadata": perRegionMetadata
           };
           dispatch(bootstrapProvider(providerUUID, params)).then((boostrapResponse) => {
+            dispatch(bootstrapProviderResponse(boostrapResponse.payload));
+          });
+        }
+      });
+    },
+
+    createAzureProvider: (name, config, regionFormVals) => {
+      Object.keys(config).forEach((key) => { if (typeof config[key] === 'string' || config[key] instanceof String) config[key] = config[key].trim(); });
+      Object.keys(regionFormVals).forEach((key) => { if (typeof regionFormVals[key] === 'string' || regionFormVals[key] instanceof String) regionFormVals[key] = regionFormVals[key].trim(); });
+      dispatch(createProvider('azu', name.trim(), config)).then((response) => {
+        dispatch(createProviderResponse(response.payload));
+        if (response.payload.status === 200) {
+          dispatch(fetchCloudMetadata());
+          const providerUUID = response.payload.data.uuid;
+          dispatch(bootstrapProvider(providerUUID, regionFormVals)).then((boostrapResponse) => {
             dispatch(bootstrapProviderResponse(boostrapResponse.payload));
           });
         }
@@ -80,6 +97,7 @@ const mapDispatchToProps = (dispatch) => {
           dispatch(deleteProviderSuccess(response.payload));
           dispatch(fetchCloudMetadata());
           dispatch(reset('awsConfigForm'));
+          // TODO: maybe need to reset azure form as well
         }
       });
     },
@@ -88,8 +106,8 @@ const mapDispatchToProps = (dispatch) => {
       dispatch(resetProviderBootstrap());
     },
 
-    // Valid Provider Types are
-    // deleteGCPProvider, deleteAWSProvider
+    // Valid Provider Types are:
+    // deleteGCPProvider, deleteAWSProvider, deleteAzureProvider
     showDeleteProviderModal: (providerType) => {
       dispatch(openDialog(providerType));
     },
@@ -147,6 +165,7 @@ const mapStateToProps = (state) => {
     modal: state.modal,
     cloud: state.cloud,
     tasks: state.tasks,
+    featureFlags: state.customer.currentCustomer?.data?.features,
   };
 };
 

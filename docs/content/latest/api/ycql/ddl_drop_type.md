@@ -1,7 +1,8 @@
 ---
-title: DROP TYPE
-summary: Drop a user-defined data type
-description: DROP TYPE
+title: DROP TYPE statement [YCQL]
+headerTitle: DROP TYPE
+linkTitle: DROP TYPE
+description: Use the DROP TYPE statement to remove an existing user-defined data type.
 menu:
   latest:
     parent: api-cassandra
@@ -15,7 +16,7 @@ showAsideToc: true
 
 ## Synopsis
 
-The `DROP TYPE` statement removes an existing user-defined data type.
+Use the `DROP TYPE` statement to remove an existing user-defined data type.
 
 ## Syntax
 
@@ -40,15 +41,14 @@ Where
 ## Examples
 
 ```sql
-cqlsh:example> CREATE TYPE person(first_name TEXT, last_name TEXT, email TEXT);
+ycqlsh:example> CREATE TYPE person(first_name TEXT, last_name TEXT, email TEXT);
 ```
 
 ```sql
-cqlsh:example> DROP TYPE person;
+ycqlsh:example> DROP TYPE person;
 ```
 
 ## See also
 
-[`CREATE TABLE`](../ddl_create_table)
-[`DROP TYPE`](../ddl_drop_keyspace)
-[Other CQL Statements](..)
+- [`CREATE TABLE`](../ddl_create_table)
+- [`DROP TYPE`](../ddl_drop_keyspace)

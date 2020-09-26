@@ -1,7 +1,8 @@
 ---
-title: Build a Python application
-linkTitle: Build a Python application
-description: Build a Python application
+title: Build a Python application that uses SQLAlchemy and YSQL
+headerTitle: Build a Python application
+linkTitle: Python
+description: Build a Python e-commerce application that uses SQLAlchemy and YSQL.
 menu:
   latest:
     parent: build-apps
@@ -13,22 +14,27 @@ isTocNested: true
 showAsideToc: true
 ---
 
-
 <ul class="nav nav-tabs-alt nav-tabs-yb">
   <li >
-    <a href="/latest/quick-start/build-apps/python/ysql-psycopg2" class="nav-link">
+    <a href="{{< relref "./ysql-psycopg2.md" >}}" class="nav-link">
       <i class="icon-postgres" aria-hidden="true"></i>
       YSQL - psycopg2
     </a>
   </li>
   <li >
-    <a href="/latest/quick-start/build-apps/python/ysql-sqlalchemy" class="nav-link active">
+    <a href="{{< relref "./ysql-aiopg.md" >}}" class="nav-link">
+      <i class="icon-postgres" aria-hidden="true"></i>
+      YSQL - aiopg
+    </a>
+  </li>
+  <li >
+    <a href="" class="nav-link active">
       <i class="icon-postgres" aria-hidden="true"></i>
       YSQL - SQL Alchemy
     </a>
   </li>
   <li>
-    <a href="/latest/quick-start/build-apps/python/ycql" class="nav-link">
+    <a href="{{< relref "./ycql.md" >}}" class="nav-link">
       <i class="icon-cassandra" aria-hidden="true"></i>
       YCQL
     </a>
@@ -37,10 +43,10 @@ showAsideToc: true
 
 This SQLAlchemy ORM example, running on Python, implements a simple REST API server for an e-commerce application scenario. Database access in this application is managed through [SQL Alchemy ORM](https://docs.sqlalchemy.org/en/13/orm/). The e-commerce database (`ysql-sqlalchemy`) includes the following tables:
 
-- `users` table — the users of the e-commerce site
-- `products` table — the products being sold
-- `orders` table — the orders placed by the users
-- `orderline` table — each line item of an order
+- `users`: the users of the e-commerce site
+- `products`: the products being sold
+- `orders`: the orders placed by the users
+- `orderline`: each line item of an order
 
 The source for this application can be found in the [`python/sqlalchemy` directory](https://github.com/yugabyte/orm-examples/tree/master/python/sqlalchemy) of Yugabyte's [Using ORMs with YugabyteDB](https://github.com/yugabyte/orm-examples) GitHub repository.
 
@@ -61,7 +67,7 @@ Python 3 is installed
 Python packages (dependencies) are installed
 
 - [SQLAlchemy (`SQLAlchemy`)](https://www.sqlalchemy.org/)
-- [Psycopg2 (`psycopg2-binary`)](http://initd.org/psycopg/)
+- [psycopg2 (`psycopg2-binary`)](http://initd.org/psycopg/)
 - [JSONpickle (`jsonpickle`)](https://jsonpickle.github.io/)
 
 To quickly install these three packages, run the following command.
@@ -86,7 +92,7 @@ import logging
 
 listen_port = 8080
 db_user = 'yugabyte'
-db_password = None
+db_password = 'yugabyte'
 database = 'ysql_sqlalchemy'
 schema = 'ysql_sqlalchemy'
 db_host = 'localhost'

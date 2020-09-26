@@ -19,12 +19,12 @@ namespace master {
 
 SystemTablet::SystemTablet(const Schema& schema, std::unique_ptr<YQLVirtualTable> yql_virtual_table,
                            const TabletId& tablet_id)
-    : schema_(schema),
+    : schema_(std::make_shared<Schema>(schema)),
       yql_virtual_table_(std::move(yql_virtual_table)),
       tablet_id_(tablet_id) {
 }
 
-const Schema& SystemTablet::SchemaRef(const std::string& table_id) const {
+yb::SchemaPtr SystemTablet::GetSchema(const std::string& table_id) const {
   // table_id is ignored. It should match the system table's id.
   return schema_;
 }
@@ -39,14 +39,6 @@ TableType SystemTablet::table_type() const {
 
 const TabletId& SystemTablet::tablet_id() const {
   return tablet_id_;
-}
-
-Status SystemTablet::RegisterReaderTimestamp(HybridTime read_point) {
-  return Status::OK();
-}
-
-void SystemTablet::UnregisterReader(HybridTime read_point) {
-  // NOOP.
 }
 
 HybridTime SystemTablet::DoGetSafeTime(

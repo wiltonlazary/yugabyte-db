@@ -26,21 +26,15 @@ namespace pggate {
 
 class PgDelete : public PgDmlWrite {
  public:
-  // Public types.
-  typedef scoped_refptr<PgDelete> ScopedRefPtr;
-  typedef scoped_refptr<const PgDelete> ScopedRefPtrConst;
-
-  typedef std::unique_ptr<PgDelete> UniPtr;
-  typedef std::unique_ptr<const PgDelete> UniPtrConst;
-
-  // Constructors.
-  PgDelete(PgSession::ScopedRefPtr pg_session, const PgObjectId& table_id, bool is_single_row_txn);
-  virtual ~PgDelete();
+  PgDelete(PgSession::ScopedRefPtr pg_session, const PgObjectId& table_id, bool is_single_row_txn)
+      : PgDmlWrite(std::move(pg_session), table_id, is_single_row_txn) {}
 
   StmtOp stmt_op() const override { return StmtOp::STMT_DELETE; }
 
  private:
-  void AllocWriteRequest() override;
+  std::unique_ptr<client::YBPgsqlWriteOp> AllocWriteOperation() const override {
+    return target_desc_->NewPgsqlDelete();
+  }
 };
 
 }  // namespace pggate

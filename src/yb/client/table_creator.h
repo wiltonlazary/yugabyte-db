@@ -51,6 +51,9 @@ class YBTableCreator {
   // not colocated.
   YBTableCreator& colocated(const bool colocated);
 
+  // Tablegroup ID - will be ignored by catalog manager if the table is not in a tablegroup.
+  YBTableCreator& tablegroup_id(const std::string& tablegroup_id);
+
   // Sets the schema with which to create the table. Must remain valid for
   // the lifetime of the builder. Required.
   YBTableCreator& schema(const YBSchema* schema);
@@ -82,16 +85,24 @@ class YBTableCreator {
   // range partitioning.
   //
   // Optional.
-  YBTableCreator& set_range_partition_columns(const std::vector<std::string>& columns);
+  YBTableCreator& set_range_partition_columns(
+      const std::vector<std::string>& columns,
+      const std::vector<std::string>& split_rows = {});
 
   // For index table: sets the indexed table id of this index.
   YBTableCreator& indexed_table_id(const std::string& id);
+
+  // For index table: uses the old style request without index_info.
+  YBTableCreator& TEST_use_old_style_create_request();
 
   // For index table: sets whether this is a local index.
   YBTableCreator& is_local_index(bool is_local_index);
 
   // For index table: sets whether this is a unique index.
   YBTableCreator& is_unique_index(bool is_unique_index);
+
+  // For index table: sets whether to do online schema migration when creating index.
+  YBTableCreator& skip_index_backfill(const bool skip_index_backfill);
 
   // For index table: indicates whether this index has mangled column name.
   // - Older index supports only ColumnRef, and its name is identical with colum name.
@@ -161,10 +172,17 @@ class YBTableCreator {
   // the data-table being indexed.
   IndexInfoPB index_info_;
 
+  bool skip_index_backfill_ = false;
+
+  bool TEST_use_old_style_create_request_ = false;
+
   MonoDelta timeout_;
   bool wait_ = true;
 
   bool colocated_ = true;
+
+  // The tablegroup id to assign (if a table is in a tablegroup).
+  std::string tablegroup_id_;
 
   DISALLOW_COPY_AND_ASSIGN(YBTableCreator);
 };

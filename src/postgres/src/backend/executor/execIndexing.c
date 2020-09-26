@@ -321,6 +321,8 @@ ExecInsertIndexTuples(TupleTableSlot *slot,
 			continue;
 
 		indexInfo = indexInfoArray[i];
+		Assert(indexInfo->ii_ReadyForInserts ==
+			   indexRelation->rd_index->indisready);
 
 		/*
 		 * No need to update YugaByte primary key which is intrinic part of
@@ -470,7 +472,7 @@ ExecInsertIndexTuples(TupleTableSlot *slot,
  *		This routine takes care of deleting index tuples
  *		from all the relations indexing the result relation
  *		when a heap tuple is updated or deleted in the result relation.
- *      This is used only for relations and indexes backed by YugaByte DB.
+ *      This is used only for relations and indexes backed by YugabyteDB.
  * ----------------------------------------------------------------
  */
 void
@@ -530,9 +532,21 @@ ExecDeleteIndexTuples(Datum ybctid, HeapTuple tuple, EState *estate)
 			continue;
 
 		indexInfo = indexInfoArray[i];
+		Assert(indexInfo->ii_ReadyForInserts ==
+			   indexRelation->rd_index->indisready);
 
-		/* If the index is marked as read-only, ignore it */
-		if (!indexInfo->ii_ReadyForInserts)
+		/*
+		 * If the index is not ready for deletes and index backfill is enabled,
+		 * ignore it
+		 */
+		if (!YBCGetDisableIndexBackfill()
+				&& !indexRelation->rd_index->indislive)
+			continue;
+		/*
+		 * If the index is marked as read-only and index backfill is disabled,
+		 * ignore it
+		 */
+		if (YBCGetDisableIndexBackfill() && !indexInfo->ii_ReadyForInserts)
 			continue;
 
 		/* Check for partial index */
@@ -648,6 +662,8 @@ ExecCheckIndexConstraints(TupleTableSlot *slot,
 			continue;
 
 		indexInfo = indexInfoArray[i];
+		Assert(indexInfo->ii_ReadyForInserts ==
+			   indexRelation->rd_index->indisready);
 
 		if (!indexInfo->ii_Unique && !indexInfo->ii_ExclusionOps)
 			continue;

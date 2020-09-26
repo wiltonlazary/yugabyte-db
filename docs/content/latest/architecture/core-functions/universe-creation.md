@@ -1,7 +1,8 @@
 ---
 title: Universe creation
+headerTitle: Universe creation
 linkTitle: Universe creation
-description: Universe creation
+description: Learn how YugabyteDB creates a universe with YB-TServer and YB-Master nodes.
 aliases:
   - /architecture/core-functions/universe-creation/
 menu:
@@ -29,9 +30,8 @@ their load, but no tablets would exist in the system yet.
 ## An example
 
 Let us illustrate this with our usual example of creating a 4-node YugabyteDB universe with a
-replication factor of 3. In order to do so, first the three masters are started in the create mode
-instructing them to that this is a brand new universe create. This is done explicitly to prevent
-accidental errors in creating a universe while it is already running.
+replication factor of 3. First the three masters are started in create mode. This is done explicitly
+to prevent accidental errors in creating a universe while it is already running.
 
 ![create_universe_masters](/images/architecture/create_universe_masters.png)
 

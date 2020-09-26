@@ -4,10 +4,10 @@ import React, { Component, Fragment } from 'react';
 import PropTypes from 'prop-types';
 import 'react-bootstrap-table/css/react-bootstrap-table.css';
 import { YBModal } from '../../common/forms/fields';
-import {getPromiseState} from 'utils/PromiseUtils';
+import {getPromiseState} from '../../../utils/PromiseUtils';
 import { connect } from 'react-redux';
 import { isEmptyObject } from "../../../utils/ObjectUtils";
-import { YBCopyButton } from 'components/common/descriptors';
+import { YBCopyButton } from '../../../components/common/descriptors';
 import { MenuItem } from 'react-bootstrap';
 
 import './NodeConnectModal.scss';
@@ -30,8 +30,8 @@ class NodeConnectModal extends Component {
     this.state = { showConnectModal: false };
   }
 
-  toggleConnectModal = () => {
-    this.setState({showConnectModal: !this.state.showConnectModal});
+  toggleConnectModal = (value) => {
+    this.setState({showConnectModal: value});
   };
 
   render() {
@@ -50,16 +50,17 @@ class NodeConnectModal extends Component {
       return <span/>;
     }
     const accessKeyInfo = accessKey.keyInfo;
-    const privateSSHCommand = `sudo ssh -i ${ accessKeyInfo.privateKey } -ostricthostkeychecking=no -p 54422 yugabyte@${nodeIPs.privateIP}`;
+    const sshPort = accessKeyInfo.sshPort || 54422;
+    const privateSSHCommand = `sudo ssh -i ${ accessKeyInfo.privateKey } -ostricthostkeychecking=no -p ${sshPort} yugabyte@${nodeIPs.privateIP}`;
     const btnId = _.uniqueId('node_action_btn_');
     return (
       <Fragment>
-        <MenuItem eventKey={btnId} onClick={this.toggleConnectModal}>
+        <MenuItem eventKey={btnId} onClick={() => this.toggleConnectModal(true)}>
           {label}
         </MenuItem>
         <YBModal title={"Access your node"}
                  visible={this.state.showConnectModal}
-                 onHide={this.toggleConnectModal}
+                 onHide={() => this.toggleConnectModal(false)}
                  showCancelButton={true} cancelLabel={"OK"}>
           <pre className={"node-command"}>
             <code>{privateSSHCommand}</code>

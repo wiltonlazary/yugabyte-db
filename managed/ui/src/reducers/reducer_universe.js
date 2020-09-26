@@ -17,11 +17,23 @@ import { FETCH_UNIVERSE_INFO, RESET_UNIVERSE_INFO, FETCH_UNIVERSE_INFO_RESPONSE,
   CREATE_UNIVERSE_BACKUP, CREATE_UNIVERSE_BACKUP_RESPONSE, GET_HEALTH_CHECK,
   GET_HEALTH_CHECK_RESPONSE, ADD_READ_REPLICA, ADD_READ_REPLICA_RESPONSE, EDIT_READ_REPLICA,
   EDIT_READ_REPLICA_RESPONSE, DELETE_READ_REPLICA, DELETE_READ_REPLICA_RESPONSE,
-  IMPORT_UNIVERSE, IMPORT_UNIVERSE_RESPONSE, IMPORT_UNIVERSE_RESET, IMPORT_UNIVERSE_INIT
+  IMPORT_UNIVERSE, IMPORT_UNIVERSE_RESPONSE, IMPORT_UNIVERSE_RESET, IMPORT_UNIVERSE_INIT,
+  UPDATE_BACKUP_STATE, UPDATE_BACKUP_STATE_RESPONSE, SET_ALERTS_CONFIG, SET_ALERTS_CONFIG_RESPONSE
 } from '../actions/universe';
 import _ from 'lodash';
-import { getInitialState, setInitialState, setLoadingState, setPromiseResponse, setSuccessState } from 'utils/PromiseUtils.js';
-import { isNonEmptyArray, isNonEmptyObject } from 'utils/ObjectUtils.js';
+import {
+  getInitialState,
+  setInitialState,
+  setLoadingState,
+  setPromiseResponse,
+  setSuccessState
+} from '../utils/PromiseUtils.js';
+import { isNonEmptyArray, isNonEmptyObject } from '../utils/ObjectUtils.js';
+import {
+  GET_NODE_INSTANCE_LIST,
+  GET_NODE_INSTANCE_LIST_READ_REPLICA,
+  GET_NODE_INSTANCE_LIST_RESPONSE, GET_NODE_INSTANCE_LIST_RESPONSE_READ_REPLICA
+} from "../actions/cloud";
 
 const INITIAL_STATE = {
   currentUniverse: getInitialState({}),
@@ -47,7 +59,9 @@ const INITIAL_STATE = {
   createUniverseBackup: getInitialState({}),
   universeBackupList: getInitialState({}),
   healthCheck: getInitialState({}),
-  universeImport: getInitialState({})
+  universeImport: getInitialState({}),
+  alertsConfig: getInitialState({}),
+  backupState: getInitialState({})
 };
 
 export default function(state = INITIAL_STATE, action) {
@@ -112,6 +126,14 @@ export default function(state = INITIAL_STATE, action) {
       return setPromiseResponse(state, "universeMasterLeader", action);
     case RESET_MASTER_LEADER:
       return { ...state, universeMasterLeader: getInitialState({})};
+    case GET_NODE_INSTANCE_LIST:
+      return setLoadingState(state, "nodeInstanceList", []);
+    case GET_NODE_INSTANCE_LIST_RESPONSE:
+      return setPromiseResponse(state, "nodeInstanceList", action);
+    case GET_NODE_INSTANCE_LIST_READ_REPLICA:
+      return setLoadingState(state, "replicaNodeInstanceList", []);
+    case GET_NODE_INSTANCE_LIST_RESPONSE_READ_REPLICA:
+      return setPromiseResponse(state, "replicaNodeInstanceList", action);
 
     // Universe Tasks Operations
     case FETCH_UNIVERSE_TASKS:
@@ -130,7 +152,7 @@ export default function(state = INITIAL_STATE, action) {
       return setSuccessState(state, "universeConfigTemplate", action.payload.data);
     case CONFIGURE_UNIVERSE_TEMPLATE_LOADING:
       return setLoadingState(state, "universeConfigTemplate");
-      
+
     case CONFIGURE_UNIVERSE_RESOURCES:
       return setLoadingState(state, "universeResourceTemplate", {});
     case CONFIGURE_UNIVERSE_RESOURCES_RESPONSE:
@@ -152,7 +174,8 @@ export default function(state = INITIAL_STATE, action) {
         isNonEmptyArray(universeReadWriteMetricList) &&
         universeReadWriteMetricList.forEach(function(metricData){
           for(let counter = 0; counter < currentUniverseList.length; counter++) {
-            if (currentUniverseList[counter].universeDetails.nodePrefix.trim() === metricData.name.trim()) {
+            const nodePrefix = currentUniverseList[counter].universeDetails.nodePrefix;
+            if (nodePrefix && nodePrefix.trim() === metricData.name.trim()) {
               if (metricData.labels["service_method"] === "Read") {
                 currentUniverseList[counter]["readData"] = metricData;
               } else if (metricData.labels["service_method"] === "Write") {
@@ -181,7 +204,7 @@ export default function(state = INITIAL_STATE, action) {
     case FETCH_UNIVERSE_BACKUPS_RESPONSE:
       return setPromiseResponse(state, "universeBackupList", action);
     case RESET_UNIVERSE_BACKUPS:
-      return { ...state, error: null, "universeBackupList": setInitialState({})};
+      return setInitialState(state, 'universeBackupList', []);
 
     case CREATE_UNIVERSE_BACKUP:
       return setLoadingState(state, "createUniverseBackup", {});
@@ -203,6 +226,14 @@ export default function(state = INITIAL_STATE, action) {
       return { ...state, universeImport: getInitialState([])};
     case IMPORT_UNIVERSE_RESPONSE:
       return setPromiseResponse(state, "universeImport", action);
+    case SET_ALERTS_CONFIG:
+      return { ...state, alertsConfig: getInitialState([])};
+    case SET_ALERTS_CONFIG_RESPONSE:
+      return setPromiseResponse(state, "alertsConfig", action);
+    case UPDATE_BACKUP_STATE:
+      return { ...state, backupState: getInitialState([])};
+    case UPDATE_BACKUP_STATE_RESPONSE:
+      return setPromiseResponse(state, "backupState", action);
 
     default:
       return state;

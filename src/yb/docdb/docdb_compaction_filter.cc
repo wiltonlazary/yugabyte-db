@@ -54,14 +54,17 @@ DocDBCompactionFilter::~DocDBCompactionFilter() {
 FilterDecision DocDBCompactionFilter::Filter(
     int level, const Slice& key, const Slice& existing_value, std::string* new_value,
     bool* value_changed) {
-  auto result = CHECK_RESULT(const_cast<DocDBCompactionFilter*>(this)->DoFilter(
-      level, key, existing_value, new_value, value_changed));
-  if (result != FilterDecision::kKeep) {
+  auto result = const_cast<DocDBCompactionFilter*>(this)->DoFilter(
+      level, key, existing_value, new_value, value_changed);
+  if (!result.ok()) {
+    LOG(FATAL) << "Error filtering " << key.ToDebugString() << ": " << result.status();
+  }
+  if (*result != FilterDecision::kKeep) {
     VLOG(3) << "Discarding key: " << BestEffortDocDBKeyToStr(key);
   } else {
     VLOG(4) << "Keeping key: " << BestEffortDocDBKeyToStr(key);
   }
-  return result;
+  return *result;
 }
 
 Result<FilterDecision> DocDBCompactionFilter::DoFilter(
@@ -204,10 +207,12 @@ Result<FilterDecision> DocDBCompactionFilter::DoFilter(
 
   auto overwrite_ht = isTtlRow ? prev_overwrite_ht : max(prev_overwrite_ht, ht);
 
-  ValueType value_type;
-  MonoDelta ttl;
-  RETURN_NOT_OK(Value::DecodePrimitiveValueType(existing_value, &value_type, nullptr, &ttl));
-  const Expiration curr_exp(ht.hybrid_time(), ttl);
+  Value value;
+  Slice value_slice = existing_value;
+  RETURN_NOT_OK(value.DecodeControlFields(&value_slice));
+  const auto value_type = static_cast<ValueType>(
+      value_slice.FirstByteOr(ValueTypeAsChar::kInvalid));
+  const Expiration curr_exp(ht.hybrid_time(), value.ttl());
 
   // If within the merge block.
   //     If the row is a TTL row, delete it.
@@ -256,7 +261,7 @@ Result<FilterDecision> DocDBCompactionFilter::DoFilter(
   if (has_expired) {
     // This is consistent with the condition we're testing for deletes at the bottom of the function
     // because ht_at_or_below_cutoff is implied by has_expired.
-    if (is_major_compaction_) {
+    if (is_major_compaction_ && !retention_.retain_delete_markers_in_major_compaction) {
       return FilterDecision::kDiscard;
     }
 
@@ -266,9 +271,6 @@ Result<FilterDecision> DocDBCompactionFilter::DoFilter(
     *new_value = Value::EncodedTombstone();
   } else if (within_merge_block_) {
     *value_changed = true;
-    Value value;
-    Slice value_slice = existing_value;
-    RETURN_NOT_OK(value.DecodeControlFields(&value_slice));
 
     if (expiration.ttl != Value::kMaxTtl) {
       expiration.ttl += MonoDelta::FromMicroseconds(
@@ -282,14 +284,31 @@ Result<FilterDecision> DocDBCompactionFilter::DoFilter(
     // We are reusing the existing encoded value without decoding/encoding it.
     value.EncodeAndAppend(new_value, &value_slice);
     within_merge_block_ = false;
+  } else if (value.intent_doc_ht().is_valid() && ht.hybrid_time() < history_cutoff) {
+    // Cleanup intent doc hybrid time when we don't need it anymore.
+    // See https://github.com/yugabyte/yugabyte-db/issues/4535 for details.
+    value.ClearIntentDocHt();
+
+    new_value->clear();
+
+    // We are reusing the existing encoded value without decoding/encoding it.
+    value.EncodeAndAppend(new_value, &value_slice);
   }
 
+  // If we are backfilling an index table, we want to preserve the delete markers in the table
+  // until the backfill process is completed. For other normal use cases, delete markers/tombstones
+  // can be cleaned up on a major compaction.
+  // retention_.retain_delete_markers_in_major_compaction will be set to true until the index
+  // backfill is complete.
+  //
   // Tombstones at or below the history cutoff hybrid_time can always be cleaned up on full (major)
   // compactions. However, we do need to update the overwrite hybrid time stack in this case (as we
   // just did), because this deletion (tombstone) entry might be the only reason for cleaning up
   // more entries appearing at earlier hybrid times.
-  return value_type == ValueType::kTombstone && is_major_compaction_ ? FilterDecision::kDiscard
-                                                                     : FilterDecision::kKeep;
+  return value_type == ValueType::kTombstone && is_major_compaction_ &&
+                 !retention_.retain_delete_markers_in_major_compaction
+             ? FilterDecision::kDiscard
+             : FilterDecision::kKeep;
 }
 
 void DocDBCompactionFilter::AssignPrevSubDocKey(
@@ -336,11 +355,9 @@ const char* DocDBCompactionFilterFactory::Name() const {
 
 HistoryRetentionDirective ManualHistoryRetentionPolicy::GetRetentionDirective() {
   std::lock_guard<std::mutex> lock(deleted_cols_mtx_);
-  return {
-    history_cutoff_.load(std::memory_order_acquire),
-    std::make_shared<ColumnIds>(deleted_cols_),
-    table_ttl_.load(std::memory_order_acquire)
-  };
+  return {history_cutoff_.load(std::memory_order_acquire),
+          std::make_shared<ColumnIds>(deleted_cols_), table_ttl_.load(std::memory_order_acquire),
+          ShouldRetainDeleteMarkersInMajorCompaction::kFalse};
 }
 
 void ManualHistoryRetentionPolicy::SetHistoryCutoff(HybridTime history_cutoff) {

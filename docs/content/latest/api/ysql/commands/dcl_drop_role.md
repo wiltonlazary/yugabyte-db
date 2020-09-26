@@ -1,8 +1,8 @@
 ---
-title: DROP ROLE
+title: DROP ROLE statement [YSQL]
+headerTitle: DROP ROLE
 linkTitle: DROP ROLE
-description: DROP ROLE
-summary: Roles (users and groups)
+description: Use the DROP ROLE statement to remove the specified roles.
 menu:
   latest:
     identifier: api-ysql-commands-drop-role
@@ -63,8 +63,7 @@ yugabyte=# DROP ROLE John;
 
 ## See also
 
-[`ALTER ROLE`](../dcl_alter_role)
-[`CREATE ROLE`](../dcl_create_role)
-[`GRANT`](../dcl_grant)
-[`REVOKE`](../dcl_revoke)
-[Other YSQL Statements](..)
+- [`ALTER ROLE`](../dcl_alter_role)
+- [`CREATE ROLE`](../dcl_create_role)
+- [`GRANT`](../dcl_grant)
+- [`REVOKE`](../dcl_revoke)

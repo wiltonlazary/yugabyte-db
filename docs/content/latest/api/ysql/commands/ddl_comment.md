@@ -1,7 +1,8 @@
-title: COMMENT
+---
+title: COMMENT statement [YSQL]
+headerTitle: COMMENT
 linkTitle: COMMENT
-summary: COMMENT
-description: COMMENT
+description: Use the COMMENT statement to set, update, or remove a comment on a database object.
 menu:
   latest:
     identifier: api-ysql-commands-comment
@@ -48,7 +49,7 @@ To remove a comment, set the value to `NULL`.
 
 ### *comment_on*
 
-#### COMMMENT ON
+#### COMMENT ON
 
 Add or change a comment about a database object. To remove a comment, set the value to `NULL`.
 
@@ -58,14 +59,16 @@ Add or change a comment about a database object. To remove a comment, set the va
 
 ### Add a comment
 
-```
+```postgresql
 COMMENT ON DATABASE postgres IS 'Default database';
 ```
 
-```
+```postgresql
 COMMENT ON INDEX index_name IS 'Special index';
 ```
 
 ### Remove a comment
 
+```postgresql
 COMMENT ON TABLE some_table IS NULL;
+```

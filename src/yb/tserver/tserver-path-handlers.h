@@ -63,28 +63,22 @@ class TabletServerPathHandlers {
 
  private:
   void HandleTablesPage(const Webserver::WebRequest& req,
-                        std::stringstream* output);
+                        Webserver::WebResponse* resp);
   void HandleTabletsPage(const Webserver::WebRequest& req,
-                         std::stringstream* output);
-  void HandleTabletPage(const Webserver::WebRequest& req,
-                        std::stringstream* output);
-  void HandleTransactionsPage(const Webserver::WebRequest& req,
-                              std::stringstream* output);
-  void HandleTabletSVGPage(const Webserver::WebRequest& req,
-                           std::stringstream* output);
-  void HandleLogAnchorsPage(const Webserver::WebRequest& req,
-                            std::stringstream* output);
-  void HandleConsensusStatusPage(const Webserver::WebRequest& req,
-                                 std::stringstream* output);
+                         Webserver::WebResponse* resp);
+  void HandleOperationsPage(const Webserver::WebRequest& req,
+                            Webserver::WebResponse* resp);
   void HandleDashboardsPage(const Webserver::WebRequest& req,
-                            std::stringstream* output);
+                            Webserver::WebResponse* resp);
   void HandleMaintenanceManagerPage(const Webserver::WebRequest& req,
-                                    std::stringstream* output);
+                                    Webserver::WebResponse* resp);
+  void HandleHealthCheck(const Webserver::WebRequest& req,
+                         Webserver::WebResponse* resp);
   std::string ConsensusStatePBToHtml(const consensus::ConsensusStatePB& cstate) const;
   std::string GetDashboardLine(const std::string& link,
                                const std::string& text, const std::string& desc);
 
-  TabletServer* tserver_;
+  TabletServer* const tserver_;
 
   DISALLOW_COPY_AND_ASSIGN(TabletServerPathHandlers);
 };

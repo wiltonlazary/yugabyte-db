@@ -2,12 +2,11 @@
 
 import React, { Component, Fragment } from 'react';
 import PropTypes from 'prop-types';
-import { BulkImportContainer, DropTableContainer, CreateBackupContainer, RestoreBackupContainer } from 'components/tables';
-import { ImportReleaseContainer, UpdateReleaseContainer } from 'components/releases';
+import { BulkImportContainer, DropTableContainer, CreateBackupContainer, RestoreBackupContainer, DeleteBackupContainer } from '../../../components/tables';
+import { ImportReleaseContainer, UpdateReleaseContainer } from '../../../components/releases';
 import {  MenuItem } from 'react-bootstrap';
 import { YBLabelWithIcon } from '../../common/descriptors';
 import { YBButton } from '../../common/forms/fields';
-
 import _ from 'lodash';
 
 export default class TableAction extends Component {
@@ -25,8 +24,12 @@ export default class TableAction extends Component {
     isMenuItem: PropTypes.bool,
     btnClass: PropTypes.string,
     onModalSubmit: PropTypes.func,
-    actionType: PropTypes.oneOf(['drop', 'import', 'create-backup', 'restore-backup',
-      'import-release', 'active-release', 'disable-release', 'delete-release'])
+    actionType: PropTypes.oneOf([
+      'drop', 'import', 'create-backup',
+      'create-scheduled-backup', 'restore-backup', 'import-release',
+      'active-release', 'disable-release', 'delete-release',
+      'delete-backup'
+    ])
   };
 
   static defaultProps = {
@@ -72,6 +75,15 @@ export default class TableAction extends Component {
         onHide = {this.closeModal}
         tableInfo = {this.state.selectedRow}
       />);
+    } else if (actionType === "create-scheduled-backup") {
+      btnLabel = "Create Scheduled Backup";
+      btnIcon = "fa fa-calendar-o";
+      modalContainer = (<CreateBackupContainer
+        visible={this.state.showModal}
+        onHide={this.closeModal}
+        tableInfo={this.state.selectedRow}
+        isScheduled
+      />);
     } else if (actionType === "create-backup") {
       btnLabel = "Create Backup";
       btnIcon = "fa fa-upload";
@@ -95,6 +107,15 @@ export default class TableAction extends Component {
         visible={this.state.showModal}
         onHide={this.closeModal}
         onModalSubmit={this.props.onModalSubmit}
+      />);
+    }
+    else if (actionType === "delete-backup") {
+      btnLabel = "Delete Backup";
+      btnIcon = "fa fa-trash";
+      modalContainer = (<DeleteBackupContainer
+        visible = {this.state.showModal}
+        onHide = { this.closeModal}
+        tableInfo = {this.state.selectedRow}
       />);
     } else if (["disable-release", "delete-release", "active-release"].includes(actionType)) {
       let action;
@@ -142,8 +163,9 @@ export default class TableAction extends Component {
     }
     return (
       <div className={this.props.className}>
-        <YBButton btnText={btnLabel} btnIcon={btnIcon}
-                btnClass={'btn ' + this.props.btnClass} onClick={this.openModal} />
+        <YBButton btnText={btnLabel} btnIcon={btnIcon} disabled={disabled}
+                btnClass={'btn ' + this.props.btnClass}
+                onClick={disabled ? null : this.openModal} />
         {modalContainer}
       </div>
     );

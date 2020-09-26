@@ -1,8 +1,7 @@
 // Copyright (c) YugaByte, Inc.
 
 import React, { Component } from 'react';
-import { isObject } from 'lodash';
-import { isNonEmptyArray } from 'utils/ObjectUtils';
+import { isNonEmptyArray } from '../../../../utils/ObjectUtils';
 import YBRadioButton from './YBRadioButton';
 import { YBLabel } from '../../descriptors';
 import _ from 'lodash';
@@ -17,10 +16,13 @@ export default class YBRadioButtonBar extends Component {
   }
 
   radioButtonChecked = event => {
-    const {onSelect, isReadOnly} = this.props;
-    if (!isReadOnly && onSelect) {
+    const {onSelect, isReadOnly, input} = this.props;
+    if (!isReadOnly) {
+      if (onSelect) {
+        onSelect(event.target.value);
+      }
       this.setState({fieldValue: event.target.value});
-      onSelect(event.target.value);
+      input.onChange(event.target.value);
     }
   };
 
@@ -31,7 +33,7 @@ export default class YBRadioButtonBar extends Component {
       let value, display;
       if (isNonEmptyArray(option)) {
         [value, display] = option;
-      } else if (isObject(option)) {
+      } else if (_.isObject(option)) {
         value = option.value;
         display = option.display;
       } else {
@@ -80,7 +82,7 @@ export class YBRadioButtonBarDefault extends Component {
       let value, display;
       if (isNonEmptyArray(option)) {
         [value, display] = option;
-      } else if (isObject(option)) {
+      } else if (_.isObject(option)) {
         value = option.value;
         display = option.display;
       } else {

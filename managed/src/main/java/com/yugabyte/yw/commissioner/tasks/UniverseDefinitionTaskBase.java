@@ -17,11 +17,8 @@ import java.util.stream.Collectors;
 import com.google.common.collect.ImmutableSet;
 
 import com.google.inject.Inject;
-import com.yugabyte.yw.commissioner.UserTaskDetails;
 import com.yugabyte.yw.commissioner.tasks.params.NodeTaskParams;
-import com.yugabyte.yw.commissioner.tasks.subtasks.KubernetesCommandExecutor;
-import com.yugabyte.yw.commissioner.tasks.subtasks.KubernetesWaitForPod;
-import com.yugabyte.yw.commissioner.tasks.subtasks.KubernetesWaitForPod.CommandType;
+import com.yugabyte.yw.forms.UniverseTaskParams;
 import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.CustomerConfig;
 import com.yugabyte.yw.models.NodeInstance;
@@ -191,7 +188,7 @@ public abstract class UniverseDefinitionTaskBase extends UniverseTaskBase {
       this.name = name;
       this.index = index;
     }
-    
+
     public String toString() {
       return "{name: " + name + ", index: " + index + "}";
     }
@@ -332,7 +329,11 @@ public abstract class UniverseDefinitionTaskBase extends UniverseTaskBase {
   }
 
   public void updateOnPremNodeUuids(Universe universe) {
-    LOG.debug("Update on prem nodes in universe {}.", taskParams().universeUUID);
+    LOG.info(
+      "Selecting prem nodes for universe {} ({}).",
+      universe.name,
+      taskParams().universeUUID
+    );
 
     UniverseDefinitionTaskParams universeDetails = universe.getUniverseDetails();
 
@@ -465,6 +466,35 @@ public abstract class UniverseDefinitionTaskBase extends UniverseTaskBase {
   }
 
   /**
+   * Creates a task list to update the disk size of the nodes.
+   *
+   * @param nodes : a collection of nodes that need to be updated.
+   */
+  public void createUpdateDiskSizeTasks(Collection<NodeDetails> nodes) {
+    SubTaskGroup subTaskGroup = new SubTaskGroup("InstanceActions", executor);
+    for (NodeDetails node : nodes) {
+      InstanceActions.Params params = new InstanceActions.Params();
+      UserIntent userIntent = taskParams().getClusterByUuid(node.placementUuid).userIntent;
+      // Add the node name.
+      params.nodeName = node.nodeName;
+      // Add device info.
+      params.deviceInfo = userIntent.deviceInfo;
+      // Add the universe uuid.
+      params.universeUUID = taskParams().universeUUID;
+      // Add the az uuid.
+      params.azUuid = node.azUuid;
+      // Set the InstanceType
+      params.instanceType = node.cloudInfo.instance_type;
+      // Create and add a task for this node.
+      InstanceActions task = new InstanceActions(NodeManager.NodeCommandType.Disk_Update);
+      task.initialize(params);
+      subTaskGroup.addTask(task);
+    }
+    subTaskGroup.setSubTaskGroupType(SubTaskGroupType.Provisioning);
+    subTaskGroupQueue.add(subTaskGroup);
+  }
+
+  /**
    * Creates a task list to start the tservers on the set of passed in nodes and adds it to the task
    * queue.
    *
@@ -551,6 +581,14 @@ public abstract class UniverseDefinitionTaskBase extends UniverseTaskBase {
       params.assignPublicIP = cloudInfo.assignPublicIP;
       params.useTimeSync = cloudInfo.useTimeSync;
       params.cmkArn = taskParams().cmkArn;
+      params.ipArnString = userIntent.awsArnString;
+      // Set the ports to provision a node to use
+      params.communicationPorts = UniverseTaskParams.CommunicationPorts
+        .exportToCommunicationPorts(node);
+      // Whether to install node_exporter on nodes or not.
+      params.extraDependencies.installNodeExporter =
+        taskParams().extraDependencies.installNodeExporter;
+
       // Create the Ansible task to setup the server.
       AnsibleSetupServer ansibleSetupServer = new AnsibleSetupServer();
       ansibleSetupServer.initialize(params);
@@ -578,6 +616,15 @@ public abstract class UniverseDefinitionTaskBase extends UniverseTaskBase {
   public SubTaskGroup createConfigureServerTasks(Collection<NodeDetails> nodes,
                                                  boolean isMasterInShellMode,
                                                  boolean updateMasterAddrsOnly) {
+    return createConfigureServerTasks(nodes, isMasterInShellMode,
+                                      updateMasterAddrsOnly /* updateMasterAddrs */,
+                                      false /* isMaster */);
+  }
+
+  public SubTaskGroup createConfigureServerTasks(Collection<NodeDetails> nodes,
+                                                 boolean isMasterInShellMode,
+                                                 boolean updateMasterAddrsOnly,
+                                                 boolean isMaster) {
     SubTaskGroup subTaskGroup = new SubTaskGroup("AnsibleConfigureServers", executor);
     for (NodeDetails node : nodes) {
       UserIntent userIntent = taskParams().getClusterByUuid(node.placementUuid).userIntent;
@@ -605,7 +652,10 @@ public abstract class UniverseDefinitionTaskBase extends UniverseTaskBase {
 
       params.allowInsecure = taskParams().allowInsecure;
       params.rootCA = taskParams().rootCA;
-      
+
+      // Development testing variable.
+      params.itestS3PackagePath = taskParams().itestS3PackagePath;
+
       UUID custUUID = Customer.get(Universe.get(taskParams().universeUUID).customerId).uuid;
 
       params.callhomeLevel = CustomerConfig.getCallhomeLevel(custUUID);
@@ -613,7 +663,11 @@ public abstract class UniverseDefinitionTaskBase extends UniverseTaskBase {
       params.updateMasterAddrsOnly = updateMasterAddrsOnly;
       if (updateMasterAddrsOnly) {
         params.type = UpgradeTaskType.GFlags;
-        params.setProperty("processType", ServerType.TSERVER.toString());
+        if (isMaster) {
+          params.setProperty("processType", ServerType.MASTER.toString());
+        } else {
+          params.setProperty("processType", ServerType.TSERVER.toString());
+        }
       }
       // Create the Ansible task to get the server info.
       AnsibleConfigureServers task = new AnsibleConfigureServers();

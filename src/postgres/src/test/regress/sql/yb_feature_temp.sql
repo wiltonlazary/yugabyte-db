@@ -257,9 +257,9 @@ CREATE TEMP TABLE temptest (col int);
 
 SELECT * FROM temptest;
 
--- Sleep a second as a wokaround due to bug github #1469.
+-- Sleep a second as a workaround due to bug github #1469.
 
-SELECT pg_sleep(1);
+SELECT pg_sleep(10);
 
 -- test temp table deletion
 
@@ -273,9 +273,9 @@ SELECT * FROM tempview;
 
 SELECT * FROM temptest;
 
--- Sleep a second as a wokaround due to bug github #1469.
+-- Sleep a second as a workaround due to bug github #1469.
 
-SELECT pg_sleep(1);
+SELECT pg_sleep(10);
 
 -- test temp table with indexes
 CREATE TEMP TABLE temptest (k int PRIMARY KEY, v1 int, v2 int);
@@ -297,6 +297,3 @@ DELETE FROM temptest WHERE k = 4;
 SELECT * FROM temptest WHERE k IN (1, 4) ORDER BY k;
 
 DROP TABLE temptest;
-
--- TODO(jason): remove when issue #1721 is closed or closing.
-DISCARD TEMP;

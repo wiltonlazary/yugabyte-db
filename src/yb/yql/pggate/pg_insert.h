@@ -26,21 +26,19 @@ namespace pggate {
 
 class PgInsert : public PgDmlWrite {
  public:
-  // Public types.
-  typedef scoped_refptr<PgInsert> ScopedRefPtr;
-  typedef scoped_refptr<const PgInsert> ScopedRefPtrConst;
-
-  typedef std::unique_ptr<PgInsert> UniPtr;
-  typedef std::unique_ptr<const PgInsert> UniPtrConst;
-
-  // Constructors.
-  PgInsert(PgSession::ScopedRefPtr pg_session, const PgObjectId& table_id, bool is_single_row_txn);
-  virtual ~PgInsert();
+  PgInsert(PgSession::ScopedRefPtr pg_session, const PgObjectId& table_id, bool is_single_row_txn)
+      : PgDmlWrite(std::move(pg_session), table_id, is_single_row_txn) {}
 
   StmtOp stmt_op() const override { return StmtOp::STMT_INSERT; }
 
+  void SetUpsertMode() {
+    write_req_->set_stmt_type(PgsqlWriteRequestPB::PGSQL_UPSERT);
+  }
+
  private:
-  void AllocWriteRequest() override;
+  std::unique_ptr<client::YBPgsqlWriteOp> AllocWriteOperation() const override {
+    return target_desc_->NewPgsqlInsert();
+  }
 };
 
 }  // namespace pggate

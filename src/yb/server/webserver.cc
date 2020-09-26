@@ -71,6 +71,8 @@
 #include "yb/util/env.h"
 #include "yb/util/flag_tags.h"
 #include "yb/util/net/net_util.h"
+#include "yb/util/scope_exit.h"
+#include "yb/util/status.h"
 #include "yb/util/url-coding.h"
 #include "yb/util/version_info.h"
 #include "yb/util/shared_lock.h"
@@ -107,7 +109,7 @@ Webserver::~Webserver() {
   STLDeleteValues(&path_handlers_);
 }
 
-void Webserver::RootHandler(const Webserver::WebRequest& args, stringstream* output) {
+void Webserver::RootHandler(const Webserver::WebRequest& args, Webserver::WebResponse* resp) {
 }
 
 void Webserver::BuildArgumentMap(const string& args, ArgumentMap* output) {
@@ -131,16 +133,21 @@ bool Webserver::IsSecure() const {
 }
 
 Status Webserver::BuildListenSpec(string* spec) const {
-  std::vector<Endpoint> addrs;
-  RETURN_NOT_OK(ParseAddressList(http_address_, 80, &addrs));
-
+  std::vector<Endpoint> endpoints;
+  RETURN_NOT_OK(ParseAddressList(http_address_, 80, &endpoints));
+  if (endpoints.empty()) {
+    return STATUS_FORMAT(
+      ConfigurationError,
+      "No IPs available for address $0", http_address_);
+  }
   std::vector<string> parts;
-  for (const auto& addr : addrs) {
+  for (const auto& endpoint : endpoints) {
     // Mongoose makes sockets with 's' suffixes accept SSL traffic only
-    parts.push_back(ToString(addr) + (IsSecure() ? "s" : ""));
+    parts.push_back(ToString(endpoint) + (IsSecure() ? "s" : ""));
   }
 
   JoinStrings(parts, ",", spec);
+  LOG(INFO) << "Webserver listen spec is " << *spec;
   return Status::OK();
 }
 
@@ -249,30 +256,70 @@ void Webserver::Stop() {
   }
 }
 
+Status Webserver::GetInputHostPort(HostPort* hp) const {
+  std::vector<HostPort> parsed_hps;
+  RETURN_NOT_OK(HostPort::ParseStrings(
+    http_address_,
+    0 /* default port */,
+    &parsed_hps));
+
+  // Webserver always gets a single host:port specification from WebserverOptions.
+  DCHECK_EQ(parsed_hps.size(), 1);
+  if (parsed_hps.size() != 1) {
+    return STATUS(InvalidArgument, "Expected single host port in WebserverOptions host port");
+  }
+
+  *hp = parsed_hps[0];
+  return Status::OK();
+}
+
 Status Webserver::GetBoundAddresses(std::vector<Endpoint>* addrs_ptr) const {
   if (!context_) {
     return STATUS(IllegalState, "Not started");
   }
 
-  struct sockaddr_in** sockaddrs;
+  struct sockaddr_storage** sockaddrs = nullptr;
   int num_addrs;
 
   if (sq_get_bound_addresses(context_, &sockaddrs, &num_addrs)) {
     return STATUS(NetworkError, "Unable to get bound addresses from Mongoose");
   }
-
+  auto cleanup = ScopeExit([sockaddrs, num_addrs] {
+    if (!sockaddrs) {
+      return;
+    }
+    for (int i = 0; i < num_addrs; ++i) {
+      free(sockaddrs[i]);
+    }
+    free(sockaddrs);
+  });
   auto& addrs = *addrs_ptr;
   addrs.resize(num_addrs);
 
   for (int i = 0; i < num_addrs; i++) {
-    memcpy(addrs[i].data(), sockaddrs[i], sizeof(*sockaddrs[i]));
-    free(sockaddrs[i]);
+    switch (sockaddrs[i]->ss_family) {
+      case AF_INET: {
+        sockaddr_in* addr = reinterpret_cast<struct sockaddr_in*>(sockaddrs[i]);
+        DSCHECK(addrs[i].capacity() >= sizeof(*addr), IllegalState, "Unexpected size of struct");
+        memcpy(addrs[i].data(), addr, sizeof(*addr));
+        break;
+      }
+      case AF_INET6: {
+        sockaddr_in6* addr6 = reinterpret_cast<struct sockaddr_in6*>(sockaddrs[i]);
+        DSCHECK(addrs[i].capacity() >= sizeof(*addr6), IllegalState, "Unexpected size of struct");
+        memcpy(addrs[i].data(), addr6, sizeof(*addr6));
+        break;
+      }
+      default: {
+        LOG(ERROR) << "Unexpected address family: " << sockaddrs[i]->ss_family;
+        DSCHECK(false, IllegalState, "Unexpected address family");
+        break;
+      }
+    }
   }
-  free(sockaddrs);
 
   return Status::OK();
 }
-
 int Webserver::LogMessageCallbackStatic(const struct sq_connection* connection,
                                         const char* message) {
   if (message != nullptr) {
@@ -364,14 +411,25 @@ int Webserver::RunPathHandler(const PathHandler& handler,
     use_style = false;
   }
 
-  stringstream output;
-  if (use_style) BootstrapPageHeader(&output);
-  for (const PathHandlerCallback& callback_ : handler.callbacks()) {
-    callback_(req, &output);
+  WebResponse resp;
+  WebResponse* resp_ptr = &resp;
+  // Default response code should be OK.
+  resp_ptr->code = 200;
+  stringstream *output = &resp_ptr->output;
+  if (use_style) {
+    BootstrapPageHeader(output);
   }
-  if (use_style) BootstrapPageFooter(&output);
-
-  string str = output.str();
+  for (const PathHandlerCallback& callback_ : handler.callbacks()) {
+    callback_(req, resp_ptr);
+    if (resp_ptr->code == 503) {
+      sq_printf(connection, "HTTP/1.1 503 Service Unavailable\r\n");
+      return 1;
+    }
+  }
+  if (use_style) {
+    BootstrapPageFooter(output);
+  }
+  string str = output->str();
   // Without styling, render the page as plain text
   if (!use_style) {
     sq_printf(connection, "HTTP/1.1 200 OK\r\n"
@@ -410,7 +468,7 @@ void Webserver::RegisterPathHandler(const string& path,
 const char* const PAGE_HEADER = "<!DOCTYPE html>"
 "<html>"
 "  <head>"
-"    <title>YugaByte DB</title>"
+"    <title>YugabyteDB</title>"
 "    <link rel='shortcut icon' href='/favicon.ico'>"
 "    <link href='/bootstrap/css/bootstrap.min.css' rel='stylesheet' media='screen' />"
 "    <link href='/bootstrap/css/bootstrap-theme.min.css' rel='stylesheet' media='screen' />"
@@ -424,7 +482,7 @@ const char* const PAGE_HEADER = "<!DOCTYPE html>"
 static const char* const NAVIGATION_BAR_PREFIX =
 "  <nav class=\"navbar navbar-fixed-top navbar-inverse sidebar-wrapper\" role=\"navigation\">"
 "    <ul class=\"nav sidebar-nav\">"
-"      <li><a href='/'><img src='/logo.png' alt='YugaByte DB' class='nav-logo' /></a></li>"
+"      <li><a href='/'><img src='/logo.png' alt='YugabyteDB' class='nav-logo' /></a></li>"
 "\n";
 
 static const char* const NAVIGATION_BAR_SUFFIX =

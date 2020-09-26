@@ -403,10 +403,10 @@ public class YBClient implements AutoCloseable {
 
     long start = System.currentTimeMillis();
     while (System.currentTimeMillis() - start < timeoutMS &&
-      getMasterUUID(hp.getHostText(), hp.getPort()) == null) {
+      getMasterUUID(hp.getHost(), hp.getPort()) == null) {
       Thread.sleep(AsyncYBClient.SLEEP_TIME);
     }
-    return getMasterUUID(hp.getHostText(), hp.getPort()) != null;
+    return getMasterUUID(hp.getHost(), hp.getPort()) != null;
   }
 
   /**
@@ -774,11 +774,24 @@ public class YBClient implements AutoCloseable {
    * @return true if the server successfully set the flag
    */
   public boolean setFlag(HostAndPort hp, String flag, String value) throws Exception {
+    return setFlag(hp, flag, value, false);
+  }
+
+  /**
+   * Set a gflag of a given server.
+   * @param hp the host and port of the server
+   * @param flag the flag to be set.
+   * @param value the value to set the flag to
+   * @param force if the flag needs to be set even if it is not marked runtime safe
+   * @return true if the server successfully set the flag
+   */
+  public boolean setFlag(HostAndPort hp, String flag, String value,
+                         boolean force) throws Exception {
     if (flag == null || flag.isEmpty() || value == null || value.isEmpty() || hp == null) {
       LOG.warn("Invalid arguments for hp: {}, flag {}, or value: {}", hp.toString(), flag, value);
       return false;
     }
-    Deferred<SetFlagResponse> d = asyncClient.setFlag(hp, flag, value);
+    Deferred<SetFlagResponse> d = asyncClient.setFlag(hp, flag, value, force);
     return !d.join(getDefaultAdminOperationTimeoutMs()).hasError();
   }
 
@@ -818,7 +831,7 @@ public class YBClient implements AutoCloseable {
     }
     @Override
     public boolean get() throws Exception {
-      return ping(hp.getHostText(), hp.getPort());
+      return ping(hp.getHost(), hp.getPort());
     }
   }
 
@@ -1160,17 +1173,25 @@ public class YBClient implements AutoCloseable {
 
   /**
    * Get the list of tablet UUIDs of a table with the given name.
+   * @param table table info.
+   * @return the set of tablet UUIDs of the table.
+   */
+  public Set<String> getTabletUUIDs(final YBTable table) throws Exception {
+    Set<String> ids = new HashSet<>();
+    for (LocatedTablet tablet : table.getTabletsLocations(getDefaultAdminOperationTimeoutMs())) {
+      ids.add(new String(tablet.getTabletId()));
+    }
+    return ids;
+  }
+
+  /**
+   * Get the list of tablet UUIDs of a table with the given name.
    * @param keyspace the keyspace name to which the table belongs.
    * @param name the table name
    * @return the set of tablet UUIDs of the table.
    */
   public Set<String> getTabletUUIDs(final String keyspace, final String name) throws Exception {
-    Set<String> ids = new HashSet<>();
-    YBTable table = openTable(keyspace, name);
-    for (LocatedTablet tablet : table.getTabletsLocations(getDefaultAdminOperationTimeoutMs())) {
-      ids.add(new String(tablet.getTabletId()));
-    }
-    return ids;
+    return getTabletUUIDs(openTable(keyspace, name));
   }
 
   /**

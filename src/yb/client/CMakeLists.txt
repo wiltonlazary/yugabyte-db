@@ -36,6 +36,7 @@ set(CLIENT_SRCS
   batcher.cc
   client.cc
   client_builder-internal.cc
+  client_error.cc
   client-internal.cc
   client_utils.cc
   error.cc
@@ -64,6 +65,7 @@ set(CLIENT_SRCS
 
 set(CLIENT_LIBS
   yb_common
+  yb_partition
   master_proto
   master_rpc
   master_util
@@ -110,6 +112,7 @@ target_link_libraries(ql-dml-test-base integration-tests)
 # Tests
 
 set(YB_TEST_LINK_LIBS integration-tests rpc_test_util ql-dml-test-base ${YB_MIN_TEST_LIBS})
+ADD_YB_TEST(backup-txn-test)
 ADD_YB_TEST(client-test)
 ADD_YB_TEST(client-unittest)
 ADD_YB_TEST(ql-dml-test)
@@ -118,6 +121,7 @@ ADD_YB_TEST(ql-list-test)
 ADD_YB_TEST(ql-tablet-test)
 ADD_YB_TEST(ql-transaction-test)
 ADD_YB_TEST(ql-stress-test)
+ADD_YB_TEST(seal-txn-test)
 ADD_YB_TEST(snapshot-txn-test)
 ADD_YB_TEST(serializable-txn-test)
 ADD_YB_TEST(tablet_rpc-test)

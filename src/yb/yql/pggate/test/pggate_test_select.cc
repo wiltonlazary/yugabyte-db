@@ -34,7 +34,8 @@ TEST_F(PggateTestSelect, TestSelectOneTablet) {
   CHECK_YBC_STATUS(YBCPgNewCreateTable(kDefaultDatabase, kDefaultSchema, tabname,
                                        kDefaultDatabaseOid, tab_oid,
                                        false /* is_shared_table */, true /* if_not_exist */,
-                                       false /* add_primary_key */, &pg_stmt));
+                                       false /* add_primary_key */, true /* colocated */,
+                                       kInvalidOid /*tablegroup_id*/, &pg_stmt));
   CHECK_YBC_STATUS(YBCTestCreateTableAddColumn(pg_stmt, "hash_key", ++col_count,
                                                DataType::INT64, true, true));
   CHECK_YBC_STATUS(YBCTestCreateTableAddColumn(pg_stmt, "id", ++col_count,
@@ -51,7 +52,6 @@ TEST_F(PggateTestSelect, TestSelectOneTablet) {
                                                DataType::INT32, false, false));
   ++col_count;
   CHECK_YBC_STATUS(YBCPgExecCreateTable(pg_stmt));
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
   CommitTransaction();
   pg_stmt = nullptr;
 
@@ -109,12 +109,12 @@ TEST_F(PggateTestSelect, TestSelectOneTablet) {
     YBCPgUpdateConstInt4(expr_oid, seed, false);
   }
 
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
   pg_stmt = nullptr;
 
   // SELECT ----------------------------------------------------------------------------------------
   LOG(INFO) << "Test SELECTing from non-partitioned table WITH RANGE values";
-  CHECK_YBC_STATUS(YBCPgNewSelect(kDefaultDatabaseOid, tab_oid, kInvalidOid, &pg_stmt));
+  CHECK_YBC_STATUS(YBCPgNewSelect(kDefaultDatabaseOid, tab_oid,
+                                  NULL /* prepare_params */, &pg_stmt));
 
   // Specify the selected expressions.
   YBCPgExpr colref;
@@ -189,12 +189,12 @@ TEST_F(PggateTestSelect, TestSelectOneTablet) {
   }
   CHECK_EQ(select_row_count, 1) << "Unexpected row count";
 
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
   pg_stmt = nullptr;
 
   // SELECT ----------------------------------------------------------------------------------------
   LOG(INFO) << "Test SELECTing from non-partitioned table WITHOUT RANGE values";
-  CHECK_YBC_STATUS(YBCPgNewSelect(kDefaultDatabaseOid, tab_oid, kInvalidOid, &pg_stmt));
+  CHECK_YBC_STATUS(YBCPgNewSelect(kDefaultDatabaseOid, tab_oid,
+                                  NULL /* prepare_params */, &pg_stmt));
 
   // Specify the selected expressions.
   YBCTestNewColumnRef(pg_stmt, 1, DataType::INT64, &colref);
@@ -256,7 +256,6 @@ TEST_F(PggateTestSelect, TestSelectOneTablet) {
     CHECK_EQ(oid, id) << "Unexpected result for OID column";
   }
 
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
   pg_stmt = nullptr;
 }
 

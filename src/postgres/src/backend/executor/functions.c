@@ -804,7 +804,7 @@ postquel_start(execution_state *es, SQLFunctionCachePtr fcache)
 		myState = (DR_sqlfunction *) dest;
 		Assert(myState->pub.mydest == DestSQLFunction);
 		myState->tstore = fcache->tstore;
-		myState->cxt = CurrentMemoryContext;
+		myState->cxt = GetCurrentMemoryContext();
 		myState->filter = fcache->junkFilter;
 	}
 	else
@@ -836,6 +836,12 @@ postquel_start(execution_state *es, SQLFunctionCachePtr fcache)
 		else
 			eflags = 0;			/* default run-to-completion flags */
 		ExecutorStart(es->qd, eflags);
+
+		/*
+		 * Since PGSQL functions don't require the row count from updates, we
+		 * can allow for batched updates.
+		 */
+		es->qd->estate->yb_can_batch_updates = true;
 	}
 
 	es->status = F_EXEC_RUN;

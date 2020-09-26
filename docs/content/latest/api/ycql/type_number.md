@@ -1,7 +1,8 @@
 ---
-title: Non-Integer
-summary: FLOAT, DOUBLE, and DECIMAL
-description: Non-Integer Numbers
+title: Non-integer data types (FLOAT, DOUBLE, and DECIMAL) [YCQL]
+headerTitle: Non-integer
+linkTitle: Non-integer
+description: Use the non-integer (floating-point and fixed-point) data types to specify non-integer numbers. 
 menu:
   latest:
     parent: api-cassandra
@@ -15,13 +16,13 @@ showAsideToc: true
 
 ## Synopsis
 
-Floating-point and fixed-point numbers are used to specify non-integer numbers. Different floating point data types represent different precision numbers.
+Use the non-integer (floating-point and fixed-point) data types to specify non-integer numbers. Different floating point data types represent different precision numbers.
 
 Data type | Description | Decimal precision |
 ---------|-----|-----|
 `FLOAT` | Inexact 32-bit floating point number | 7 |
 `DOUBLE` | Inexact 64-bit floating point number | 15 |
-`DECIMAL` | Exact fixed-point number | 99 |
+`DECIMAL` | Arbitrary-precision number  | no upper-bound |
 
 ## Syntax
 
@@ -51,22 +52,22 @@ Where
 ## Examples
 
 ```sql
-cqlsh:example> CREATE TABLE sensor_data (sensor_id INT PRIMARY KEY, float_val FLOAT, dbl_val DOUBLE, dec_val DECIMAL);
+ycqlsh:example> CREATE TABLE sensor_data (sensor_id INT PRIMARY KEY, float_val FLOAT, dbl_val DOUBLE, dec_val DECIMAL);
 ```
 
 ```sql
-cqlsh:example> INSERT INTO sensor_data(sensor_id, float_val, dbl_val, dec_val) 
+ycqlsh:example> INSERT INTO sensor_data(sensor_id, float_val, dbl_val, dec_val) 
                   VALUES (1, 321.0456789, 321.0456789, 321.0456789);
 ```
 
 Integers literals can also be used (Using upsert semantics to update a non-existent row).
 
 ```sql
-cqlsh:example> UPDATE sensor_data SET float_val = 1, dbl_val = 1, dec_val = 1 WHERE sensor_id = 2;
+ycqlsh:example> UPDATE sensor_data SET float_val = 1, dbl_val = 1, dec_val = 1 WHERE sensor_id = 2;
 ```
 
 ```sql
-cqlsh:example> SELECT * FROM sensor_data;
+ycqlsh:example> SELECT * FROM sensor_data;
 ```
 
 ```
@@ -78,4 +79,4 @@ cqlsh:example> SELECT * FROM sensor_data;
 
 ## See also
 
-[Data Types](..#data-types)
+- [Data types](..#data-types)

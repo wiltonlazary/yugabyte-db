@@ -529,7 +529,7 @@ class LevelFileIteratorState : public TwoLevelIteratorState {
       const FileDescriptor* fd =
           reinterpret_cast<const FileDescriptor*>(meta_handle.data());
       return table_cache_->NewIterator(
-          read_options_, env_options_, icomparator_, *fd,
+          read_options_, env_options_, icomparator_, *fd, Slice() /* filter */,
           nullptr /* don't need reference to table*/, file_read_hist_,
           for_compaction_, nullptr /* arena */, skip_filters_);
     }
@@ -821,7 +821,8 @@ void Version::AddIterators(const ReadOptions& read_options,
       if (s.ok()) {
         if (!read_options.table_aware_file_filter ||
             read_options.table_aware_file_filter->Filter(trwh.table_reader)) {
-          file_iter = cfd_->table_cache()->NewIterator(read_options, &trwh, false, arena);
+          file_iter = cfd_->table_cache()->NewIterator(
+              read_options, &trwh, storage_info_.LevelFiles(0)[i]->UserFilter(), false, arena);
         } else {
           file_iter = nullptr;
         }
@@ -2062,6 +2063,27 @@ std::string Version::DebugString(bool hex) const {
   return r;
 }
 
+Result<std::string> Version::GetMiddleKey() {
+  // Largest files are at lowest level.
+  const auto level = storage_info_.num_levels_ - 1;
+  const FileMetaData* largest_sst_meta = nullptr;
+  for (const auto* file : storage_info_.files_[level]) {
+    if (!largest_sst_meta ||
+        file->fd.GetTotalFileSize() > largest_sst_meta->fd.GetTotalFileSize()) {
+      largest_sst_meta = file;
+    }
+  }
+  if (!largest_sst_meta) {
+    return STATUS(Incomplete, "No SST files.");
+  }
+
+  const auto trwh = VERIFY_RESULT(table_cache_->GetTableReader(
+      vset_->env_options_, cfd_->internal_comparator(), largest_sst_meta->fd, kDefaultQueryId,
+      /* no_io =*/ false, cfd_->internal_stats()->GetFileReadHist(level),
+      IsFilterSkipped(level, /* is_file_last_in_level =*/ true)));
+  return trwh.table_reader->GetMiddleKey();
+}
+
 // this is used to batch writes to the manifest file
 struct VersionSet::ManifestWriter {
   Status status;
@@ -2389,7 +2411,7 @@ Status VersionSet::LogAndApply(ColumnFamilyData* column_family_data,
         "Deleting manifest %" PRIu64 " current manifest %" PRIu64 "\n",
         manifest_file_number_, pending_manifest_file_number_);
       descriptor_log_.reset();
-      env_->DeleteFile(
+      env_->CleanupFile(
           DescriptorFileName(dbname_, pending_manifest_file_number_));
     }
   }
@@ -3478,7 +3500,7 @@ uint64_t VersionSet::ApproximateSize(Version* v, const FdWithBoundaries& f, cons
     // approximate offset of "key" within the table.
     TableReader* table_reader_ptr;
     InternalIterator* iter = v->cfd_->table_cache()->NewIterator(
-        ReadOptions(), env_options_, v->cfd_->internal_comparator(), f.fd,
+        ReadOptions(), env_options_, v->cfd_->internal_comparator(), f.fd, Slice() /* filter */,
         &table_reader_ptr);
     if (table_reader_ptr != nullptr) {
       result = table_reader_ptr->ApproximateOffsetOf(key);
@@ -3549,8 +3571,8 @@ InternalIterator* VersionSet::MakeInputIterator(Compaction* c) {
         for (size_t i = 0; i < flevel->num_files; i++) {
           list[num++] = cfd->table_cache()->NewIterator(
               read_options, env_options_compactions_,
-              cfd->internal_comparator(), flevel->files[i].fd, nullptr,
-              nullptr, /* no per level latency histogram*/
+              cfd->internal_comparator(), flevel->files[i].fd, flevel->files[i].user_filter_data,
+              nullptr, nullptr /* no per level latency histogram*/,
               true /* for compaction */);
         }
       } else {

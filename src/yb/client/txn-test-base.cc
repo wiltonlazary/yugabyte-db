@@ -21,6 +21,8 @@
 #include "yb/common/ql_value.h"
 #include "yb/consensus/consensus.h"
 
+#include "yb/integration-tests/mini_cluster_utils.h"
+
 #include "yb/tserver/mini_tablet_server.h"
 #include "yb/tserver/tablet_server.h"
 #include "yb/tserver/ts_tablet_manager.h"
@@ -30,14 +32,14 @@
 using namespace std::literals;
 
 DECLARE_double(transaction_max_missed_heartbeat_periods);
-DECLARE_uint64(log_segment_size_bytes);
+DECLARE_uint64(transaction_status_tablet_log_segment_size_bytes);
 DECLARE_int32(log_min_seconds_to_retain);
 DECLARE_bool(transaction_disable_heartbeat_in_tests);
-DECLARE_double(transaction_ignore_applying_probability_in_tests);
+DECLARE_double(TEST_transaction_ignore_applying_probability_in_tests);
 DECLARE_string(time_source);
 DECLARE_int32(intents_flush_max_delay_ms);
 DECLARE_int32(load_balancer_max_concurrent_adds);
-DECLARE_bool(combine_batcher_errors);
+DECLARE_bool(TEST_combine_batcher_errors);
 
 namespace yb {
 namespace client {
@@ -67,7 +69,7 @@ int32_t ValueForTransactionAndIndex(size_t transaction, size_t index, const Writ
 }
 
 void SetIgnoreApplyingProbability(double value) {
-  SetAtomicFlag(value, &FLAGS_transaction_ignore_applying_probability_in_tests);
+  SetAtomicFlag(value, &FLAGS_TEST_transaction_ignore_applying_probability_in_tests);
 }
 
 void SetDisableHeartbeatInTests(bool value) {
@@ -94,8 +96,8 @@ void DisableTransactionTimeout() {
 }
 
 void TransactionTestBase::SetUp() {
-  FLAGS_combine_batcher_errors = true;
-  FLAGS_log_segment_size_bytes = log_segment_size_bytes();
+  FLAGS_TEST_combine_batcher_errors = true;
+  FLAGS_transaction_status_tablet_log_segment_size_bytes = log_segment_size_bytes();
   FLAGS_log_min_seconds_to_retain = 5;
   FLAGS_intents_flush_max_delay_ms = 250;
 
@@ -105,7 +107,7 @@ void TransactionTestBase::SetUp() {
   ASSERT_NO_FATALS(KeyValueTableTest::SetUp());
 
   if (create_table_) {
-    CreateTable(Transactional::kTrue);
+    CreateTable();
   }
 
   HybridTime::TEST_SetPrettyToString(true);
@@ -118,19 +120,26 @@ void TransactionTestBase::SetUp() {
   transaction_manager2_.emplace(client_.get(), clock2, client::LocalTabletFilter());
 }
 
+void TransactionTestBase::CreateTable() {
+  KeyValueTableTest::CreateTable(
+      Transactional(GetIsolationLevel() != IsolationLevel::NON_TRANSACTIONAL));
+}
+
 uint64_t TransactionTestBase::log_segment_size_bytes() const {
   return 128;
 }
 
-void TransactionTestBase::WriteRows(
-    const YBSessionPtr& session, size_t transaction, const WriteOpType op_type) {
+Status TransactionTestBase::WriteRows(
+    const YBSessionPtr& session, size_t transaction, const WriteOpType op_type, Flush flush) {
   for (size_t r = 0; r != kNumRows; ++r) {
-    ASSERT_OK(WriteRow(
+    RETURN_NOT_OK(WriteRow(
         session,
         KeyForTransactionAndIndex(transaction, r),
         ValueForTransactionAndIndex(transaction, r, op_type),
-        op_type));
+        op_type,
+        flush));
   }
+  return Status::OK();
 }
 
 void TransactionTestBase::VerifyRow(
@@ -145,7 +154,7 @@ void TransactionTestBase::VerifyRow(
 
 void TransactionTestBase::WriteData(const WriteOpType op_type, size_t transaction) {
   auto txn = CreateTransaction();
-  WriteRows(CreateSession(txn), transaction, op_type);
+  ASSERT_OK(WriteRows(CreateSession(txn), transaction, op_type));
   ASSERT_OK(txn->CommitFuture().get());
   LOG(INFO) << "Committed: " << txn->id();
 }
@@ -170,6 +179,9 @@ YBTransactionPtr CreateTransactionHelper(
     TransactionManager* transaction_manager,
     SetReadTime set_read_time,
     IsolationLevel isolation_level) {
+  if (isolation_level == IsolationLevel::NON_TRANSACTIONAL) {
+    return nullptr;
+  }
   auto result = std::make_shared<YBTransaction>(transaction_manager);
   ReadHybridTime read_time;
   if (set_read_time) {
@@ -202,7 +214,8 @@ void TransactionTestBase::VerifyRows(
   for (size_t r = 0; r != kNumRows; ++r) {
     SCOPED_TRACE(Format("Row: $0, key: $1", r, KeyForTransactionAndIndex(transaction, r)));
     auto& op = ops[r];
-    ASSERT_EQ(op->response().status(), QLResponsePB::YQL_STATUS_OK);
+    ASSERT_EQ(op->response().status(), QLResponsePB::YQL_STATUS_OK)
+        << QLResponsePB_QLStatus_Name(op->response().status());
     auto rowblock = yb::ql::RowsResult(op.get()).GetRowBlock();
     ASSERT_EQ(rowblock->row_count(), 1);
     const auto& first_column = rowblock->row(0).column(0);
@@ -250,61 +263,11 @@ bool TransactionTestBase::HasTransactions() {
 }
 
 size_t TransactionTestBase::CountRunningTransactions() {
-  size_t result = 0;
-  auto peers = ListTabletPeers(cluster_.get(), ListPeersFilter::kAll);
-  for (const auto &peer : peers) {
-    auto participant = peer->tablet()->transaction_participant();
-    result += participant ? participant->TEST_GetNumRunningTransactions() : 0;
-  }
-  return result;
+  return yb::CountRunningTransactions(cluster_.get());
 }
 
-void TransactionTestBase::CheckNoRunningTransactions() {
-  MonoTime deadline = MonoTime::Now() + 7s * kTimeMultiplier;
-  bool has_bad = false;
-  for (int i = 0; i != cluster_->num_tablet_servers(); ++i) {
-    auto server = cluster_->mini_tablet_server(i)->server();
-    std::vector<std::shared_ptr<tablet::TabletPeer>> tablets;
-    auto status = Wait([server, &tablets] {
-      tablets.clear();
-      server->tablet_manager()->GetTabletPeers(&tablets);
-      for (const auto& peer : tablets) {
-        if (peer->tablet() == nullptr) {
-          return false;
-        }
-      }
-      return true;
-    }, deadline, "Wait until all peers have tablets");
-    if (!status.ok()) {
-      has_bad = true;
-      for (const auto& peer : tablets) {
-        if (peer->tablet() == nullptr) {
-          LOG(ERROR) << Format(
-              "T $1 P $0: Tablet object is not created",
-              server->permanent_uuid(), peer->tablet_id());
-        }
-      }
-      continue;
-    }
-    for (const auto& peer : tablets) {
-      auto participant = peer->tablet()->transaction_participant();
-      if (participant) {
-        auto status = Wait([participant] {
-              return participant->TEST_GetNumRunningTransactions() == 0;
-            },
-            deadline,
-            "Wait until no transactions are running");
-        if (!status.ok()) {
-          LOG(ERROR) << Format(
-              "T $1 P $0: Transactions: $2",
-              server->permanent_uuid(), peer->tablet_id(),
-              participant->TEST_GetNumRunningTransactions());
-          has_bad = true;
-        }
-      }
-    }
-  }
-  ASSERT_EQ(false, has_bad);
+void TransactionTestBase::AssertNoRunningTransactions() {
+  yb::AssertNoRunningTransactions(cluster_.get());
 }
 
 bool TransactionTestBase::CheckAllTabletsRunning() {

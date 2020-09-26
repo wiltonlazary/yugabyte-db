@@ -37,6 +37,7 @@
 #include "yb/client/client.h"
 #include "yb/consensus/consensus.h"
 #include "yb/gutil/strings/strcat.h"
+#include "yb/master/sys_catalog_constants.h"
 #include "yb/tablet/tablet.h"
 #include "yb/tablet/tablet_peer.h"
 #include "yb/tablet/operations/operation_tracker.h"
@@ -50,7 +51,7 @@
 
 using namespace std::literals;
 
-DEFINE_test_flag(int32, TEST_delay_execute_async_ms, 0,
+DEFINE_test_flag(int32, delay_execute_async_ms, 0,
                  "Delay execution of ExecuteAsync for specified amount of milliseconds during "
                      "tests");
 
@@ -164,7 +165,7 @@ void OperationDriver::ExecuteAsync() {
   auto delay = GetAtomicFlag(&FLAGS_TEST_delay_execute_async_ms);
   if (delay != 0 &&
       operation_type() == OperationType::kWrite &&
-      operation_->state()->tablet()->tablet_id() != "00000000000000000000000000000000") {
+      operation_->state()->tablet()->tablet_id() != master::kSysCatalogTabletId) {
     LOG(INFO) << "T " << operation_->state()->tablet()->tablet_id()
               << " Debug sleep for: " << MonoDelta(1ms * delay) << "\n" << GetStackTrace();
     std::this_thread::sleep_for(1ms * delay);
@@ -172,21 +173,22 @@ void OperationDriver::ExecuteAsync() {
 
   auto s = preparer_->Submit(this);
 
+  if (operation_) {
+    operation_->SubmittedToPreparer();
+  }
+
   if (!s.ok()) {
     HandleFailure(s);
   }
 }
 
-void OperationDriver::HandleConsensusAppend() {
+void OperationDriver::HandleConsensusAppend(
+    const yb::OpId& op_id, const yb::OpId& committed_op_id) {
+  ADOPT_TRACE(trace());
   if (!StartOperation()) {
     return;
   }
-  ADOPT_TRACE(trace());
-  auto* const replicate_msg = operation_->state()->consensus_round()->replicate_msg().get();
-  CHECK(!replicate_msg->has_hybrid_time());
-  replicate_msg->set_hybrid_time(operation_->state()->hybrid_time().ToUint64());
-  replicate_msg->set_monotonic_counter(
-      *operation_->state()->tablet()->monotonic_counter());
+  operation_->state()->LeaderInit(op_id, committed_op_id);
 }
 
 void OperationDriver::PrepareAndStartTask() {
@@ -251,42 +253,15 @@ Status OperationDriver::PrepareAndStart() {
     // We can only do this after we've called Start()
     prepare_state_ = PREPARED;
 
-    // On the replica (non-leader) side, the replication state might have been REPLICATING during
-    // our previous acquisition of this lock, but it might have changed to REPLICATED in the
-    // meantime. That would mean ReplicationFinished got called, but ReplicationFinished would not
-    // trigger Apply unless the operation is PREPARED, so we are responsible for doing that.
-    // If we fail to capture the new replication state here, the operation will never be applied.
-    repl_state_copy = replication_state_;
-  }
-
-  switch (repl_state_copy) {
-    case NOT_REPLICATING:
-    {
-      {
-        std::lock_guard<simple_spinlock> lock(lock_);
-        replication_state_ = REPLICATING;
-      }
-
-      // After the batching changes from 07/2017, It is the caller's responsibility to call
-      // Consensus::Replicate. See Preparer for details.
-      return Status::OK();
-    }
-    case REPLICATING:
-    {
-      // Already replicating - nothing to trigger
-      return Status::OK();
-    }
-    case REPLICATION_FAILED:
-      DCHECK(!operation_status_.ok());
-      FALLTHROUGH_INTENDED;
-    case REPLICATED:
-    {
-      // We can move on to apply.  Note that ApplyOperation() will handle the error status in the
-      // REPLICATION_FAILED case.
-      return ApplyOperation(yb::OpId::kUnknownTerm, nullptr /* applied_op_ids */);
+    if (replication_state_ == NOT_REPLICATING) {
+      replication_state_ = REPLICATING;
     }
   }
-  FATAL_INVALID_ENUM_VALUE(ReplicationState, repl_state_copy);
+
+  return Status::OK();
+}
+
+OperationDriver::~OperationDriver() {
 }
 
 void OperationDriver::ReplicationFailed(const Status& replication_status) {
@@ -339,7 +314,7 @@ void OperationDriver::HandleFailure(Status status) {
     case REPLICATED:
     {
       LOG_WITH_PREFIX(FATAL) << "Cannot cancel operations that have already replicated"
-                             << ": " << status << " operation:" << ToString();
+                             << ": " << status << " operation: " << ToString();
     }
   }
 }
@@ -368,11 +343,30 @@ void OperationDriver::ReplicationFinished(
   // Note that if we set the state to REPLICATION_FAILED above, ApplyOperation() will actually abort
   // the operation, i.e. ApplyTask() will never be called and the operation will never be applied to
   // the tablet.
-  if (prepare_state_copy == PREPARED) {
-    // We likely need to do cleanup if this fails so for now just
-    // CHECK_OK
-    CHECK_OK(ApplyOperation(leader_term, applied_op_ids));
+  if (prepare_state_copy != PrepareState::PREPARED) {
+    LOG(DFATAL) << "Replicating an operation that has not been prepared: " << AsString(this);
+
+    LOG(ERROR) << "Attempting to wait for the operation to be prepared";
+
+    // This case should never happen, but if it happens we are trying to survive.
+    for (;;) {
+      std::this_thread::sleep_for(1ms);
+      PrepareState prepare_state;
+      {
+        std::lock_guard<simple_spinlock> lock(lock_);
+        prepare_state = prepare_state_;
+        if (prepare_state == PrepareState::PREPARED) {
+          break;
+        }
+      }
+      YB_LOG_EVERY_N_SECS(WARNING, 1)
+          << "Waiting for the operation to be prepared, current state: " << prepare_state;
+    }
   }
+
+  // We likely need to do cleanup if this fails so for now just
+  // CHECK_OK
+  CHECK_OK(ApplyOperation(leader_term, applied_op_ids));
 }
 
 void OperationDriver::Abort(const Status& status) {
@@ -438,7 +432,8 @@ void OperationDriver::ApplyTask(int64_t leader_term, OpIds* applied_op_ids) {
   scoped_refptr<OperationDriver> ref(this);
 
   {
-    CHECK_OK(operation_->Replicated(leader_term));
+    auto status = operation_->Replicated(leader_term);
+    LOG_IF_WITH_PREFIX(FATAL, !status.ok()) << "Apply failed: " << status;
     operation_tracker_->Release(this, applied_op_ids);
   }
 }
@@ -476,10 +471,10 @@ std::string OperationDriver::StateString(ReplicationState repl_state,
 }
 
 std::string OperationDriver::LogPrefix() const {
-
   ReplicationState repl_state_copy;
   PrepareState prep_state_copy;
-  string ts_string;
+  std::string ts_string;
+  OperationType operation_type;
 
   {
     std::lock_guard<simple_spinlock> lock(lock_);
@@ -487,17 +482,17 @@ std::string OperationDriver::LogPrefix() const {
     prep_state_copy = prepare_state_;
     ts_string = state() && state()->has_hybrid_time()
         ? state()->hybrid_time().ToString() : "No hybrid_time";
+    operation_type = this->operation_type();
   }
 
   string state_str = StateString(repl_state_copy, prep_state_copy);
   // We use the tablet and the peer (T, P) to identify ts and tablet and the hybrid_time (Ts) to
   // (help) identify the operation. The state string (S) describes the state of the operation.
-  return strings::Substitute("T $0 P $1 S $2 Ts $3: ",
-                             // consensus_ is NULL in some unit tests.
-                             PREDICT_TRUE(consensus_) ? consensus_->tablet_id() : "(unknown)",
-                             PREDICT_TRUE(consensus_) ? consensus_->peer_uuid() : "(unknown)",
-                             state_str,
-                             ts_string);
+  return Format("T $0 P $1 S $2 Ts $3 $4: ",
+                // consensus_ is NULL in some unit tests.
+                PREDICT_TRUE(consensus_) ? consensus_->tablet_id() : "(unknown)",
+                PREDICT_TRUE(consensus_) ? consensus_->peer_uuid() : "(unknown)",
+                state_str, ts_string, operation_type);
 }
 
 int64_t OperationDriver::SpaceUsed() {

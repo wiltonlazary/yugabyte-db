@@ -31,6 +31,8 @@ namespace docdb {
 #define DOCDB_VALUE_TYPES \
     /* This ValueType is used as -infinity for scanning purposes only. */\
     ((kLowest, 0)) \
+    /* Prefix for transaction apply state records. */ \
+    ((kTransactionApplyState, 7)) \
     /* Obsolete intent prefix. Should be deleted when DBs in old format are gone. */ \
     ((kObsoleteIntentPrefix, 10)) \
     /* We use ASCII code 13 in order to have it before all other value types which can occur in */ \
@@ -46,6 +48,9 @@ namespace docdb {
     /* Old intent type had 6 different types of intents, one for each possible intent. */ \
     /* Intent type set has 4 different types of intents, but allow their combinations. */ \
     ((kObsoleteIntentType, 20)) \
+    /* Value type that is greater than any of intent types. */ \
+    /* It is NOT stored in DB, so should be updated if we add new intent value type */ \
+    ((kGreaterThanIntentType, 21)) \
     /* This indicates the end of the "hashed" or "range" group of components of the primary */ \
     /* key. This needs to sort before all other value types, so that a DocKey that has a prefix */ \
     /* of the sequence of components of another key sorts before the other key. kGroupEnd is */ \
@@ -75,6 +80,7 @@ namespace docdb {
     ((kRedisSortedSet, ',')) /* ASCII code 44 */ \
     ((kInetaddress, '-'))  /* ASCII code 45 */ \
     ((kInetaddressDescending, '.'))  /* ASCII code 46 */ \
+    ((kPgTableOid, '0')) /* ASCII code 48 */ \
     ((kJsonb, '2')) /* ASCII code 50 */ \
     ((kFrozen, '<')) /* ASCII code 60 */ \
     ((kFrozenDescending, '>')) /* ASCII code 62 */ \
@@ -118,6 +124,7 @@ namespace docdb {
     ((kMergeFlags, 'k')) /* ASCII code 107 */ \
     /* Indicator for whether an intent is for a row lock. */ \
     ((kRowLock, 'l'))  /* ASCII code 108 */ \
+    ((kBitSet, 'm')) /* ASCII code 109 */ \
     /* Timestamp value in microseconds */ \
     ((kTimestamp, 's'))  /* ASCII code 115 */ \
     /* TTL value in milliseconds, optionally present at the start of a value. */ \
@@ -210,13 +217,16 @@ constexpr inline bool IsCollectionType(const ValueType value_type) {
 }
 
 constexpr inline bool IsPrimitiveValueType(const ValueType value_type) {
-  return kMinPrimitiveValueType <= value_type && value_type <= kMaxPrimitiveValueType &&
-         !IsCollectionType(value_type) &&
-         value_type != ValueType::kTombstone;
+  return (kMinPrimitiveValueType <= value_type && value_type <= kMaxPrimitiveValueType &&
+          !IsCollectionType(value_type) &&
+          value_type != ValueType::kTombstone) ||
+         value_type == ValueType::kTransactionApplyState;
 }
 
 constexpr inline bool IsSpecialValueType(ValueType value_type) {
-  return value_type == ValueType::kLowest || value_type == ValueType::kHighest;
+  return value_type == ValueType::kLowest || value_type == ValueType::kHighest ||
+         value_type == ValueType::kMaxByte || value_type == ValueType::kIntentTypeSet ||
+         value_type == ValueType::kGreaterThanIntentType;
 }
 
 constexpr inline bool IsPrimitiveOrSpecialValueType(ValueType value_type) {

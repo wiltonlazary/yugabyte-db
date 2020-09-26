@@ -45,6 +45,7 @@ using std::string;
 using std::shared_ptr;
 using namespace std::placeholders;
 
+using audit::AuditLogger;
 using client::YBColumnSpec;
 using client::YBOperation;
 using client::YBqlOpPtr;
@@ -68,8 +69,10 @@ using strings::Substitute;
 
 //--------------------------------------------------------------------------------------------------
 
-Executor::Executor(QLEnv *ql_env, Rescheduler* rescheduler, const QLMetrics* ql_metrics)
+Executor::Executor(QLEnv* ql_env, AuditLogger* audit_logger, Rescheduler* rescheduler,
+                   const QLMetrics* ql_metrics)
     : ql_env_(ql_env),
+      audit_logger_(*audit_logger),
       rescheduler_(rescheduler),
       session_(ql_env_->NewSession()),
       ql_metrics_(ql_metrics) {
@@ -166,6 +169,8 @@ void Executor::ExecuteAsync(const StatementBatch& batch, StatementExecutedCallba
     RETURN_STMT_NOT_OK(Execute(parse_tree, params));
   }
 
+  RETURN_STMT_NOT_OK(audit_logger_.EndBatchRequest());
+
   FlushAsync();
 }
 
@@ -177,7 +182,14 @@ Status Executor::Execute(const ParseTree& parse_tree, const StatementParameters&
   exec_context_ = &exec_contexts_.back();
   auto root_node = parse_tree.root().get();
   RETURN_NOT_OK(PreExecTreeNode(root_node));
-  return ProcessStatementStatus(parse_tree, ExecTreeNode(root_node));
+  RETURN_NOT_OK(audit_logger_.LogStatement(root_node, exec_context_->stmt(),
+                                           false /* is_prepare */));
+  Status s = ExecTreeNode(root_node);
+  if (!s.ok()) {
+    RETURN_NOT_OK(audit_logger_.LogStatementError(root_node, exec_context_->stmt(), s,
+                                                  false /* error_is_formatted */));
+  }
+  return ProcessStatementStatus(parse_tree, s);
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -385,7 +397,7 @@ Status Executor::ExecPTNode(const PTCreateType *tnode) {
   std::vector<std::string> field_names;
   std::vector<std::shared_ptr<QLType>> field_types;
 
-  for (const PTTypeField::SharedPtr field : tnode->fields()->node_list()) {
+  for (const PTTypeField::SharedPtr& field : tnode->fields()->node_list()) {
     field_names.emplace_back(field->yb_name());
     field_types.push_back(field->ql_type());
   }
@@ -784,6 +796,16 @@ Status Executor::GetOffsetOrLimit(
 Status Executor::ExecPTNode(const PTSelectStmt *tnode, TnodeContext* tnode_context) {
   const shared_ptr<client::YBTable>& table = tnode->table();
   if (table == nullptr) {
+    // If this is a request for 'system.peers_v2' table make sure that we send the appropriate error
+    // so that the client driver can query the proper peers table i.e. 'system.peers' based on the
+    // error.
+    if (tnode->is_system() &&
+        tnode->table_name().table_name() == "peers_v2" &&
+        tnode->table_name().namespace_name() == "system") {
+      string error_msg = "Unknown keyspace/cf pair (system.peers_v2)";
+      return exec_context_->Error(tnode, error_msg, ErrorCode::SERVER_ERROR);
+    }
+
     // If this is a system table but the table does not exist, it is okay. Just return OK with void
     // result.
     return tnode->is_system() ? Status::OK()
@@ -1140,8 +1162,9 @@ Status Executor::ExecPTNode(const PTInsertStmt *tnode, TnodeContext* tnode_conte
     if (PREDICT_FALSE(!s.ok())) {
       // Note: INVALID_ARGUMENTS is retryable error code (due to mapping into STALE_METADATA),
       //       INVALID_REQUEST - non-retryable.
-      ErrorCode error_code = (s.code() == Status::kNotSupported ?
-          ErrorCode::INVALID_REQUEST : ErrorCode::INVALID_ARGUMENTS);
+      ErrorCode error_code =
+          s.code() == Status::kNotSupported || s.code() == Status::kRuntimeError ?
+          ErrorCode::INVALID_REQUEST : ErrorCode::INVALID_ARGUMENTS;
 
       return exec_context_->Error(tnode, s, error_code);
     }
@@ -1498,8 +1521,12 @@ void Executor::FlushAsync() {
   }
   for (ExecContext& exec_context : exec_contexts_) {
     if (exec_context.HasTransaction()) {
-      if (exec_context.transactional_session()->CountBufferedOperations() > 0) {
-        flush_sessions.push_back({exec_context.transactional_session(), &exec_context});
+      auto transactional_session = exec_context.transactional_session();
+      if (transactional_session->CountBufferedOperations() > 0) {
+        // In case or retry we should ignore values that could be written by previous attempts
+        // of retried operation.
+        transactional_session->SetInTxnLimit(transactional_session->read_point()->Now());
+        flush_sessions.push_back({transactional_session, &exec_context});
       } else if (!exec_context.HasPendingOperations()) {
         commit_contexts.push_back(&exec_context);
       }
@@ -2053,9 +2080,20 @@ Status Executor::AddIndexWriteOps(const PTDmlStmt *tnode,
   }
 
   // Create the write operation for each index and populate it using the original operation.
+  // CQL does not allow the primary key to be updated, so PK-only index rows will be either
+  // deleted when the row in the main table is deleted, or it will be inserted into the index
+  // when a row is inserted into the main table or updated (for a non-pk column).
   for (const auto& index_table : tnode->pk_only_indexes()) {
     const IndexInfo* index =
         VERIFY_RESULT(tnode->table()->index_map().FindIndex(index_table->id()));
+    const bool index_ready_to_accept = (is_upsert ? index->HasWritePermission()
+                                                  : index->HasDeletePermission());
+    if (!index_ready_to_accept) {
+      VLOG(2) << "Index not ready to apply operaton " << index->ToString();
+      // We are in the process of backfilling the index. It should not be updated with a
+      // write/delete yet. The backfill stage will update the index for such entries.
+      continue;
+    }
     YBqlWriteOpPtr index_op(is_upsert ? index_table->NewQLInsert() : index_table->NewQLDelete());
     index_op->set_writes_primary_row(true);
     QLWriteRequestPB *index_req = index_op->mutable_request();

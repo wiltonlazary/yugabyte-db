@@ -7,11 +7,11 @@ import {
   YBFormInput, YBButton, YBFormSelect, YBCheckBox, YBFormDropZone
 } from '../../common/forms/fields';
 import { YBLoadingCircleIcon } from '../../common/indicators';
-import { getPromiseState } from 'utils/PromiseUtils';
+import { getPromiseState } from '../../../utils/PromiseUtils';
 import ListKeyManagementConfigurations from './ListKeyManagementConfigurations';
 import * as Yup from 'yup';
 
-import { regionsData } from '../../config/PublicCloud/views/providerRegionsData';
+import { regionsData } from '../PublicCloud/views/providerRegionsData';
 import { readUploadedFile } from "../../../utils/UniverseUtils";
 import {change} from "redux-form";
 
@@ -276,7 +276,8 @@ class KeyManagementConfiguration extends Component {
           onSubmit={values => {
             this.submitKMSForm(values);
           }}
-          render={props => (
+        >
+          {props => (
             <form onSubmit={props.handleSubmit}>
               <Row>
                 <Col lg={8}>
@@ -311,7 +312,7 @@ class KeyManagementConfiguration extends Component {
               </div>
             </form>
           )}
-        />
+        </Formik>
       </div>
     );
   }

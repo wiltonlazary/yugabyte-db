@@ -1,8 +1,8 @@
 ---
-title: CREATE POLICY
+title: CREATE POLICY statement [YSQL]
+headerTitle: CREATE POLICY
 linkTitle: CREATE POLICY
-description: CREATE POLICY
-summary: Create row level security policy
+description: Use the CREATE POLICY statement to create a new row level security policy for a table to select, insert, update, or delete rows that match the relevant policy expression.
 menu:
   latest:
     identifier: api-ysql-commands-create-policy
@@ -88,7 +88,6 @@ yugabyte=# CREATE POLICY p2 ON document FOR INSERT WITH CHECK (dauthor = current
 
 ## See also
 
-[`ALTER POLICY`](../dcl_alter_policy)
-[`DROP POLICY`](../dcl_drop_policy)
-[`ALTER TABLE`](../ddl_alter_table)
-[Other YSQL Statements](..)
+- [`ALTER POLICY`](../dcl_alter_policy)
+- [`DROP POLICY`](../dcl_drop_policy)
+- [`ALTER TABLE`](../ddl_alter_table)

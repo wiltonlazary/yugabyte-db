@@ -1,7 +1,8 @@
 ---
 title: System configuration
+headerTitle: System configuration
 linkTitle: 1. System configuration
-description: System configuration
+description: Configure NTP and ulimits on your YugabyteDB cluster
 aliases:
   - /deploy/manual-deployment/system-config
 menu:
@@ -108,6 +109,48 @@ On CentOS, /etc/security/limits.d/20-nproc.conf must also be configured
 ```
 *          soft    nproc     12000
 ```
+
+{{< note title="Note" >}}
+
+If you're using [systemd](https://systemd.io/) to start the processes, and the ulimits are not propagated, you
+ must add them also in the `Service` section in the configuration file.
+
+```
+[Unit]
+.....
+
+[Service]
+.....
+ulimits options here
+
+[Install]
+.....
+```
+
+The mappings of ulimit options with values are:
+
+Data type | ulimit equivalent | Value |
+----------|-------------|-----|
+Directive       | ulimit equivalent    | Value |
+LimitCPU=       | ulimit -t            | infinity |
+LimitFSIZE=     | ulimit -f            | infinity |
+LimitDATA=      | ulimit -d            | infinity |
+LimitSTACK=     | ulimit -s            | 8192 |
+LimitCORE=      | ulimit -c            | infinity |
+LimitRSS=       | ulimit -m            | infinity |
+LimitNOFILE=    | ulimit -n            | 1048576  |
+LimitAS=        | ulimit -v            | infinity |
+LimitNPROC=     | ulimit -u            | 12000  |
+LimitMEMLOCK=   | ulimit -l            | 64 |
+LimitLOCKS=     | ulimit -x            | infinity |
+LimitSIGPENDING=| ulimit -i            | 119934 |
+LimitMSGQUEUE=  | ulimit -q            | 819200 |
+LimitNICE=      | ulimit -e            | 0 |
+LimitRTPRIO=    | ulimit -r            | 0 |
+
+If a ulimit is set to `unlimited`, set it to `infinity` in the systemd config.
+
+{{< /note >}}
 
 {{< note title="Note" >}}
 

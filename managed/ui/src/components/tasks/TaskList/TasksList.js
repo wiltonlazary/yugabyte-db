@@ -2,7 +2,7 @@
 
 import React, { Component } from 'react';
 import { TaskListTable } from '../../tasks';
-import { showOrRedirect } from 'utils/LayoutUtils';
+import { showOrRedirect } from '../../../utils/LayoutUtils';
 
 export default class TasksList extends Component {
 
@@ -18,7 +18,7 @@ export default class TasksList extends Component {
     showOrRedirect(currentCustomer.data.features, "menu.tasks");
     const errorPlatformMessage = (
       <div className="oss-unavailable-warning">
-        Only available on YugaByte Platform.
+        Only available on Yugabyte Platform.
       </div>
     );
 

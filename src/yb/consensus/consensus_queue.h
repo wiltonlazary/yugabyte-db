@@ -75,6 +75,35 @@ struct MajorityReplicatedData;
 // The id for the server-wide consensus queue MemTracker.
 extern const char kConsensusQueueParentTrackerId[];
 
+// Utility structure to track value sent to and received by follower.
+template <class Value>
+struct FollowerWatermark {
+  const Value initial;
+
+  // When value is sent to follower, its value is written to last_sent.
+  Value last_sent;
+
+  // After follower successfully process our request, we copy value from last_sent to last_received.
+  Value last_received;
+
+  explicit FollowerWatermark(const Value& initial_ = Value())
+      : initial(initial_), last_sent(initial_), last_received(initial_) {}
+
+  void Reset() {
+    last_sent = initial;
+    last_received = initial;
+  }
+
+  void OnReplyFromFollower() {
+    last_received = last_sent;
+  }
+
+  std::string ToString() const {
+    return Format("{ last_sent: $0 last_received: $1 }", last_sent, last_received);
+  }
+};
+
+
 // Tracks the state of the peers and which transactions they have replicated.  Owns the LogCache
 // which actually holds the replicate messages which are en route to the various peers.
 //
@@ -113,12 +142,21 @@ class PeerMessageQueue {
     // Next index to send to the peer.  This corresponds to "nextIndex" as specified in Raft.
     int64_t next_index = kInvalidOpIdIndex;
 
+    // Number of ops starting from next_index_ to retransmit.
+    int64_t last_num_messages_sent = -1;
+
+    // Number of retransmissions from same next_index_.
+    int64_t current_retransmissions = -1;
+
     // The last operation that we've sent to this peer and that it acked. Used for watermark
     // movement.
-    OpId last_received;
+    OpIdPB last_received;
 
     // The last committed index this peer knows about.
     int64_t last_known_committed_idx;
+
+    // The ID of the operation last applied by this peer.
+    OpId last_applied;
 
     // Whether the last exchange with this peer was successful.
     bool is_last_exchange_successful = false;
@@ -128,23 +166,15 @@ class PeerMessageQueue {
     // successful communication ever took place.
     MonoTime last_successful_communication_time;
 
-    // The leader sets this field to the time of sending request + leader lease duration, and uses
-    // it when handling the response to establish the majority replicated lease expiration
-    // timestamp. This is not actually sent to the follower: what we're sending is the lease
-    // duration, not an expiration timestamp, because the timestamp is specific to the leader's
-    // monotonic clock.
-    CoarseTimePoint last_leader_lease_expiration_sent_to_follower;
+    // Leader lease expiration from this follower's point of view.
+    FollowerWatermark<CoarseTimePoint> leader_lease_expiration;
 
-    // The last leader lease expiration timestamp received by the follower described by this
-    // TrackedPeer. We set this to the value of what we sent to that follower
-    // (last_leader_lease_expiration_sent_to_follower) when we receive the follower's response.
-    CoarseTimePoint last_leader_lease_expiration_received_by_follower;
+    // Leader hybrid time lease expiration from this follower's point of view.
+    FollowerWatermark<MicrosTime> leader_ht_lease_expiration{
+        HybridTime::kMin.GetPhysicalValueMicros()};
 
-    MicrosTime last_ht_lease_expiration_sent_to_follower =
-        HybridTime::kMin.GetPhysicalValueMicros();
-
-    MicrosTime last_ht_lease_expiration_received_by_follower =
-        HybridTime::kMin.GetPhysicalValueMicros();
+    // History cutoff from this follower's point of view.
+    FollowerWatermark<HybridTime> history_cutoff{HybridTime::kMin};
 
     // Whether the follower was detected to need remote bootstrap.
     bool needs_remote_bootstrap = false;
@@ -172,7 +202,7 @@ class PeerMessageQueue {
                    std::unique_ptr<ThreadPoolToken> raft_pool_observers_token);
 
   // Initialize the queue.
-  virtual void Init(const OpId& last_locally_replicated);
+  virtual void Init(const OpIdPB& last_locally_replicated);
 
   // Changes the queue to leader mode, meaning it tracks majority replicated operations and notifies
   // observers when those change.
@@ -185,8 +215,9 @@ class PeerMessageQueue {
   //
   // 'active_config' is the currently-active Raft config. This must always be a superset of the
   // tracked peers, and that is enforced with runtime CHECKs.
-  virtual void SetLeaderMode(const OpId& committed_index,
+  virtual void SetLeaderMode(const OpIdPB& committed_op_id,
                              int64_t current_term,
+                             const OpId& last_applied_op_id,
                              const RaftConfigPB& active_config);
 
   // Changes the queue to non-leader mode. Currently tracked peers will still be tracked so that the
@@ -261,21 +292,26 @@ class PeerMessageQueue {
 
   // Updates the request queue with the latest response of a peer, returns whether this peer has
   // more requests pending.
-  virtual void ResponseFromPeer(const std::string& peer_uuid,
-                                const ConsensusResponsePB& response,
-                                bool* more_pending);
+  virtual bool ResponseFromPeer(const std::string& peer_uuid,
+                                const ConsensusResponsePB& response);
 
   // Closes the queue, peers are still allowed to call UntrackPeer() and ResponseFromPeer() but no
   // additional peers can be tracked or messages queued.
   virtual void Close();
 
   // Returns the last message replicated by all peers, for tests.
-  OpId GetAllReplicatedIndexForTests() const;
+  OpIdPB GetAllReplicatedIndexForTests() const;
 
-  OpId GetCommittedIndexForTests() const;
+  OpIdPB GetCommittedIndexForTests() const;
+
+  OpId TEST_GetAllAppliedOpId() const;
 
   // Returns the current majority replicated OpId, for tests.
-  OpId GetMajorityReplicatedOpIdForTests() const;
+  OpIdPB GetMajorityReplicatedOpIdForTests() const;
+
+  OpIdPB TEST_GetLastAppended() const;
+
+  OpId TEST_GetLastAppliedOpId() const;
 
   // Returns true if specified peer accepted our lease request.
   bool PeerAcceptedOurLease(const std::string& uuid) const;
@@ -292,6 +328,8 @@ class PeerMessageQueue {
   CHECKED_STATUS UnRegisterObserver(PeerMessageQueueObserver* observer);
 
   bool CanPeerBecomeLeader(const std::string& peer_uuid) const;
+
+  std::string GetUpToDatePeer() const;
 
   struct Metrics {
     // Keeps track of the number of ops. that are completed by a majority but still need
@@ -327,6 +365,10 @@ class PeerMessageQueue {
 
   size_t LogCacheSize();
   size_t EvictLogCache(size_t bytes_to_evict);
+
+  CHECKED_STATUS FlushLogIndex();
+
+  CHECKED_STATUS CopyLogTo(const std::string& dest_dir);
 
   // Start memory tracking of following operations in case they are still present in our caches.
   void TrackOperationsMemory(const OpIds& op_ids);
@@ -367,18 +409,27 @@ class PeerMessageQueue {
 
   struct QueueState {
 
-    // The first operation that has been replicated to all currently tracked peers.
-    OpId all_replicated_opid = MinimumOpId();
+    // The last operation that has been replicated to all currently tracked peers.
+    OpIdPB all_replicated_op_id = MinimumOpId();
+
+    // The last operation that has been replicated to all currently non-lagging tracked peers.
+    OpIdPB all_nonlagging_replicated_op_id = MinimumOpId();
+
+    // The last operation that has been applied by all currently tracked peers.
+    yb::OpId all_applied_op_id = yb::OpId::Min();
 
     // The index of the last operation replicated to a majority.  This is usually the same as
-    // 'committed_index' but might not be if the terms changed.
-    OpId majority_replicated_opid = MinimumOpId();
+    // 'committed_op_id' but might not be if the terms changed.
+    OpIdPB majority_replicated_op_id = MinimumOpId();
 
     // The index of the last operation to be considered committed.
-    OpId committed_index = MinimumOpId();
+    OpIdPB committed_op_id = MinimumOpId();
+
+    // The ID of the last applied operation.
+    OpId last_applied_op_id = OpId::Min();
 
     // The opid of the last operation appended to the queue.
-    OpId last_appended = MinimumOpId();
+    OpIdPB last_appended = MinimumOpId();
 
     // The queue's owner current_term.  Set by the last appended operation.  If the queue owner's
     // term is less than the term observed from another peer the queue owner must step down.
@@ -410,14 +461,13 @@ class PeerMessageQueue {
   void NotifyObserversOfMajorityReplOpChangeTask(const MajorityReplicatedData& data);
 
   void NotifyObserversOfTermChange(int64_t term);
-  void NotifyObserversOfTermChangeTask(int64_t term);
 
   void NotifyObserversOfFailedFollower(const std::string& uuid,
                                        int64_t term,
                                        const std::string& reason);
-  void NotifyObserversOfFailedFollowerTask(const std::string& uuid,
-                                           int64_t term,
-                                           const std::string& reason);
+
+  template <class Func>
+  void NotifyObservers(const char* title, Func&& func);
 
   typedef std::unordered_map<std::string, TrackedPeer*> PeersMap;
 
@@ -432,7 +482,7 @@ class PeerMessageQueue {
 
   // Returns the last operation in the message queue, or 'preceding_first_op_in_queue_' if the queue
   // is empty.
-  const OpId& GetLastOp() const;
+  const OpIdPB& GetLastOp() const;
 
   TrackedPeer* TrackPeerUnlocked(const std::string& uuid);
 
@@ -442,11 +492,19 @@ class PeerMessageQueue {
   void CheckPeersInActiveConfigIfLeaderUnlocked() const;
 
   // Callback when a REPLICATE message has finished appending to the local log.
-  void LocalPeerAppendFinished(const OpId& id,
+  void LocalPeerAppendFinished(const OpIdPB& id,
                                const Status& status);
 
+  void NumSSTFilesChanged();
+
   // Updates op id replicated on each node.
-  void UpdateAllReplicatedOpId(OpId* result);
+  void UpdateAllReplicatedOpId(OpIdPB* result) REQUIRES(queue_lock_);
+
+  // Updates op id applied on each node.
+  void UpdateAllAppliedOpId(yb::OpId* result) REQUIRES(queue_lock_);
+
+  // Updates op id replicated on each non-lagging node.
+  void UpdateAllNonLaggingReplicatedOpId(int32_t threshold) REQUIRES(queue_lock_);
 
   // Policy is responsible for tuning of watermark calculation.
   // I.e. simple leader lease or hybrid time leader lease etc.
@@ -456,7 +514,7 @@ class PeerMessageQueue {
 
   CoarseTimePoint LeaderLeaseExpirationWatermark();
   MicrosTime HybridTimeLeaseExpirationWatermark();
-  OpId OpIdWatermark();
+  OpIdPB OpIdWatermark();
   uint64_t NumSSTFilesWatermark();
 
   Result<ReadOpsResult> ReadFromLogCache(int64_t from_index,
@@ -498,6 +556,7 @@ class PeerMessageQueue {
   server::ClockPtr clock_;
 
   ConsensusContext* context_ = nullptr;
+  bool installed_num_sst_files_changed_listener_ = false;
 
   // Used to protect cdc_consumer_op_id_ and cdc_consumer_op_id_last_updated_.
   mutable rw_spinlock cdc_consumer_lock_;
@@ -514,7 +573,7 @@ inline std::ostream& operator <<(std::ostream& out, PeerMessageQueue::State stat
 }
 
 struct MajorityReplicatedData {
-  OpId op_id;
+  OpIdPB op_id;
   CoarseTimePoint leader_lease_expiration;
   MicrosTime ht_lease_expiration;
   uint64_t num_sst_files;
@@ -530,11 +589,12 @@ class PeerMessageQueueObserver {
   // triggers the apply for pending transactions.
   //
   // 'committed_index' is set to the id of the last operation considered committed by consensus.
+  // `last_applied_op_id` is set the ID of the last operation applied by consensus.
   //
   // The implementation is idempotent, i.e. independently of the ordering of calls to this method
   // only non-triggered applys will be started.
-  virtual void UpdateMajorityReplicated(const MajorityReplicatedData& data,
-                                        OpId* committed_index) = 0;
+  virtual void UpdateMajorityReplicated(
+      const MajorityReplicatedData& data, OpIdPB* committed_index, OpId* last_applied_op_id) = 0;
 
   // Notify the Consensus implementation that a follower replied with a term higher than that
   // established in the queue.
@@ -545,6 +605,8 @@ class PeerMessageQueueObserver {
   virtual void NotifyFailedFollower(const std::string& peer_uuid,
                                     int64_t term,
                                     const std::string& reason) = 0;
+
+  virtual void MajorityReplicatedNumSSTFilesChanged(uint64_t majority_replicated_num_sst_files) = 0;
 
   virtual ~PeerMessageQueueObserver() {}
 };

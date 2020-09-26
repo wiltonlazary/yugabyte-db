@@ -19,14 +19,35 @@
 
 #include "yb/client/table.h"
 
+#include "yb/common/snapshot.h"
+
 namespace yb {
 namespace master {
+
+struct TableDescription {
+  scoped_refptr<NamespaceInfo> namespace_info;
+  scoped_refptr<TableInfo> table_info;
+  TabletInfos tablet_infos;
+};
 
 // This wraps around the proto containing CDC stream information. It will be used for
 // CowObject managed access.
 struct PersistentCDCStreamInfo : public Persistent<SysCDCStreamEntryPB, SysRowEntry::CDC_STREAM> {
   const TableId& table_id() const {
     return pb.table_id();
+  }
+
+  bool started_deleting() const {
+    return pb.state() == SysCDCStreamEntryPB::DELETING ||
+        pb.state() == SysCDCStreamEntryPB::DELETED;
+  }
+
+  bool is_deleting() const {
+    return pb.state() == SysCDCStreamEntryPB::DELETING;
+  }
+
+  bool is_deleted() const {
+    return pb.state() == SysCDCStreamEntryPB::DELETED;
   }
 
   const google::protobuf::RepeatedPtrField<CDCStreamOptionsPB> options() const {
@@ -90,6 +111,7 @@ class UniverseReplicationInfo : public RefCountedThreadSafe<UniverseReplicationI
   const std::string producer_id_;
 
   std::shared_ptr<CDCRpcTasks> cdc_rpc_tasks_;
+  std::string master_addrs_;
 
   // Protects cdc_rpc_tasks_.
   mutable rw_spinlock lock_;
@@ -165,9 +187,12 @@ class SnapshotInfo : public RefCountedThreadSafe<SnapshotInfo>,
   // Returns true if the snapshot deleting is in-progress.
   bool IsDeleteInProgress() const;
 
-  CHECKED_STATUS AddEntries(const scoped_refptr<NamespaceInfo> ns,
-                            const scoped_refptr<TableInfo>& table,
-                            const std::vector<scoped_refptr<TabletInfo> >& tablets);
+  CHECKED_STATUS AddEntries(const TableDescription& table_description);
+
+  static void AddEntries(
+      const TableDescription& table_description,
+      google::protobuf::RepeatedPtrField<SysRowEntry>* out,
+      google::protobuf::RepeatedPtrField<SysSnapshotEntryPB::TabletSnapshotPB>* tablet_infos);
 
  private:
   friend class RefCountedThreadSafe<SnapshotInfo>;

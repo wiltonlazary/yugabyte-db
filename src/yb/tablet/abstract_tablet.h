@@ -37,11 +37,13 @@ struct PgsqlReadRequestResult {
   HybridTime restart_read_ht;
 };
 
+class TabletRetentionPolicy;
+
 class AbstractTablet {
  public:
   virtual ~AbstractTablet() {}
 
-  virtual const Schema& SchemaRef(const std::string& table_id = "") const = 0;
+  virtual yb::SchemaPtr GetSchema(const std::string& table_id = "") const = 0;
 
   virtual const common::YQLStorageIf& QLStorage() const = 0;
 
@@ -70,8 +72,7 @@ class AbstractTablet {
                                                   const size_t row_count,
                                                   QLResponsePB* response) const = 0;
 
-  virtual CHECKED_STATUS RegisterReaderTimestamp(HybridTime read_point) = 0;
-  virtual void UnregisterReader(HybridTime read_point) = 0;
+  virtual TabletRetentionPolicy* RetentionPolicy() = 0;
 
   // Returns safe timestamp to read.
   // `require_lease` - whether this read requires a hybrid time leader lease. Typically, strongly

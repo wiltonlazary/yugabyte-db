@@ -1,8 +1,9 @@
 ---
-title: Encryption in transit
+title: Encryption in transit on YugabyteDB clusters
+headerTitle: Encryption in transit
 linkTitle: Encryption in transit
-description: Encryption in transit
-headcontent: Enable encryption in transit to protect network communications.
+description: Enable encryption in transit (using TLS) to protect network communication.
+headcontent: Enable encryption in transit (using TLS) to protect network communication.
 image: /images/section_icons/secure/tls-encryption.png
 aliases:
   - /secure/tls-encryption/
@@ -10,65 +11,80 @@ menu:
   latest:
     identifier: tls-encryption
     parent: secure
-    weight: 740
+    weight: 721
 ---
 
-YugabyteDB supports encryption in transit using Transport Layer Security (TLS), which supercedes Secure Socket Layers (SSL). You can configure YugabyteDB to encrypt network communication, including:
+YugabyteDB can be configured to protect data in transit with:
 
-* Server-server — between YB-TServer and YB-Master services
-* Client-server — using CLIs and APIs for YSQL and YCQL
+- [Server-server encryption](./server-to-server) for intra-node communication between YB-Master and YB-TServer nodes
+- [Client-server](./client-to-server) for communication between clients and nodes when using CLIs, tools, and APIs for YSQL and YCQL
 
-{{< note title="Note" >}}
+YugabyteDB supports [Transport Layer Security (TLS)](https://en.wikipedia.org/wiki/Transport_Layer_Security) encryption based on [OpenSSL](https://www.openssl.org), an open source cryptography toolkit that provides an implementation of the Transport Layer Security (TLS) and Secure Socket Layer (SSL) protocols. 
 
-YEDIS does not include support for client-server TLS encryption.
+**Note:** Client-server TLS encryption is not supported for YEDIS.
 
-{{</note>}}
-
-In this section, we will look at how to set up a 3-node YugabyteDB cluster with TLS encryption enabled.
+Follow the steps in this section to learn how to enable encryption using TLS for a three-node YugabyteDB cluster.
 
 <div class="row">
+
   <div class="col-12 col-md-6 col-lg-12 col-xl-6">
-    <a class="section-link icon-offset" href="prepare-nodes/">
+    <a class="section-link icon-offset" href="server-certificates/">
       <div class="head">
         <img class="icon" src="/images/section_icons/secure/tls-encryption/prepare-nodes.png" aria-hidden="true" />
-        <div class="title">1. Prepare nodes</div>
+        <div class="title">Create server certificates</div>
       </div>
       <div class="body">
-          Generate the per-node configuration and prepare the nodes with the configuration data.
+          Create server certificates (using TLS) for protecting data in transit between YugabyteDB nodes.
       </div>
     </a>
   </div>
+
+  <div class="col-12 col-md-6 col-lg-12 col-xl-6">
+    <a class="section-link icon-offset" href="client-certificates/">
+      <div class="head">
+        <img class="icon" src="/images/section_icons/secure/tls-encryption/prepare-nodes.png" aria-hidden="true" />
+        <div class="title">Create client certificates</div>
+      </div>
+      <div class="body">
+          Create self-signed certificates to connect clients to YugabyteDB clusters.
+      </div>
+    </a>
+  </div>
+
   <div class="col-12 col-md-6 col-lg-12 col-xl-6">
     <a class="section-link icon-offset" href="server-to-server/">
       <div class="head">
         <img class="icon" src="/images/section_icons/secure/tls-encryption/server-to-server.png" aria-hidden="true" />
-        <div class="title">2. Server-server encryption</div>
+        <div class="title">Enable server-to-server encryption</div>
       </div>
       <div class="body">
-          Enable server-server encryption between YB-Masters and YB-TServers.
+          Enable server-to-server encryption (using TLS) between YB-Master and YB-TServer nodes.
       </div>
     </a>
   </div>
+
   <div class="col-12 col-md-6 col-lg-12 col-xl-6">
     <a class="section-link icon-offset" href="client-to-server/">
       <div class="head">
         <img class="icon" src="/images/section_icons/secure/tls-encryption/client-to-server.png" aria-hidden="true" />
-        <div class="title">3. Client-server encryption</div>
+        <div class="title">Enable client-to-server encryption</div>
       </div>
       <div class="body">
-          Enable client-server encryption for YSQL and YCQL.
+          Enable client-to-server encryption (using TLS) for YSQL and YCQL.
       </div>
     </a>
   </div>
+
   <div class="col-12 col-md-6 col-lg-12 col-xl-6">
     <a class="section-link icon-offset" href="connect-to-cluster/">
       <div class="head">
         <img class="icon" src="/images/section_icons/secure/tls-encryption/connect-to-cluster.png" aria-hidden="true" />
-        <div class="title">4. Connect to cluster</div>
+        <div class="title">Connect to clusters</div>
       </div>
       <div class="body">
-          Connect to a YugabyteDB cluster with TLS encryption enabled.
+          Connect clients, tools, and APIs to encryption-enabled YugabyteDB clusters.
       </div>
     </a>
   </div>
+
 </div>

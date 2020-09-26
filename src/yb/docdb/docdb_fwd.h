@@ -19,6 +19,7 @@
 namespace yb {
 namespace docdb {
 
+class ConsensusFrontier;
 class DocPath;
 class DocWriteBatch;
 class IntentAwareIterator;
@@ -26,6 +27,7 @@ class KeyValueWriteBatchPB;
 class QLWriteOperation;
 class PgsqlWriteOperation;
 
+struct ApplyTransactionState;
 struct DocDB;
 
 YB_STRONGLY_TYPED_BOOL(PartialRangeKeyIntents);

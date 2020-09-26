@@ -21,6 +21,7 @@
 #include "yb/docdb/doc_key.h"
 #include "yb/docdb/doc_operation.h"
 #include "yb/docdb/doc_rowwise_iterator.h"
+#include "yb/docdb/intent_aware_iterator.h"
 
 namespace yb {
 
@@ -42,15 +43,10 @@ class QLWriteOperation :
     public DocOperationBase<DocOperationType::QL_WRITE_OPERATION, QLWriteRequestPB>,
     public DocExprExecutor {
  public:
-  QLWriteOperation(const Schema& schema,
+  QLWriteOperation(std::shared_ptr<const Schema> schema,
                    const IndexMap& index_map,
                    const Schema* unique_index_key_schema,
-                   const TransactionOperationContextOpt& txn_op_context)
-      : schema_(schema),
-        index_map_(index_map),
-        unique_index_key_schema_(unique_index_key_schema),
-        txn_op_context_(txn_op_context)
-  {}
+                   const TransactionOperationContextOpt& txn_op_context);
 
   // Construct a QLWriteOperation. Content of request will be swapped out by the constructor.
   CHECKED_STATUS Init(QLWriteRequestPB* request, QLResponsePB* response);
@@ -124,7 +120,14 @@ class QLWriteOperation :
                                    const QLTableRow& table_row,
                                    std::unique_ptr<QLRowBlock>* rowblock);
 
-  Result<bool> DuplicateUniqueIndexValue(const DocOperationApplyData& data);
+  Result<bool> HasDuplicateUniqueIndexValue(const DocOperationApplyData& data);
+  Result<bool> HasDuplicateUniqueIndexValue(
+      const DocOperationApplyData& data, yb::docdb::Direction direction);
+  Result<bool> HasDuplicateUniqueIndexValue(
+      const DocOperationApplyData& data, ReadHybridTime read_time);
+  Result<HybridTime> FindOldestOverwrittenTimestamp(
+      IntentAwareIterator* iter, const SubDocKey& sub_doc_key,
+      HybridTime min_hybrid_time);
 
   CHECKED_STATUS DeleteRow(const DocPath& row_path, DocWriteBatch* doc_write_batch,
                            const ReadHybridTime& read_ht, CoarseTimePoint deadline);
@@ -137,7 +140,7 @@ class QLWriteOperation :
                                     QLWriteRequestPB::QLStmtType type,
                                     const QLTableRow& new_row);
 
-  const Schema& schema_;
+  std::shared_ptr<const Schema> schema_;
   const IndexMap& index_map_;
   const Schema* unique_index_key_schema_ = nullptr;
 
@@ -175,6 +178,13 @@ class QLWriteOperation :
   // Does the liveness column exist before the write operation?
   bool liveness_column_exists_ = false;
 };
+
+CHECKED_STATUS PrepareIndexWriteAndCheckIfIndexKeyChanged(QLExprExecutor* expr_executor,
+                                                          const QLTableRow &existing_row,
+                                                          const QLTableRow &new_row,
+                                                          const IndexInfo *index,
+                                                          QLWriteRequestPB* index_request,
+                                                          bool* has_index_key_changed = nullptr);
 
 class QLReadOperation : public DocExprExecutor {
  public:

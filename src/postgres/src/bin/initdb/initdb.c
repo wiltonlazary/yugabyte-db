@@ -2226,6 +2226,15 @@ make_system_platform(FILE *cmdfd) {
 }
 
 /*
+ * Create pg_stat_statements extension by default
+ */
+static void
+enable_pg_stat_statements(FILE *cmdfd)
+{
+	PG_CMD_PUTS("CREATE EXTENSION pg_stat_statements schema pg_catalog;\n\n");
+}
+
+/*
  * signal handler in case we are interrupted.
  *
  * The Windows runtime docs at
@@ -2475,9 +2484,9 @@ setlocales(void)
 		lc_collate = pg_strdup(kYBDefaultLocaleForSortOrder);
 		fprintf(
 			stderr,
-			_("In YugaByte DB, setting LC_COLLATE to %s and all other locale settings to %s "
+			_("In YugabyteDB, setting LC_COLLATE to %s and all other locale settings to %s "
 			  "by default. Locale support will be enhanced as part of addressing "
-			  "https://github.com/YugaByte/yugabyte-db/issues/1557"),
+			  "https://github.com/yugabyte/yugabyte-db/issues/1557\n"),
 			lc_collate, locale);
 	}
 
@@ -3218,6 +3227,9 @@ initialize_data_directory(void)
 	setup_schema(cmdfd);
 
 	load_plpgsql(cmdfd);
+
+	/* Enable pg_stat_statements */
+	enable_pg_stat_statements(cmdfd);
 
 	if (!IsYugaByteGlobalClusterInitdb())
 	{

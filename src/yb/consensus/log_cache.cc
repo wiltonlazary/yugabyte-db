@@ -43,6 +43,8 @@
 
 #include "yb/consensus/log.h"
 #include "yb/consensus/log_reader.h"
+#include "yb/consensus/consensus_util.h"
+
 #include "yb/gutil/bind.h"
 #include "yb/gutil/map-util.h"
 #include "yb/gutil/stl_util.h"
@@ -70,23 +72,23 @@ DEFINE_int32(global_log_cache_size_limit_mb, 1024,
              "caching log entries across all tablets is kept under this threshold.");
 TAG_FLAG(global_log_cache_size_limit_mb, advanced);
 
-DEFINE_test_flag(bool, TEST_log_cache_skip_eviction, false,
+DEFINE_test_flag(bool, log_cache_skip_eviction, false,
                  "Don't evict log entries in tests.");
 
 using strings::Substitute;
 
-namespace yb {
-namespace consensus {
-
 METRIC_DEFINE_gauge_int64(tablet, log_cache_num_ops, "Log Cache Operation Count",
-                          MetricUnit::kOperations,
+                          yb::MetricUnit::kOperations,
                           "Number of operations in the log cache.");
 METRIC_DEFINE_gauge_int64(tablet, log_cache_size, "Log Cache Memory Usage",
-                          MetricUnit::kBytes,
+                          yb::MetricUnit::kBytes,
                           "Amount of memory in use for caching the local log.");
 METRIC_DEFINE_counter(tablet, log_cache_disk_reads, "Log Cache Disk Reads",
-                      MetricUnit::kEntries,
+                      yb::MetricUnit::kEntries,
                       "Amount of operations read from disk.");
+
+namespace yb {
+namespace consensus {
 
 namespace {
 
@@ -139,7 +141,7 @@ LogCache::~LogCache() {
   tracker_->UnregisterFromParent();
 }
 
-void LogCache::Init(const OpId& preceding_op) {
+void LogCache::Init(const OpIdPB& preceding_op) {
   std::lock_guard<simple_spinlock> l(lock_);
   CHECK_EQ(cache_.size(), 1) << "Cache should have only our special '0' op";
   next_sequential_op_index_ = preceding_op.index() + 1;
@@ -291,7 +293,9 @@ Result<ReadOpsResult> LogCache::ReadOps(int64_t after_op_index,
 
   std::unique_lock<simple_spinlock> l(lock_);
   int64_t next_index = after_op_index + 1;
-  int64_t to_index = to_op_index > 0 ? to_op_index + 1 : next_sequential_op_index_;
+  int64_t to_index = to_op_index > 0
+      ? std::min(to_op_index + 1, next_sequential_op_index_)
+      : next_sequential_op_index_;
 
   // Return as many operations as we can, up to the limit.
   int64_t remaining_space = max_size_bytes;
@@ -408,6 +412,14 @@ size_t LogCache::EvictSomeUnlocked(int64_t stop_after_index, int64_t bytes_to_ev
   return bytes_evicted;
 }
 
+Status LogCache::FlushIndex() {
+  return log_->FlushIndex();
+}
+
+CHECKED_STATUS LogCache::CopyLogTo(const std::string& dest_dir) {
+  return log_->CopyTo(dest_dir);
+}
+
 void LogCache::AccountForMessageRemovalUnlocked(const CacheEntry& entry) {
   if (entry.tracked) {
     tracker_->Release(entry.mem_usage);
@@ -444,9 +456,7 @@ std::string LogCache::ToStringUnlocked() const {
 }
 
 std::string LogCache::LogPrefixUnlocked() const {
-  return Substitute("T $0 P $1: ",
-                    tablet_id_,
-                    local_uuid_);
+  return MakeTabletLogPrefix(tablet_id_, local_uuid_);
 }
 
 void LogCache::DumpToLog() const {

@@ -18,7 +18,9 @@
 #ifndef YB_YQL_PGGATE_PG_TABLEDESC_H_
 #define YB_YQL_PGGATE_PG_TABLEDESC_H_
 
+#include "yb/common/pgsql_protocol.pb.h"
 #include "yb/client/client.h"
+#include "yb/client/yb_op.h"
 #include "yb/yql/pggate/pg_column.h"
 
 namespace yb {
@@ -52,17 +54,29 @@ class PgTableDesc : public RefCountedThreadSafe<PgTableDesc> {
   const size_t num_key_columns() const;
   const size_t num_columns() const;
 
-  client::YBPgsqlReadOp* NewPgsqlSelect();
-  client::YBPgsqlWriteOp* NewPgsqlInsert();
-  client::YBPgsqlWriteOp* NewPgsqlUpdate();
-  client::YBPgsqlWriteOp* NewPgsqlDelete();
+  std::unique_ptr<client::YBPgsqlReadOp> NewPgsqlSelect();
+  std::unique_ptr<client::YBPgsqlWriteOp> NewPgsqlInsert();
+  std::unique_ptr<client::YBPgsqlWriteOp> NewPgsqlUpdate();
+  std::unique_ptr<client::YBPgsqlWriteOp> NewPgsqlDelete();
+  std::unique_ptr<client::YBPgsqlWriteOp> NewPgsqlTruncateColocated();
 
   // Find the column given the postgres attr number.
   Result<PgColumn *> FindColumn(int attr_num);
 
   CHECKED_STATUS GetColumnInfo(int16_t attr_number, bool *is_primary, bool *is_hash) const;
 
+  const std::vector<std::string>& GetPartitions() const;
+
+  int GetPartitionCount() const;
+
+  Result<int> FindPartitionStartIndex(const string& partition_key) const;
+  Result<int> FindPartitionStartIndex(const Slice& ybctid, uint16 *hash_code) const;
+  Result<int> FindPartitionStartIndex(
+      const google::protobuf::RepeatedPtrField<PgsqlExpressionPB>& hash_col_values,
+      uint16 *hash_code) const;
+
   bool IsTransactional() const;
+  bool IsColocated() const;
 
  private:
   std::shared_ptr<client::YBTable> table_;

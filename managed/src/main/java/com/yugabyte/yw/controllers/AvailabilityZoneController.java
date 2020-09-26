@@ -16,6 +16,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.inject.Inject;
 import com.yugabyte.yw.forms.AvailabilityZoneFormData;
 import com.yugabyte.yw.forms.AvailabilityZoneFormData.AvailabilityZoneData;
+import com.yugabyte.yw.models.Audit;
 import com.yugabyte.yw.models.AvailabilityZone;
 import com.yugabyte.yw.models.Region;
 
@@ -44,7 +45,7 @@ public class AvailabilityZoneController extends AuthenticatedController {
     }
 
     try {
-      List<AvailabilityZone>  zoneList = AvailabilityZone.find.where()
+      List<AvailabilityZone>  zoneList = AvailabilityZone.find.query().where()
           .eq("region", region)
           .findList();
       return ApiResponse.success(zoneList);
@@ -78,6 +79,7 @@ public class AvailabilityZoneController extends AuthenticatedController {
         AvailabilityZone az = AvailabilityZone.create(region, azData.code, azData.name, azData.subnet);
         availabilityZones.put(az.code, az);
       }
+      Audit.createAuditEntry(ctx(), request(), Json.toJson(formData.data()));
       return ApiResponse.success(availabilityZones);
     } catch (Exception e) {
       LOG.error(e.getMessage());
@@ -100,8 +102,8 @@ public class AvailabilityZoneController extends AuthenticatedController {
       ApiResponse.error(BAD_REQUEST, "Invalid PlacementRegion/Provider UUID");
     }
 
-    AvailabilityZone az = AvailabilityZone.find.where().
-            idEq(azUUID).eq("region_uuid", regionUUID).findUnique();
+    AvailabilityZone az = AvailabilityZone.find.query().where().
+            idEq(azUUID).eq("region_uuid", regionUUID).findOne();
 
     if (az == null) {
       return ApiResponse.error(BAD_REQUEST, "Invalid Region/AZ UUID:" + azUUID);
@@ -111,6 +113,7 @@ public class AvailabilityZoneController extends AuthenticatedController {
       az.setActiveFlag(false);
       az.update();
       ObjectNode responseJson = Json.newObject();
+      Audit.createAuditEntry(ctx(), request());
       responseJson.put("success", true);
       return ApiResponse.success(responseJson);
     } catch (Exception e) {

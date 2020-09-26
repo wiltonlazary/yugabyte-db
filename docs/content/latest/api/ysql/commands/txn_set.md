@@ -1,7 +1,8 @@
 ---
-title: SET TRANSACTION
+title: SET TRANSACTION statement [YSQL]
+headerTitle: SET TRANSACTION
 linkTitle: SET TRANSACTION
-description: SET TRANSACTION
+description: Use the `SET TRANSACTION` statement to set the current transaction isolation level.
 summary: SET TRANSACTION
 menu:
   latest:
@@ -34,18 +35,18 @@ Use the `SET TRANSACTION` statement to set the current transaction isolation lev
   </li>
 </ul>
 
-<div class="tab-content">
+<div class="tab-content"> 
   <div id="grammar" class="tab-pane fade show active" role="tabpanel" aria-labelledby="grammar-tab">
-    {{% includeMarkdown "../syntax_resources/commands/set.grammar.md" /%}}
+    {{% includeMarkdown "../syntax_resources/commands/set_transaction.grammar.md" /%}}
   </div>
   <div id="diagram" class="tab-pane fade" role="tabpanel" aria-labelledby="diagram-tab">
-    {{% includeMarkdown "../syntax_resources/commands/set.diagram.md" /%}}
+    {{% includeMarkdown "../syntax_resources/commands/set_transaction.diagram.md" /%}}
   </div>
 </div>
 
 ## Semantics
 
-Supports both Serializable and Snapshot Isolation using the PostgreSQL isolation level syntax of `SERIALIZABLE` and `REPEATABLE READS` respectively. Even `READ COMMITTED` and `READ UNCOMMITTED` isolation levels are mapped to Snapshot Isolation.
+Supports both Serializable and Snapshot Isolation using the PostgreSQL isolation level syntax of `SERIALIZABLE` and `REPEATABLE READ` respectively. Even `READ COMMITTED` and `READ UNCOMMITTED` isolation levels are mapped to Snapshot Isolation.
 
 ### *transaction_mode*
 
@@ -70,15 +71,15 @@ Default.
 
 A statement can only see rows committed before it begins.
 
-`READ_COMMITTED` is mapped to `REPEATABLE_READ`.
+`READ COMMITTED` is mapped to `REPEATABLE READ`.
 
 Default in PostgreSQL.
 
 #### READ UNCOMMITTED
 
-`READ_UNCOMMITTED` is mapped to `REPEATABLE_READ`.
+`READ UNCOMMITTED` is mapped to `REPEATABLE READ`.
 
-In PostgreSQL, `READ_UNCOMMITTED` is mapped to `READ_COMMITTED`.
+In PostgreSQL, `READ UNCOMMITTED` is mapped to `READ COMMITTED`.
 
 ### READ WRITE mode
 
@@ -114,7 +115,7 @@ The `DEFERRABLE` mode may be useful for long-running reports or back-ups.
 
 ## Examples
 
-Note that the Serializable isolation level support was added in [v1.2.6](../../../../releases/v1.2.6/). The examples on this page have not been updated to reflect this recent addition.
+Note that the Serializable isolation level support was added in [v1.2.6](../../../../releases/earlier-releases/v1.2.6/). The examples on this page have not been updated to reflect this recent addition.
 
 Create a sample table.
 
@@ -125,7 +126,7 @@ yugabyte=# CREATE TABLE sample(k1 int, k2 int, v1 int, v2 text, PRIMARY KEY (k1,
 Begin a transaction and insert some rows.
 
 ```postgresql
-yugabyte=# BEGIN TRANSACTION; SET TRANSACTION ISOLATION LEVEL REPEATABLE READ; 
+yugabyte=# BEGIN TRANSACTION; SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
 ```
 
 ```postgresql
@@ -135,7 +136,7 @@ yugabyte=# INSERT INTO sample(k1, k2, v1, v2) VALUES (1, 2.0, 3, 'a'), (1, 3.0, 
 Start a new shell  with `ysqlsh` and begin another transaction to insert some more rows.
 
 ```postgresql
-yugabyte=# BEGIN TRANSACTION; SET TRANSACTION ISOLATION LEVEL REPEATABLE READ; 
+yugabyte=# BEGIN TRANSACTION; SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
 ```
 
 ```postgresql

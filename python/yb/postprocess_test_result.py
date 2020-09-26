@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 """
-Post-processes results of running a single YugaByte DB unit test (e.g. a C++ or Java test) and
+Post-processes results of running a single YugabyteDB unit test (e.g. a C++ or Java test) and
 creates a structured output file with a summary of those results. This includes test running time
 and possible causes of test failure.
 """
@@ -224,7 +224,7 @@ class Postprocessor:
                 time_str = test_kvs["time"].replace(",", "")
                 try:
                     test_kvs["time"] = float(time_str)
-                except ValueError, ex:
+                except ValueError as ex:
                     test_kvs["time"] = None
                     parsing_errors.append(
                         "Could not parse time: %s. Error: %s" % (time_str, str(ex))

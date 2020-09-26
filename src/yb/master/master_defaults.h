@@ -34,6 +34,7 @@ static const char* const kSystemDistributedNamespaceName = "system_distributed";
 static const char* const kSystemTracesNamespaceName = "system_traces";
 
 static const char* const kSystemPeersTableName = "peers";
+static const char* const kSystemPeersV2TableName = "peers_v2";
 static const char* const kSystemLocalTableName = "local";
 static const char* const kSystemPartitionsTableName = "partitions";
 static const char* const kSystemSizeEstimatesTableName = "size_estimates";
@@ -57,6 +58,8 @@ constexpr size_t kCdcStreamIdIdx = 1;
 static const char* const kCdcCheckpoint  = "checkpoint";
 constexpr size_t kCdcCheckpointIdx = 2;
 static const char* const kCdcData = "data";
+static const char* const kCdcLastReplicationTime = "last_replication_time";
+constexpr size_t kCdcLastReplicationTimeIdx = 4;
 
 static const char* const kSystemAuthRolesTableName = "roles";
 static const char* const kSystemAuthRolePermissionsTableName = "role_permissions";

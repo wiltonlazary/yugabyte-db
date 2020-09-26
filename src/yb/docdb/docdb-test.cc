@@ -17,10 +17,14 @@
 #include <string>
 
 #include "yb/rocksdb/db.h"
-#include "yb/rocksdb/status.h"
+#include "yb/rocksdb/db/db_impl.h"
+#include "yb/rocksdb/db/version_set.h"
+#include "yb/rocksdb/db/writebuffer.h"
 #include "yb/rocksdb/util/statistics.h"
 
 #include "yb/common/hybrid_time.h"
+#include "yb/docdb/doc_reader.h"
+#include "yb/docdb/docdb_debug.h"
 #include "yb/docdb/docdb-internal.h"
 #include "yb/docdb/docdb_compaction_filter.h"
 #include "yb/docdb/docdb_test_base.h"
@@ -28,6 +32,7 @@
 #include "yb/docdb/in_mem_docdb.h"
 #include "yb/docdb/intent.h"
 #include "yb/gutil/stringprintf.h"
+#include "yb/gutil/walltime.h"
 #include "yb/rocksutil/yb_rocksdb.h"
 #include "yb/tablet/tablet_options.h"
 #include "yb/server/hybrid_clock.h"
@@ -35,7 +40,9 @@
 #include "yb/docdb/docdb_rocksdb_util.h"
 
 #include "yb/util/minmax.h"
+#include "yb/util/net/net_util.h"
 #include "yb/util/path_util.h"
+#include "yb/util/random_util.h"
 #include "yb/util/size_literals.h"
 #include "yb/util/string_trim.h"
 #include "yb/util/test_macros.h"
@@ -60,7 +67,7 @@ using namespace std::chrono_literals;
 
 DECLARE_bool(use_docdb_aware_bloom_filter);
 DECLARE_int32(max_nexts_to_avoid_seek);
-DECLARE_bool(docdb_sort_weak_intents_in_tests);
+DECLARE_bool(TEST_docdb_sort_weak_intents_in_tests);
 
 #define ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(str) ASSERT_NO_FATALS(AssertDocDbDebugDumpStrEq(str))
 
@@ -248,9 +255,9 @@ SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey_b", "subkey_d"; HT{ physica
       const int expected_num_iterators_increment, int *total_iterators) {
     if (FLAGS_use_docdb_aware_bloom_filter) {
       const auto total_useful_updated =
-          options().statistics->getTickerCount(rocksdb::BLOOM_FILTER_USEFUL);
+          regular_db_options().statistics->getTickerCount(rocksdb::BLOOM_FILTER_USEFUL);
       const auto total_iterators_updated =
-          options().statistics->getTickerCount(rocksdb::NO_TABLE_CACHE_ITERATORS);
+          regular_db_options().statistics->getTickerCount(rocksdb::NO_TABLE_CACHE_ITERATORS);
       if (expected_max_increment > 0) {
         ASSERT_GT(total_useful_updated, *total_useful);
         ASSERT_LE(total_useful_updated, *total_useful + expected_max_increment);
@@ -264,9 +271,7 @@ SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey_b", "subkey_d"; HT{ physica
   }
 
   InetAddress GetInetAddress(const std::string &strval) {
-    InetAddress addr;
-    CHECK_OK(addr.FromString(strval));
-    return addr;
+    return InetAddress(CHECK_RESULT(ParseIpAddress(strval)));
   }
 
   void InsertInet(const std::string strval) {
@@ -1935,6 +1940,109 @@ SubDocKey(DocKey([], ["k1"]), ["s3"; HT{ physical: 2000 }]) -> "v3"; ttl: 0.000s
       )#");
 }
 
+// Test table tombstones for colocated tables.
+TEST_F(DocDBTest, TableTombstoneCompaction) {
+  constexpr PgTableOid pgtable_id(0x4001);
+  HybridTime t = 1000_usec_ht;
+
+  // Simulate SQL:
+  //   INSERT INTO t VALUES ("r1"), ("r2"), ("r3");
+  for (int i = 1; i <= 3; ++i) {
+    DocKey doc_key;
+    std::string range_key_str = Format("r$0", i);
+
+    doc_key.set_pgtable_id(pgtable_id);
+    doc_key.ResizeRangeComponents(1);
+    doc_key.SetRangeComponent(PrimitiveValue(range_key_str), 0 /* idx */);
+    ASSERT_OK(SetPrimitive(
+        DocPath(doc_key.Encode(), PrimitiveValue::SystemColumnId(SystemColumnIds::kLivenessColumn)),
+        Value(PrimitiveValue()),
+        t));
+    t = server::HybridClock::AddPhysicalTimeToHybridTime(t, 1ms);
+  }
+  ASSERT_OK(FlushRocksDbAndWait());
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
+SubDocKey(DocKey(PgTableId=16385, [], ["r1"]), [SystemColumnId(0); HT{ physical: 1000 }]) -> null
+SubDocKey(DocKey(PgTableId=16385, [], ["r2"]), [SystemColumnId(0); HT{ physical: 2000 }]) -> null
+SubDocKey(DocKey(PgTableId=16385, [], ["r3"]), [SystemColumnId(0); HT{ physical: 3000 }]) -> null
+      )#");
+
+  // Simulate SQL (set table tombstone):
+  //   TRUNCATE TABLE t;
+  {
+    DocKey doc_key(pgtable_id);
+    ASSERT_OK(SetPrimitive(
+        DocPath(doc_key.Encode()),
+        Value(PrimitiveValue::kTombstone),
+        t));
+    t = server::HybridClock::AddPhysicalTimeToHybridTime(t, 1ms);
+  }
+  ASSERT_OK(FlushRocksDbAndWait());
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
+SubDocKey(DocKey(PgTableId=16385, [], []), [HT{ physical: 4000 }]) -> DEL
+SubDocKey(DocKey(PgTableId=16385, [], ["r1"]), [SystemColumnId(0); HT{ physical: 1000 }]) -> null
+SubDocKey(DocKey(PgTableId=16385, [], ["r2"]), [SystemColumnId(0); HT{ physical: 2000 }]) -> null
+SubDocKey(DocKey(PgTableId=16385, [], ["r3"]), [SystemColumnId(0); HT{ physical: 3000 }]) -> null
+      )#");
+
+  // Simulate SQL:
+  //  INSERT INTO t VALUES ("r1"), ("r2");
+  for (int i = 1; i <= 2; ++i) {
+    DocKey doc_key;
+    std::string range_key_str = Format("r$0", i);
+
+    doc_key.set_pgtable_id(pgtable_id);
+    doc_key.ResizeRangeComponents(1);
+    doc_key.SetRangeComponent(PrimitiveValue(range_key_str), 0 /* idx */);
+    ASSERT_OK(SetPrimitive(
+        DocPath(doc_key.Encode(), PrimitiveValue::SystemColumnId(SystemColumnIds::kLivenessColumn)),
+        Value(PrimitiveValue()),
+        t));
+    t = server::HybridClock::AddPhysicalTimeToHybridTime(t, 1ms);
+  }
+  ASSERT_OK(FlushRocksDbAndWait());
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
+SubDocKey(DocKey(PgTableId=16385, [], []), [HT{ physical: 4000 }]) -> DEL
+SubDocKey(DocKey(PgTableId=16385, [], ["r1"]), [SystemColumnId(0); HT{ physical: 5000 }]) -> null
+SubDocKey(DocKey(PgTableId=16385, [], ["r1"]), [SystemColumnId(0); HT{ physical: 1000 }]) -> null
+SubDocKey(DocKey(PgTableId=16385, [], ["r2"]), [SystemColumnId(0); HT{ physical: 6000 }]) -> null
+SubDocKey(DocKey(PgTableId=16385, [], ["r2"]), [SystemColumnId(0); HT{ physical: 2000 }]) -> null
+SubDocKey(DocKey(PgTableId=16385, [], ["r3"]), [SystemColumnId(0); HT{ physical: 3000 }]) -> null
+      )#");
+
+  // Simulate SQL:
+  //  DELETE FROM t WHERE c = "r2";
+  {
+    DocKey doc_key;
+    std::string range_key_str = Format("r$0", 2);
+
+    doc_key.set_pgtable_id(pgtable_id);
+    doc_key.ResizeRangeComponents(1);
+    doc_key.SetRangeComponent(PrimitiveValue(range_key_str), 0 /* idx */);
+    ASSERT_OK(SetPrimitive(
+        DocPath(doc_key.Encode()),
+        Value(PrimitiveValue::kTombstone),
+        t));
+    t = server::HybridClock::AddPhysicalTimeToHybridTime(t, 1ms);
+  }
+  ASSERT_OK(FlushRocksDbAndWait());
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
+SubDocKey(DocKey(PgTableId=16385, [], []), [HT{ physical: 4000 }]) -> DEL
+SubDocKey(DocKey(PgTableId=16385, [], ["r1"]), [SystemColumnId(0); HT{ physical: 5000 }]) -> null
+SubDocKey(DocKey(PgTableId=16385, [], ["r1"]), [SystemColumnId(0); HT{ physical: 1000 }]) -> null
+SubDocKey(DocKey(PgTableId=16385, [], ["r2"]), [HT{ physical: 7000 }]) -> DEL
+SubDocKey(DocKey(PgTableId=16385, [], ["r2"]), [SystemColumnId(0); HT{ physical: 6000 }]) -> null
+SubDocKey(DocKey(PgTableId=16385, [], ["r2"]), [SystemColumnId(0); HT{ physical: 2000 }]) -> null
+SubDocKey(DocKey(PgTableId=16385, [], ["r3"]), [SystemColumnId(0); HT{ physical: 3000 }]) -> null
+      )#");
+
+  // Major compact.
+  FullyCompactHistoryBefore(10000_usec_ht);
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
+SubDocKey(DocKey(PgTableId=16385, [], ["r1"]), [SystemColumnId(0); HT{ physical: 5000 }]) -> null
+      )#");
+}
+
 TEST_F(DocDBTest, MinorCompactionNoDeletions) {
   ASSERT_OK(DisableCompactions());
   const DocKey doc_key(PrimitiveValues("k"));
@@ -2464,7 +2572,7 @@ TEST_F(DocDBTest, BloomFilterTest) {
   auto flush_rocksdb = [this, &total_table_iterators]() {
     ASSERT_OK(FlushRocksDbAndWait());
     total_table_iterators =
-        options().statistics->getTickerCount(rocksdb::NO_TABLE_CACHE_ITERATORS);
+        regular_db_options().statistics->getTickerCount(rocksdb::NO_TABLE_CACHE_ITERATORS);
   };
 
   // The following code will set 2/3 keys at a time and flush those 2 writes in a new file. That
@@ -3083,7 +3191,7 @@ SubDocKey(DocKey([], ["c"]), ["k5"; HT{ physical: 1100 }]) -> "vv5"; ttl: 25.000
 }
 
 TEST_F(DocDBTest, CompactionWithTransactions) {
-  FLAGS_docdb_sort_weak_intents_in_tests = true;
+  FLAGS_TEST_docdb_sort_weak_intents_in_tests = true;
 
   const DocKey doc_key(PrimitiveValues("mydockey", 123456));
   KeyBytes encoded_doc_key(doc_key.Encode());
@@ -3244,16 +3352,16 @@ TEST_F(DocDBTest, ForceFlushedFrontier) {
 
   LOG(INFO) << "Attempting to change flushed frontier from " << consensus_frontier
             << " to " << new_consensus_frontier;
-  ASSERT_OK(rocksdb_->ModifyFlushedFrontier(
+  ASSERT_OK(regular_db_->ModifyFlushedFrontier(
       new_user_frontier_ptr, rocksdb::FrontierModificationMode::kForce));
   LOG(INFO) << "Checking that flushed froniter was set to " << new_consensus_frontier;
-  ASSERT_EQ(*new_user_frontier_ptr, *rocksdb_->GetFlushedFrontier());
+  ASSERT_EQ(*new_user_frontier_ptr, *regular_db_->GetFlushedFrontier());
 
   LOG(INFO) << "Reopening RocksDB";
   ASSERT_OK(ReopenRocksDB());
   LOG(INFO) << "Checking that flushed frontier is still set to "
-            << rocksdb_->GetFlushedFrontier()->ToString();
-  ASSERT_EQ(*new_user_frontier_ptr, *rocksdb_->GetFlushedFrontier());
+            << regular_db_->GetFlushedFrontier()->ToString();
+  ASSERT_EQ(*new_user_frontier_ptr, *regular_db_->GetFlushedFrontier());
 }
 
 // Handy code to analyze some DB.
@@ -3290,6 +3398,129 @@ TEST_F(DocDBTest, DISABLED_DumpDB) {
   }
 
   LOG(INFO) << "TXN meta: " << txn_meta << ", rev key: " << rev_key << ", intents: " << intent;
+}
+
+TEST_F(DocDBTest, SetHybridTimeFilter) {
+  auto dwb = MakeDocWriteBatch();
+  for (int i = 1; i <= 4; ++i) {
+    ASSERT_OK(WriteSimple(i));
+  }
+
+  ASSERT_OK(FlushRocksDbAndWait());
+
+  CloseRocksDB();
+
+  RocksDBPatcher patcher(rocksdb_dir_, regular_db_options_);
+
+  ASSERT_OK(patcher.Load());
+  ASSERT_OK(patcher.SetHybridTimeFilter(HybridTime::FromMicros(2000)));
+
+  ASSERT_OK(OpenRocksDB());
+
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
+      SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(10); HT{ physical: 1000 }]) -> 1
+      SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(10); HT{ physical: 2000 }]) -> 2
+  )#");
+
+  ASSERT_OK(WriteSimple(5));
+
+  for (int j = 0; j < 3; ++j) {
+    SCOPED_TRACE(Format("Iteration $0", j));
+
+    ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
+      SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(10); HT{ physical: 1000 }]) -> 1
+      SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(10); HT{ physical: 2000 }]) -> 2
+      SubDocKey(DocKey([], ["row5", 55555]), [ColumnId(10); HT{ physical: 5000 }]) -> 5
+    )#");
+
+    if (j == 0) {
+      ASSERT_OK(FlushRocksDbAndWait());
+    } else if (j == 1) {
+      ForceRocksDBCompact(rocksdb());
+    }
+  }
+
+}
+
+void Append(const char* a, const char* b, std::string* out) {
+  out->append(a, b);
+}
+
+void PushBack(const std::string& value, std::vector<std::string>* out) {
+  out->push_back(value);
+}
+
+void Append(const char* a, const char* b, faststring* out) {
+  out->append(a, b - a);
+}
+
+void PushBack(const faststring& value, std::vector<std::string>* out) {
+  out->emplace_back(value.c_str(), value.size());
+}
+
+void Append(const char* a, const char* b, boost::container::small_vector_base<char>* out) {
+  out->insert(out->end(), a, b);
+}
+
+void PushBack(
+    const boost::container::small_vector_base<char>& value, std::vector<std::string>* out) {
+  out->emplace_back(value.begin(), value.end());
+}
+
+template <size_t SmallLen>
+void Append(const char* a, const char* b, ByteBuffer<SmallLen>* out) {
+  out->Append(a, b);
+}
+
+template <size_t SmallLen>
+void PushBack(const ByteBuffer<SmallLen>& value, std::vector<std::string>* out) {
+  out->push_back(value.ToString());
+}
+
+constexpr size_t kSourceLen = 32;
+const std::string kSource = RandomHumanReadableString(kSourceLen);
+
+template <class T>
+void TestKeyBytes(const char* title, std::vector<std::string>* out = nullptr) {
+#ifdef NDEBUG
+  constexpr size_t kIterations = 100000000;
+#else
+  constexpr size_t kIterations = RegularBuildVsSanitizers(10000000, 100000);
+#endif
+  const char* source_start = kSource.c_str();
+
+  auto start = GetThreadCpuTimeMicros();
+  T key_bytes;
+  for (size_t i = kIterations; i-- > 0;) {
+    key_bytes.clear();
+    const char* a = source_start + ((i * 102191ULL) & (kSourceLen - 1ULL));
+    const char* b = source_start + ((i * 99191ULL) & (kSourceLen - 1ULL));
+    Append(std::min(a, b), std::max(a, b) + 1, &key_bytes);
+    a = source_start + ((i * 88937ULL) & (kSourceLen - 1ULL));
+    b = source_start + ((i * 74231ULL) & (kSourceLen - 1ULL));
+    Append(std::min(a, b), std::max(a, b) + 1, &key_bytes);
+    a = source_start + ((i * 75983ULL) & (kSourceLen - 1ULL));
+    b = source_start + ((i * 72977ULL) & (kSourceLen - 1ULL));
+    Append(std::min(a, b), std::max(a, b) + 1, &key_bytes);
+    if (out) {
+      PushBack(key_bytes, out);
+    }
+  }
+  auto time = MonoDelta::FromMicroseconds(GetThreadCpuTimeMicros() - start);
+  LOG(INFO) << title << ": " << time;
+}
+
+TEST_F(DocDBTest, DISABLED_KeyBuffer) {
+  TestKeyBytes<std::string>("std::string");
+  TestKeyBytes<faststring>("faststring");
+  TestKeyBytes<boost::container::small_vector<char, 8>>("small_vector<char, 8>");
+  TestKeyBytes<boost::container::small_vector<char, 16>>("small_vector<char, 16>");
+  TestKeyBytes<boost::container::small_vector<char, 32>>("small_vector<char, 32>");
+  TestKeyBytes<boost::container::small_vector<char, 64>>("small_vector<char, 64>");
+  TestKeyBytes<ByteBuffer<8>>("ByteBuffer<8>");
+  TestKeyBytes<ByteBuffer<16>>("ByteBuffer<16>");
+  TestKeyBytes<ByteBuffer<32>>("ByteBuffer<32>");
+  TestKeyBytes<ByteBuffer<64>>("ByteBuffer<64>");
 }
 
 }  // namespace docdb

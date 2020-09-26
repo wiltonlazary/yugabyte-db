@@ -32,6 +32,9 @@
 #ifndef YB_TOOLS_YB_ADMIN_CLIENT_H
 #define YB_TOOLS_YB_ADMIN_CLIENT_H
 
+#include <string>
+#include <vector>
+
 #include <boost/optional.hpp>
 
 #include "yb/client/client.h"
@@ -45,6 +48,7 @@
 #include "yb/consensus/consensus.pb.h"
 #include "yb/master/master.pb.h"
 #include "yb/master/master.proxy.h"
+#include "yb/master/master_backup.proxy.h"
 #include "yb/rpc/rpc_fwd.h"
 #include "yb/rpc/messenger.h"
 
@@ -61,8 +65,23 @@ class YBClient;
 namespace tools {
 
 struct TypedNamespaceName {
-  YQLDatabase db_type;
+  YQLDatabase db_type = YQL_DATABASE_UNKNOWN;
   std::string name;
+};
+
+class TableNameResolver {
+ public:
+  TableNameResolver(std::vector<client::YBTableName> tables,
+                    std::vector<master::NamespaceIdentifierPB> namespaces);
+  TableNameResolver(TableNameResolver&&);
+  ~TableNameResolver();
+
+  Result<bool> Feed(const std::string& value);
+  std::vector<client::YBTableName>& values();
+
+ private:
+  class Impl;
+  std::unique_ptr<Impl> impl_;
 };
 
 class ClusterAdminClient {
@@ -75,12 +94,14 @@ class ClusterAdminClient {
   // Creates an admin client for host/port combination e.g.,
   // "localhost" or "127.0.0.1:7050" with the given timeout.
   // If certs_dir is non-empty, caller will init the yb_client_.
-  ClusterAdminClient(std::string addrs, int64_t timeout_millis, string certs_dir);
+  ClusterAdminClient(std::string addrs, MonoDelta timeout);
+
+  ClusterAdminClient(const HostPort& init_master_addr, MonoDelta timeout);
 
   virtual ~ClusterAdminClient();
 
   // Initialized the client and connects to the specified tablet server.
-  virtual CHECKED_STATUS Init();
+  CHECKED_STATUS Init();
 
   // Parse the user-specified change type to consensus change type
   CHECKED_STATUS ParseChangeType(
@@ -104,7 +125,9 @@ class ClusterAdminClient {
   CHECKED_STATUS DumpMasterState(bool to_console);
 
   // List all the tables.
-  CHECKED_STATUS ListTables(bool include_db_type);
+  CHECKED_STATUS ListTables(bool include_db_type,
+                            bool include_table_id,
+                            bool include_table_type);
 
   // List all tablets of this table
   CHECKED_STATUS ListTablets(const client::YBTableName& table_name, int max_tablets);
@@ -131,7 +154,7 @@ class ClusterAdminClient {
   CHECKED_STATUS DeleteNamespaceById(const NamespaceId& namespace_id);
 
   // List all tablet servers known to master
-  CHECKED_STATUS ListAllTabletServers();
+  CHECKED_STATUS ListAllTabletServers(bool exclude_dead = false);
 
   // List all masters
   CHECKED_STATUS ListAllMasters();
@@ -144,6 +167,8 @@ class ClusterAdminClient {
 
   CHECKED_STATUS SetLoadBalancerEnabled(bool is_enabled);
 
+  CHECKED_STATUS GetLoadBalancerState();
+
   CHECKED_STATUS GetLoadMoveCompletion();
 
   CHECKED_STATUS GetLeaderBlacklistCompletion();
@@ -152,13 +177,26 @@ class ClusterAdminClient {
 
   CHECKED_STATUS ListLeaderCounts(const client::YBTableName& table_name);
 
+  Result<unordered_map<string, int>> GetLeaderCounts(const client::YBTableName& table_name);
+
   CHECKED_STATUS SetupRedisTable();
 
   CHECKED_STATUS DropRedisTable();
 
-  CHECKED_STATUS FlushTable(const client::YBTableName& table_name,
-                            int timeout_secs,
-                            bool is_compaction);
+  CHECKED_STATUS FlushTables(const std::vector<client::YBTableName>& table_names,
+                             bool add_indexes,
+                             int timeout_secs,
+                             bool is_compaction);
+
+  CHECKED_STATUS FlushTablesById(const std::vector<TableId>& table_id,
+                                 bool add_indexes,
+                                 int timeout_secs,
+                                 bool is_compaction);
+
+  CHECKED_STATUS ModifyTablePlacementInfo(const client::YBTableName& table_name,
+                                          const std::string& placement_info,
+                                          int replication_factor,
+                                          const std::string& optional_uuid);
 
   CHECKED_STATUS ModifyPlacementInfo(std::string placement_infos,
                                      int replication_factor,
@@ -185,6 +223,18 @@ class ClusterAdminClient {
   CHECKED_STATUS LeaderStepDownWithNewLeader(
       const std::string& tablet_id,
       const std::string& dest_ts_uuid);
+
+  CHECKED_STATUS MasterLeaderStepDown(
+      const std::string& leader_uuid,
+      const std::string& new_leader_uuid = std::string());
+
+  CHECKED_STATUS SplitTablet(const std::string& tablet_id);
+
+  Result<TableNameResolver> BuildTableNameResolver();
+
+  Result<std::string> GetMasterLeaderUuid();
+
+  CHECKED_STATUS GetYsqlCatalogVersion();
 
  protected:
   // Fetch the locations of the replicas for a given tablet from the Master.
@@ -223,22 +273,27 @@ class ClusterAdminClient {
 
   CHECKED_STATUS StartElection(const std::string& tablet_id);
 
-  CHECKED_STATUS MasterLeaderStepDown(const std::string& leader_uuid);
-  CHECKED_STATUS GetMasterLeaderInfo(std::string* leader_uuid);
   CHECKED_STATUS WaitUntilMasterLeaderReady();
 
-  const std::string master_addr_list_;
+  std::string master_addr_list_;
+  HostPort init_master_addr_;
   const MonoDelta timeout_;
   HostPort leader_addr_;
+  std::unique_ptr<rpc::SecureContext> secure_context_;
   std::unique_ptr<rpc::Messenger> messenger_;
   std::unique_ptr<rpc::ProxyCache> proxy_cache_;
   std::unique_ptr<master::MasterServiceProxy> master_proxy_;
+  std::unique_ptr<master::MasterBackupServiceProxy> master_backup_proxy_;
+
   // Skip yb_client_ and related fields' initialization.
-  bool client_init_ = true;
   std::unique_ptr<client::YBClient> yb_client_;
   bool initted_ = false;
 
  private:
+
+  CHECKED_STATUS DiscoverAllMasters(
+    const HostPort& init_master_addr, std::string* all_master_addrs);
+
   CHECKED_STATUS FillPlacementInfo(
       master::PlacementInfoPB* placement_info_pb, const std::string& placement_str);
 
@@ -274,7 +329,9 @@ static constexpr const char* kColumnSep = " \t";
 
 std::string RightPadToUuidWidth(const std::string &s);
 
-Result<TypedNamespaceName> ParseNamespaceName(const std::string& full_namespace_name);
+Result<TypedNamespaceName> ParseNamespaceName(
+    const std::string& full_namespace_name,
+    const YQLDatabase default_if_no_prefix = YQL_DATABASE_CQL);
 
 }  // namespace tools
 }  // namespace yb

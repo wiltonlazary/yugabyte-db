@@ -1,4 +1,16 @@
-// Copyright (c) Yugabyte, Inc.
+// Copyright 2020 YugaByte, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package com.yugabyte.yw.controllers;
 
@@ -19,6 +31,12 @@ import com.yugabyte.yw.models.Users;
 import org.apache.commons.io.input.ReversedLinesFileReader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import org.pac4j.core.profile.CommonProfile;
+import org.pac4j.core.profile.ProfileManager;
+import org.pac4j.play.java.Secure;
+import org.pac4j.play.PlayWebContext;
+import org.pac4j.play.store.PlaySessionStore;
 
 import play.Configuration;
 import play.Environment;
@@ -49,10 +67,11 @@ public class SessionController extends Controller {
   @Inject
   ConfigHelper configHelper;
 
-
   @Inject
   Environment environment;
 
+  @Inject
+  private PlaySessionStore playSessionStore;
 
   public static final String AUTH_TOKEN = "authToken";
   public static final String API_TOKEN = "apiToken";
@@ -60,9 +79,21 @@ public class SessionController extends Controller {
   public static final String USER_UUID = "userUUID";
   private static final Integer FOREVER = 2147483647;
 
+  private CommonProfile getProfile() {
+    final PlayWebContext context = new PlayWebContext(ctx(), playSessionStore);
+    final ProfileManager<CommonProfile> profileManager = new ProfileManager(context);
+    return profileManager.get(true).get();
+  }
+
   public Result login() {
-    Form<CustomerLoginFormData> formData = formFactory.form(CustomerLoginFormData.class).bindFromRequest();
     ObjectNode responseJson = Json.newObject();
+    boolean useOAuth = appConfig.getBoolean("yb.security.use_oauth", false);
+    if (useOAuth) {
+      responseJson.put("error", "Platform login not supported when using SSO.");
+      return badRequest(responseJson);
+    }
+    Form<CustomerLoginFormData> formData = formFactory.form(CustomerLoginFormData.class)
+                                                      .bindFromRequest();
 
     if (formData.hasErrors()) {
       responseJson.set("error", formData.errorsAsJson());
@@ -83,8 +114,55 @@ public class SessionController extends Controller {
     authTokenJson.put(AUTH_TOKEN, authToken);
     authTokenJson.put(CUSTOMER_UUID, cust.uuid.toString());
     authTokenJson.put(USER_UUID, user.uuid.toString());
-    response().setCookie(Http.Cookie.builder(AUTH_TOKEN, authToken).withSecure(ctx().request().secure()).build());
+    response().setCookie(Http.Cookie.builder(AUTH_TOKEN, authToken)
+                                    .withSecure(ctx().request().secure()).build());
+    response().setCookie(Http.Cookie.builder("customerId", cust.uuid.toString())
+                                    .withSecure(ctx().request().secure()).build());
+    response().setCookie(Http.Cookie.builder("userId", user.uuid.toString())
+                                    .withSecure(ctx().request().secure()).build());
     return ok(authTokenJson);
+  }
+
+  public Result getPlatformConfig() {
+    boolean useOAuth = appConfig.getBoolean("yb.security.use_oauth", false);
+    String platformConfig = "window.YB_Platform_Config = window.YB_Platform_Config || %s";
+    ObjectNode responseJson = Json.newObject();
+    responseJson.put("use_oauth", useOAuth);
+    platformConfig = String.format(platformConfig, responseJson.toString());
+    return ok(platformConfig);
+  }
+
+  @Secure(clients = "OidcClient")
+  public Result thirdPartyLogin() {
+    ObjectNode responseJson = Json.newObject();
+    CommonProfile profile = getProfile();
+    String emailAttr = appConfig.getString("yb.security.oidcEmailAttribute", "");
+    String email = "";
+    if (emailAttr.equals("")) {
+      email = profile.getEmail();
+    } else {
+      email = (String) profile.getAttribute(emailAttr);
+    }
+    Users user = Users.getByEmail(email.toLowerCase());
+    if (user == null) {
+      final PlayWebContext context = new PlayWebContext(ctx(), playSessionStore);
+      final ProfileManager<CommonProfile> profileManager = new ProfileManager(context);
+      profileManager.logout();
+      playSessionStore.destroySession(context);
+    } else {
+      Customer cust = Customer.get(user.customerUUID);
+      ctx().args.put("customer", cust);
+      ctx().args.put("user", user);
+      response().setCookie(Http.Cookie.builder("customerId", cust.uuid.toString())
+                                      .withSecure(ctx().request().secure()).build());
+      response().setCookie(Http.Cookie.builder("userId", user.uuid.toString())
+                                      .withSecure(ctx().request().secure()).build());
+    }
+    if (environment.isDev()) {
+      return redirect("http://localhost:3000/");
+    } else {
+      return redirect("/");
+    }
   }
 
   public Result insecure_login() {
@@ -94,7 +172,8 @@ public class SessionController extends Controller {
       responseJson.put("error", "Cannot allow insecure with multiple customers.");
       return unauthorized(responseJson);
     }
-    String securityLevel = (String) configHelper.getConfig(ConfigHelper.ConfigType.Security).get("level");
+    String securityLevel = (String) configHelper.getConfig(ConfigHelper.ConfigType.Security)
+                                                .get("level");
     if (securityLevel != null && securityLevel.equals("insecure")) {
       List<Users> users = Users.getAllReadOnly();
       if (users == null || users.isEmpty()) {
@@ -115,7 +194,8 @@ public class SessionController extends Controller {
       apiTokenJson.put(API_TOKEN, apiToken);
       apiTokenJson.put(CUSTOMER_UUID, user.customerUUID.toString());
       apiTokenJson.put(USER_UUID, user.uuid.toString());
-      response().setCookie(Http.Cookie.builder(API_TOKEN, apiToken).withSecure(ctx().request().secure()).build());
+      response().setCookie(Http.Cookie.builder(API_TOKEN, apiToken)
+                                      .withSecure(ctx().request().secure()).build());
       return ok(apiTokenJson);
     }
     responseJson.put("error", "Insecure login unavailable.");
@@ -125,7 +205,8 @@ public class SessionController extends Controller {
   // Any changes to security should be authenticated.
   @With(TokenAuthenticator.class)
   public Result set_security(UUID customerUUID) {
-    Form<SetSecurityFormData> formData = formFactory.form(SetSecurityFormData.class).bindFromRequest();
+    Form<SetSecurityFormData> formData = formFactory.form(SetSecurityFormData.class)
+                                                    .bindFromRequest();
     ObjectNode responseJson = Json.newObject();
     List<Customer> allCustomers = Customer.getAll();
     if (allCustomers.size() != 1) {
@@ -147,7 +228,7 @@ public class SessionController extends Controller {
       }
 
       try {
-        InputStream featureStream = environment.resourceAsStream("sampleFeatureConfig.json");
+        InputStream featureStream = environment.resourceAsStream("ossFeatureConfig.json");
         ObjectMapper mapper = new ObjectMapper();
         JsonNode features = mapper.readTree(featureStream);
         Customer.get(customerUUID).upsertFeatures(features);
@@ -169,36 +250,62 @@ public class SessionController extends Controller {
     String apiToken = user.upsertApiToken();
     ObjectNode apiTokenJson = Json.newObject();
     apiTokenJson.put(API_TOKEN, apiToken);
-    response().setCookie(Http.Cookie.builder(API_TOKEN, apiToken).withSecure(ctx().request().secure()).withMaxAge(FOREVER).build());
+    response().setCookie(Http.Cookie.builder(API_TOKEN, apiToken)
+              .withSecure(ctx().request().secure())
+              .withMaxAge(FOREVER).build());
     return ok(apiTokenJson);
   }
 
   public Result register() {
-    Form<CustomerRegisterFormData> formData = formFactory.form(CustomerRegisterFormData.class).bindFromRequest();
+    Form<CustomerRegisterFormData> formData = formFactory.form(CustomerRegisterFormData.class)
+                                                         .bindFromRequest();
 
     if (formData.hasErrors()) {
       return ApiResponse.error(BAD_REQUEST, formData.errorsAsJson());
     }
     boolean multiTenant = appConfig.getBoolean("yb.multiTenant", false);
+    boolean useOAuth = appConfig.getBoolean("yb.security.use_oauth", false);
     int customerCount = Customer.find.all().size();
     if (!multiTenant && customerCount >= 1) {
-      return ApiResponse.error(BAD_REQUEST, "Cannot register multiple accounts in Single tenancy.");
+      return ApiResponse.error(BAD_REQUEST, "Cannot register multiple "+
+                               "accounts in Single tenancy.");
     }
-
+    if (useOAuth && customerCount >= 1) {
+      return ApiResponse.error(BAD_REQUEST, "Cannot register multiple "+
+                               "accounts with SSO enabled platform.");
+    }
     CustomerRegisterFormData data = formData.get();
+    if (customerCount == 0) {
+      return registerCustomer(data, true);
+    } else {
+      TokenAuthenticator tokenAuth = new TokenAuthenticator();
+      if (tokenAuth.superAdminAuthentication(ctx())) {
+        return registerCustomer(data, false);
+      } else {
+        return ApiResponse.error(BAD_REQUEST, "Only Super Admins can register tenant.");
+      }
+    }
+  }
+
+  private Result registerCustomer(CustomerRegisterFormData data, boolean isSuper) {
     try {
       Customer cust = Customer.create(data.code, data.name);
       if (cust == null) {
         return ApiResponse.error(INTERNAL_SERVER_ERROR, "Unable to register the customer");
       }
-      Users user = Users.create(data.email, data.password, Role.Admin,
+      Role role = Role.Admin;
+      if (isSuper) {
+        role = Role.SuperAdmin;
+      }
+      Users user = Users.create(data.email, data.password, role,
           cust.uuid, /* Primary user*/ true);
       String authToken = user.createAuthToken();
       ObjectNode authTokenJson = Json.newObject();
       authTokenJson.put(AUTH_TOKEN, authToken);
       authTokenJson.put(CUSTOMER_UUID, cust.uuid.toString());
       authTokenJson.put(USER_UUID, user.uuid.toString());
-      response().setCookie(Http.Cookie.builder(AUTH_TOKEN, authToken).withSecure(ctx().request().secure()).build());
+      response().setCookie(Http.Cookie.builder(AUTH_TOKEN, authToken)
+                                      .withSecure(ctx().request().secure()).build());
       return ok(authTokenJson);
     } catch (PersistenceException pe) {
       return ApiResponse.error(INTERNAL_SERVER_ERROR, "Customer already registered.");
@@ -236,9 +343,10 @@ public class SessionController extends Controller {
 
   @With(TokenAuthenticator.class)
   public Result getLogs(Integer maxLines) {
-    String logDir = appConfig.getString("application.home", ".");
-    File file = new File(String.format("%s/logs/application.log", logDir));
-    // TODO(bogdan): This is not really pagination friendly as it re-reads everything all the time..
+    String appHomeDir = appConfig.getString("application.home", ".");
+    String logDir = System.getProperty("log.override.path", String.format("%s/logs", appHomeDir));
+    File file = new File(String.format("%s/application.log", logDir));
+    // TODO(bogdan): This is not really pagination friendly as it re-reads everything all the time.
     // TODO(bogdan): Need to figure out if there's a rotation-friendly log-reader..
     try {
       ReversedLinesFileReader reader = new ReversedLinesFileReader(file);
@@ -259,7 +367,8 @@ public class SessionController extends Controller {
       return ApiResponse.success(result);
     } catch (IOException ex) {
       LOG.error("Log file open failed.", ex);
-      return ApiResponse.error(INTERNAL_SERVER_ERROR, "Could not open log file with error " + ex.getMessage());
+      return ApiResponse.error(INTERNAL_SERVER_ERROR, "Could not open log file with error " +
+                               ex.getMessage());
     }
   }
 }

@@ -422,7 +422,7 @@ fetch_input_tuple(AggState *aggstate)
  * This function handles only one grouping set, already set in
  * aggstate->current_set.
  *
- * When called, CurrentMemoryContext should be the per-query context.
+ * When called, GetCurrentMemoryContext() should be the per-query context.
  */
 static void
 initialize_aggregate(AggState *aggstate, AggStatePerTrans pertrans,
@@ -510,7 +510,7 @@ initialize_aggregate(AggState *aggstate, AggStatePerTrans pertrans,
  * NB: This cannot be used for hash aggregates, as for those the grouping set
  * number has to be specified from further up.
  *
- * When called, CurrentMemoryContext should be the per-query context.
+ * When called, GetCurrentMemoryContext() should be the per-query context.
  */
 static void
 initialize_aggregates(AggState *aggstate,
@@ -642,7 +642,7 @@ advance_transition_function(AggState *aggstate,
 			if (DatumIsReadWriteExpandedObject(newVal,
 											   false,
 											   pertrans->transtypeLen) &&
-				MemoryContextGetParent(DatumGetEOHP(newVal)->eoh_context) == CurrentMemoryContext)
+				MemoryContextGetParent(DatumGetEOHP(newVal)->eoh_context) == GetCurrentMemoryContext())
 				 /* do nothing */ ;
 			else
 				newVal = datumCopy(newVal,
@@ -675,7 +675,7 @@ advance_transition_function(AggState *aggstate,
  * and one for hashed; we do them both here, to avoid multiple evaluation of
  * the inputs.
  *
- * When called, CurrentMemoryContext should be the per-query context.
+ * When called, GetCurrentMemoryContext() should be the per-query context.
  */
 static void
 advance_aggregates(AggState *aggstate)
@@ -707,7 +707,7 @@ advance_aggregates(AggState *aggstate)
  * This function handles only one grouping set (already set in
  * aggstate->current_set).
  *
- * When called, CurrentMemoryContext should be the per-query context.
+ * When called, GetCurrentMemoryContext() should be the per-query context.
  */
 static void
 process_ordered_aggregate_single(AggState *aggstate,
@@ -800,7 +800,7 @@ process_ordered_aggregate_single(AggState *aggstate,
  * This function handles only one grouping set (already set in
  * aggstate->current_set).
  *
- * When called, CurrentMemoryContext should be the per-query context.
+ * When called, GetCurrentMemoryContext() should be the per-query context.
  */
 static void
 process_ordered_aggregate_multi(AggState *aggstate,
@@ -890,7 +890,7 @@ process_ordered_aggregate_multi(AggState *aggstate,
  * aggstate->current_set).
  *
  * The finalfunction will be run, and the result delivered, in the
- * output-tuple context; caller's CurrentMemoryContext does not matter.
+ * output-tuple context; caller's GetCurrentMemoryContext() does not matter.
  *
  * The finalfn uses the state as set in the transno. This also might be
  * being used by another aggregate function, so it's important that we do
@@ -983,7 +983,7 @@ finalize_aggregate(AggState *aggstate,
 	 * If result is pass-by-ref, make sure it is in the right context.
 	 */
 	if (!peragg->resulttypeByVal && !*resultIsNull &&
-		!MemoryContextContains(CurrentMemoryContext,
+		!MemoryContextContains(GetCurrentMemoryContext(),
 							   DatumGetPointer(*resultVal)))
 		*resultVal = datumCopy(*resultVal,
 							   peragg->resulttypeByVal,
@@ -996,7 +996,7 @@ finalize_aggregate(AggState *aggstate,
  * Compute the output value of one partial aggregate.
  *
  * The serialization function will be run, and the result delivered, in the
- * output-tuple context; caller's CurrentMemoryContext does not matter.
+ * output-tuple context; caller's GetCurrentMemoryContext() does not matter.
  */
 static void
 finalize_partialaggregate(AggState *aggstate,
@@ -1043,7 +1043,7 @@ finalize_partialaggregate(AggState *aggstate,
 
 	/* If result is pass-by-ref, make sure it is in the right context. */
 	if (!peragg->resulttypeByVal && !*resultIsNull &&
-		!MemoryContextContains(CurrentMemoryContext,
+		!MemoryContextContains(GetCurrentMemoryContext(),
 							   DatumGetPointer(*resultVal)))
 		*resultVal = datumCopy(*resultVal,
 							   peragg->resulttypeByVal,
@@ -1448,7 +1448,7 @@ hash_agg_entry_size(int numAggs)
  * set (which the caller must have selected - note that initialize_aggregate
  * depends on this).
  *
- * When called, CurrentMemoryContext should be the per-query context.
+ * When called, GetCurrentMemoryContext() should be the per-query context.
  */
 static TupleHashEntryData *
 lookup_hash_entry(AggState *aggstate)
@@ -1614,7 +1614,24 @@ yb_agg_pushdown_supported(AggState *aggstate)
 			TargetEntry *tle = lfirst_node(TargetEntry, lc_arg);
 
 			/* Only support simple column expressions until DocDB can eval PG exprs. */
-			if (!IsA(tle->expr, Var))
+			Oid type = InvalidOid;
+			if (IsA(tle->expr, Var))
+			{
+				type = castNode(Var, tle->expr)->vartype;
+			}
+			else if (IsA(tle->expr, Const))
+			{
+				Const* const_node = castNode(Const, tle->expr);
+				if (const_node->constisnull)
+					/* NULL has a type UNKNOWNOID which isn't very helpful. */
+					type = aggref->aggtranstype;
+				else if (!const_node->constbyval)
+					/* Do not support pointer-based constants yet. */
+					return;
+				else
+					type = const_node->consttype;
+			}
+			else
 				return;
 
 			/*
@@ -1622,7 +1639,7 @@ yb_agg_pushdown_supported(AggState *aggstate)
 			 * we can safely perform postgres semantic compatible DocDB aggregate evaluation
 			 * otherwise.
 			 */
-			if (!YBCDataTypeIsValidForKey(castNode(Var, tle->expr)->vartype))
+			if (!YBCDataTypeIsValidForKey(type))
 				return;
 		}
 	}
@@ -1648,6 +1665,8 @@ yb_agg_pushdown(AggState *aggstate)
 		pushdown_aggs = lappend(pushdown_aggs, aggref);
 	}
 	scan_state->yb_fdw_aggs = pushdown_aggs;
+	/* Disable projection for tuples produced by pushed down aggregate operators. */
+	scan_state->ss.ps.ps_ProjInfo = NULL;
 }
 
 /*
@@ -1693,7 +1712,7 @@ ExecAgg(PlanState *pstate)
 			case AGG_HASHED:
 				if (!node->table_filled)
 					agg_fill_hash_table(node);
-				/* FALLTHROUGH */
+				switch_fallthrough();
 			case AGG_MIXED:
 				result = agg_retrieve_hash_table(node);
 				break;

@@ -1,7 +1,8 @@
 ---
-title: Build a NodeJS application
-linkTitle: Build a NodeJS application
-description: Build a NodeJS application
+title: Build a NodeJS application that uses Sequelize ORM and YSQL
+headerTitle: Build a NodeJS application
+linkTitle: NodeJS
+description: Build a NodeJS application that uses Sequelize ORM and YSQL.
 menu:
   latest:
     parent: build-apps
@@ -16,19 +17,19 @@ showAsideToc: true
 
 <ul class="nav nav-tabs-alt nav-tabs-yb">
   <li >
-    <a href="/latest/quick-start/build-apps/nodejs/ysql-pg" class="nav-link ">
+    <a href="{{< relref "./ysql-pg.md" >}}" class="nav-link ">
       <i class="icon-postgres" aria-hidden="true"></i>
       YSQL - PG driver
     </a>
   </li>
   <li >
-    <a href="/latest/quick-start/build-apps/nodejs/ysql-sequelize" class="nav-link active">
+    <a href="{{< relref "./ysql-sequelize.md" >}}" class="nav-link active">
       <i class="icon-postgres" aria-hidden="true"></i>
       YSQL - Sequelize
     </a>
   </li>
   <li>
-    <a href="/latest/quick-start/build-apps/nodejs/ycql" class="nav-link">
+    <a href="{{< relref "./ycql.md" >}}" class="nav-link">
       <i class="icon-cassandra" aria-hidden="true"></i>
       YCQL
     </a>
@@ -50,9 +51,9 @@ $ git clone https://github.com/yugabyte/orm-examples.git
 
 This repository has a node.js example that implements a simple REST API server. The scenario is that of an e-commerce application. Database access in this application is managed through the Sequelize ORM. It consists of the following.
 
-- The users of the e-commerce site are stored in the users table.
-- The products table contains a list of products the e-commerce site sells.
-- The orders placed by the users are populated in the orders table. An order can consist of multiple line items, each of these are inserted in the orderline table.
+- The users of the e-commerce site are stored in the `users` table.
+- The `products` table contains a list of products the e-commerce site sells.
+- The orders placed by the users are populated in the `orders` table. An order can consist of multiple line items, each of these are inserted in the `orderline` table.
 
 The source for the above application can be found in the [repo](https://github.com/yugabyte/orm-examples/tree/master/node/sequelize). There are a number of options that can be customized in the properties file located at `config/config.json`. 
 

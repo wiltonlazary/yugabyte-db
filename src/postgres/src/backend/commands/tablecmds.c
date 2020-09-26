@@ -71,6 +71,7 @@
 #include "commands/sequence.h"
 #include "commands/tablecmds.h"
 #include "commands/tablespace.h"
+#include "commands/tablegroup.h"
 #include "commands/trigger.h"
 #include "commands/typecmds.h"
 #include "commands/user.h"
@@ -639,6 +640,58 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("only shared relations can be placed in pg_global tablespace")));
 
+	/*
+	 * Select tablegroup to use. If not specified, InvalidOid.
+	 * Disallow mixing of COLOCATED=true/false syntax and TABLEGROUP. Cannot use tablegroups
+	 * in colocated databases.
+	 * If the pg_tablegroup system table has not been created, get_tablegroup_oid will produce
+	 * an error.
+	 */
+	Oid tablegroupId = InvalidOid;
+	if (stmt->tablegroup)
+	{
+		OptTableGroup *grp = stmt->tablegroup;
+		if (MyDatabaseColocated)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot use tablegroups in a colocated database")));
+		else if (!grp->has_tablegroup)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+					 errmsg("Cannot use NO TABLEGROUP in CREATE TABLE statement.")));
+		}
+		else
+			tablegroupId = get_tablegroup_oid(grp->tablegroup_name, false);
+	}
+
+	/*
+	 * Check permissions for tablegroup. To create a table within a tablegroup, a user must
+	 * either be a superuser, the owner of the tablegroup, or have create perms on it.
+	 */
+	if (OidIsValid(tablegroupId) && !pg_tablegroup_ownercheck(tablegroupId, GetUserId()))
+	{
+		AclResult  aclresult;
+
+		aclresult = pg_tablegroup_aclcheck(tablegroupId, GetUserId(), ACL_CREATE);
+		if (aclresult != ACLCHECK_OK)
+			aclcheck_error(aclresult, OBJECT_TABLEGROUP,
+						   get_tablegroup_name(tablegroupId));
+	}
+
+	/*
+	 * Prepend to stmt->options to be parsed for reloptions if tablegroupId is valid.
+	 * We set this here instead of in parse_utilcmd since we need to do the above
+	 * preprocessing and RBAC checks first. This still happens before transformReloptions
+	 * so this option is included in the reloptions text array.
+	 */
+	if (OidIsValid(tablegroupId))
+	{
+		stmt->options = lcons(makeDefElem("tablegroup",
+										  (Node *) makeInteger(tablegroupId), -1),
+										  stmt->options);
+	}
+
 	/* Identify user ID that will own the table */
 	if (!OidIsValid(ownerId))
 		ownerId = GetUserId();
@@ -768,53 +821,6 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	}
 
 	/*
-	 * In YugaByte mode create the YB table. We still call heap create below
-	 * which will now only handle the side-effects (i.e. updating the system
-	 * catalogs).
-	 */
-	if (IsYugaByteEnabled())
-	{
-		CheckIsYBSupportedRelationByKind(relkind);
-
-		Relation pg_class_desc = heap_open(RelationRelationId,
-		                                   RowExclusiveLock);
-
-		/* Allocate a new OID for the relation same way as vanilla Postgres:
-		 * during a binary upgrade use override for pg_class.oid/relfilenode */
-		if (IsBinaryUpgrade &&
-		    (relkind == RELKIND_RELATION || relkind == RELKIND_SEQUENCE ||
-		     relkind == RELKIND_VIEW || relkind == RELKIND_MATVIEW ||
-		     relkind == RELKIND_COMPOSITE_TYPE || relkind == RELKIND_FOREIGN_TABLE ||
-		     relkind == RELKIND_PARTITIONED_TABLE))
-		{
-			if (!OidIsValid(binary_upgrade_next_heap_pg_class_oid))
-				ereport(ERROR,
-				        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						        errmsg("pg_class heap OID value not set when in binary upgrade mode")));
-
-			relationId = binary_upgrade_next_heap_pg_class_oid;
-			binary_upgrade_next_heap_pg_class_oid = InvalidOid;
-		}
-		/* There might be no TOAST table, so we have to test for it. */
-		else if (IsBinaryUpgrade &&
-		         OidIsValid(binary_upgrade_next_toast_pg_class_oid) &&
-		         relkind == RELKIND_TOASTVALUE)
-		{
-			relationId = binary_upgrade_next_toast_pg_class_oid;
-			binary_upgrade_next_toast_pg_class_oid = InvalidOid;
-		}
-		else
-		{
-			relationId = GetNewRelFileNode(tablespaceId,
-			                               pg_class_desc,
-			                               stmt->relation->relpersistence);
-		}
-
-		heap_close(pg_class_desc, RowExclusiveLock);
-		YBCCreateTable(stmt, relkind, descriptor, relationId, namespaceId);
-	}
-
-	/*
 	 * Create the relation.  Inherited defaults and constraints are passed in
 	 * for immediate handling --- since they don't need parsing, they can be
 	 * stored immediately.
@@ -822,7 +828,7 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	relationId = heap_create_with_catalog(relname,
 										  namespaceId,
 										  tablespaceId,
-										  relationId, /* YugaByte change, used to be InvalidOid */
+										  InvalidOid,
 										  InvalidOid,
 										  ofTypeId,
 										  ownerId,
@@ -843,14 +849,17 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 										  InvalidOid,
 										  typaddress);
 
-	/* Store inheritance information for new rel. */
-	StoreCatalogInheritance(relationId, inheritOids, stmt->partbound != NULL);
-
 	/*
 	 * We must bump the command counter to make the newly-created relation
 	 * tuple visible for opening.
 	 */
 	CommandCounterIncrement();
+
+	if (IsYugaByteEnabled())
+	{
+		CheckIsYBSupportedRelationByKind(relkind);
+		YBCCreateTable(stmt, relkind, descriptor, relationId, namespaceId, tablegroupId);
+	}
 
 	/*
 	 * Open the new relation and acquire exclusive lock on it.  This isn't
@@ -1058,7 +1067,7 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	 */
 	if (rawDefaults || stmt->constraints)
 		AddRelationNewConstraints(rel, rawDefaults, stmt->constraints,
-								  true, true, false);
+															true, true, false);
 
 	ObjectAddressSet(address, RelationRelationId, relationId);
 
@@ -3447,12 +3456,6 @@ AlterTableInternal(Oid relid, List *cmds, bool recurse)
 	EventTriggerAlterTableRelid(relid);
 
 	ATController(NULL, rel, cmds, recurse, lockmode);
-
-	if (IsYugaByteEnabled())
-	{
-		YBReportFeatureUnsupported("Alter table is not yet supported");
-	}
-
 }
 
 /*
@@ -3774,7 +3777,7 @@ ATController(AlterTableStmt *parsetree,
 	 */
 	if (handle)
 	{
-		YBCExecAlterTable(handle);
+		YBCExecAlterTable(handle, relid);
 	}
 	/* Phase 3: scan/rewrite tables as needed */
 	ATRewriteTables(parsetree, &wqueue, lockmode);
@@ -6935,7 +6938,7 @@ ATExecDropColumn(List **wqueue, Relation rel, const char *colName,
 
 	/* Don't drop columns used in the partition key */
 	if (has_partition_attrs(rel,
-							bms_make_singleton(attnum - FirstLowInvalidHeapAttributeNumber),
+							bms_make_singleton(attnum - YBGetFirstLowInvalidAttributeNumber(rel)),
 							&is_expr))
 	{
 		if (!is_expr)
@@ -9439,6 +9442,14 @@ ATExecDropConstraint(Relation rel, const char *constrName,
 			heap_close(frel, NoLock);
 		}
 
+		if (IsYugaByteEnabled() &&
+			contype == CONSTRAINT_PRIMARY)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("dropping a primary key constraint is not yet supported")));
+		}
+
 		/*
 		 * Perform the actual constraint deletion
 		 */
@@ -9654,7 +9665,7 @@ ATPrepAlterColumnType(List **wqueue,
 
 	/* Don't alter columns used in the partition key */
 	if (has_partition_attrs(rel,
-							bms_make_singleton(attnum - FirstLowInvalidHeapAttributeNumber),
+							bms_make_singleton(attnum - YBGetFirstLowInvalidAttributeNumber(rel)),
 							&is_expr))
 	{
 		if (!is_expr)
@@ -10163,6 +10174,7 @@ ATExecAlterColumnType(AlteredTableInfo *tab, Relation rel,
 			case OCLASS_TSCONFIG:
 			case OCLASS_ROLE:
 			case OCLASS_DATABASE:
+			case OCLASS_TBLGROUP:
 			case OCLASS_TBLSPACE:
 			case OCLASS_FDW:
 			case OCLASS_FOREIGN_SERVER:
@@ -10967,7 +10979,7 @@ ATExecChangeOwner(Oid relationOid, Oid newOwnerId, bool recursing, LOCKMODE lock
 		case RELKIND_TOASTVALUE:
 			if (recursing)
 				break;
-			/* FALL THRU */
+			switch_fallthrough();
 		default:
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
@@ -15060,7 +15072,7 @@ AttachPartitionEnsureIndexes(Relation rel, Relation attachrel)
 	MemoryContext cxt;
 	MemoryContext oldcxt;
 
-	cxt = AllocSetContextCreate(CurrentMemoryContext,
+	cxt = AllocSetContextCreate(GetCurrentMemoryContext(),
 								"AttachPartitionEnsureIndexes",
 								ALLOCSET_DEFAULT_SIZES);
 	oldcxt = MemoryContextSwitchTo(cxt);
@@ -15209,7 +15221,7 @@ CloneRowTriggersToPartition(Relation parent, Relation partition)
 	scan = systable_beginscan(pg_trigger, TriggerRelidNameIndexId,
 							  true, NULL, 1, &key);
 
-	perTupCxt = AllocSetContextCreate(CurrentMemoryContext,
+	perTupCxt = AllocSetContextCreate(GetCurrentMemoryContext(),
 									  "clone trig", ALLOCSET_SMALL_SIZES);
 	oldcxt = MemoryContextSwitchTo(perTupCxt);
 

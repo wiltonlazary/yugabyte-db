@@ -51,6 +51,7 @@ struct AsyncRpcData {
   RemoteTablet* tablet = nullptr;
   bool allow_local_calls_in_curr_thread = false;
   bool need_consistent_read = false;
+  HybridTime write_time_for_backfill_ = HybridTime::kInvalid;
   InFlightOps ops;
 };
 
@@ -158,6 +159,7 @@ class WriteRpc : public AsyncRpcBase<tserver::WriteRequestPB, tserver::WriteResp
   void SwapRequestsAndResponses(bool skip_responses);
   void CallRemoteMethod() override;
   void ProcessResponseFromTserver(const Status& status) override;
+  bool ShouldRetryExpiredRequest() override;
 };
 
 class ReadRpc : public AsyncRpcBase<tserver::ReadRequestPB, tserver::ReadResponsePB> {

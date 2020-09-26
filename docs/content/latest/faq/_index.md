@@ -1,7 +1,8 @@
 ---
-title: Frequently asked questions
-linkTitle: Other FAQs
-description: Frequently asked questions
+title: Frequently asked questions (FAQs)
+headerTitle: FAQs
+linkTitle: FAQs
+description: FAQs
 image: /images/section_icons/index/faq.png
 headcontent:
 aliases:
@@ -14,62 +15,39 @@ menu:
 ---
 
 <div class="row">
-  <div class="col-12 col-md-6 col-lg-12 col-xl-6">
-    <a class="section-link icon-offset" href="../introduction/">
-      <div class="head">
-        <img class="icon" src="/images/section_icons/index/introduction.png" aria-hidden="true" />       
-        <div class="title">Introduction</div>
-      </div>
-      <div class="body">
-        Learn YugabyteDB's unique value proposition.
-      </div>
-    </a>
-  </div>
 
   <div class="col-12 col-md-6 col-lg-12 col-xl-6">
     <a class="section-link icon-offset" href="../comparisons/">
       <div class="head">
-        <img class="icon" src="/images/section_icons/index/comparisons.png" aria-hidden="true" />     
-        <div class="title">Comparison</div>
+        <img class="icon" src="/images/section_icons/index/comparisons.png" aria-hidden="true" />
+        <div class="title">Comparisons</div>
       </div>
       <div class="body">
-        Comparisons with common operational databases.
+        Compare YugabyteDB with popular distributed SQL and NoSQL databases.
       </div>
     </a>
   </div>
 
   <div class="col-12 col-md-6 col-lg-12 col-xl-6">
-    <a class="section-link icon-offset" href="product/">
+    <a class="section-link icon-offset" href="general/">
       <div class="head">
-        <img class="icon" src="/images/section_icons/introduction/core_features.png" aria-hidden="true" />       
-        <div class="title">Product</div>
+        <img class="icon" src="/images/section_icons/introduction/core_features.png" aria-hidden="true" />
+        <div class="title">General FAQ</div>
       </div>
       <div class="body">
-        Editions, release status and more.
+        Questions about YugabyteDB, APIs, functionality, editions, releases, and more.
       </div>
     </a>
   </div>
 
   <div class="col-12 col-md-6 col-lg-12 col-xl-6">
-    <a class="section-link icon-offset" href="architecture/">
+    <a class="section-link icon-offset" href="operations-faq/">
       <div class="head">
-        <img class="icon" src="/images/section_icons/index/architecture.png" aria-hidden="true" />     
-        <div class="title">Architecture</div>
+        <img class="icon" src="/images/section_icons/manage/enterprise.png" aria-hidden="true" />
+        <div class="title">Operations FAQ</div>
       </div>
       <div class="body">
-        Sharding, replication, transactions, storage layer questions.
-      </div>
-    </a>
-  </div>
-
-  <div class="col-12 col-md-6 col-lg-12 col-xl-6">
-    <a class="section-link icon-offset" href="enterprise-edition/">
-      <div class="head">
-        <img class="icon" src="/images/section_icons/manage/enterprise.png" aria-hidden="true" />      
-        <div class="title">Yugabyte Platform</div>
-      </div>
-      <div class="body">
-        Running YugabyteDB using the Yugabyte Platform.
+        Questions related to managing YugabyteDB clusters.
       </div>
     </a>
   </div>
@@ -77,12 +55,26 @@ menu:
   <div class="col-12 col-md-6 col-lg-12 col-xl-6">
     <a class="section-link icon-offset" href="compatibility/">
       <div class="head">
-        <img class="icon" src="/images/section_icons/index/api.png" aria-hidden="true" />    
-        <div class="title">API compatibility</div>
+        <img class="icon" src="/images/section_icons/index/api.png" aria-hidden="true" />
+        <div class="title">API compatibility FAQ</div>
       </div>
       <div class="body">
-        Understanding API compatibility with popular DB languages.
+        Understanding YugabyteDB API compatibility with popular database languages.
       </div>
     </a>
   </div>
+</div>
+
+<div class="col-12 col-md-6 col-lg-12 col-xl-6">
+  <a class="section-link icon-offset" href="yugabyte-platform/">
+    <div class="head">
+      <img class="icon" src="/images/section_icons/manage/enterprise.png" aria-hidden="true" />
+      <div class="title">Yugabyte Platform FAQ</div>
+    </div>
+    <div class="body">
+      Questions about using the commercial Yugabyte Platform.
+    </div>
+  </a>
+</div>
+
 </div>

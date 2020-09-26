@@ -15,20 +15,21 @@ package org.yb.pgsql;
 
 import org.junit.Test;
 import org.junit.runner.RunWith;
-import org.yb.YBTestRunner;
 import org.yb.client.TestUtils;
+import org.yb.util.YBTestRunnerNonTsanOnly;
 
 import java.nio.file.FileSystem;
 import java.nio.file.FileSystems;
-import java.sql.Statement;
-import java.util.*;
+import java.util.Map;
+
+import static org.yb.AssertionWrappers.assertEquals;
 
 // This test tests node to node encryption only.
 // Postgres connections to t-server and master are encrypted as well.
 // But postgres client connections are not encrypted.
 // Some extra work required to adopt BasePgSQLTest for using encrypted connection.
 // Encrypted client connections are tested in pg_wrapper-test test now.
-@RunWith(value=YBTestRunner.class)
+@RunWith(value= YBTestRunnerNonTsanOnly.class)
 public class TestSecureCluster extends BasePgSQLTest {
   private String certsDir = null;
 
@@ -43,9 +44,31 @@ public class TestSecureCluster extends BasePgSQLTest {
 
   @Test
   public void testConnection() throws Exception {
-    try (Statement statement = connection.createStatement()) {
-      createSimpleTable("test", "v");
-    }
+    createSimpleTable("test", "v");
+  }
+
+  @Test
+  public void testYbAdmin() throws Exception {
+    runProcess(TestUtils.findBinary("yb-admin"),
+               "--master_addresses",
+               masterAddresses,
+               "--certs_dir_name",
+               certsDir,
+               "list_tables");
+  }
+
+  @Test
+  public void testYbTsCli() throws Exception {
+    runProcess(TestUtils.findBinary("yb-ts-cli"),
+               "--server_address",
+               miniCluster.getTabletServers().keySet().iterator().next().toString(),
+               "--certs_dir_name",
+               certsDir,
+               "list_tablets");
+  }
+
+  private void runProcess(String... args) throws Exception {
+    assertEquals(0, new ProcessBuilder(args).start().waitFor());
   }
 
   @Override

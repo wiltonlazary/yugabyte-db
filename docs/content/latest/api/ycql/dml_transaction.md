@@ -1,21 +1,22 @@
 ---
-title: TRANSACTION
-summary: Make changes to multiple rows in a transaction
-description: TRANSACTION
+title: TRANSACTION statement [YCQL]
+headerTitle: TRANSACTION
+linkTitle: TRANSACTION
+description: Use the TRANSACTION statement block to make changes to multiple rows in one or more tables in a distributed ACID transaction.
 menu:
   latest:
     parent: api-cassandra
     weight: 1330
 aliases:
-  - /latest/api/cassandra/dml_insert
-  - /latest/api/ycql/dml_insert
+  - /latest/api/cassandra/dml_transaction
+  - /latest/api/ycql/dml_transaction
 isTocNested: true
 showAsideToc: true
 ---
 
 ## Synopsis
 
-The transaction statement block makes changes to multiple rows in one or more tables in a [distributed ACID transaction](../../explore/transactions).
+Use the TRANSACTION statement block to make changes to multiple rows in one or more tables in a [distributed ACID transaction](../../../architecture/transactions/distributed-txns).
 
 ## Syntax
 
@@ -57,7 +58,7 @@ transaction_block ::= START TRANSACTION ';'
 ### Create a table with transactions enabled
 
 ```sql
-cqlsh:example> CREATE TABLE accounts (account_name TEXT,
+ycqlsh:example> CREATE TABLE accounts (account_name TEXT,
                                       account_type TEXT,
                                       balance DOUBLE,
                                       PRIMARY KEY ((account_name), account_type))
@@ -67,18 +68,18 @@ cqlsh:example> CREATE TABLE accounts (account_name TEXT,
 ### Insert some data
 
 ```sql
-cqlsh:example> INSERT INTO accounts (account_name, account_type, balance)
+ycqlsh:example> INSERT INTO accounts (account_name, account_type, balance)
                VALUES ('John', 'savings', 1000);
-cqlsh:example> INSERT INTO accounts (account_name, account_type, balance)
+ycqlsh:example> INSERT INTO accounts (account_name, account_type, balance)
                VALUES ('John', 'checking', 100);
-cqlsh:example> INSERT INTO accounts (account_name, account_type, balance)
+ycqlsh:example> INSERT INTO accounts (account_name, account_type, balance)
                VALUES ('Smith', 'savings', 2000);
-cqlsh:example> INSERT INTO accounts (account_name, account_type, balance)
+ycqlsh:example> INSERT INTO accounts (account_name, account_type, balance)
                VALUES ('Smith', 'checking', 50);
 ```
 
 ```sql
-cqlsh:example> SELECT account_name, account_type, balance, writetime(balance) FROM accounts;
+ycqlsh:example> SELECT account_name, account_type, balance, writetime(balance) FROM accounts;
 ```
 
 ```
@@ -95,14 +96,14 @@ cqlsh:example> SELECT account_name, account_type, balance, writetime(balance) FR
 You can do this as shown below.
 
 ```sql
-cqlsh:example> BEGIN TRANSACTION
+ycqlsh:example> BEGIN TRANSACTION
                  UPDATE accounts SET balance = balance - 200 WHERE account_name = 'John' AND account_type = 'savings';
                  UPDATE accounts SET balance = balance + 200 WHERE account_name = 'John' AND account_type = 'checking';
                END TRANSACTION;
 ```
 
 ```sql
-cqlsh:example> SELECT account_name, account_type, balance, writetime(balance) FROM accounts;
+ycqlsh:example> SELECT account_name, account_type, balance, writetime(balance) FROM accounts;
 ```
 
 ```
@@ -117,14 +118,14 @@ cqlsh:example> SELECT account_name, account_type, balance, writetime(balance) FR
 ### Update 2 rows with the different partition keys
 
 ```sql
-cqlsh:example> BEGIN TRANSACTION
+ycqlsh:example> BEGIN TRANSACTION
                  UPDATE accounts SET balance = balance - 200 WHERE account_name = 'John' AND account_type = 'checking';
                  UPDATE accounts SET balance = balance + 200 WHERE account_name = 'Smith' AND account_type = 'checking';
                END TRANSACTION;
 ```
 
 ```sql
-cqlsh:example> SELECT account_name, account_type, balance, writetime(balance) FROM accounts;
+ycqlsh:example> SELECT account_name, account_type, balance, writetime(balance) FROM accounts;
 ```
 
 ```
@@ -136,9 +137,15 @@ cqlsh:example> SELECT account_name, account_type, balance, writetime(balance) FR
         Smith |      savings |    2000 |   1523313964363056
 ```
 
+
+
+{{< note Type="Note" >}}
+`BEGIN/END TRANSACTION` doesn't currently support `RETURNS STATUS AS ROW`. 
+{{< /note >}}
+
+
 ## See also
 
-[`INSERT`](../dml_insert)
-[`UPDATE`](../dml_update)
-[`DELETE`](../dml_delete)
-[Other CQL Statements](..)
+- [`INSERT`](../dml_insert)
+- [`UPDATE`](../dml_update)
+- [`DELETE`](../dml_delete)

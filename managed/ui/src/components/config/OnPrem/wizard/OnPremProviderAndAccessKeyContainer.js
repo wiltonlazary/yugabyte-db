@@ -4,7 +4,8 @@ import { connect } from 'react-redux';
 import { reduxForm } from 'redux-form';
 import {OnPremProviderAndAccessKey} from '../../../config';
 import {setOnPremConfigData} from '../../../../actions/cloud';
-import {isDefinedNotNull, isNonEmptyObject, isNonEmptyArray} from 'utils/ObjectUtils';
+import {isDefinedNotNull, isNonEmptyObject, isNonEmptyArray} from '../../../../utils/ObjectUtils';
+import _ from 'lodash';
 
 const mapDispatchToProps = (dispatch, ownProps) => {
   return {
@@ -12,11 +13,15 @@ const mapDispatchToProps = (dispatch, ownProps) => {
       Object.keys(formData).forEach((key) => { if (typeof formData[key] === 'string' || formData[key] instanceof String) formData[key] = formData[key].trim(); });
       if (!ownProps.isEditProvider) {
         const formSubmitVals = {
-          provider: {name: formData.name},
+          provider: {
+            name: formData.name,
+            config: { YB_HOME_DIR: formData.homeDir, USE_HOSTNAME: _.get(formData, "useHostnames", false).toString() }
+          },
           key: {
             code: formData.name.toLowerCase().replace(/ /g, "-") + "-key",
             privateKeyContent: formData.privateKeyContent,
             sshUser: formData.sshUser,
+            sshPort: formData.sshPort,
             passwordlessSudoAccess: formData.passwordlessSudoAccess,
             airGapInstall: formData.airGapInstall
           }
@@ -30,8 +35,10 @@ const mapDispatchToProps = (dispatch, ownProps) => {
 
 const mapStateToProps = (state, ownProps) => {
   let initialFormValues = {
+    sshPort: 54422,
     passwordlessSudoAccess: true,
-    airGapInstall: false
+    airGapInstall: false,
+    useHostnames: false
   };
   const {cloud: {onPremJsonFormData}} = state;
   if (ownProps.isEditProvider && isNonEmptyObject(onPremJsonFormData)) {
@@ -40,8 +47,11 @@ const mapStateToProps = (state, ownProps) => {
       keyCode: onPremJsonFormData.key.code,
       privateKeyContent: onPremJsonFormData.key.privateKeyContent,
       sshUser: onPremJsonFormData.key.sshUser,
+      sshPort: onPremJsonFormData.key.sshPort,
       passwordlessSudoAccess: onPremJsonFormData.key.passwordlessSudoAccess,
       airGapInstall: onPremJsonFormData.key.airGapInstall,
+      useHostnames: _.get(onPremJsonFormData, "provider.config.USE_HOSTNAME", "false") === "true",
+      homeDir: _.get(onPremJsonFormData, "provider.config.YB_HOME_DIR", ""),
       machineTypeList : onPremJsonFormData.instanceTypes.map(function (item) {
         return {
           code: item.instanceTypeCode,
@@ -85,7 +95,7 @@ const validate = values => {
 
 const onPremProviderConfigForm = reduxForm({
   form: 'onPremConfigForm',
-  fields: ['name', 'sshUser', 'privateKeyContent', 'passwordlessSudoAccess', 'airGapInstall'],
+  fields: ['name', 'sshUser', 'sshPort', 'privateKeyContent', 'passwordlessSudoAccess', 'airGapInstall', 'useHostnames', 'homeDir'],
   validate,
   destroyOnUnmount: false,
   enableReinitialize: true,

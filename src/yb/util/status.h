@@ -32,6 +32,7 @@
 #include <string>
 
 #include <boost/intrusive_ptr.hpp>
+#include <boost/optional.hpp>
 
 #include <boost/preprocessor/cat.hpp>
 #include <boost/preprocessor/seq/for_each.hpp>
@@ -222,6 +223,8 @@ class StatusErrorCodeImpl : public StatusErrorCode {
 
   explicit StatusErrorCodeImpl(const Status& status);
 
+  static boost::optional<StatusErrorCodeImpl> FromStatus(const Status& status);
+
   uint8_t Category() const override {
     return kCategory;
   }
@@ -359,7 +362,19 @@ struct StatusCategoryDescription {
   }
 };
 
-class Status {
+#ifdef __clang__
+#define NODISCARD_CLASS [[nodiscard]] // NOLINT
+#else
+#define NODISCARD_CLASS // NOLINT
+#endif
+
+#ifndef DISABLE_STATUS_NODISCARD
+#define STATUS_NODISCARD_CLASS NODISCARD_CLASS
+#else
+#define STATUS_NODISCARD_CLASS
+#endif
+
+class STATUS_NODISCARD_CLASS Status {
  public:
   // Wrapper class for OK status to forbid creation of Result from Status::OK in compile time
   class OK {
@@ -522,6 +537,16 @@ template <class Tag>
 StatusErrorCodeImpl<Tag>::StatusErrorCodeImpl(const Status& status)
     : value_(Tag::Decode(status.ErrorData(Tag::kCategory))) {}
 
+template <class Tag>
+boost::optional<StatusErrorCodeImpl<Tag>> StatusErrorCodeImpl<Tag>::FromStatus(
+    const Status& status) {
+  const auto* error_data = status.ErrorData(Tag::kCategory);
+  if (!error_data) {
+    return boost::none;
+  }
+  return StatusErrorCodeImpl<Tag>(Tag::Decode(error_data));
+}
+
 inline Status&& MoveStatus(Status&& status) {
   return std::move(status);
 }
@@ -553,6 +578,12 @@ inline std::ostream& operator<<(std::ostream& out, const Status& status) {
             __FILE__, \
             __LINE__, \
             ::yb::Format(__VA_ARGS__)))
+
+#define STATUS_EC_FORMAT(status_type, error_code, ...) \
+    (::yb::Status(::yb::Status::BOOST_PP_CAT(k, status_type), \
+            __FILE__, \
+            __LINE__, \
+            ::yb::Format(__VA_ARGS__), error_code))
 
 // Utility macros to perform the appropriate check. If the check fails,
 // returns the specified (error) Status, with the given message.

@@ -1,8 +1,8 @@
 ---
-title: ALTER USER
+title: ALTER USER statement [YSQL]
+headerTitle: ALTER USER
 linkTitle: ALTER USER
-description: Users and roles
-summary: Users and roles
+description: Use the ALTER USER statement to alter a role. ALTER USER is an alias for ALTER ROLE and is used to alter a role.
 menu:
   latest:
     identifier: api-ysql-commands-alter-user
@@ -15,7 +15,7 @@ showAsideToc: true
 
 ## Synopsis
 
-Use the `ALTER USER` statementto alter a role. `ALTER USER` is an alias for [`ALTER ROLE`](../dcl_alter_role) and is used to alter a role.
+Use the `ALTER USER` statement to alter a role. `ALTER USER` is an alias for [`ALTER ROLE`](../dcl_alter_role) and is used to alter a role.
 
 ## Syntax
 
@@ -43,13 +43,11 @@ Use the `ALTER USER` statementto alter a role. `ALTER USER` is an alias for [`AL
   </div>
 </div>
 
-
 See [`ALTER ROLE`](../dcl_alter_role) for more details.
 
 ## See also
 
-[`CREATE ROLE`](../dcl_create_role)
-[`DROP ROLE`](../dcl_drop_role)
-[`GRANT`](../dcl_grant)
-[`REVOKE`](../dcl_revoke)
-[Other YSQL Statements](..)
+- [`CREATE ROLE`](../dcl_create_role)
+- [`DROP ROLE`](../dcl_drop_role)
+- [`GRANT`](../dcl_grant)
+- [`REVOKE`](../dcl_revoke)

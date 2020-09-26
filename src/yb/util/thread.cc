@@ -32,8 +32,6 @@
 
 #include "yb/util/thread.h"
 
-#include <cds/init.h>
-#include <cds/gc/dhp.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
@@ -50,6 +48,9 @@
 #include <memory>
 #include <set>
 #include <vector>
+
+#include <cds/init.h>
+#include <cds/gc/dhp.h>
 
 #include "yb/gutil/atomicops.h"
 #include "yb/gutil/dynamic_annotations.h"
@@ -170,7 +171,8 @@ scoped_refptr<AtomicGauge<uint64>> ThreadCategoryTracker::FindOrCreateGauge(
     EscapeMetricNameForPrometheus(&id);
     const string description = id + " metric in ThreadCategoryTracker";
     std::unique_ptr<GaugePrototype<uint64>> gauge = std::make_unique<OwningGaugePrototype<uint64>>(
-        "server", id, description, yb::MetricUnit::kThreads, description, yb::EXPOSE_AS_COUNTER);
+        "server", id, description, yb::MetricUnit::kThreads, description,
+        yb::MetricLevel::kInfo, yb::EXPOSE_AS_COUNTER);
     gauges_[category] =
         metrics_->FindOrCreateGauge(std::move(gauge), static_cast<uint64>(0) /* initial_value */);
   }
@@ -263,8 +265,9 @@ class ThreadMgr {
   uint64_t ReadThreadsRunning();
 
   // Webpage callback; prints all threads by category
-  void ThreadPathHandler(const WebCallbackRegistry::WebRequest& args, stringstream* output);
-  void PrintThreadCategoryRows(const ThreadCategory& category, stringstream* output);
+  void ThreadPathHandler(const WebCallbackRegistry::WebRequest& args,
+                                WebCallbackRegistry::WebResponse* resp);
+  void RenderThreadCategoryRows(const ThreadCategory& category, std::string* output);
 };
 
 void ThreadMgr::SetThreadName(const string& name, int64 tid) {
@@ -384,7 +387,7 @@ int Compare(const Result<StackTrace>& lhs, const Result<StackTrace>& rhs) {
 
 }
 
-void ThreadMgr::PrintThreadCategoryRows(const ThreadCategory& category, stringstream* output) {
+void ThreadMgr::RenderThreadCategoryRows(const ThreadCategory& category, std::string* output) {
   struct ThreadData {
     int64_t tid;
     ThreadIdForStack tid_for_stack;
@@ -446,27 +449,35 @@ void ThreadMgr::PrintThreadCategoryRows(const ThreadCategory& category, stringst
     }
   }
 
+  std::string* active_out = output;
   for (const auto& thread : threads) {
-    (*output)
-          << "<tr><td>" << *thread.name << "</td><td>"
-          << (static_cast<double>(thread.stats.user_ns) / 1e9) << "</td><td>"
-          << (static_cast<double>(thread.stats.kernel_ns) / 1e9) << "</td><td>"
-          << (static_cast<double>(thread.stats.iowait_ns) / 1e9) << "</td>";
+    std::string symbolized;
     if (thread.rowspan > 0) {
-      *output << Format("<td rowspan=\"$0\"><pre>", thread.rowspan);
+      StackTraceGroup group = StackTraceGroup::kActive;
       if (thread.stack_trace.ok()) {
-        *output << thread.stack_trace->Symbolize();
+        symbolized = thread.stack_trace->Symbolize(StackTraceLineFormat::DEFAULT, &group);
       } else {
-        *output << thread.stack_trace.status().message().ToBuffer();
+        symbolized = thread.stack_trace.status().message().ToBuffer();
       }
-      *output << "</pre></td>";
+      active_out = output + to_underlying(group);
     }
-    *output << "</tr>\n";
+
+    *active_out += Format(
+         "<tr><td>$0</td><td>$1</td><td>$2</td><td>$3</td>",
+         *thread.name, MonoDelta::FromNanoseconds(thread.stats.user_ns),
+         MonoDelta::FromNanoseconds(thread.stats.kernel_ns / 1e9),
+         MonoDelta::FromNanoseconds(thread.stats.iowait_ns / 1e9));
+    if (thread.rowspan > 0) {
+      *active_out += Format("<td rowspan=\"$0\"><pre>$1\nTotal number of threads: $0</pre></td>",
+                            thread.rowspan, symbolized);
+    }
+    *active_out += "</tr>\n";
   }
 }
 
 void ThreadMgr::ThreadPathHandler(const WebCallbackRegistry::WebRequest& req,
-    stringstream* output) {
+    WebCallbackRegistry::WebResponse* resp) {
+  std::stringstream *output = &resp->output;
   MutexLock l(lock_);
   vector<const ThreadCategory*> categories_to_print;
   auto category_name = req.parsed_args.find("group");
@@ -494,8 +505,14 @@ void ThreadMgr::ThreadPathHandler(const WebCallbackRegistry::WebRequest& req,
               << "<th>Cumulative Kernel CPU(s)</th>"
               << "<th>Cumulative IO-wait(s)</th></tr>";
 
+    std::array<std::string, kStackTraceGroupMapSize> groups;
+
     for (const ThreadCategory* category : categories_to_print) {
-      PrintThreadCategoryRows(*category, output);
+      RenderThreadCategoryRows(*category, groups.data());
+    }
+
+    for (auto g : kStackTraceGroupList) {
+      *output << groups[to_underlying(g)];
     }
     (*output) << "</table>";
   } else {
@@ -627,6 +644,10 @@ Status ThreadJoiner::Join() {
     }
     waited += wait_for;
   }
+
+#ifndef NDEBUG
+  LOG(WARNING) << "Failed to join:\n" << DumpThreadStack(thread_->tid_for_stack());
+#endif
 
   return STATUS_FORMAT(Aborted, "Timed out after $0 joining on $1", waited, thread_->name_);
 }

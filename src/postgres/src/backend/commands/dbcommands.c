@@ -147,7 +147,7 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	DefElem    *distemplate = NULL;
 	DefElem    *dallowconnections = NULL;
 	DefElem    *dconnlimit = NULL;
-	DefElem    **default_options[] = {&dctype, &dcollate, &dencoding, &dtablespacename};
+	DefElem    **default_options[] = {&dtablespacename};
 	char	   *dbname = stmt->dbname;
 	char	   *dbowner = NULL;
 	const char *dbtemplate = NULL;
@@ -361,37 +361,67 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 		dbtemplate = "template1";	/* Default template database name */
 
 	/* Check YB options support */
-	if (YBIsUsingYBParser()) {
-		for (int i = lengthof(default_options); i > 0; --i) {
+	if (YBIsUsingYBParser())
+	{
+		for (int i = lengthof(default_options); i > 0; --i)
+		{
 			DefElem *option = *default_options[i - 1];
-			if (option != NULL && option->arg != NULL) {
-        ereport(YBUnsupportedFeatureSignalLevel(),
-            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-             errmsg("Value other than default for %s option is not yet supported", option->defname),
-             errhint("Please report the issue on "
-                     "https://github.com/YugaByte/yugabyte-db/issues"),
-             parser_errposition(pstate, option->location)));
-			}
+			if (option != NULL && option->arg != NULL)
+				ereport(YBUnsupportedFeatureSignalLevel(),
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("Value other than default for %s option is "
+								"not yet supported", option->defname),
+						 errhint("Please report the issue on "
+								 "https://github.com/YugaByte/yugabyte-db"
+								 "/issues"),
+						 parser_errposition(pstate, option->location)));
 		}
 
-		if (strcmp(dbtemplate, "template0") != 0 && strcmp(dbtemplate, "template1") != 0) {
-      ereport(YBUnsupportedFeatureSignalLevel(),
-          (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-           errmsg("Value other than default, template0 or template1 "
-                  "for template option is not yet supported"),
-           errhint("Please report the issue on "
-                   "https://github.com/YugaByte/yugabyte-db/issues"),
-           parser_errposition(pstate, dtemplate->location)));
-		}
+		if (strcmp(dbtemplate, "template0") != 0 &&
+			strcmp(dbtemplate, "template1") != 0)
+			ereport(YBUnsupportedFeatureSignalLevel(),
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("Value other than default, template0 or template1 "
+							"for template option is not yet supported"),
+					 errhint("Please report the issue on "
+							 "https://github.com/YugaByte/yugabyte-db/issues"),
+					 parser_errposition(pstate, dtemplate->location)));
 
-		if (dbistemplate) {
-      ereport(YBUnsupportedFeatureSignalLevel(),
-          (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-           errmsg("Value other than default or false for is_template option is not yet supported"),
-           errhint("Please report the issue on "
-                   "https://github.com/YugaByte/yugabyte-db/issues"),
-           parser_errposition(pstate, distemplate->location)));
-		}
+		if (dbistemplate)
+			ereport(YBUnsupportedFeatureSignalLevel(),
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("Value other than default or false for "
+							"is_template option is not yet supported"),
+					 errhint("Please report the issue on "
+							 "https://github.com/YugaByte/yugabyte-db/issues"),
+					 parser_errposition(pstate, distemplate->location)));
+
+		if (encoding >= 0 && encoding != PG_UTF8)
+			ereport(YBUnsupportedFeatureSignalLevel(),
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("Value other than unicode or utf8 for encoding "
+							"option is not yet supported"),
+					 errhint("Please report the issue on "
+							 "https://github.com/yugabyte/yugabyte-db/issues"),
+					 parser_errposition(pstate, dencoding->location)));
+
+		if (dcollate && dbcollate && strcmp(dbcollate, "C") != 0)
+			ereport(YBUnsupportedFeatureSignalLevel(),
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("Value other than 'C' for lc_collate "
+							"option is not yet supported"),
+					 errhint("Please report the issue on "
+							 "https://github.com/YugaByte/yugabyte-db/issues"),
+					 parser_errposition(pstate, dcollate->location)));
+
+		if (dctype && dbctype && strcmp(dbctype, "en_US.UTF-8") != 0)
+			ereport(YBUnsupportedFeatureSignalLevel(),
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("Value other than 'en_US.UTF-8' for lc_ctype "
+							"option is not yet supported"),
+					 errhint("Please report the issue on "
+							 "https://github.com/YugaByte/yugabyte-db/issues"),
+					 parser_errposition(pstate, dctype->location)));
 	}
 
 	if (!get_db_info(dbtemplate, ShareLock,
@@ -1142,9 +1172,8 @@ RenameDatabase(const char *oldname, const char *newname)
 	if (IsYugaByteEnabled()) {
 		YBCPgStatement handle = NULL;
 		HandleYBStatus(YBCPgNewAlterDatabase(oldname, db_id, &handle));
-		HandleYBStmtStatus(YBCPgAlterDatabaseRenameDatabase(handle, newname), handle);
-		HandleYBStmtStatus(YBCPgExecAlterDatabase(handle), handle);
-		HandleYBStatus(YBCPgDeleteStatement(handle));
+		HandleYBStatus(YBCPgAlterDatabaseRenameDatabase(handle, newname));
+		HandleYBStatus(YBCPgExecAlterDatabase(handle));
 	}
 
 	InvokeObjectPostAlterHook(DatabaseRelationId, db_id, 0);
@@ -1570,11 +1599,13 @@ AlterDatabase(ParseState *pstate, AlterDatabaseStmt *stmt, bool isTopLevel)
 			DefElem *option = *unsupported_options[i - 1];
 			if (option != NULL && option->arg != NULL) {
 				ereport(YBUnsupportedFeatureSignalLevel(),
-								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-										errmsg("Altering %s option is not yet supported", option->defname),
-                    errhint("Please report the issue on "
-                            "https://github.com/YugaByte/yugabyte-db/issues"),
-										parser_errposition(pstate, option->location)));
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("Altering %s option is not yet supported",
+								option->defname),
+						 errhint("Please report the issue on "
+								 "https://github.com/YugaByte/yugabyte-db"
+								 "/issues"),
+						 parser_errposition(pstate, option->location)));
 			}
 		}
 	}

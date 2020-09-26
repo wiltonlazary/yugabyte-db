@@ -50,6 +50,10 @@ struct ChildTransactionData {
   static Result<ChildTransactionData> FromPB(const ChildTransactionDataPB& data);
 };
 
+// SealOnly is a special commit mode.
+// I.e. sealed transaction will be committed after seal record and all write batches are replicated.
+YB_STRONGLY_TYPED_BOOL(SealOnly);
+
 // YBTransaction is a representation of a single transaction.
 // After YBTransaction is created, it could be used during construction of YBSession,
 // to indicate that this session will send commands related to this transaction.
@@ -75,6 +79,8 @@ class YBTransaction : public std::enable_shared_from_this<YBTransaction> {
 
   void SetPriority(uint64_t priority);
 
+  uint64_t GetPriority() const;
+
   // Should be invoked to complete transaction creation.
   // Transaction is unusable before Init is called.
   CHECKED_STATUS Init(
@@ -90,22 +96,32 @@ class YBTransaction : public std::enable_shared_from_this<YBTransaction> {
   bool Prepare(const internal::InFlightOps& ops,
                ForceConsistentRead force_consistent_read,
                CoarseTimePoint deadline,
+               Initial initial,
                Waiter waiter,
                TransactionMetadata* metadata);
+
+  // Ask transaction to expect `count` operations in future. I.e. Prepare will be called with such
+  // number of ops.
+  void ExpectOperations(size_t count);
 
   // Notifies transaction that specified ops were flushed with some status.
   void Flushed(
       const internal::InFlightOps& ops, const ReadHybridTime& used_read_time, const Status& status);
 
   // Commits this transaction.
-  void Commit(CoarseTimePoint deadline, CommitCallback callback);
+  void Commit(CoarseTimePoint deadline, SealOnly seal_only, CommitCallback callback);
+
+  void Commit(CoarseTimePoint deadline, CommitCallback callback) {
+    Commit(deadline, SealOnly::kFalse, callback);
+  }
 
   void Commit(CommitCallback callback) {
-    Commit(CoarseTimePoint(), std::move(callback));
+    Commit(CoarseTimePoint(), SealOnly::kFalse, std::move(callback));
   }
 
   // Utility function for Commit.
-  std::future<Status> CommitFuture(CoarseTimePoint deadline = CoarseTimePoint());
+  std::future<Status> CommitFuture(
+      CoarseTimePoint deadline = CoarseTimePoint(), SealOnly seal_only = SealOnly::kFalse);
 
   // Aborts this transaction.
   void Abort(CoarseTimePoint deadline = CoarseTimePoint());

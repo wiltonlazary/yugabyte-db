@@ -1,8 +1,8 @@
 ---
-title: CREATE TABLE AS
+title: CREATE TABLE AS statement [YSQL]
+headerTitle: CREATE TABLE AS
 linkTitle: CREATE TABLE AS
-summary: Create a new table from a query result
-description: CREATE TABLE AS
+description: Use the CREATE TABLE AS statement to create a new table using the output of a subquery.
 menu:
   latest:
     identifier: api-ysql-commands-create-table-as
@@ -93,4 +93,4 @@ yugabyte=# SELECT * FROM selective_sample ORDER BY k1;
 
 ## See also
 
-- [`CREATE TABLE`](../dml_create_table)
+- [`CREATE TABLE`](../ddl_create_table)

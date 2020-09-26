@@ -37,11 +37,13 @@
 #include <deque>
 #include <queue>
 #include <vector>
+#include <iostream>
 
 #include "yb/server/clock.h"
 #include "yb/util/debug-util.h"
 #include "yb/util/opid.h"
 #include "yb/util/enums.h"
+#include "yb/gutil/thread_annotations.h"
 
 namespace yb {
 namespace tablet {
@@ -58,6 +60,23 @@ struct SafeTimeWithSource {
   std::string ToString() const;
 };
 
+struct FixedHybridTimeLease {
+  HybridTime time;
+  HybridTime lease = HybridTime::kMax;
+
+  bool empty() const {
+    return lease.GetPhysicalValueMicros() >= kMaxHybridTimePhysicalMicros;
+  }
+
+  std::string ToString() const {
+    return Format("{ time: $0 lease: $1 }", time, lease);
+  }
+};
+
+inline std::ostream& operator<<(std::ostream& out, const FixedHybridTimeLease& ht_lease) {
+  return out << ht_lease.ToString();
+}
+
 // MvccManager is used to track operations.
 // When new operation is initiated its time should be added using AddPending.
 // When operation is replicated or aborted, MvccManager is notified using Replicated or Aborted
@@ -68,6 +87,7 @@ class MvccManager {
  public:
   // `prefix` is used for logging.
   explicit MvccManager(std::string prefix, server::ClockPtr clock);
+  ~MvccManager();
 
   // Set special RF==1 mode flag to handle safe time requests correctly in case
   // there are no heartbeats to update internal propagated_safe_time_ correctly.
@@ -83,7 +103,7 @@ class MvccManager {
   // majority-replicated watermark callback from Raft. If we have some read requests that were
   // initiated when this server was a follower and are waiting for the safe time to advance past
   // a certain point, they can also get unblocked by this update of propagated_safe_time.
-  void UpdatePropagatedSafeTimeOnLeader(HybridTime ht_lease);
+  void UpdatePropagatedSafeTimeOnLeader(const FixedHybridTimeLease& ht_lease);
 
   // Adds time of new tracked operation.
   // `ht` is in-out parameter.
@@ -118,9 +138,9 @@ class MvccManager {
   // Returns invalid hybrid time in case it cannot satisfy provided requirements, for instance
   // because of timeout.
   HybridTime SafeTime(
-      HybridTime min_allowed, CoarseTimePoint deadline, HybridTime ht_lease) const;
+      HybridTime min_allowed, CoarseTimePoint deadline, const FixedHybridTimeLease& ht_lease) const;
 
-  HybridTime SafeTime(HybridTime ht_lease) const {
+  HybridTime SafeTime(const FixedHybridTimeLease& ht_lease) const {
     return SafeTime(HybridTime::kMin /* min_allowed */, CoarseTimePoint::max() /* deadline */,
                     ht_lease);
   }
@@ -130,13 +150,25 @@ class MvccManager {
   // Returns time of last replicated operation.
   HybridTime LastReplicatedHybridTime() const;
 
+  class MvccOpTrace;
+
+  void TEST_DumpTrace(std::ostream* out);
+
+
  private:
   HybridTime DoGetSafeTime(HybridTime min_allowed,
                            CoarseTimePoint deadline,
-                           HybridTime ht_lease,
+                           const FixedHybridTimeLease& ht_lease,
                            std::unique_lock<std::mutex>* lock) const;
 
   const std::string& LogPrefix() const { return prefix_; }
+
+  struct InvariantViolationLoggingHelper;
+  InvariantViolationLoggingHelper InvariantViolationLogPrefix() const;
+
+  friend std::ostream& operator<<(
+      std::ostream& out, const InvariantViolationLoggingHelper& helper);
+
   void PopFront(std::lock_guard<std::mutex>* lock);
 
   std::string prefix_;
@@ -168,6 +200,8 @@ class MvccManager {
   mutable SafeTimeWithSource max_safe_time_returned_with_lease_;
   mutable SafeTimeWithSource max_safe_time_returned_without_lease_;
   mutable SafeTimeWithSource max_safe_time_returned_for_follower_ { HybridTime::kMin };
+
+  std::unique_ptr<MvccOpTrace> op_trace_ GUARDED_BY(mutex_);
 };
 
 }  // namespace tablet

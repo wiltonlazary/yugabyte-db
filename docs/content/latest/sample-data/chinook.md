@@ -1,7 +1,8 @@
 ---
 title: Chinook sample database
+headerTitle: Chinook sample database
 linkTitle: Chinook
-description: Chinook sample database
+description: Use the Chinook sample database for a media store to explore and learn YugabyteDB.
 menu:
   latest:
     identifier: chinook
@@ -80,7 +81,7 @@ yugabyte=# \c chinook
 ```
 
 ```
-You are now connected to database "chinook" as user "postgres".
+You are now connected to database "chinook" as user "yugabyte".
 chinook=#
 ```
 
@@ -92,7 +93,7 @@ To build the tables and database objects, run the following `\i` command.
 chinook=# \i share/chinook_ddl.sql
 ```
 
-You can verify that all 14 tables have been created by running the `\d` command.
+You can verify that all 11 tables have been created by running the `\d` command.
 
 ```postgresql
 chinook=# \d

@@ -206,8 +206,8 @@ class TabletInfo : public RefCountedThreadSafe<TabletInfo>,
   MonoTime last_update_time() const;
 
   // Accessors for the last reported schema version.
-  bool set_reported_schema_version(uint32_t version);
-  uint32_t reported_schema_version() const;
+  bool set_reported_schema_version(const TableId& table_id, uint32_t version);
+  uint32_t reported_schema_version(const TableId& table_id);
 
   bool colocated() const;
 
@@ -225,6 +225,9 @@ class TabletInfo : public RefCountedThreadSafe<TabletInfo>,
   // failures that happened before a certain point in time.
   void GetLeaderStepDownFailureTimes(MonoTime forget_failures_before,
                                      LeaderStepDownFailureTimes* dest);
+
+  CHECKED_STATUS CheckRunning() const;
+
  private:
   friend class RefCountedThreadSafe<TabletInfo>;
 
@@ -250,15 +253,12 @@ class TabletInfo : public RefCountedThreadSafe<TabletInfo>,
   ReplicaMap replica_locations_;
 
   // Reported schema version (in-memory only).
-  uint32_t reported_schema_version_ = 0;
+  std::unordered_map<TableId, uint32_t> reported_schema_version_ = {};
 
   LeaderStepDownFailureTimes leader_stepdown_failure_times_;
 
   DISALLOW_COPY_AND_ASSIGN(TabletInfo);
 };
-
-typedef scoped_refptr<TabletInfo> TabletInfoPtr;
-typedef std::vector<TabletInfoPtr> TabletInfos;
 
 // The data related to a table which is persisted on disk.
 // This portion of TableInfo is managed via CowObject.
@@ -293,7 +293,9 @@ struct PersistentTableInfo : public Persistent<SysTablesEntryPB, SysRowEntry::TA
   }
 
   // Return the table's namespace id.
-  const NamespaceName& namespace_id() const { return pb.namespace_id(); }
+  const NamespaceId& namespace_id() const { return pb.namespace_id(); }
+  // Return the table's namespace name.
+  const NamespaceName& namespace_name() const { return pb.namespace_name(); }
 
   const SchemaPB& schema() const {
     return pb.schema();
@@ -324,8 +326,10 @@ class TableInfo : public RefCountedThreadSafe<TableInfo>,
   bool is_running() const;
 
   std::string ToString() const override;
+  std::string ToStringWithState() const;
 
   const NamespaceId namespace_id() const;
+  const NamespaceName namespace_name() const;
 
   const CHECKED_STATUS GetSchema(Schema* schema) const;
 
@@ -336,6 +340,10 @@ class TableInfo : public RefCountedThreadSafe<TableInfo>,
 
   // Return the indexed table id if the table is an index table. Otherwise, return an empty string.
   const std::string indexed_table_id() const;
+
+  bool is_index() const {
+    return !indexed_table_id().empty();
+  }
 
   // For index table
   bool is_local_index() const;
@@ -351,6 +359,7 @@ class TableInfo : public RefCountedThreadSafe<TableInfo>,
 
   // Add a tablet to this table.
   void AddTablet(TabletInfo *tablet);
+
   // Add multiple tablets to this table.
   void AddTablets(const std::vector<TabletInfo*>& tablets);
 
@@ -361,16 +370,31 @@ class TableInfo : public RefCountedThreadSafe<TableInfo>,
   // This only returns tablets which are in RUNNING state.
   void GetTabletsInRange(const GetTableLocationsRequestPB* req, TabletInfos *ret) const;
 
+  // Get all tablets of the table.
   void GetAllTablets(TabletInfos *ret) const;
+
+  // Get the tablet of the table.  The table must be colocated.
+  TabletInfoPtr GetColocatedTablet() const;
 
   // Get info of the specified index.
   IndexInfo GetIndexInfo(const TableId& index_id) const;
 
-  // Returns true if the table creation is in-progress.
+  // Returns true if all tablets of the table are deleted.
   bool AreAllTabletsDeleted() const;
 
   // Returns true if the table creation is in-progress.
   bool IsCreateInProgress() const;
+
+  // Returns true if the table is backfilling an index.
+  bool IsBackfilling() const {
+    std::shared_lock<decltype(lock_)> l(lock_);
+    return is_backfilling_;
+  }
+
+  void SetIsBackfilling(bool flag) {
+    std::lock_guard<decltype(lock_)> l(lock_);
+    is_backfilling_ = flag;
+  }
 
   // Returns true if an "Alter" operation is in-progress.
   bool IsAlterInProgress(uint32_t version) const;
@@ -381,6 +405,7 @@ class TableInfo : public RefCountedThreadSafe<TableInfo>,
   // Get the Status of the last error from the current CreateTable.
   CHECKED_STATUS GetCreateTableErrorStatus() const;
 
+  std::size_t NumLBTasks() const;
   std::size_t NumTasks() const;
   bool HasTasks() const;
   bool HasTasks(MonitoredTask::Type type) const;
@@ -414,6 +439,9 @@ class TableInfo : public RefCountedThreadSafe<TableInfo>,
 
   // If closing, requests to AddTask will be promptly aborted.
   bool closing_ = false;
+
+  // In memory state set during backfill to prevent multiple backfill jobs.
+  bool is_backfilling_ = false;
 
   // List of pending tasks (e.g. create/alter tablet requests).
   std::unordered_set<std::shared_ptr<MonitoredTask>> pending_tasks_;
@@ -480,13 +508,15 @@ class NamespaceInfo : public RefCountedThreadSafe<NamespaceInfo>,
  public:
   explicit NamespaceInfo(NamespaceId ns_id);
 
-  virtual const std::string& id() const override { return namespace_id_; }
+  virtual const NamespaceId& id() const override { return namespace_id_; }
 
   const NamespaceName& name() const;
 
   YQLDatabase database_type() const;
 
   bool colocated() const;
+
+  ::yb::master::SysNamespaceEntryPB_State state() const;
 
   std::string ToString() const override;
 
@@ -500,6 +530,37 @@ class NamespaceInfo : public RefCountedThreadSafe<NamespaceInfo>,
   DISALLOW_COPY_AND_ASSIGN(NamespaceInfo);
 };
 
+// The information about a tablegroup.
+class TablegroupInfo : public RefCountedThreadSafe<TablegroupInfo>{
+ public:
+  explicit TablegroupInfo(TablegroupId tablegroup_id,
+                          NamespaceId namespace_id);
+
+  const std::string& id() const { return tablegroup_id_; }
+  const std::string& namespace_id() const { return namespace_id_; }
+
+  // Operations to track table_set_ information (what tables belong to the tablegroup)
+  void AddChildTable(const TableId& table_id);
+  void DeleteChildTable(const TableId& table_id);
+  bool HasChildTables() const;
+  std::size_t NumChildTables() const;
+
+ private:
+  friend class RefCountedThreadSafe<TablegroupInfo>;
+  ~TablegroupInfo() = default;
+
+  // The tablegroup ID is used in the catalog manager maps to look up the proper
+  // tablet to add user tables to.
+  const TablegroupId tablegroup_id_;
+  const NamespaceId namespace_id_;
+
+  // Protects table_set_.
+  mutable simple_spinlock lock_;
+  std::unordered_set<TableId> table_set_;
+
+  DISALLOW_COPY_AND_ASSIGN(TablegroupInfo);
+};
+
 // The data related to a User-Defined Type which is persisted on disk.
 // This portion of UDTypeInfo is managed via CowObject.
 // It wraps the underlying protobuf to add useful accessors.
@@ -510,7 +571,7 @@ struct PersistentUDTypeInfo : public Persistent<SysUDTypeEntryPB, SysRowEntry::U
   }
 
   // Return the table's namespace id.
-  const NamespaceName& namespace_id() const {
+  const NamespaceId& namespace_id() const {
     return pb.namespace_id();
   }
 
@@ -541,7 +602,7 @@ class UDTypeInfo : public RefCountedThreadSafe<UDTypeInfo>,
 
   const UDTypeName& name() const;
 
-  const NamespaceName& namespace_id() const;
+  const NamespaceId& namespace_id() const;
 
   int field_names_size() const;
 
@@ -643,8 +704,9 @@ class SysConfigInfo : public RefCountedThreadSafe<SysConfigInfo>,
 };
 
 // Convenience typedefs.
-typedef std::unordered_map<TabletId, scoped_refptr<TabletInfo>> TabletInfoMap;
-typedef std::unordered_map<TableId, scoped_refptr<TableInfo>> TableInfoMap;
+// Table(t)InfoMap ordered for deterministic locking.
+typedef std::map<TabletId, scoped_refptr<TabletInfo>> TabletInfoMap;
+typedef std::map<TableId, scoped_refptr<TableInfo>> TableInfoMap;
 typedef std::pair<NamespaceId, TableName> TableNameKey;
 typedef std::unordered_map<
     TableNameKey, scoped_refptr<TableInfo>, boost::hash<TableNameKey>> TableInfoByNameMap;
@@ -653,6 +715,13 @@ typedef std::unordered_map<UDTypeId, scoped_refptr<UDTypeInfo>> UDTypeInfoMap;
 typedef std::pair<NamespaceId, UDTypeName> UDTypeNameKey;
 typedef std::unordered_map<
     UDTypeNameKey, scoped_refptr<UDTypeInfo>, boost::hash<UDTypeNameKey>> UDTypeInfoByNameMap;
+
+template <class Info>
+void FillInfoEntry(const Info& info, SysRowEntry* entry) {
+  entry->set_id(info.id());
+  entry->set_type(info.metadata().state().type());
+  entry->set_data(info.metadata().state().pb.SerializeAsString());
+}
 
 }  // namespace master
 }  // namespace yb

@@ -1,8 +1,8 @@
 ---
-title: ALTER GROUP
+title: ALTER GROUP statement [YSQL]
+headerTitle: ALTER GROUP
 linkTitle: ALTER GROUP
-description: ALTER GROUP
-summary: Groups and roles
+description: Use the `ALTER GROUP` statement to alter attributes for a group (role).
 menu:
   latest:
     identifier: api-ysql-commands-alter-group
@@ -15,7 +15,7 @@ showAsideToc: true
 
 ## Synopsis
 
-`ALTER GROUP` is used to alter attributes for a group (role).
+Use the `ALTER GROUP` statement to alter attributes for a group (role).
 This is added for compatibility with Postgres. Its usage is discouraged. [`ALTER ROLE`](../dcl_alter_role) is the preferred way to change attributes of a role.
 
 ## Syntax
@@ -52,9 +52,8 @@ It can also be used to rename a role.
 
 ## See also
 
-[`ALTER ROLE`](../dcl_alter_role)
-[`CREATE ROLE`](../dcl_create_role)
-[`DROP ROLE`](../dcl_drop_role)
-[`GRANT`](../dcl_grant)
-[`REVOKE`](../dcl_revoke)
-[Other YSQL Statements](..)
+- [`ALTER ROLE`](../dcl_alter_role)
+- [`CREATE ROLE`](../dcl_create_role)
+- [`DROP ROLE`](../dcl_drop_role)
+- [`GRANT`](../dcl_grant)
+- [`REVOKE`](../dcl_revoke)

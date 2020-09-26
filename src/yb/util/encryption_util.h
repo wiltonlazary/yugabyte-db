@@ -30,6 +30,7 @@ namespace enterprise {
 
 class HeaderManager;
 class BlockAccessCipherStream;
+class OpenSSLInitializer;
 
 // Struct generated for encryption status of existing files.
 struct FileEncryptionStatus {
@@ -48,6 +49,10 @@ struct EncryptionParams {
   // Counter of 4 bytes incremented for each block.
   uint32_t counter;
   uint32_t key_size;
+
+  // When computing counter increment, do we want to overflow the counter into the rest of the
+  // initialization vector as part of the new format.
+  bool openssl_compatible_counter_overflow;
 
   void ToEncryptionParamsPB(EncryptionParamsPB* encryption_header) const;
 
@@ -134,7 +139,10 @@ Status CreateEncryptionInfoForWrite(HeaderManager* header_manager,
   // Since file doesn't exist or this overwrites, append key to the name and create.
   *stream = std::make_unique<BlockAccessCipherStream>(std::move(encryption_params));
   RETURN_NOT_OK((*stream)->Init());
-  *header_size = header.size();
+  if (header.size() > std::numeric_limits<uint32_t>::max()) {
+    return STATUS_FORMAT(Corruption, "Invalid encryption header size: $0", header.size());
+  }
+  *header_size = static_cast<uint32_t>(header.size());
   return Status::OK();
 }
 
@@ -178,6 +186,8 @@ Status CreateWritableFile(WritablePtr* result,
 }
 
 Result<uint32_t> GetHeaderSize(SequentialFile* file, HeaderManager* header_manager);
+
+OpenSSLInitializer& InitOpenSSL();
 
 } // namespace enterprise
 } // namespace yb

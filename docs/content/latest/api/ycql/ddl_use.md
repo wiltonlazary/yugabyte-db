@@ -1,7 +1,8 @@
 ---
-title: USE
-summary: Create a new database
-description: USE
+title: USE statement [YCQL]
+headerTitle: USE
+linkTitle: USE
+description: Use the USE statement to specify a default keyspace for the current client session.
 menu:
   latest:
     parent: api-cassandra
@@ -15,7 +16,7 @@ showAsideToc: true
 
 ## Synopsis
 
-The `USE` keyspace statement specifies a default keyspace for the current client session. When a database object (such as [table](../ddl_create_table) or [type](../ddl_create_type)) name does not identify a keyspace, this default keyspace is used.
+Use the `USE` statement to specify a default keyspace for the current client session. When a database object (such as [table](../ddl_create_table) or [type](../ddl_create_type)) name does not identify a keyspace, this default keyspace is used.
 
 ## Syntax
 
@@ -43,23 +44,23 @@ Where
 ### Create and use keyspaces
 
 ```sql
-cqlsh> CREATE KEYSPACE example;
+ycqlsh> CREATE KEYSPACE example;
 ```
 
 ```sql
-cqlsh> CREATE KEYSPACE other_keyspace;
+ycqlsh> CREATE KEYSPACE other_keyspace;
 ```
 
 ```sql
-cqlsh> USE example;
+ycqlsh> USE example;
 ```
 
 ### Create a table in the current keyspace
 
 ``` sql
-cqlsh:example> CREATE TABLE test(id INT PRIMARY KEY);
-cqlsh:example> INSERT INTO test(id) VALUES (1);
-cqlsh:example> SELECT * FROM test;
+ycqlsh:example> CREATE TABLE test(id INT PRIMARY KEY);
+ycqlsh:example> INSERT INTO test(id) VALUES (1);
+ycqlsh:example> SELECT * FROM test;
 ```
 
 ```
@@ -71,9 +72,9 @@ cqlsh:example> SELECT * FROM test;
 ### Create a table in another keyspace
 
 ``` sql
-cqlsh:example> CREATE TABLE other_keyspace.test(id INT PRIMARY KEY);
-cqlsh:example> INSERT INTO other_keyspace.test(id) VALUES (2);
-cqlsh:example> SELECT * FROM other_keyspace.test;
+ycqlsh:example> CREATE TABLE other_keyspace.test(id INT PRIMARY KEY);
+ycqlsh:example> INSERT INTO other_keyspace.test(id) VALUES (2);
+ycqlsh:example> SELECT * FROM other_keyspace.test;
 ```
 
 ```
@@ -83,7 +84,7 @@ cqlsh:example> SELECT * FROM other_keyspace.test;
 ```
 
 ## See also
-[`ALTER KEYSPACE`](../ddl_alter_keyspace)
-[`CREATE KEYSPACE`](../ddl_create_keyspace)
-[`DROP KEYSPACE`](../ddl_drop_keyspace)
-[Other CQL Statements](..)
+
+- [`ALTER KEYSPACE`](../ddl_alter_keyspace)
+- [`CREATE KEYSPACE`](../ddl_create_keyspace)
+- [`DROP KEYSPACE`](../ddl_drop_keyspace)

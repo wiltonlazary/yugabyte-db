@@ -6,7 +6,7 @@ import { DescriptionList, YBResourceCount } from '../../common/descriptors';
 import { getPrimaryCluster, getReadOnlyCluster, nodeComparisonFunction, isKubernetesUniverse } from '../../../utils/UniverseUtils';
 import { FlexContainer, FlexGrow, FlexShrink } from '../../common/flexbox/YBFlexBox';
 import { YBWidget } from '../../panels';
-const pluralize = require('pluralize');
+import pluralize from 'pluralize';
 
 export default class ClusterInfoPanel extends Component {
   static propTypes = {
@@ -31,7 +31,7 @@ export default class ClusterInfoPanel extends Component {
       universeDetails.nodeDetailsSet.sort((a, b) => nodeComparisonFunction(a, b, clusters))
       : [];
     const primaryNodes = nodeDetails
-      .filter((node) => node.placementUuid === cluster.uuid);
+      .filter((node) => node.placementUuid === cluster.uuid && node.isTserver);
 
     const isItKubernetesUniverse = isKubernetesUniverse(universeInfo);
 

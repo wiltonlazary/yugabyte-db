@@ -1,7 +1,7 @@
 // Copyright (c) YugaByte, Inc.
 
 import axios from 'axios';
-import { ROOT_URL } from '../config';
+import {IN_DEVELOPMENT_MODE, ROOT_URL, USE_SSO} from '../config';
 import Cookies from 'js-cookie';
 
 // Get current user(me) from token in localStorage
@@ -78,6 +78,8 @@ export const ADD_TLS_CERT_RESET = 'ADD_TLS_CERT_RESET';
 export const ADD_TLS_CERT = 'ADD_TLS_CERT';
 export const ADD_TLS_CERT_RESPONSE = 'ADD_TLS_CERT_RESPONSE';
 
+export const FETCH_CLIENT_CERT = 'FETCH_CLIENT_CERT';
+
 export const REFRESH_RELEASES = 'REFRESH_RELEASES';
 export const REFRESH_RELEASES_RESPONSE = 'REFRESH_RELEASES_RESPONSE';
 
@@ -96,6 +98,14 @@ export const GET_SCHEDULES_RESPONSE = 'GET_SCHEDULES_RESPONSE';
 export const DELETE_SCHEDULE = 'DELETE_SCHEDULE';
 export const DELETE_SCHEDULE_RESPONSE = 'DELETE_SCHEDULE_RESPONSE';
 
+export const CREATE_USER = 'CREATE_USER';
+export const CREATE_USER_RESPONSE = 'CREATE_USER_RESPONSE';
+
+export const DELETE_USER = 'DELETE_USER';
+export const DELETE_USER_RESPONSE  = 'DELETE_USER_RESPONSE';
+
+export const CHANGE_USER_ROLE = 'CHANGE_USER_ROLE';
+
 export function validateToken() {
   let cUUID = Cookies.get("customerId");
   if (cUUID) {
@@ -103,12 +113,24 @@ export function validateToken() {
   } else {
     cUUID = localStorage.getItem("customerId");
   }
-  const authToken = Cookies.get("authToken") || localStorage.getItem("authToken");
-  axios.defaults.headers.common['X-AUTH-TOKEN'] = authToken;
+
+  // in single sign-on mode authentication happens via PLAY_SESSION cookie and not via headers
+  if (!USE_SSO) {
+    axios.defaults.headers.common['X-AUTH-TOKEN'] = Cookies.get("authToken") || localStorage.getItem("authToken");
+  }
   const apiToken = Cookies.get("apiToken") || localStorage.getItem("apiToken");
   if (apiToken && apiToken !== '') {
     axios.defaults.headers.common['X-AUTH-YW-API-TOKEN'] = apiToken;
   }
+
+  // in dev mode UI and API usually run on different hosts, so need to include cookies for cross-domain requests
+  if (IN_DEVELOPMENT_MODE) {
+    axios.defaults.withCredentials = true;
+  }
+  if (!IN_DEVELOPMENT_MODE || !process.env.REACT_APP_YUGAWARE_API_URL) {
+    axios.defaults.headers.common['Csrf-Token'] = Cookies.get("csrfCookie");
+  }
+
   const request = axios(`${ROOT_URL}/customers/${cUUID}`);
   return {
     type: VALIDATE_FROM_TOKEN,
@@ -169,7 +191,8 @@ export function insecureLoginResponse(response) {
 }
 
 export function logout() {
-  const request = axios.get(`${ROOT_URL}/logout`);
+  const url = USE_SSO ? `${ROOT_URL}/third_party_logout` : `${ROOT_URL}/logout`;
+  const request = axios.get(url);
   return {
     type: LOGOUT,
     payload: request
@@ -252,6 +275,34 @@ export function updateProfileFailure(error) {
   };
 }
 
+export function updatePassword(user, values) {
+  const cUUID = localStorage.getItem("customerId");
+  const userUUID = user.uuid;
+  const data = {
+    ...values,
+    role: user.role
+  };
+  const request = axios.put(`${ROOT_URL}/customers/${cUUID}/users/${userUUID}/change_password`, data);
+  return {
+    type: UPDATE_PROFILE,
+    payload: request
+  };
+}
+
+export function updatePasswordSuccess(response) {
+  return {
+    type: UPDATE_PROFILE_SUCCESS,
+    payload: response
+  };
+}
+
+export function updatePasswordFailure(error) {
+  return {
+    type: UPDATE_PROFILE_FAILURE,
+    payload: error
+  };
+}
+
 export function fetchSoftwareVersions() {
   const cUUID = localStorage.getItem("customerId");
   const request = axios.get(`${ROOT_URL}/customers/${cUUID}/releases`);
@@ -310,6 +361,15 @@ export function addCertificateResponse(response) {
 export function addCertificateReset() {
   return {
     type: ADD_TLS_CERT_RESET
+  };
+}
+
+export function retrieveClientCertificate(certUUID, config) {
+  const cUUID = localStorage.getItem('customerId');
+  const request = axios.post(`${ROOT_URL}/customers/${cUUID}/certificates/${certUUID}`, config);
+  return {
+    type: FETCH_CLIENT_CERT,
+    payload: request
   };
 }
 
@@ -569,6 +629,47 @@ export function updateYugaByteRelease(version, payload) {
 export function updateYugaByteReleaseResponse(response) {
   return {
     type: UPDATE_RELEASE_RESPONSE,
+    payload: response
+  };
+}
+
+export function createUser(formValues) {
+  const cUUID = localStorage.getItem("customerId");
+  const request = axios.post(`${ROOT_URL}/customers/${cUUID}/users`, formValues);
+  return {
+    type: CREATE_USER,
+    payload: request
+  };
+}
+
+export function createUserResponse(response) {
+  return {
+    type: CREATE_USER_RESPONSE,
+    payload: response
+  };
+}
+
+export function changeUserRole(userUUID, newRole) {
+  const cUUID = localStorage.getItem('customerId');
+  const request = axios.put(`${ROOT_URL}/customers/${cUUID}/users/${userUUID}?role=${newRole}`);
+  return {
+    type: CHANGE_USER_ROLE,
+    payload: request
+  };
+}
+
+export function deleteUser(userUUID) {
+  const cUUID = localStorage.getItem("customerId");
+  const request = axios.delete(`${ROOT_URL}/customers/${cUUID}/users/${userUUID}`);
+  return {
+    type: DELETE_USER,
+    payload: request
+  };
+}
+
+export function deleteUserResponse(response) {
+  return {
+    type: DELETE_USER_RESPONSE,
     payload: response
   };
 }

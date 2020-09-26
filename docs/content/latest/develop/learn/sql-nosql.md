@@ -1,7 +1,8 @@
 ---
-title: 1. SQL vs NoSQL
+title: SQL vs NoSQL in YugabyteDB
+headerTitle: SQL vs NoSQL
 linkTitle: 1. SQL vs NoSQL
-description: SQL vs NoSQL
+description: Learn how YugabyteDB brings the best of SQL and NoSQL together into one unified platform to simplify development of scalable cloud services.
 aliases:
   - /develop/learn/sql-nosql/
 menu:
@@ -28,7 +29,7 @@ These can be loosely defined as the high-level concerns when choosing a database
 | Database characteristics  | SQL | NoSQL | YugabyteDB |
 | --------------- | ---------------- | ------------------ | ------------------ |
 | Data model | Well-defined schema (tables, rows, columns)  | Schemaless | Both |
-| API    | SQL | Various | SQL + Flexible-Schema NoSQL + Key-Value NoSQL |
+| API    | SQL | Various | Fully-relational SQL + Semi-relational SQL |
 | Consistency | Strong consistency | Eventual consistency | Strong consistency |
 | Transactions | ACID transactions | No transactions | ACID transactions |
 | High Write Throughput | No | Sometimes | Yes
@@ -41,7 +42,7 @@ Operational characteristics can be defined as the runtime concerns that arise wh
 | Operational characteristics  | SQL | NoSQL | YugabyteDB |
 | --------------- | ---------------- | ------------------ | ------------------ |
 | Automatic sharding | No | Sometimes | Yes
-| Linear scalability | No | Yes | Yes 
+| Linear scalability | No | Yes | Yes
 | Fault tolerance | No - manual setup | Yes - smart client detects failed nodes | Yes - smart client detects failed nodes
 | Data resilience | No | Yes - but rebuilds cause high latencies | Yes - automatic, efficient data rebuilds
 | Geo-distributed | No - manual setup | Sometimes | Yes
@@ -53,19 +54,20 @@ Operational characteristics can be defined as the runtime concerns that arise wh
 
 ## Core features
 
-Applications and cloud services depend on databases for a variety of built-in features. These can include the ability to perform multi-row transactions, JSON or document support, secondary indexes, automatic data expiry with TTLs, and so on.
+Applications and cloud services depend on databases for a variety of built-in features. These can include the ability to perform multi-row transactions, JSON or document support, secondary indexes, automatic data expiration with TTLs, and so on.
 
 Here is a table that lists some of the important features that YugabyteDB supports, and which of YugabyteDB's APIs to use in order to achieve these features. Note that typically, multiple databases are deployed in order to achieve these features.
 
-| Database features  | YugabyteDB - Cassandra-compatible YCQL API | YugabyteDB - Redis-compatible YEDIS API|
+| Database features  | [Yugabyte SQL API](../../../api/ysql) | [Yugabyte Cloud QL API](../../../api/ycql) |
 | --------------- | ---------------- | ------------------ |
-| Multi-row transactions | Yes | - |
-| Consistent secondary indexes | Coming soon | - |
-| JSON/document support | Roadmap - JSON data type coming soon | Yes - supports primitive types, maps, lists, (sorted) sets |
-| Secondary Indexes | Coming soon | - |
-| High Throughput | Yes - batch inserts | Yes - pipelined operations |
-| Automatic data expiry with TTL | Yes - table and column level TTL | Yes - key level TTL |
-| Run Apache Spark for AI/ML | Yes | - |
+| Multi-row transactions | Yes | Yes |
+| Consistent secondary indexes | Yes | Yes |
+| JSON/document support | Yes | Yes |
+| Secondary Indexes | Yes | Yes |
+| Foreign keys | Yes | No |
+| JOINs | Yes | No |
+| Automatic data expiry with TTL | No | Yes - table and column level TTL |
+| Run Apache Spark for AI/ML | No | Yes |
 
 ## Linear scalability
 

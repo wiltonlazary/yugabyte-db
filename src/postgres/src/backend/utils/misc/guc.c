@@ -80,6 +80,7 @@
 #include "utils/builtins.h"
 #include "utils/bytea.h"
 #include "utils/guc_tables.h"
+#include "utils/float.h"
 #include "utils/memutils.h"
 #include "utils/pg_locale.h"
 #include "utils/plancache.h"
@@ -200,8 +201,14 @@ static const char *show_unix_socket_permissions(void);
 static const char *show_log_file_mode(void);
 static const char *show_data_directory_mode(void);
 
+static bool check_transaction_priority_lower_bound(double *newval, void **extra, GucSource source);
 extern void YBCAssignTransactionPriorityLowerBound(double newval, void* extra);
+static bool check_transaction_priority_upper_bound(double *newval, void **extra, GucSource source);
 extern void YBCAssignTransactionPriorityUpperBound(double newval, void* extra);
+
+static bool check_max_backoff(int *max_backoff_msecs, void **extra, GucSource source);
+static bool check_min_backoff(int *min_backoff_msecs, void **extra, GucSource source);
+static bool check_backoff_multiplier(double *multiplier, void **extra, GucSource source);
 
 /* Private functions in guc-file.l that need to be called from guc.c */
 static ConfigVariable *ProcessConfigFileInternal(GucContext context,
@@ -1833,12 +1840,45 @@ static struct config_bool ConfigureNamesBool[] =
 	},
 
 	{
-		{"yb_debug_mode", PGC_USERSET, DEVELOPER_OPTIONS,
-			gettext_noop("Enable yb debugging."),
+		{"yb_debug_report_error_stacktrace", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Append stacktrace information for error messages."),
 			NULL,
 			GUC_NOT_IN_SAMPLE
 		},
-		&yb_debug_mode,
+		&yb_debug_report_error_stacktrace,
+		false,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"yb_debug_log_catcache_events", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Log details for every catalog cache event such as a cache miss or cache invalidation/refresh."),
+			NULL,
+			GUC_NOT_IN_SAMPLE
+		},
+		&yb_debug_log_catcache_events,
+		false,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"yb_debug_log_internal_restarts", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Log details for internal restarts such as read-restarts, cache-invalidation restarts, or txn restarts."),
+			NULL,
+			GUC_NOT_IN_SAMPLE
+		},
+		&yb_debug_log_internal_restarts,
+		false,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"yb_debug_log_docdb_requests", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Log the contents of all internal (protobuf) requests to DocDB."),
+			NULL,
+			GUC_NOT_IN_SAMPLE
+		},
+		&yb_debug_log_docdb_requests,
 		false,
 		NULL, NULL, NULL
 	},
@@ -2287,7 +2327,30 @@ static struct config_int ConfigureNamesInt[] =
 		},
 		&StatementTimeout,
 		0, 0, INT_MAX,
-		NULL, NULL, NULL
+		NULL, YBCSetTimeout, NULL
+	},
+
+
+	{
+		{"retry_min_backoff", PGC_USERSET, CLIENT_CONN_STATEMENT,
+			gettext_noop("Sets the minimum backoff in milliseconds between retries."),
+			NULL,
+			GUC_UNIT_MS
+		},
+		&RetryMinBackoffMsecs,
+		100, 0, INT_MAX,
+		check_min_backoff, NULL, NULL
+	},
+
+	{
+		{"retry_max_backoff", PGC_USERSET, CLIENT_CONN_STATEMENT,
+			gettext_noop("Sets the maximum backoff in milliseconds between retries."),
+			NULL,
+			GUC_UNIT_MS
+		},
+		&RetryMaxBackoffMsecs,
+		1000, 0, INT_MAX,
+		check_max_backoff, NULL, NULL
 	},
 
 	{
@@ -3292,7 +3355,7 @@ static struct config_real ConfigureNamesReal[] =
 		},
 		&yb_transaction_priority_lower_bound,
 		0.0, 0.0, 1.0,
-		NULL, YBCAssignTransactionPriorityLowerBound, NULL
+		check_transaction_priority_lower_bound, YBCAssignTransactionPriorityLowerBound, NULL
 	},
 	{
 		{"yb_transaction_priority_upper_bound", PGC_USERSET, CLIENT_CONN_STATEMENT,
@@ -3301,7 +3364,18 @@ static struct config_real ConfigureNamesReal[] =
 		},
 		&yb_transaction_priority_upper_bound,
 		1.0, 0.0, 1.0,
-		NULL, YBCAssignTransactionPriorityUpperBound, NULL
+		check_transaction_priority_upper_bound, YBCAssignTransactionPriorityUpperBound, NULL
+	},
+
+	{
+		{"retry_backoff_multiplier", PGC_USERSET, CLIENT_CONN_STATEMENT,
+			gettext_noop("Sets the multiplier used to calculate the retry backoff."),
+			NULL,
+			GUC_UNIT_MS
+		},
+		&RetryBackoffMultiplier,
+		2.0, 1.0, 1e10,
+		check_backoff_multiplier, NULL, NULL
 	},
 
 	/* End-of-list marker */
@@ -6316,7 +6390,7 @@ set_config_option(const char *name, const char *value,
 				return 0;
 			}
 			/* fall through to process the same as PGC_BACKEND */
-			/* FALLTHROUGH */
+			switch_fallthrough();
 		case PGC_BACKEND:
 			if (context == PGC_SIGHUP)
 			{
@@ -7697,7 +7771,7 @@ ExecSetVariableStmt(VariableSetStmt *stmt, bool isTopLevel)
 		case VAR_SET_DEFAULT:
 			if (stmt->is_local)
 				WarnNoTransactionBlock(isTopLevel, "SET LOCAL");
-			/* fall through */
+			switch_fallthrough();
 		case VAR_RESET:
 			if (strcmp(stmt->name, "transaction_isolation") == 0)
 				WarnNoTransactionBlock(isTopLevel, "RESET TRANSACTION");
@@ -10850,6 +10924,65 @@ show_data_directory_mode(void)
 
 	snprintf(buf, sizeof(buf), "%04o", data_directory_mode);
 	return buf;
+}
+
+static bool
+check_transaction_priority_lower_bound(double *newval, void **extra, GucSource source)
+{
+	if (*newval > yb_transaction_priority_upper_bound) {
+		GUC_check_errdetail("must be less than or equal to yb_transaction_priority_upper_bound (%f)",
+		                    yb_transaction_priority_upper_bound);
+		return false;
+	}
+
+	return true;
+}
+
+static bool
+check_transaction_priority_upper_bound(double *newval, void **extra, GucSource source)
+{
+	if (*newval < yb_transaction_priority_lower_bound) {
+		GUC_check_errdetail("must be greater than or equal to yb_transaction_priority_lower_bound (%f)",
+		                    yb_transaction_priority_lower_bound);
+		return false;
+	}
+
+	return true;
+}
+
+static bool
+check_max_backoff(int *max_backoff_msecs, void **extra, GucSource source)
+{
+	if (*max_backoff_msecs < 0)
+	{
+		GUC_check_errdetail("must be greater than or equal to 0");
+		return false;
+	}
+
+	return true;
+}
+
+static bool
+check_min_backoff(int *min_backoff_msecs, void **extra, GucSource source)
+{
+	if (*min_backoff_msecs < 0)
+	{
+		GUC_check_errdetail("must be greater than or equal to 0");
+		return false;
+	}
+
+	return true;
+}
+
+static bool
+check_backoff_multiplier(double *multiplier, void **extra, GucSource source)
+{
+	if (*multiplier < 1)
+	{
+		GUC_check_errdetail("must be greater than or equal to 1");
+		return false;
+	}
+	return true;
 }
 
 #include "guc-file.c"

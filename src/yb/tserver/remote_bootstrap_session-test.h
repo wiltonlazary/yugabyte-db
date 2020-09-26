@@ -72,7 +72,6 @@ namespace tserver {
 
 using std::unique_ptr;
 using consensus::ConsensusMetadata;
-using consensus::OpId;
 using consensus::RaftConfigPB;
 using consensus::RaftPeerPB;
 using log::Log;
@@ -97,7 +96,7 @@ class RemoteBootstrapTest : public YBTabletTest {
   virtual void SetUp() override {
     ASSERT_OK(ThreadPoolBuilder("raft").Build(&raft_pool_));
     ASSERT_OK(ThreadPoolBuilder("prepare").Build(&tablet_prepare_pool_));
-    ASSERT_OK(ThreadPoolBuilder("append").Build(&append_pool_));
+    ASSERT_OK(ThreadPoolBuilder("log").Build(&log_thread_pool_));
     YBTabletTest::SetUp();
     SetUpTabletPeer();
     ASSERT_NO_FATALS(PopulateTablet());
@@ -121,7 +120,9 @@ class RemoteBootstrapTest : public YBTabletTest {
                        *tablet()->schema(),
                        0,  // schema_version
                        nullptr, // metric_entity
-                       append_pool_.get(),
+                       log_thread_pool_.get(),
+                       log_thread_pool_.get(),
+                       std::numeric_limits<int64_t>::max(), // cdc_min_replicated_index
                        &log));
 
     scoped_refptr<MetricEntity> metric_entity =
@@ -134,16 +135,15 @@ class RemoteBootstrapTest : public YBTabletTest {
     hp->set_host("fake-host");
     hp->set_port(0);
 
-    tablet_peer_.reset(
-        new TabletPeer(
-            tablet()->metadata(),
-            config_peer,
-            clock(),
-            fs_manager()->uuid(),
-            Bind(
-                &RemoteBootstrapTest::TabletPeerStateChangedCallback,
-                Unretained(this),
-                tablet()->tablet_id()), &metric_registry_));
+    tablet_peer_.reset(new TabletPeer(
+        tablet()->metadata(), config_peer, clock(), fs_manager()->uuid(),
+        Bind(
+            &RemoteBootstrapTest::TabletPeerStateChangedCallback,
+            Unretained(this),
+            tablet()->tablet_id()),
+        &metric_registry_,
+        nullptr /* tablet_splitter */,
+        std::shared_future<client::YBClient*>()));
 
     // TODO similar to code in tablet_peer-test, consider refactor.
     RaftConfigPB config;
@@ -161,16 +161,17 @@ class RemoteBootstrapTest : public YBTabletTest {
 
     log_anchor_registry_.reset(new LogAnchorRegistry());
     ASSERT_OK(tablet_peer_->SetBootstrapping());
-    ASSERT_OK(tablet_peer_->InitTabletPeer(tablet(),
-                                           std::shared_future<client::YBClient*>(),
-                                           nullptr /* server_mem_tracker */,
-                                           messenger_.get(),
-                                           proxy_cache_.get(),
-                                           log,
-                                           metric_entity,
-                                           raft_pool_.get(),
-                                           tablet_prepare_pool_.get(),
-                                           nullptr /* retryable_requests */));
+    ASSERT_OK(tablet_peer_->InitTabletPeer(
+        tablet(),
+        nullptr /* server_mem_tracker */,
+        messenger_.get(),
+        proxy_cache_.get(),
+        log,
+        metric_entity,
+        raft_pool_.get(),
+        tablet_prepare_pool_.get(),
+        nullptr /* retryable_requests */,
+        yb::OpId() /* split_op_id */));
     consensus::ConsensusBootstrapInfo boot_info;
     ASSERT_OK(tablet_peer_->Start(boot_info));
 
@@ -215,8 +216,8 @@ class RemoteBootstrapTest : public YBTabletTest {
   }
 
   virtual void InitSession() {
-    session_.reset(new enterprise::RemoteBootstrapSession(
-        tablet_peer_, "TestSession", "FakeUUID", fs_manager(), nullptr /* nsessions */));
+    session_.reset(new RemoteBootstrapSession(
+        tablet_peer_, "TestSession", "FakeUUID", nullptr /* nsessions */));
     ASSERT_OK(session_->Init());
   }
 
@@ -224,9 +225,9 @@ class RemoteBootstrapTest : public YBTabletTest {
   scoped_refptr<LogAnchorRegistry> log_anchor_registry_;
   unique_ptr<ThreadPool> raft_pool_;
   unique_ptr<ThreadPool> tablet_prepare_pool_;
-  unique_ptr<ThreadPool> append_pool_;
+  unique_ptr<ThreadPool> log_thread_pool_;
   std::shared_ptr<TabletPeer> tablet_peer_;
-  scoped_refptr<enterprise::RemoteBootstrapSession> session_;
+  scoped_refptr<RemoteBootstrapSession> session_;
   std::unique_ptr<rpc::Messenger> messenger_;
   std::unique_ptr<rpc::ProxyCache> proxy_cache_;
 };

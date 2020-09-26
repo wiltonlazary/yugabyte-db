@@ -1,7 +1,8 @@
 ---
-title: DROP TABLE
-summary: Remove a table
-description: DROP TABLE
+title: DROP TABLE statement [YCQL]
+headerTitle: DROP TABLE
+linkTitle: DROP TABLE
+description: Use the DROP TABLE statement to remove a table and all of its data from the database.
 menu:
   latest:
     parent: api-cassandra
@@ -15,7 +16,7 @@ showAsideToc: true
 
 ## Synopsis
 
-The `DROP TABLE` statement removes a table and all of its data from the database.
+Use the `DROP TABLE` statement to remove a table and all of its data from the database.
 
 ## Syntax
 
@@ -41,19 +42,18 @@ Where
 ## Examples
 
 ```sql
-cqlsh:example> CREATE TABLE users(id INT PRIMARY KEY, name TEXT);
+ycqlsh:example> CREATE TABLE users(id INT PRIMARY KEY, name TEXT);
 ```
 
 ```sql
-cqlsh:example> DROP TABLE users;
+ycqlsh:example> DROP TABLE users;
 ```
 
 ## See also
 
-[`ALTER TABLE`](../ddl_alter_table)
-[`CREATE TABLE`](../ddl_create_table)
-[`DELETE`](../dml_delete)
-[`INSERT`](../dml_insert)
-[`SELECT`](../dml_select)
-[`UPDATE`](../dml_update)
-[Other CQL Statements](..)
+- [`ALTER TABLE`](../ddl_alter_table)
+- [`CREATE TABLE`](../ddl_create_table)
+- [`DELETE`](../dml_delete)
+- [`INSERT`](../dml_insert)
+- [`SELECT`](../dml_select)
+- [`UPDATE`](../dml_update)

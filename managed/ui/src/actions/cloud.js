@@ -65,6 +65,9 @@ export const GET_EBS_TYPE_LIST_RESPONSE = 'GET_EBS_TYPES_RESPONSE';
 export const GET_GCP_TYPE_LIST = 'GET_GCP_TYPES';
 export const GET_GCP_TYPE_LIST_RESPONSE = 'GET_GCP_TYPES_RESPONSE';
 
+export const GET_AZU_TYPE_LIST = 'GET_AZU_TYPES';
+export const GET_AZU_TYPE_LIST_RESPONSE = 'GET_AZU_TYPES_RESPONSE';
+
 export const CREATE_DOCKER_PROVIDER = 'CREATE_DOCKER_PROVIDER';
 export const CREATE_DOCKER_PROVIDER_RESPONSE = 'CREATE_DOCKER_PROVIDER_RESPONSE';
 
@@ -74,6 +77,9 @@ export const SET_ON_PREM_CONFIG_DATA = 'SET_ON_PREM_CONFIG_DATA';
 
 export const GET_NODE_INSTANCE_LIST = 'GET_NODE_INSTANCE';
 export const GET_NODE_INSTANCE_LIST_RESPONSE = 'GET_NODE_INSTANCE_RESPONSE';
+
+export const GET_NODE_INSTANCE_LIST_READ_REPLICA = 'GET_NODE_INSTANCE_READ_REPLICA';
+export const GET_NODE_INSTANCE_LIST_RESPONSE_READ_REPLICA = 'GET_NODE_INSTANCE_RESPONSE_READ_REPLICA';
 
 export const RESET_ON_PREM_CONFIG_DATA = 'RESET_ON_PREM_CONFIG_DATA';
 
@@ -295,6 +301,7 @@ export function createAccessKey(providerUUID, regionUUID, keyInfo) {
     keyType: "PRIVATE",
     keyContent: keyInfo.privateKeyContent,
     sshUser: keyInfo.sshUser,
+    sshPort: keyInfo.sshPort,
     passwordlessSudoAccess: keyInfo.passwordlessSudoAccess,
     airGapInstall: keyInfo.airGapInstall
   };
@@ -474,6 +481,21 @@ export function getGCPTypeListResponse(responsePayload) {
   };
 }
 
+export function getAZUTypeList() {
+  const request = axios.get(`${ROOT_URL}/metadata/azu_types`);
+  return {
+    type: GET_AZU_TYPE_LIST,
+    payload: request
+  };
+}
+
+export function getAZUTypeListResponse(responsePayload) {
+  return {
+    type: GET_AZU_TYPE_LIST_RESPONSE,
+    payload: responsePayload
+  };
+}
+
 export function createDockerProvider() {
   const cUUID = localStorage.getItem("customerId");
   const request = axios.post(`${ROOT_URL}/customers/${cUUID}/providers/setup_docker`);
@@ -515,6 +537,22 @@ export function getNodeInstancesForProvider(pUUID) {
 export function getNodesInstancesForProviderResponse(response) {
   return {
     type: GET_NODE_INSTANCE_LIST_RESPONSE,
+    payload: response
+  };
+}
+
+export function getNodeInstancesForReadReplicaProvider(pUUID) {
+  const cUUID = localStorage.getItem("customerId");
+  const request = axios.get(`${ROOT_URL}/customers/${cUUID}/providers/${pUUID}/nodes/list`);
+  return {
+    type: GET_NODE_INSTANCE_LIST_READ_REPLICA,
+    payload: request
+  };
+}
+
+export function getNodesInstancesForReadReplicaProviderResponse(response) {
+  return {
+    type: GET_NODE_INSTANCE_LIST_RESPONSE_READ_REPLICA,
     payload: response
   };
 }

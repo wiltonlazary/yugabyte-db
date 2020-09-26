@@ -43,53 +43,61 @@ public class TestPgRegressLargeTable extends BasePgSQLTest {
   @Test
   public void testPgRegressLargeTable() throws Exception {
     // Run schedule, check time for release build.
-    runPgRegressTest("yb_large_table_serial_schedule",
-                     getPerfMaxRuntime(60000, 0, 0, 0, 0) /* maxRuntimeMillis */);
+    runPgRegressTest("yb_large_table_serial_schedule");
 
     // Number of executions for each statement.
     // Performance number is the average run time for each execution.
     final int execCount = 3;
 
-    // Check elapsed time.
-    timeQueryWithRowCount("SELECT 1 FROM airports LIMIT 1",
-                          1 /* expectedRowCount */,
-                          2000 /* maxRuntimeMillis */,
-                          execCount);
+    try (Statement stmt = connection.createStatement()) {
+      // Check elapsed time.
+      assertQueryRuntimeWithRowCount(stmt,
+                                     "SELECT 1 FROM airports LIMIT 1",
+                                     1 /* expectedRowCount */,
+                                     execCount /* numberOfRuns */,
+                                     2000 /* maxTotalMillis */);
 
-    // Check time when selecting less than 4096 rows (YugaByte default prefetch limit).
-    timeQueryWithRowCount("SELECT 1 FROM airports LIMIT 1 OFFSET 1000",
-                          1 /* expectedRowCount */,
-                          2000 /* maxRuntimeMillis */,
-                          execCount);
+      // Check time when selecting less than 4096 rows (YugaByte default prefetch limit).
+      assertQueryRuntimeWithRowCount(stmt,
+                                     "SELECT 1 FROM airports LIMIT 1 OFFSET 1000",
+                                     1 /* expectedRowCount */,
+                                     execCount /* numberOfRuns */,
+                                     2000 /* maxTotalMillis */);
 
-    // Check time when selecting more than 4096 rows (YugaByte default prefetch limit).
-    timeQueryWithRowCount("SELECT 1 FROM airports LIMIT 1 OFFSET 5000",
-                          1 /* expectedRowCount */,
-                          3000 /* maxRuntimeMillis */,
-                          execCount);
+      // Check time when selecting more than 4096 rows (YugaByte default prefetch limit).
+      assertQueryRuntimeWithRowCount(stmt,
+                                     "SELECT 1 FROM airports LIMIT 1 OFFSET 5000",
+                                     1 /* expectedRowCount */,
+                                     execCount /* numberOfRuns */,
+                                     3000 /* maxTotalMillis */);
 
-    // Check aggregate functions.
-    timeQueryWithRowCount("SELECT count(*) FROM airports",
-                          1 /* expectedRowCount */,
-                          4000 /* maxRuntimeMillis */,
-                          execCount);
+      // Check aggregate functions.
+      assertQueryRuntimeWithRowCount(stmt,
+                                     "SELECT count(*) FROM airports",
+                                     1 /* expectedRowCount */,
+                                     execCount /* numberOfRuns */,
+                                     4000 /* maxTotalMillis */);
 
-    // Check large result set.
-    timeQueryWithRowCount("SELECT * FROM airports",
-                          9999 /* expectedRowCount */,
-                          10000 /* maxRuntimeMillis */,
-                          execCount);
+      // Check large result set.
+      assertQueryRuntimeWithRowCount(stmt,
+                                     "SELECT * FROM airports",
+                                     9999 /* expectedRowCount */,
+                                     execCount /* numberOfRuns */,
+                                     10000 /* maxTotalMillis */);
 
-    // Check large result set with WHERE clause.
-    timeQueryWithRowCount("SELECT * FROM airports WHERE ident < '04' AND ident > '01'",
-                          188 /* expectedRowCount */,
-                          10000 /* maxRuntimeMillis */,
-                          execCount);
+      // Check large result set with WHERE clause.
+      assertQueryRuntimeWithRowCount(stmt,
+                                     "SELECT * FROM airports WHERE ident < '04' AND ident > '01'",
+                                     188 /* expectedRowCount */,
+                                     execCount /* numberOfRuns */,
+                                     10000 /* maxTotalMillis */);
 
-    // Check large result set with WHERE clause.
-    timeQueryWithRowCount("SELECT * FROM airports WHERE iso_region = 'US-CA'",
-                          488 /* expectedRowCount */,
-                          10000 /* maxRuntimeMillis */,
-                          execCount);
+      // Check large result set with WHERE clause.
+      assertQueryRuntimeWithRowCount(stmt,
+                                     "SELECT * FROM airports WHERE iso_region = 'US-CA'",
+                                     488 /* expectedRowCount */,
+                                     execCount /* numberOfRuns */,
+                                     10000 /* maxTotalMillis */);
+    }
   }
 }

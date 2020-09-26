@@ -358,76 +358,158 @@ CREATE TABLE tbl1 (
 	a			int4 primary key
 ) SPLIT (INTO 20 TABLETS);
 
+CREATE TABLE tbl1_5 (
+	a       int4,
+ 	primary key(a asc)
+) SPLIT (INTO 20 TABLETS);
+
 CREATE TABLE tbl2 (
 	a			int4,
 	primary key (a asc)
-) SPLIT (AT VALUES (4), (25), (100));
+) SPLIT AT VALUES ((4), (25), (100));
 
 CREATE TABLE tbl3 (
 	a			int4,
 	primary key (a asc)
-) SPLIT (AT VALUES (25), (100), (4));
+) SPLIT AT VALUES ((25), (100), (4));
 
 CREATE TABLE tbl4 (
 	a			int4,
 	b			text,
 	primary key (a asc, b)
-) SPLIT (AT VALUES (1, 'c'), (1, 'cb'), (2, 'a'));
+) SPLIT AT VALUES ((1, 'c'), (1, 'cb'), (2, 'a'));
 
 CREATE TABLE tbl5 (
 	a			int4,
 	b			text,
 	primary key (b asc)
-) SPLIT (AT VALUES ('a'), ('aba'), ('ac'));
+) SPLIT AT VALUES (('a'), ('aba'), ('ac'));
 
 CREATE TABLE tbl6 (
 	a			int4,
 	b			text,
 	primary key (b asc)
-) SPLIT (AT VALUES ('a'), (2, 'aba'), ('ac'));
+) SPLIT AT VALUES (('a'), (2, 'aba'), ('ac'));
 
 CREATE TABLE tbl7 (
 	a			int4,
 	primary key (a asc)
-) SPLIT (AT VALUES ('a'), ('b'), ('c'));
+) SPLIT AT VALUES (('a'), ('b'), ('c'));
 
 CREATE TABLE tbl8 (
 	a			text,
 	primary key (a asc)
-) SPLIT (AT VALUES (100), (1000), (10000));
+) SPLIT AT VALUES ((100), (1000), (10000));
 
 CREATE TABLE tbl9 (
 	a			int4,
 	primary key (a hash)
-) SPLIT (AT VALUES (100), (1000), (10000));
+) SPLIT AT VALUES ((100), (1000), (10000));
 
 CREATE TEMPORARY TABLE tbl10 (
 	a			int4 primary key
-) SPLIT (INTO 20 TABLETS);
+) SPLIT INTO 20 TABLETS;
 
 CREATE TABLE tbl11 (
 	a			int4,
 	b			int4,
 	c			int4,
 	primary key (a asc, b desc)
-) SPLIT (AT VALUES (-7, 1), (0, 0), (23, 4));
+) SPLIT AT VALUES ((-7, 1), (0, 0), (23, 4));
 
 CREATE TABLE tbl12 (
 	a			int4,
 	b			text,
 	primary key (b desc)
-) SPLIT (AT VALUES ('bienvenidos'), ('goodbye'), ('hello'), ('hola'));
+) SPLIT AT VALUES (('bienvenidos'), ('goodbye'), ('hello'), ('hola'));
 
-CREATE TABLE tbl12 (
+CREATE TABLE tbl13 (
 	a			text,
 	b			date,
 	c			time
-) SPLIT (INTO 9 TABLETS);
+) SPLIT INTO 9 TABLETS;
 
-CREATE TABLE tbl13 (
+CREATE TABLE tbl14 (
 	a			int4,
 	primary key (a asc)
-) SPLIT (AT VALUES (MINVALUE), (0), (MAXVALUE));
+) SPLIT AT VALUES ((MINVALUE), (0), (MAXVALUE));
 
--- TODO(jason): remove when issue #1721 is closed or closing.
-DISCARD TEMP;
+CREATE TABLE tbl15 (
+	a			int4,
+	b			int4,
+	c			int4,
+	primary key (a asc, b desc)
+) SPLIT AT VALUES ((-10), (0, 0), (23, 4), (50));
+
+-- This is invalid because split rows do not honor column b's ordering
+CREATE TABLE tbl16(
+  a int,
+  b int,
+  primary key(a asc, b asc)
+) SPLIT AT VALUES((100), (200, 5), (200));
+
+-- This is invalid because split rows do not honor column b's ordering
+CREATE TABLE tbl16(
+  a int,
+  b int,
+  primary key(a asc, b asc nulls first)
+) SPLIT AT VALUES((100), (200, 5), (200));
+
+-- This is invalid because split rows do not honor column b's ordering
+CREATE TABLE tbl16(
+  a int,
+  b int,
+  primary key(a asc, b asc nulls last)
+) SPLIT AT VALUES((100), (200, 5), (200));
+
+CREATE TABLE tbl16(
+  a int,
+  b int,
+  primary key(a asc, b desc)
+) SPLIT AT VALUES((100), (200), (200, 5));
+
+CREATE TABLE tbl17(
+  a int,
+  b int,
+  primary key(a asc, b desc nulls first)
+) SPLIT AT VALUES((100), (200), (200, 5));
+
+CREATE TABLE tbl18(
+  a int,
+  b int,
+  primary key(a asc, b desc nulls last)
+) SPLIT AT VALUES((100), (200), (200, 5));
+
+-- This is invalid because we cannot have duplicate split rows
+CREATE TABLE tbl19(
+  a int,
+  b int,
+  primary key(a asc, b desc nulls last)
+) SPLIT AT VALUES((100), (200, 5), (200, 5));
+
+-- Test ordering on splitted tables
+CREATE TABLE ordered_asc(
+    k INT,
+    PRIMARY KEY(k ASC)
+) SPLIT AT VALUES((10), (20), (30));
+INSERT INTO ordered_asc VALUES
+    (5), (6), (16), (15), (25), (26), (36), (35), (46), (10), (20), (30);
+EXPLAIN (COSTS OFF) SELECT * FROM ordered_asc ORDER BY k ASC;
+SELECT * FROM ordered_asc ORDER BY k ASC;
+EXPLAIN (COSTS OFF) SELECT * FROM ordered_asc ORDER BY k DESC;
+SELECT * FROM ordered_asc ORDER BY k DESC;
+EXPLAIN (COSTS OFF) SELECT k FROM ordered_asc WHERE k > 10 and k < 40 ORDER BY k DESC;
+SELECT k FROM ordered_asc WHERE k > 10 and k < 40 ORDER BY k DESC;
+
+CREATE TABLE ordered_desc(
+    k INT,
+    PRIMARY KEY(k DESC)
+) SPLIT AT VALUES((30), (20), (10));
+INSERT INTO ordered_desc VALUES
+    (5), (6), (16), (15), (25), (26), (36), (35), (46), (10), (20), (30);
+EXPLAIN (COSTS OFF) SELECT * FROM ordered_desc ORDER BY k ASC;
+SELECT * FROM ordered_desc ORDER BY k ASC;
+EXPLAIN (COSTS OFF) SELECT * FROM ordered_desc ORDER BY k DESC;
+SELECT * FROM ordered_desc ORDER BY k DESC;
+EXPLAIN (COSTS OFF) SELECT k FROM ordered_desc WHERE k > 10 and k < 40 ORDER BY k ASC;
+SELECT k FROM ordered_desc WHERE k > 10 and k < 40 ORDER BY k ASC;

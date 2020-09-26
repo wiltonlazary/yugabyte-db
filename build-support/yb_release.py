@@ -1,4 +1,5 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python3
+
 # Copyright (c) YugaByte, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
@@ -25,6 +26,7 @@ import uuid
 import yaml
 
 from yb.library_packager import LibraryPackager, add_common_arguments
+from yb import library_packager as library_packager_module
 from yb.mac_library_packager import MacLibraryPackager, add_common_arguments
 from yb.release_util import ReleaseUtil, check_for_local_changes
 from yb.common_util import init_env, get_build_type_from_build_root, set_thirdparty_dir
@@ -59,9 +61,18 @@ def main():
                              'This allows to post-process / upload the newly generated release '
                              'in an enclosing script.')
     parser.add_argument('--yw', action='store_true', help='Package YugaWare too.')
+    parser.add_argument('--no_reinitdb', action='store_true',
+                        help='Do not re-create the initial sys catalog snapshot. Useful when '
+                             'debugging the release process.')
+    parser.add_argument('--package_name',
+                        default='all',
+                        help='Name of package to release (e.g. cli).')
     add_common_arguments(parser)
     args = parser.parse_args()
 
+    # ---------------------------------------------------------------------------------------------
+    # Processing the arguments
+    # ---------------------------------------------------------------------------------------------
     init_env(args.verbose)
 
     if not args.build_target and not args.build_archive:
@@ -111,7 +122,7 @@ def main():
     if not build_type:
         build_type = 'release'
 
-    logging.info("Building YugaByte DB {} build".format(build_type))
+    logging.info("Building YugabyteDB {} build".format(build_type))
 
     build_desc_path = os.path.join(tmp_dir, 'build_descriptor.yaml')
     build_cmd_list = [
@@ -130,15 +141,22 @@ def main():
 
     build_cmd_list += [
         # This will build the exact set of targets that are needed for the release.
-        "packaged_targets",
-        # We do not need java code built for a release package
-        "--skip-java"
+        "packaged_targets"
     ]
+
+    if not args.yw:
+        build_cmd_list += ["--skip-java"]
+
     if args.skip_build:
         build_cmd_list += ["--skip-build"]
+
     if args.build_args:
         # TODO: run with shell=True and append build_args as is.
         build_cmd_list += args.build_args.strip().split()
+
+    # ---------------------------------------------------------------------------------------------
+    # Perform the build
+    # ---------------------------------------------------------------------------------------------
 
     build_cmd_line = " ".join(build_cmd_list).strip()
     logging.info("Build command line: {}".format(build_cmd_line))
@@ -149,14 +167,22 @@ def main():
         for preliminary_target in ['protoc-gen-insertions', 'bfql_codegen']:
             preliminary_step_cmd_list = [
                     arg for arg in build_cmd_list if arg != 'packaged_targets'
-                ] + ['--target', preliminary_target, '--skip-java']
+                ] + ['--target', preliminary_target]
+
+            if not args.yw:
+                preliminary_step_cmd_list += ["--skip-java"]
+
             logging.info(
                     "Running a preliminary step to build target %s: %s",
                     preliminary_target,
-                    " ".join(preliminary_step_cmd_list))
+                    preliminary_step_cmd_list)
             subprocess.check_call(preliminary_step_cmd_list)
 
-    subprocess.check_call(build_cmd_list)
+    # We still need to call this even when --skip-build is specified to generate the "build
+    # descriptor" YAML file.
+    final_build_cmd_list = build_cmd_list + ([] if args.no_reinitdb else ['reinitdb'])
+    logging.info("Running final build step: %s", final_build_cmd_list)
+    subprocess.check_call(final_build_cmd_list)
 
     if not os.path.exists(build_desc_path):
         raise IOError("The build script failed to generate build descriptor file at '{}'".format(
@@ -176,6 +202,9 @@ def main():
             "Build root from the build descriptor file (see above) is inconsistent with that "
             "specified on the command line ('{}')".format(build_root))
 
+    # We are guaranteed to have a build_root by now.
+    library_packager_module.set_build_root(build_root)
+
     thirdparty_dir = build_desc["thirdparty_dir"]
     thirdparty_dir_from_env = os.environ.get("YB_THIRDPARTY_DIR", thirdparty_dir)
     if (thirdparty_dir != thirdparty_dir_from_env and
@@ -189,7 +218,8 @@ def main():
     # This points to the release manifest within the release_manager, and we are modifying that
     # directly.
     release_util = ReleaseUtil(
-            YB_SRC_ROOT, build_type, build_target, args.force, args.commit, build_root)
+        YB_SRC_ROOT, build_type, build_target, args.force, args.commit, build_root,
+        args.package_name)
 
     system = platform.system().lower()
     library_packager_args = dict(
@@ -214,6 +244,10 @@ def main():
         raise RuntimeError("Directory '{}' exists and is non-empty".format(build_target))
     release_util.create_distribution(build_target)
 
+    # ---------------------------------------------------------------------------------------------
+    # Invoke YugaWare packaging
+    # ---------------------------------------------------------------------------------------------
+
     if args.yw:
         managed_dir = os.path.join(YB_SRC_ROOT, "managed")
         yw_dir = os.path.join(build_target, "ui")
@@ -223,8 +257,22 @@ def main():
             os.path.join(managed_dir, "yb_release"),
             "--destination", yw_dir, "--unarchived"
         ]
-        logging.info("Creating YugaWare package with command: {}".format(package_yw_cmd))
-        subprocess.check_call(package_yw_cmd, cwd=managed_dir)
+        logging.info(
+            "Creating YugaWare package with command '{}'".format(" ".join(package_yw_cmd)))
+        try:
+            subprocess.check_output(package_yw_cmd, cwd=managed_dir)
+        except subprocess.CalledProcessError as e:
+            logging.error(
+                "Failed to build YugaWare package:\n{}\nOutput:\n{}".format(
+                    traceback.format_exc(), e.output))
+            raise
+        except OSError as e:
+            logging.error("Failed to build YugaWare package: {}".format(e))
+            raise
+
+    # ---------------------------------------------------------------------------------------------
+    # Create a tar.gz (we almost always do this, can be skipped in debug mode)
+    # ---------------------------------------------------------------------------------------------
 
     if args.build_archive:
         release_file = os.path.realpath(release_util.generate_release())

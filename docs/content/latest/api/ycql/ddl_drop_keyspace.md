@@ -1,7 +1,8 @@
 ---
-title: DROP KEYSPACE
-summary: Removes a keyspace
-description: DROP KEYSPACE
+title: DROP KEYSPACE statement [YCQL]
+headerTitle: DROP KEYSPACE
+linkTitle: DROP KEYSPACE
+description: Use the DROP KEYSPACE statement to remove a keyspace from the system.
 menu:
   latest:
     parent: api-cassandra
@@ -15,7 +16,7 @@ showAsideToc: true
 
 ## Synopsis
 
-The `DROP KEYSPACE` statement removes a keyspace from the system.
+Use the `DROP KEYSPACE` statement to remove a keyspace from the system.
 
 ## Syntax
 
@@ -43,19 +44,19 @@ Where
 You can do this as shown below.
 
 ```sql
-cqlsh> CREATE KEYSPACE example;
+ycqlsh> CREATE KEYSPACE example;
 ```
 
 ```sql
-cqlsh> DROP KEYSPACE example;
+ycqlsh> DROP KEYSPACE example;
 ```
 
 ```sql
-cqlsh> DROP KEYSPACE IF EXISTS example;
+ycqlsh> DROP KEYSPACE IF EXISTS example;
 ```
 
 ## See also
-[`ALTER KEYSPACE`](../ddl_alter_keyspace)
-[`CREATE KEYSPACE`](../ddl_create_keyspace)
-[`USE`](../ddl_use)
-[Other CQL Statements](..)
+
+- [`ALTER KEYSPACE`](../ddl_alter_keyspace)
+- [`CREATE KEYSPACE`](../ddl_create_keyspace)
+- [`USE`](../ddl_use)

@@ -1,7 +1,8 @@
 ---
-title: ALTER ROLE
-summary: Change the properties of a role
-description: ALTER ROLE
+title: ALTER ROLE statement [YCQL]
+headerTitle: ALTER ROLE
+linkTitle: ALTER ROLE
+description: Use the ALTER ROLE statement to change the properties of an existing role.
 menu:
   latest:
     parent: api-cassandra
@@ -15,10 +16,10 @@ showAsideToc: true
 
 ## Synopsis
 
-The `ALTER ROLE` statement changes the properties of an existing role.
+Use the `ALTER ROLE` statement to change the properties of an existing role.
 It allows modifying properties `SUPERUSER`, `PASSWORD`, and `LOGIN`.
 
-This statement is enabled by setting the YB-TServer configuration option [`use_cassandra_authentication`](../../../reference/configuration/yb-tserver/#use-cassandra-authentication) to `true`.
+This statement is enabled by setting the YB-TServer flag [`--use_cassandra_authentication`](../../../reference/configuration/yb-tserver/#use-cassandra-authentication) to `true`.
 
 ## Syntax
 
@@ -40,34 +41,34 @@ Where
 - `role_name` is a text identifier.
 
 ## Semantics
-- An error is raised if `role_name` does not exist.
+
+An error is raised if `role_name` does not exist.
 
 ## Examples
 
 You can do this as shown below.
 
 ```sql
-cqlsh:example> CREATE ROLE finance;
+ycqlsh:example> CREATE ROLE finance;
 ```
 
 ```sql
-cqlsh:example> ALTER ROLE finance with LOGIN = true;
+ycqlsh:example> ALTER ROLE finance with LOGIN = true;
 ```
 
 ```sql
-cqlsh:example> ALTER ROLE finance with SUPERUSER = true;
+ycqlsh:example> ALTER ROLE finance with SUPERUSER = true;
 ```
 
 ```sql
-cqlsh:example> ALTER ROLE finance with PASSWORD = 'jsfp9ajhufans2' AND SUPERUSER = false;
+ycqlsh:example> ALTER ROLE finance with PASSWORD = 'jsfp9ajhufans2' AND SUPERUSER = false;
 ```
 
 ## See also
 
-[`CREATE ROLE`](../ddl_create_role)
-[`DROP ROLE`](../ddl_drop_role)
-[`GRANT ROLE`](../ddl_grant_role)
-[`REVOKE ROLE`](../ddl_revoke_role)
-[`GRANT PERMISSION`](../ddl_grant_permission)
-[`REVOKE PERMISSION`](../ddl_revoke_permission)
-[Other CQL Statements](..)
+- [`CREATE ROLE`](../ddl_create_role)
+- [`DROP ROLE`](../ddl_drop_role)
+- [`GRANT ROLE`](../ddl_grant_role)
+- [`REVOKE ROLE`](../ddl_revoke_role)
+- [`GRANT PERMISSION`](../ddl_grant_permission)
+- [`REVOKE PERMISSION`](../ddl_revoke_permission)

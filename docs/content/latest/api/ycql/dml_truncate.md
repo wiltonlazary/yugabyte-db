@@ -1,7 +1,8 @@
 ---
-title: TRUNCATE
-summary: Removes all rows from a table.
-description: TRUNCATE
+title: TRUNCATE statement [YCQL]
+headerTitle: TRUNCATE
+linkTitle: TRUNCATE
+description: Use the TRUNCATE statement to remove all rows from a specified table.
 menu:
   latest:
     parent: api-cassandra
@@ -15,7 +16,7 @@ showAsideToc: true
 
 ## Synopsis
 
-The `TRUNCATE` statement removes all rows from a specified table.
+Use the `TRUNCATE` statement to remove all rows from a specified table.
 
 ## Syntax
 
@@ -42,26 +43,26 @@ Where
 ### Truncate a table
 
 ```sql
-cqlsh:example> CREATE TABLE employees(department_id INT, 
-                                      employee_id INT, 
-                                      name TEXT, 
+ycqlsh:example> CREATE TABLE employees(department_id INT,
+                                      employee_id INT,
+                                      name TEXT,
                                       PRIMARY KEY(department_id, employee_id));
 ```
 
 ```sql
-cqlsh:example> INSERT INTO employees(department_id, employee_id, name) VALUES (1, 1, 'John');
+ycqlsh:example> INSERT INTO employees(department_id, employee_id, name) VALUES (1, 1, 'John');
 ```
 
 ```sql
-cqlsh:example> INSERT INTO employees(department_id, employee_id, name) VALUES (1, 2, 'Jane');
+ycqlsh:example> INSERT INTO employees(department_id, employee_id, name) VALUES (1, 2, 'Jane');
 ```
 
 ```sql
-cqlsh:example> INSERT INTO employees(department_id, employee_id, name) VALUES (2, 1, 'Joe');
+ycqlsh:example> INSERT INTO employees(department_id, employee_id, name) VALUES (2, 1, 'Joe');
 ```
 
 ```sql
-cqlsh:example> SELECT * FROM employees;
+ycqlsh:example> SELECT * FROM employees;
 ```
 
 ```
@@ -70,15 +71,16 @@ cqlsh:example> SELECT * FROM employees;
              2 |           1 |  Joe
              1 |           1 | John
              1 |           2 | Jane
-```             
+```
+
 Remove all rows from the table.
 
 ```sql
-cqlsh:example> TRUNCATE employees;
+ycqlsh:example> TRUNCATE employees;
 ```
 
 ```sql
-cqlsh:example> SELECT * FROM employees;
+ycqlsh:example> SELECT * FROM employees;
 ```
 
 ```
@@ -88,9 +90,8 @@ cqlsh:example> SELECT * FROM employees;
 
 ## See also
 
-[`CREATE TABLE`](../ddl_create_table)
-[`INSERT`](../dml_insert)
-[`SELECT`](../dml_select)
-[`UPDATE`](../dml_update)
-[`DELETE`](../dml_delete)
-[Other CQL Statements](..)
+- [`CREATE TABLE`](../ddl_create_table)
+- [`INSERT`](../dml_insert)
+- [`SELECT`](../dml_select)
+- [`UPDATE`](../dml_update)
+- [`DELETE`](../dml_delete)

@@ -54,7 +54,6 @@
 
 namespace yb {
 
-class DnsResolver;
 class HostPort;
 
 namespace master {
@@ -89,23 +88,52 @@ class YBClient::Data {
                                 const master::AlterNamespaceRequestPB& req,
                                 CoarseTimePoint deadline);
 
+  CHECKED_STATUS IsCreateNamespaceInProgress(YBClient* client,
+                                const std::string& namespace_name,
+                                const boost::optional<YQLDatabase>& database_type,
+                                const std::string& namespace_id,
+                                CoarseTimePoint deadline,
+                                bool *create_in_progress);
+
+  CHECKED_STATUS WaitForCreateNamespaceToFinish(YBClient* client,
+                                const std::string& namespace_name,
+                                const boost::optional<YQLDatabase>& database_type,
+                                const std::string& namespace_id,
+                                CoarseTimePoint deadline);
+
+  CHECKED_STATUS IsDeleteNamespaceInProgress(YBClient* client,
+                                             const std::string& namespace_name,
+                                             const boost::optional<YQLDatabase>& database_type,
+                                             const std::string& namespace_id,
+                                             CoarseTimePoint deadline,
+                                             bool *delete_in_progress);
+
+  CHECKED_STATUS WaitForDeleteNamespaceToFinish(YBClient* client,
+                                                const std::string& namespace_name,
+                                                const boost::optional<YQLDatabase>& database_type,
+                                                const std::string& namespace_id,
+                                                CoarseTimePoint deadline);
+
   CHECKED_STATUS CreateTable(YBClient* client,
                              const master::CreateTableRequestPB& req,
                              const YBSchema& schema,
                              CoarseTimePoint deadline,
                              std::string* table_id);
 
+  // Take one of table id or name.
   CHECKED_STATUS IsCreateTableInProgress(YBClient* client,
                                          const YBTableName& table_name,
                                          const std::string& table_id,
                                          CoarseTimePoint deadline,
                                          bool *create_in_progress);
 
+  // Take one of table id or name.
   CHECKED_STATUS WaitForCreateTableToFinish(YBClient* client,
                                             const YBTableName& table_name,
                                             const std::string& table_id,
                                             CoarseTimePoint deadline);
 
+  // Take one of table id or name.
   CHECKED_STATUS DeleteTable(YBClient* client,
                              const YBTableName& table_name,
                              const std::string& table_id,
@@ -141,6 +169,7 @@ class YBClient::Data {
                             const master::AlterTableRequestPB& req,
                             CoarseTimePoint deadline);
 
+  // Take one of table id or name.
   CHECKED_STATUS IsAlterTableInProgress(YBClient* client,
                                         const YBTableName& table_name,
                                         string table_id,
@@ -151,6 +180,27 @@ class YBClient::Data {
                                            const YBTableName& alter_name,
                                            string table_id,
                                            CoarseTimePoint deadline);
+
+  CHECKED_STATUS FlushTables(YBClient* client,
+                             const vector<YBTableName>& table_names,
+                             bool add_indexes,
+                             const CoarseTimePoint deadline,
+                             const bool is_compaction);
+
+  CHECKED_STATUS FlushTables(YBClient* client,
+                             const vector<TableId>& table_ids,
+                             bool add_indexes,
+                             const CoarseTimePoint deadline,
+                             const bool is_compaction);
+
+  CHECKED_STATUS IsFlushTableInProgress(YBClient* client,
+                                        const FlushRequestId& flush_id,
+                                        const CoarseTimePoint deadline,
+                                        bool *flush_in_progress);
+
+  CHECKED_STATUS WaitForFlushTableToFinish(YBClient* client,
+                                           const FlushRequestId& flush_id,
+                                           const CoarseTimePoint deadline);
 
   CHECKED_STATUS GetTableSchema(YBClient* client,
                                 const YBTableName& table_name,
@@ -166,6 +216,18 @@ class YBClient::Data {
                                     std::shared_ptr<YBTableInfo> info,
                                     StatusCallback callback);
 
+  Result<IndexPermissions> GetIndexPermissions(
+      YBClient* client,
+      const TableId& table_id,
+      const TableId& index_id,
+      const CoarseTimePoint deadline);
+  Result<IndexPermissions> WaitUntilIndexPermissionsAtLeast(
+      YBClient* client,
+      const TableId& table_id,
+      const TableId& index_id,
+      const CoarseTimePoint deadline,
+      const IndexPermissions& target_index_permissions);
+
   void CreateCDCStream(YBClient* client,
                        const TableId& table_id,
                        const std::unordered_map<std::string, std::string>& options,
@@ -176,6 +238,13 @@ class YBClient::Data {
                        const CDCStreamId& stream_id,
                        CoarseTimePoint deadline,
                        StatusCallback callback);
+
+  void GetCDCStream(YBClient* client,
+                    const CDCStreamId& stream_id,
+                    std::shared_ptr<TableId> table_id,
+                    std::shared_ptr<std::unordered_map<std::string, std::string>> options,
+                    CoarseTimePoint deadline,
+                    StdStatusCallback callback);
 
   CHECKED_STATUS InitLocalHostNames();
 
@@ -213,9 +282,9 @@ class YBClient::Data {
   // Invokes 'cb' with the appropriate status when finished.
   //
   // Works with both a distributed and non-distributed configuration.
-  void SetMasterServerProxyAsync(YBClient* client,
-                                 CoarseTimePoint deadline,
+  void SetMasterServerProxyAsync(CoarseTimePoint deadline,
                                  bool skip_resolution,
+                                 bool wait_for_leader_election,
                                  const StatusCallback& cb);
 
   // Synchronous version of SetMasterServerProxyAsync method above.
@@ -225,9 +294,9 @@ class YBClient::Data {
   //
   // TODO (KUDU-492): Get rid of this method and re-factor the client
   // to lazily initialize 'master_proxy_'.
-  CHECKED_STATUS SetMasterServerProxy(YBClient* client,
-                                      CoarseTimePoint deadline,
-                                      bool skip_resolution = false);
+  CHECKED_STATUS SetMasterServerProxy(CoarseTimePoint deadline,
+                                      bool skip_resolution = false,
+                                      bool wait_for_leader_election = true);
 
   std::shared_ptr<master::MasterServiceProxy> master_proxy() const;
 
@@ -268,15 +337,20 @@ class YBClient::Data {
   // the resulting Status.
   template <class ReqClass, class RespClass>
   CHECKED_STATUS SyncLeaderMasterRpc(
-      CoarseTimePoint deadline, YBClient* client, const ReqClass& req, RespClass* resp,
+      CoarseTimePoint deadline, const ReqClass& req, RespClass* resp,
       int* num_attempts, const char* func_name,
       const std::function<Status(
           master::MasterServiceProxy*, const ReqClass&, RespClass*, rpc::RpcController*)>& func);
 
+  bool IsMultiMaster();
+
+  void StartShutdown();
+
+  void CompleteShutdown();
+
   rpc::Messenger* messenger_ = nullptr;
   std::unique_ptr<rpc::Messenger> messenger_holder_;
   std::unique_ptr<rpc::ProxyCache> proxy_cache_;
-  gscoped_ptr<DnsResolver> dns_resolver_;
   scoped_refptr<internal::MetaCache> meta_cache_;
   scoped_refptr<MetricEntity> metric_entity_;
 
@@ -288,12 +362,23 @@ class YBClient::Data {
   // takes precedence over both 'master_server_addrs_file_' and 'master_server_addrs_'.
   std::string master_server_endpoint_;
 
+  // Flag name to fetch master addresses from flagfile.
+  std::string master_address_flag_name_;
   // This vector holds the list of master server addresses. Note that each entry in this vector
   // can either be a single 'host:port' or a comma separated list of 'host1:port1,host2:port2,...'.
+  std::vector<MasterAddressSource> master_address_sources_;
+  // User specified master server addresses.
   std::vector<std::string> master_server_addrs_;
+  // master_server_addrs_ + addresses from master_address_sources_.
+  std::vector<std::string> full_master_server_addrs_;
   mutable simple_spinlock master_server_addrs_lock_;
 
   bool skip_master_flagfile_ = false;
+
+  // If all masters are available but no leader is present on client init,
+  // this flag determines if the client returns failure right away
+  // or waits for a leader to be elected.
+  bool wait_for_leader_election_on_init_ = true;
 
   MonoDelta default_admin_operation_timeout_;
   MonoDelta default_rpc_timeout_;
@@ -322,6 +407,10 @@ class YBClient::Data {
 
   AtomicInt<uint64_t> latest_observed_hybrid_time_;
 
+  std::atomic<bool> closing_{false};
+
+  std::atomic<int> running_sync_requests_{0};
+
   // Cloud info indicating placement information of client.
   CloudInfoPB cloud_info_pb_;
 
@@ -343,7 +432,13 @@ class YBClient::Data {
   simple_spinlock tablet_requests_mutex_;
   std::unordered_map<TabletId, TabletRequests> tablet_requests_;
 
+  std::atomic<int> tserver_count_cached_{0};
+
  private:
+  CHECKED_STATUS FlushTablesHelper(YBClient* client,
+                          const CoarseTimePoint deadline,
+                          const master::FlushTablesRequestPB req);
+
   DISALLOW_COPY_AND_ASSIGN(Data);
 };
 

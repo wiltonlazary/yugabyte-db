@@ -1,7 +1,8 @@
 ---
 title: Northwind sample database
+headerTitle: Northwind sample database
 linkTitle: Northwind
-description: Northwind sample database
+description: Use the Northwind sample database to explore and learn YugabyteDB.
 menu:
   latest:
     identifier: northwind
@@ -11,7 +12,7 @@ isTocNested: true
 showAsideToc: true
 ---
 
-Download and install the PostgreSQL-compatible version of Northwind on the YugabyteDB distributed SQL database.
+Download and install the PostgreSQL-compatible version of the Northwind dataset on the YugabyteDB distributed SQL database.
 
 ## About the Northwind sample database
 
@@ -82,7 +83,7 @@ yugabyte=# \c northwind
 ```
 
 ```
-You are now connected to database "northwind" as user "postgres".
+You are now connected to database "northwind" as user "yugabyte".
 northwind=#
 ```
 

@@ -57,7 +57,7 @@ void GetBindVariableSchemasFromDmlStmt(const PTDmlStmt& stmt,
   for (const PTBindVar *var : stmt.bind_variables()) {
     DCHECK_NOTNULL(var->name().get());
     schemas->emplace_back(var->name() ? string(var->name()->c_str()) : string(), var->ql_type());
-    if (table_names != nullptr) {
+    if (table_names != nullptr && stmt.bind_table()) {
       table_names->emplace_back(stmt.bind_table()->name());
     }
   }
@@ -79,7 +79,7 @@ shared_ptr<vector<ColumnSchema>> GetColumnSchemasFromOp(const YBqlOp& op, const 
       shared_ptr<vector<ColumnSchema>> column_schemas = make_shared<vector<ColumnSchema>>();
       const auto& write_op = static_cast<const YBqlWriteOp&>(op);
       column_schemas->reserve(write_op.response().column_schemas_size());
-      for (const auto column_schema : write_op.response().column_schemas()) {
+      for (const auto& column_schema : write_op.response().column_schemas()) {
         column_schemas->emplace_back(ColumnSchemaFromPB(column_schema));
       }
       return column_schemas;
@@ -120,7 +120,7 @@ QLClient GetClientFromOp(const YBqlOp& op) {
 
 //------------------------------------------------------------------------------------------------
 PreparedResult::PreparedResult(const PTDmlStmt& stmt)
-    : table_name_(stmt.bind_table()->name()),
+    : table_name_(stmt.bind_table() ? stmt.bind_table()->name() : YBTableName()),
       hash_col_indices_(stmt.hash_col_indices()),
       column_schemas_(stmt.selected_schemas()) {
   GetBindVariableSchemasFromDmlStmt(stmt, &bind_variable_schemas_);

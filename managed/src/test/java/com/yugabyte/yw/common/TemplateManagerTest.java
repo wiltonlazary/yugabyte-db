@@ -57,6 +57,7 @@ public class TemplateManagerTest extends FakeDBApplication {
     AccessKey.KeyInfo keyInfo = new AccessKey.KeyInfo();
     keyInfo.privateKey = "/path/to/pk.pem";
     keyInfo.sshUser = "centos";
+    keyInfo.sshPort = 3333;
     keyInfo.vaultFile = "/path/to/vault";
     keyInfo.vaultPasswordFile = "/path/to/vaultpassword";
     keyInfo.privateKey = "/path/to/pemfile";
@@ -83,6 +84,8 @@ public class TemplateManagerTest extends FakeDBApplication {
     cmd.add(keyInfo.privateKey);
     cmd.add("--local_package_path");
     cmd.add(YB_THIRDPARTY_VALUE);
+    cmd.add("--custom_ssh_port");
+    cmd.add(keyInfo.sshPort.toString());
     return cmd;
   }
 
@@ -120,6 +123,7 @@ public class TemplateManagerTest extends FakeDBApplication {
   public void testTemplateCommandWithAirGapEnabled() {
     AccessKey accessKey = setupTestAccessKey();
     List<String> expectedCommand = getExpectedCommmand(accessKey.getKeyInfo());
+    expectedCommand.add("--air_gap");
     when(shellProcessHandler.run(expectedCommand, new HashMap<>())).thenReturn(ShellResponse.create(0, "{}"));
     templateManager.createProvisionTemplate(accessKey, true, false);
     verify(shellProcessHandler, times(1)).run(expectedCommand, new HashMap<>());
@@ -130,6 +134,7 @@ public class TemplateManagerTest extends FakeDBApplication {
   public void testTemplateCommandWithAirGapAndPasswordlessSudoAccessEnabled() {
     AccessKey accessKey = setupTestAccessKey();
     List<String> expectedCommand = getExpectedCommmand(accessKey.getKeyInfo());
+    expectedCommand.add("--air_gap");
     expectedCommand.add("--passwordless_sudo");
     when(shellProcessHandler.run(expectedCommand, new HashMap<>())).thenReturn(ShellResponse.create(0, "{}"));
     templateManager.createProvisionTemplate(accessKey, true, true);
@@ -152,6 +157,7 @@ public class TemplateManagerTest extends FakeDBApplication {
   public void testTemplateCommandError() {
     AccessKey accessKey = setupTestAccessKey();
     List<String> expectedCommand = getExpectedCommmand(accessKey.getKeyInfo());
+    expectedCommand.add("--air_gap");
     expectedCommand.add("--passwordless_sudo");
     when(shellProcessHandler.run(expectedCommand, new HashMap<>())).thenReturn(ShellResponse.create(1, "foobar"));
     expectedException.expect(RuntimeException.class);

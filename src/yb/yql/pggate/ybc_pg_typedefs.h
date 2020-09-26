@@ -52,6 +52,9 @@ YB_DEFINE_HANDLE_TYPE(PgExpr);
 // Handle to a table description
 YB_DEFINE_HANDLE_TYPE(PgTableDesc);
 
+// Handle to a memory context.
+YB_DEFINE_HANDLE_TYPE(PgMemctx);
+
 //--------------------------------------------------------------------------------------------------
 // Other definitions are the same between C++ and C.
 //--------------------------------------------------------------------------------------------------
@@ -163,6 +166,32 @@ typedef struct PgSysColumns {
   uint8_t *ybbasectid;
 } YBCPgSysColumns;
 
+// Structure to hold parameters for preparing query plan.
+//
+// Index-related parameters are used to describe different types of scan.
+//   - Sequential scan: Index parameter is not used.
+//     { index_oid, index_only_scan, use_secondary_index } = { kInvalidOid, false, false }
+//   - IndexScan:
+//     { index_oid, index_only_scan, use_secondary_index } = { IndexOid, false, true }
+//   - IndexOnlyScan:
+//     { index_oid, index_only_scan, use_secondary_index } = { IndexOid, true, true }
+//   - PrimaryIndexScan: This is a special case as YugaByte doesn't have a separated
+//     primary-index database object from table object.
+//       index_oid = TableOid
+//       index_only_scan = true if ROWID is wanted. Otherwise, regular rowset is wanted.
+//       use_secondary_index = false
+//
+// Attribute "querying_colocated_table"
+//   - If 'true', SELECT from SQL system catalogs or colocated tables.
+//   - Note that the system catalogs are specifically for Postgres API and not Yugabyte
+//     system-tables.
+typedef struct PgPrepareParameters {
+  YBCPgOid index_oid;
+  bool index_only_scan;
+  bool use_secondary_index;
+  bool querying_colocated_table;
+} YBCPgPrepareParameters;
+
 // Structure to hold the execution-control parameters.
 typedef struct PgExecParameters {
   // TODO(neil) Move forward_scan flag here.
@@ -187,8 +216,12 @@ typedef struct PgExecParameters {
   // For now we only support one rowmark.
 #ifdef __cplusplus
   int rowmark = -1;
+  uint64_t read_time = 0;
+  char *partition_key = NULL;
 #else
   int rowmark;
+  uint64_t read_time;
+  char *partition_key;
 #endif
 } YBCPgExecParameters;
 
@@ -198,6 +231,17 @@ typedef struct PgAttrValueDescriptor {
   bool is_null;
   const YBCPgTypeEntity *type_entity;
 } YBCPgAttrValueDescriptor;
+
+typedef struct PgCallbacks {
+  void (*FetchUniqueConstraintName)(YBCPgOid, char*, size_t);
+  YBCPgMemctx (*GetCurrentYbMemctx)();
+} YBCPgCallbacks;
+
+typedef struct PgTableProperties {
+  uint32_t num_tablets;
+  uint32_t num_hash_key_columns;
+  bool is_colocated;
+} YBCPgTableProperties;
 
 #ifdef __cplusplus
 }  // extern "C"

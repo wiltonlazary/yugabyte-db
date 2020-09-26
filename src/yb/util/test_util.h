@@ -226,7 +226,15 @@ CHECKED_STATUS LoggedWaitFor(
     MonoDelta max_delay = MonoDelta::FromMilliseconds(test_util::kDefaultMaxWaitDelayMs));
 
 // Return the path of a yb-tool.
-std::string GetToolPath(const std::string& tool_name);
+std::string GetToolPath(const std::string& rel_path, const std::string& tool_name);
+
+inline std::string GetToolPath(const std::string& tool_name) {
+  return GetToolPath("../bin", tool_name);
+}
+
+inline std::string GetPgToolPath(const std::string& tool_name) {
+  return GetToolPath("../postgres/bin", tool_name);
+}
 
 int CalcNumTablets(int num_tablet_servers);
 
@@ -297,12 +305,18 @@ class TestThreadHolder {
     yb::WaitStopped(duration, &stop_flag_);
   }
 
-  void JoinAll() {
-    for (auto& thread : threads_) {
-      if (thread.joinable()) {
-        thread.join();
+  void JoinAll();
+
+  template <class Cond>
+  CHECKED_STATUS WaitCondition(const Cond& cond) {
+    while (!cond()) {
+      if (stop_flag_.load(std::memory_order_acquire)) {
+        return STATUS(Aborted, "Wait aborted");
       }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
+
+    return Status::OK();
   }
 
   void WaitAndStop(const CoarseDuration& duration) {

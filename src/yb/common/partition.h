@@ -88,11 +88,11 @@ class Partition {
     return partition_key_end_;
   }
 
-  void TEST_set_partition_key_start(const std::string& partition_key_start) {
+  void set_partition_key_start(const std::string& partition_key_start) {
     partition_key_start_ = partition_key_start;
   }
 
-  void TEST_set_partition_key_end(const std::string& partition_key_end) {
+  void set_partition_key_end(const std::string& partition_key_end) {
     partition_key_end_ = partition_key_end;
   }
 
@@ -108,6 +108,36 @@ class Partition {
   bool ContainsKey(const std::string& partition_key) const {
     return partition_key >= partition_key_start() &&
         (partition_key_end().empty() || partition_key < partition_key_end());
+  }
+
+  // Checks if this partition is a superset or is exactly the same as another partition.
+  template <class T>
+  bool ContainsPartition(const T& other) const {
+    return other.partition_key_start() >= partition_key_start() &&
+           (partition_key_end().empty() || (!other.partition_key_end().empty() &&
+                                            other.partition_key_end() <= partition_key_end()));
+  }
+
+  // Checks if this and another partitions have equal bounds.
+  template <class T>
+  bool BoundsEqualToPartition(const T& other) const {
+    return partition_key_start() == other.partition_key_start() &&
+           partition_key_end() == other.partition_key_end();
+  }
+
+  // Checks if this partition is a strict superset of another partition (shouldn't be exactly the
+  // same).
+  template <class T>
+  bool ContainsPartitionStrict(const T& other) const {
+    return ContainsPartition(other) && !BoundsEqualToPartition(other);
+  }
+
+  std::string ToString() const {
+    return Format(
+        "{ partition_key_start: $0 partition_key_end: $1 hash_buckets: $2 }",
+        Slice(partition_key_start_).ToDebugString(),
+        Slice(partition_key_end_).ToDebugString(),
+        hash_buckets_);
   }
 
  private:
@@ -224,6 +254,10 @@ class PartitionSchema {
                                   const Schema& schema,
                                   std::vector<Partition>* partitions) const WARN_UNUSED_RESULT;
 
+  CHECKED_STATUS CreatePartitions(const std::vector<std::string>& split_rows,
+                                  const Schema& schema,
+                                  std::vector<Partition>* partitions) const;
+
   // Tests if the partition contains the row.
   CHECKED_STATUS PartitionContainsRow(const Partition& partition,
                                       const YBPartialRow& row,
@@ -236,6 +270,9 @@ class PartitionSchema {
 
   // Returns a text description of the partition suitable for debug printing.
   std::string PartitionDebugString(const Partition& partition, const Schema& schema) const;
+
+  // Returns a text description of a range partition suitable for debug printing.
+  std::string RangePartitionDebugString(const Partition& partition, const Schema& schema) const;
 
   // Returns a text description of the partial row's partition key suitable for debug printing.
   std::string RowDebugString(const YBPartialRow& row) const;

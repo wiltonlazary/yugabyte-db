@@ -75,10 +75,22 @@
 #include "yb/rocksdb/util/xfunc.h"
 #include "yb/rocksdb/utilities/merge_operators.h"
 
+namespace yb {
+namespace enterprise {
+
+class UniverseKeyManager;
+
+} // namespace enterprise
+} // namespace yb
+
 namespace rocksdb {
 
 uint64_t TestGetTickerCount(const Options& options, Tickers ticker_type) {
   return options.statistics->getTickerCount(ticker_type);
+}
+
+void TestResetTickerCount(const Options& options, Tickers ticker_type) {
+  return options.statistics->setTickerCount(ticker_type, 0);
 }
 
 class OnFileDeletionListener : public EventListener {
@@ -551,32 +563,31 @@ class DBTestBase : public testing::Test {
     kPlainTableAllBytesPrefix = 6,
     kVectorRep = 7,
     kHashLinkList = 8,
-    kHashCuckoo = 9,
-    kMergePut = 10,
-    kFilter = 11,
-    kFullFilterWithNewTableReaderForCompactions = 12,
-    kUncompressed = 13,
-    kNumLevel_3 = 14,
-    kDBLogDir = 15,
-    kWalDirAndMmapReads = 16,
-    kManifestFileSize = 17,
-    kPerfOptions = 18,
-    kDeletesFilterFirst = 19,
-    kHashSkipList = 20,
-    kUniversalCompaction = 21,
-    kUniversalCompactionMultiLevel = 22,
-    kCompressedBlockCache = 23,
-    kInfiniteMaxOpenFiles = 24,
-    kxxHashChecksum = 25,
-    kFIFOCompaction = 26,
-    kOptimizeFiltersForHits = 27,
-    kRowCache = 28,
-    kRecycleLogFiles = 29,
-    kConcurrentSkipList = 30,
-    kEnd = 31,
-    kLevelSubcompactions = 31,
-    kUniversalSubcompactions = 32,
-    kBlockBasedTableWithIndexRestartInterval = 33,
+    kMergePut = 9,
+    kFilter = 10,
+    kFullFilterWithNewTableReaderForCompactions = 11,
+    kUncompressed = 12,
+    kNumLevel_3 = 13,
+    kDBLogDir = 14,
+    kWalDirAndMmapReads = 15,
+    kManifestFileSize = 16,
+    kPerfOptions = 17,
+    kDeletesFilterFirst = 18,
+    kHashSkipList = 19,
+    kUniversalCompaction = 20,
+    kUniversalCompactionMultiLevel = 21,
+    kCompressedBlockCache = 22,
+    kInfiniteMaxOpenFiles = 23,
+    kxxHashChecksum = 24,
+    kFIFOCompaction = 25,
+    kOptimizeFiltersForHits = 26,
+    kRowCache = 27,
+    kRecycleLogFiles = 28,
+    kConcurrentSkipList = 29,
+    kEnd = 30,
+    kLevelSubcompactions = 30,
+    kUniversalSubcompactions = 31,
+    kBlockBasedTableWithIndexRestartInterval = 32,
   };
   int option_config_;
 
@@ -591,6 +602,13 @@ class DBTestBase : public testing::Test {
 
   Options last_options_;
 
+  // For encryption
+  std::unique_ptr<yb::enterprise::UniverseKeyManager> universe_key_manager_;
+  std::unique_ptr<rocksdb::Env> encrypted_env_;
+
+  static const std::string kKeyId;
+  static const std::string kKeyFile;
+
   // Skip some options, as they may not be applicable to a specific test.
   // To add more skip constants, use values 4, 8, 16, etc.
   enum OptionSkip {
@@ -601,14 +619,15 @@ class DBTestBase : public testing::Test {
     kSkipPlainTable = 8,
     kSkipHashIndex = 16,
     kSkipNoSeekToLast = 32,
-    kSkipHashCuckoo = 64,
-    kSkipFIFOCompaction = 128,
-    kSkipMmapReads = 256,
+    kSkipFIFOCompaction = 64,
+    kSkipMmapReads = 128,
   };
 
-  explicit DBTestBase(const std::string path);
+  explicit DBTestBase(const std::string path, bool encryption_enabled = false);
 
   ~DBTestBase();
+
+  void CreateEncryptedEnv();
 
   static std::string Key(int i) {
     char buf[100];

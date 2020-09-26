@@ -1,6 +1,6 @@
 /* Copyright (c) YugaByte, Inc. */
 
-@import "_style/colors.scss";
+@import "../../../../_style/colors.scss";
 
 /* From gentelella.css need to cleanup */
 
@@ -80,4 +80,8 @@ footer {
   a:hover {
     color: inherit;
   }
+}
+
+.sidebar-hidden footer {
+  margin-left: 0;
 }

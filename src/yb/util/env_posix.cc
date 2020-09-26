@@ -37,6 +37,7 @@
 
 #include <set>
 #include <vector>
+#include "yb/util/status.h"
 
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
@@ -45,6 +46,7 @@
 #include <linux/falloc.h>
 #include <sys/sysinfo.h>
 #endif  // defined(__APPLE__)
+#include <sys/resource.h>
 
 #include <glog/logging.h>
 
@@ -120,10 +122,10 @@ DEFINE_int32(o_direct_block_alignment_bytes, 4096,
              "Alignment (in bytes) for blocks used for O_DIRECT operations.");
 TAG_FLAG(o_direct_block_alignment_bytes, advanced);
 
-DEFINE_test_flag(bool, TEST_simulate_fs_without_fallocate, false,
+DEFINE_test_flag(bool, simulate_fs_without_fallocate, false,
     "If true, the system simulates a file system that doesn't support fallocate.");
 
-DEFINE_test_flag(int64, TEST_simulate_free_space_bytes, -1,
+DEFINE_test_flag(int64, simulate_free_space_bytes, -1,
     "If a non-negative value, GetFreeSpaceBytes will return the specified value.");
 
 using base::subtle::Atomic64;
@@ -963,6 +965,16 @@ class PosixEnv : public Env {
     return access(fname.c_str(), F_OK) == 0;
   }
 
+  virtual bool DirExists(const std::string& dname) override {
+    TRACE_EVENT1("io", "PosixEnv::DirExists", "path", dname);
+    ThreadRestrictions::AssertIOAllowed();
+    struct stat statbuf;
+    if (stat(dname.c_str(), &statbuf) == 0) {
+      return S_ISDIR(statbuf.st_mode);
+    }
+    return false;
+  }
+
   CHECKED_STATUS GetChildren(const std::string& dir,
                              ExcludeDots exclude_dots,
                              std::vector<std::string>* result) override {
@@ -1397,6 +1409,45 @@ class PosixEnv : public Env {
     uint64_t available_blocks = static_cast<uint64_t>(stat.f_bavail);
 
     return available_blocks * block_size;
+  }
+
+  Status GetUlimit(int resource, int64_t* soft_limit, int64_t* hard_limit) override {
+    struct rlimit lim;
+    if (getrlimit(resource, &lim) != 0) {
+      return STATUS_IO_ERROR("getrlimit() failed", errno);
+    }
+    if (soft_limit != NULL) *soft_limit = lim.rlim_cur;
+    if (hard_limit != NULL) *hard_limit = lim.rlim_max;
+    return Status::OK();
+  }
+
+  Status SetUlimit(int resource, int64_t value) override {
+    return SetUlimit(resource, value, strings::Substitute("resource no. $0", resource));
+  }
+
+  Status SetUlimit(int resource, int64_t value, const std::string& resource_name) override {
+    int64_t soft_limit = 0, hard_limit = 0;
+    RETURN_NOT_OK(GetUlimit(resource, &soft_limit, &hard_limit));
+    if (soft_limit == value) {
+      return Status::OK();
+    }
+    if (hard_limit != RLIM_INFINITY && hard_limit < value) {
+      return STATUS_FORMAT(
+        InvalidArgument,
+        "Resource limit value $0 for resource $1 greater than hard limit $2",
+        value, resource, hard_limit);
+    }
+    struct rlimit lim;
+    lim.rlim_cur = value;
+    lim.rlim_max = hard_limit;
+    LOG(INFO)
+        << "Modifying limit for " << resource_name
+        << " from " << soft_limit
+        << " to " << value;
+    if (setrlimit(resource, &lim) != 0) {
+      return STATUS(RuntimeError, "Unable to set rlimit", Errno(errno));
+    }
+    return Status::OK();
   }
 
  private:

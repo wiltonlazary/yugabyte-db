@@ -66,12 +66,23 @@ enum TabletDataState {
 
   // The tablet has been deleted, and now just consists of a "tombstone".
   TABLET_DATA_TOMBSTONED = 3;
+
+  // This tablet split has been completed. In this state tablet could only be used as a remote
+  // bootstrap source for some time (follower_unavailable_considered_failed_sec) and then will be
+  // shutdown.
+  // TODO(tsplit): After https://github.com/yugabyte/yugabyte-db/issues/1461:
+  // - implement deleting tablet in state TABLET_DATA_SPLIT_COMPLETED after
+  //   follower_unavailable_considered_failed_sec.
+  // - add integration test for remote bootstrap from source split tablet before/after
+  // follower_unavailable_considered_failed_sec.
+  TABLET_DATA_SPLIT_COMPLETED = 4;
 }
 
 // Table information.
 message TableInfoPB {
   // Table id, name, and type.
   optional bytes table_id = 1;
+  optional string namespace_name = 10;
   optional string table_name = 2;
   optional TableType table_type = 3 [ default = DEFAULT_TABLE_TYPE ];
 
@@ -116,6 +127,11 @@ message KvStoreInfoPB {
   // See docdb::KeyBounds.
   optional bytes lower_bound_key = 6;
   optional bytes upper_bound_key = 7;
+
+  // Whether KV-store regular DB has been fully compacted since creation.
+  // We don't split not yet fully compacted post-split tablets as of 2020-06-23, since
+  // detecting effective middle key and tablet size for such tablets is not yet implemented.
+  optional bool has_been_fully_compacted = 8;
 }
 
 // The super-block keeps track of the Raft group.
@@ -186,6 +202,11 @@ message RaftGroupReplicaSuperBlockPB {
 
   // True if the raft group is for a colocated tablet.
   optional bool colocated = 25 [ default = false ];
+
+  // Minimum replicated op id index for cdc streams. This value is used to retain log files
+  // that contain any entries with indices larger than this one. By default max int64 to avoid
+  // retaining any log files unnecessarily.
+  optional int64 cdc_min_replicated_index = 26 [ default = 9223372036854775807 ];
 }
 
 message FilePB {

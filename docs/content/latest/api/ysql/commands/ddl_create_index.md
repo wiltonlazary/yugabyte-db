@@ -1,8 +1,8 @@
 ---
-title: CREATE INDEX
+title: CREATE INDEX statement [YSQL]
+headerTitle: CREATE INDEX
 linkTitle: CREATE INDEX
-summary: Create index on a table in a database
-description: CREATE INDEX
+description: Use the CREATE INDEX statement to create an index on the specified columns of the specified table.
 menu:
   latest:
     identifier: api-ysql-commands-create-index
@@ -15,7 +15,7 @@ showAsideToc: true
 
 ## Synopsis
 
-This command creates an index on the specified column(s) of the specified table. Indexes are primarily used to improve query performance.
+Use the `CREATE INDEX` statement to create an index on the specified columns of the specified table. Indexes are primarily used to improve query performance.
 
 ## Syntax
 
@@ -47,6 +47,12 @@ This command creates an index on the specified column(s) of the specified table.
 
 `CONCURRENTLY`, `USING method`, `COLLATE`, and `TABLESPACE` options are not yet supported.
 
+{{< note title="Note" >}}
+
+When an index is created on an existing table, YugabyteDB automatically backfills existing data into the index. Currently, this is not done in an online manner. To online backfill an index, you can set the `ysql_disable_index_backfill` flag to `false` when starting yb-tservers. Note that we don't recommend setting this flag in a production cluster yet. For details on how online index backfill works, see [Online Index Backfill](https://github.com/yugabyte/yugabyte-db/blob/master/architecture/design/online-index-backfill.md).
+
+{{< /note >}}
+
 ### UNIQUE
 
 Enforce that duplicate values in a table are not allowed.
@@ -54,6 +60,13 @@ Enforce that duplicate values in a table are not allowed.
 ### INCLUDE clause
 
 Specify a list of columns which will be included in the index as non-key columns.
+
+### WHERE clause
+
+A [partial index](#partial-indexes) is an index that is built on a subset of a table and includes only rows that satisfy the condition specified in the `WHERE` clause. 
+It can be used to exclude NULL or common values from the index, or include just the rows of interest.
+This will speed up any writes to the table since rows containing the common column values don't need to be indexed. 
+It will also reduce the size of the index, thereby improving the speed for read queries that use the index.
 
 #### *name*
 
@@ -78,6 +91,17 @@ Specify one or more columns of the table and must be surrounded by parentheses.
 - `DESC` — Sort in descending order.
 - `NULLS FIRST` - Specifies that nulls sort before non-nulls. This is the default when DESC is specified.
 - `NULLS LAST` - Specifies that nulls sort after non-nulls. This is the default when DESC is not specified.
+
+### SPLIT INTO
+
+For hash-sharded indexes, you can use the `SPLIT INTO` clause to specify the number of tablets to be created for the index. The hash range is then evenly split across those tablets.
+Presplitting indexes, using `SPLIT INTO`, distributes index workloads on a production cluster. For example, if you have 3 servers, splitting the index into 30 tablets can provide higher write throughput on the index. For an example, see [Create an index specifying the number of tablets](#create-an-index-specifying-the-number-of-tablets).
+
+{{< note title="Note" >}}
+
+By default, YugabyteDB presplits an index into `ysql_num_shards_per_tserver * num_of_tserver` tablets. The `SPLIT INTO` clause can be used to override that setting on a per-index basis.
+
+{{< /note >}}
 
 ## Examples
 
@@ -129,4 +153,22 @@ yugabyte=# \d products_name_code;
  name   | text | yes  | name
  code   | text | no   | code
 lsm, for table "public.products"
+```
+
+### Create an index specifying the number of tablets
+
+To specify the number of tablets for an index, you can use the `CREATE INDEX` statement with the [`SPLIT INTO`](#split-into) clause.
+
+```postgresql
+CREATE TABLE employees (id int PRIMARY KEY, first_name TEXT, last_name TEXT) SPLIT INTO 10 TABLETS;
+CREATE INDEX ON employees(first_name, last_name) SPLIT INTO 10 TABLETS;
+```
+
+### Partial indexes
+
+Consider an application maintaining shipments information. It has a `shipments` table with a column for `delivery_status`. If the application needs to access in-flight shipments frequently, then it can use a partial index to exclude rows whose shipment status is `delivered`.
+
+```postgresql
+yugabyte=# create table shipments(id int, delivery_status text, address text, delivery_date date);
+yugabyte=# create index shipment_delivery on shipments(delivery_status, address, delivery_date) where delivery_status != 'delivered';
 ```

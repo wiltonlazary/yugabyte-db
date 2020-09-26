@@ -22,16 +22,15 @@
 
 #include "yb/server/secure.h"
 
-DECLARE_bool(running_test);
+DECLARE_bool(TEST_running_test);
 
 namespace yb {
 namespace client {
 
 std::future<Result<internal::RemoteTabletPtr>> LookupFirstTabletFuture(const YBTable* table) {
   return table->client()->data_->meta_cache_->LookupTabletByKeyFuture(
-      table, "" /* partition_key */, CoarseTimePoint::max() /* deadline */);
+      table, "" /* partition_key */, CoarseMonoClock::now() + std::chrono::seconds(60));
 }
-
 
 Result<std::unique_ptr<rpc::Messenger>> CreateClientMessenger(
     const string& client_name,
@@ -47,7 +46,7 @@ Result<std::unique_ptr<rpc::Messenger>> CreateClientMessenger(
     server::ApplySecureContext(secure_context, &builder);
   }
   auto messenger = VERIFY_RESULT(builder.Build());
-  if (PREDICT_FALSE(FLAGS_running_test)) {
+  if (PREDICT_FALSE(FLAGS_TEST_running_test)) {
     messenger->TEST_SetOutboundIpBase(VERIFY_RESULT(HostToAddress("127.0.0.1")));
   }
   return messenger;

@@ -41,6 +41,7 @@
 #include "yb/gutil/bind.h"
 #include "yb/gutil/map-util.h"
 #include "yb/util/hdr_histogram.h"
+#include "yb/util/histogram.pb.h"
 #include "yb/util/jsonreader.h"
 #include "yb/util/jsonwriter.h"
 #include "yb/util/metrics.h"
@@ -65,6 +66,28 @@ class MetricsTest : public YBTest {
   }
 
  protected:
+  template <class LagType>
+  void DoLagTest(const MillisLagPrototype& metric) {
+    scoped_refptr<LagType> lag = new LagType(&metric);
+    ASSERT_EQ(metric.description(), lag->prototype()->description());
+    SleepFor(MonoDelta::FromMilliseconds(500));
+    // Internal timestamp is set to the time when the metric was created.
+    // So this lag is measure of the time elapsed since the metric was
+    // created and the check time.
+    ASSERT_GE(lag->lag_ms(), 500);
+    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    lag->UpdateTimestampInMilliseconds(now_ms);
+    // Verify that the update happened correctly. The lag time should
+    // be close to 0, but giving it extra time to account for slow
+    // tests.
+    ASSERT_LT(lag->lag_ms(), 200);
+    // Set the timestamp to some time in the future to verify that the
+    // metric can correctly deal with this case.
+    lag->UpdateTimestampInMilliseconds(now_ms * 2);
+    ASSERT_EQ(0, lag->lag_ms());
+  }
+
   MetricRegistry registry_;
   scoped_refptr<MetricEntity> entity_;
 };
@@ -81,6 +104,17 @@ TEST_F(MetricsTest, SimpleCounterTest) {
   ASSERT_EQ(1, requests->value());
   requests->IncrementBy(2);
   ASSERT_EQ(3, requests->value());
+}
+
+METRIC_DEFINE_lag(test_entity, lag_simple, "Test MillisLag", "Test MillisLag Description");
+TEST_F(MetricsTest, SimpleLagTest) {
+  ASSERT_NO_FATALS(DoLagTest<MillisLag>(METRIC_lag_simple));
+}
+
+METRIC_DEFINE_lag(test_entity, atomic_lag_simple, "Test Atomic MillisLag",
+                  "Test Atomic MillisLag Description");
+TEST_F(MetricsTest, SimpleAtomicLagTest) {
+  ASSERT_NO_FATALS(DoLagTest<AtomicMillisLag>(METRIC_atomic_lag_simple));
 }
 
 METRIC_DEFINE_gauge_uint64(test_entity, fake_memory_usage, "Memory Usage",
@@ -180,6 +214,52 @@ TEST_F(MetricsTest, SimpleHistogramTest) {
   ASSERT_EQ(2, hist->histogram_->TotalCount());
   ASSERT_EQ(6, hist->histogram_->TotalSum());
   // TODO: Test coverage needs to be improved a lot.
+}
+
+TEST_F(MetricsTest, ResetHistogramTest) {
+  scoped_refptr<Histogram> hist = METRIC_test_hist.Instantiate(entity_);
+  for (int i = 1; i <= 100; i++) {
+    hist->Increment(i);
+  }
+  EXPECT_EQ(5050, hist->histogram_->TotalSum());
+  EXPECT_EQ(100, hist->histogram_->TotalCount());
+  EXPECT_EQ(5050, hist->histogram_->CurrentSum());
+  EXPECT_EQ(100, hist->histogram_->CurrentCount());
+
+  EXPECT_EQ(1, hist->histogram_->MinValue());
+  EXPECT_EQ(50.5, hist->histogram_->MeanValue());
+  EXPECT_EQ(100, hist->histogram_->MaxValue());
+  EXPECT_EQ(10, hist->histogram_->ValueAtPercentile(10));
+  EXPECT_EQ(25, hist->histogram_->ValueAtPercentile(25));
+  EXPECT_EQ(50, hist->histogram_->ValueAtPercentile(50));
+  EXPECT_EQ(75, hist->histogram_->ValueAtPercentile(75));
+  EXPECT_EQ(99, hist->histogram_->ValueAtPercentile(99));
+  EXPECT_EQ(100, hist->histogram_->ValueAtPercentile(99.9));
+  EXPECT_EQ(100, hist->histogram_->ValueAtPercentile(100));
+
+  hist->histogram_->DumpHumanReadable(&LOG(INFO));
+  // Test that the Histogram's percentiles are reset.
+  HistogramSnapshotPB snapshot_pb;
+  MetricJsonOptions options;
+  options.include_raw_histograms = true;
+  ASSERT_OK(hist->GetAndResetHistogramSnapshotPB(&snapshot_pb, options));
+  hist->histogram_->DumpHumanReadable(&LOG(INFO));
+
+  EXPECT_EQ(5050, hist->histogram_->TotalSum());
+  EXPECT_EQ(100, hist->histogram_->TotalCount());
+  EXPECT_EQ(0, hist->histogram_->CurrentSum());
+  EXPECT_EQ(0, hist->histogram_->CurrentCount());
+
+  EXPECT_EQ(0, hist->histogram_->MinValue());
+  EXPECT_EQ(0, hist->histogram_->MeanValue());
+  EXPECT_EQ(0, hist->histogram_->MaxValue());
+  EXPECT_EQ(0, hist->histogram_->ValueAtPercentile(10));
+  EXPECT_EQ(0, hist->histogram_->ValueAtPercentile(25));
+  EXPECT_EQ(0, hist->histogram_->ValueAtPercentile(50));
+  EXPECT_EQ(0, hist->histogram_->ValueAtPercentile(75));
+  EXPECT_EQ(0, hist->histogram_->ValueAtPercentile(99));
+  EXPECT_EQ(0, hist->histogram_->ValueAtPercentile(99.9));
+  EXPECT_EQ(0, hist->histogram_->ValueAtPercentile(100));
 }
 
 TEST_F(MetricsTest, JsonPrintTest) {
@@ -298,6 +378,7 @@ TEST_F(MetricsTest, TestDumpJsonPrototypes) {
     "            \"type\": \"gauge\",\n"
     "            \"unit\": \"bytes\",\n"
     "            \"description\": \"Test Gauge 2\",\n"
+    "            \"level\": \"info\",\n"
     "            \"entity_type\": \"test_entity\"\n"
     "        }";
   ASSERT_STR_CONTAINS(json, expected);

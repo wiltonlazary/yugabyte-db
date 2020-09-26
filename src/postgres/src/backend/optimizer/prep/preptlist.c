@@ -411,7 +411,7 @@ expand_targetlist(List *tlist, int command_type,
 														  true, /* isnull */
 														  true /* byval */ );
 						}
-						else 
+						else
 						{
 							// Query all attribute in the YugaByte relation.
 							new_expr = (Node *) makeVar(result_relation,
@@ -423,7 +423,7 @@ expand_targetlist(List *tlist, int command_type,
 						}
 						break;
 					}
-					/* FALLTHROUGH */
+					switch_fallthrough();
 				default:
 					elog(ERROR, "unrecognized command_type: %d",
 						 (int) command_type);

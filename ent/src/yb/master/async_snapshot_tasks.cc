@@ -12,6 +12,7 @@
 
 #include "yb/master/async_snapshot_tasks.h"
 
+#include "yb/common/transaction_error.h"
 #include "yb/common/wire_protocol.h"
 
 #include "yb/master/master.h"
@@ -51,7 +52,8 @@ AsyncTabletSnapshotOp::AsyncTabletSnapshotOp(Master *master,
 }
 
 string AsyncTabletSnapshotOp::description() const {
-  return Format("$0 Tablet Snapshot Operation $1 RPC", *tablet_, operation_);
+  return Format("$0 Tablet Snapshot Operation $1 RPC",
+                *tablet_, tserver::TabletSnapshotOpRequestPB::Operation_Name(operation_));
 }
 
 TabletId AsyncTabletSnapshotOp::tablet_id() const {
@@ -72,63 +74,77 @@ void AsyncTabletSnapshotOp::HandleResponse(int attempt) {
     switch (resp_.error().code()) {
       case TabletServerErrorPB::TABLET_NOT_FOUND:
         LOG(WARNING) << "TS " << permanent_uuid() << ": snapshot failed for tablet "
-                     << tablet_->ToString() << " no further retry: " << status.ToString();
-        TransitionToTerminalState(MonitoredTaskState::kRunning, MonitoredTaskState::kComplete);
+                     << tablet_->ToString() << " no further retry: " << status;
+        TransitionToCompleteState();
+        break;
+      case TabletServerErrorPB::INVALID_SNAPSHOT:
+        LOG(WARNING) << "TS " << permanent_uuid() << ": snapshot failed for tablet "
+                     << tablet_->ToString() << ": " << status;
+        if (operation_ == tserver::TabletSnapshotOpRequestPB::RESTORE) {
+          LOG(WARNING) << "No further retry for RESTORE snapshot operation: " << status;
+          TransitionToCompleteState();
+        }
         break;
       default:
         LOG(WARNING) << "TS " << permanent_uuid() << ": snapshot failed for tablet "
-                     << tablet_->ToString() << ": " << status.ToString();
+                     << tablet_->ToString() << ": " << status;
+        if (TransactionError(status) == TransactionErrorCode::kSnapshotTooOld) {
+          TransitionToCompleteState();
+        }
+        break;
     }
   } else {
-    TransitionToTerminalState(MonitoredTaskState::kRunning, MonitoredTaskState::kComplete);
+    TransitionToCompleteState();
     VLOG(1) << "TS " << permanent_uuid() << ": snapshot complete on tablet "
             << tablet_->ToString();
   }
 
-  if (state() == MonitoredTaskState::kComplete) {
-    bool handled = false;
-    switch (operation_) {
-      case tserver::TabletSnapshotOpRequestPB::CREATE: {
-        handled = true;
-        // TODO: this class should not know CatalogManager API,
-        //       remove circular dependency between classes.
-        master_->catalog_manager()->HandleCreateTabletSnapshotResponse(
-            tablet_.get(), resp_.has_error());
-        break;
-      }
-      case tserver::TabletSnapshotOpRequestPB::RESTORE: {
-        handled = true;
-        // TODO: this class should not know CatalogManager API,
-        //       remove circular dependency between classes.
-        master_->catalog_manager()->HandleRestoreTabletSnapshotResponse(
-            tablet_.get(), resp_.has_error());
-        break;
-      }
-      case tserver::TabletSnapshotOpRequestPB::DELETE: {
-        handled = true;
-        // TODO: this class should not know CatalogManager API,
-        //       remove circular dependency between classes.
-        master_->catalog_manager()->HandleDeleteTabletSnapshotResponse(
-            snapshot_id_, tablet_.get(), resp_.has_error());
-        break;
-      }
-      case tserver::TabletSnapshotOpRequestPB::UNKNOWN: break; // Not handled.
-    }
-
-    if (!handled) {
-      FATAL_INVALID_ENUM_VALUE(tserver::TabletSnapshotOpRequestPB::Operation, operation_);
-    }
-  } else {
+  if (state() != MonitoredTaskState::kComplete) {
     VLOG(1) << "TabletSnapshotOp task is not completed";
+    return;
   }
+
+  switch (operation_) {
+    case tserver::TabletSnapshotOpRequestPB::CREATE_ON_TABLET: {
+      // TODO: this class should not know CatalogManager API,
+      //       remove circular dependency between classes.
+      master_->catalog_manager()->HandleCreateTabletSnapshotResponse(
+          tablet_.get(), resp_.has_error());
+      return;
+    }
+    case tserver::TabletSnapshotOpRequestPB::RESTORE: {
+      // TODO: this class should not know CatalogManager API,
+      //       remove circular dependency between classes.
+      master_->catalog_manager()->HandleRestoreTabletSnapshotResponse(
+          tablet_.get(), resp_.has_error());
+      return;
+    }
+    case tserver::TabletSnapshotOpRequestPB::DELETE_ON_TABLET: {
+      // TODO: this class should not know CatalogManager API,
+      //       remove circular dependency between classes.
+      master_->catalog_manager()->HandleDeleteTabletSnapshotResponse(
+          snapshot_id_, tablet_.get(), resp_.has_error());
+      return;
+    }
+    case tserver::TabletSnapshotOpRequestPB::CREATE_ON_MASTER: FALLTHROUGH_INTENDED;
+    case tserver::TabletSnapshotOpRequestPB::DELETE_ON_MASTER: FALLTHROUGH_INTENDED;
+    case google::protobuf::kint32min: FALLTHROUGH_INTENDED;
+    case google::protobuf::kint32max: FALLTHROUGH_INTENDED;
+    case tserver::TabletSnapshotOpRequestPB::UNKNOWN: break; // Not handled.
+  }
+
+  FATAL_INVALID_ENUM_VALUE(tserver::TabletSnapshotOpRequestPB::Operation, operation_);
 }
 
 bool AsyncTabletSnapshotOp::SendRequest(int attempt) {
   tserver::TabletSnapshotOpRequestPB req;
   req.set_dest_uuid(permanent_uuid());
-  req.set_tablet_id(tablet_->tablet_id());
+  req.add_tablet_id(tablet_->tablet_id());
   req.set_snapshot_id(snapshot_id_);
   req.set_operation(operation_);
+  if (snapshot_hybrid_time_) {
+    req.set_snapshot_hybrid_time(snapshot_hybrid_time_.ToUint64());
+  }
   req.set_propagated_hybrid_time(master_->clock()->Now().ToUint64());
 
   ts_backup_proxy_->TabletSnapshotOpAsync(req, &resp_, &rpc_, BindRpcCallback());
@@ -136,6 +152,25 @@ bool AsyncTabletSnapshotOp::SendRequest(int attempt) {
           << " (attempt " << attempt << "):\n"
           << req.DebugString();
   return true;
+}
+
+void AsyncTabletSnapshotOp::Finished(const Status& status) {
+  if (!callback_) {
+    return;
+  }
+  if (!status.ok()) {
+    callback_(status);
+    return;
+  }
+  if (resp_.has_error()) {
+    auto status = tablet_->CheckRunning();
+    if (status.ok()) {
+      status = StatusFromPB(resp_.error().status());
+    }
+    callback_(status);
+  } else {
+    callback_(&resp_);
+  }
 }
 
 } // namespace master

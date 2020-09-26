@@ -49,6 +49,10 @@ DEFINE_int32(catalog_manager_bg_task_wait_ms, 1000,
              "between runs");
 TAG_FLAG(catalog_manager_bg_task_wait_ms, hidden);
 
+DEFINE_int32(load_balancer_initial_delay_secs, 120,
+             "Amount of time to wait between becoming master leader and enabling the load "
+             "balancer.");
+
 namespace yb {
 namespace master {
 
@@ -108,7 +112,7 @@ void CatalogManagerBgTasks::Run() {
       const auto& ts_manager = catalog_manager_->master_->ts_manager();
       ts_manager->GetAllDescriptors(&descs);
       for (auto& ts_desc : descs) {
-        if (!ts_manager->IsTSLive(ts_desc)) {
+        if (!ts_desc->IsLive()) {
           ts_desc->ClearMetrics();
         }
       }
@@ -139,11 +143,19 @@ void CatalogManagerBgTasks::Run() {
                      << s.ToString();
         }
       } else {
-        catalog_manager_->load_balance_policy_->RunLoadBalancer();
+        if (catalog_manager_->TimeSinceElectedLeader() >
+            MonoDelta::FromSeconds(FLAGS_load_balancer_initial_delay_secs)) {
+          catalog_manager_->load_balance_policy_->RunLoadBalancer();
+        }
       }
 
       if (!to_delete.empty() || catalog_manager_->AreTablesDeleting()) {
         catalog_manager_->CleanUpDeletedTables();
+      }
+      std::vector<scoped_refptr<CDCStreamInfo>> streams;
+      auto s = catalog_manager_->FindCDCStreamsMarkedAsDeleting(&streams);
+      if (s.ok() && !streams.empty()) {
+        s = catalog_manager_->CleanUpDeletedCDCStreams(streams);
       }
     }
     WARN_NOT_OK(catalog_manager_->encryption_manager_->

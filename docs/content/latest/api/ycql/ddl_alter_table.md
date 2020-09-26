@@ -1,7 +1,8 @@
 ---
-title: ALTER TABLE
-summary: Change the schema of a table
-description: ALTER TABLE
+title: ALTER TABLE statement [YCQL]
+headerTitle: ALTER TABLE
+linkTitle: ALTER TABLE
+description: Use the ALTER TABLE statement to change the schema or definition of an existing table.
 menu:
   latest:
     parent: api-cassandra
@@ -15,7 +16,7 @@ showAsideToc: true
 
 ## Synopsis
 
-The `ALTER TABLE` statement changes the schema or definition of an existing table.
+Use the `ALTER TABLE` statement to change the schema or definition of an existing table.
 It allows adding, dropping, or renaming a column as well as updating a table property.
 
 ## Syntax
@@ -57,15 +58,15 @@ Where
 ### Add a column to a table
 
 ```sql
-cqlsh:example> CREATE TABLE employees (id INT, name TEXT, salary FLOAT, PRIMARY KEY((id), name));
+ycqlsh:example> CREATE TABLE employees (id INT, name TEXT, salary FLOAT, PRIMARY KEY((id), name));
 ```
 
 ```sql
-cqlsh:example> ALTER TABLE employees ADD title TEXT;
+ycqlsh:example> ALTER TABLE employees ADD title TEXT;
 ```
 
 ```sql
-cqlsh:example> DESCRIBE TABLE employees;
+ycqlsh:example> DESCRIBE TABLE employees;
 ```
 
 Following result would be shown.
@@ -83,14 +84,15 @@ CREATE TABLE example.employees (
 ### Remove a column from a table
 
 ```sql
-cqlsh:example> ALTER TABLE employees DROP salary;
+ycqlsh:example> ALTER TABLE employees DROP salary;
 ```
 
 ```sql
-cqlsh:example> DESCRIBE TABLE employees;
+ycqlsh:example> DESCRIBE TABLE employees;
 ```
 
 Following result would be shown.
+
 ```
 CREATE TABLE example.employees (
     id int,
@@ -103,14 +105,15 @@ CREATE TABLE example.employees (
 ### Rename a column in a table
 
 ```sql
-cqlsh:example> ALTER TABLE employees RENAME title TO job_title;
+ycqlsh:example> ALTER TABLE employees RENAME title TO job_title;
 ```
 
 ```sql
-cqlsh:example> DESCRIBE TABLE employees;
+ycqlsh:example> DESCRIBE TABLE employees;
 ```
 
 Following result would be shown.
+
 ```
 CREATE TABLE example.employees (
     id int,
@@ -125,11 +128,11 @@ CREATE TABLE example.employees (
 You can do this as shown below.
 
 ```sql
-cqlsh:example> ALTER TABLE employees WITH default_time_to_live = 5;
+ycqlsh:example> ALTER TABLE employees WITH default_time_to_live = 5;
 ```
 
 ```sql
-cqlsh:example> DESCRIBE TABLE employees;
+ycqlsh:example> DESCRIBE TABLE employees;
 ```
 
 Following result would be shown.
@@ -146,10 +149,9 @@ CREATE TABLE example.employees (
 
 ## See also
 
-[`CREATE TABLE`](../ddl_create_table)
-[`DELETE`](../dml_delete)
-[`DROP TABLE`](../ddl_drop_table)
-[`INSERT`](../dml_insert)
-[`SELECT`](../dml_select)
-[`UPDATE`](../dml_update)
-[Other CQL Statements](..)
+- [`CREATE TABLE`](../ddl_create_table)
+- [`DELETE`](../dml_delete)
+- [`DROP TABLE`](../ddl_drop_table)
+- [`INSERT`](../dml_insert)
+- [`SELECT`](../dml_select)
+- [`UPDATE`](../dml_update)

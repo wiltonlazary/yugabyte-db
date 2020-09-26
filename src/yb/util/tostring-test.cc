@@ -129,10 +129,13 @@ TEST(ToStringTest, TestPointer) {
   CheckPointer(expected, shared_ptr);
 }
 
+const std::string kShortDebugString = "ShortDebugString";
+const std::string kToStringable = "ToStringable";
+
 class ToStringable : public RefCountedThreadSafe<ToStringable> {
  public:
   std::string ToString() const {
-    return std::string("ToStringable");
+    return kToStringable;
   }
 };
 
@@ -142,7 +145,7 @@ class ToStringableChild : public ToStringable {
 class WithShortDebugString {
  public:
   std::string ShortDebugString() const {
-    return std::string("ShortDebugString");
+    return kShortDebugString;
   }
 };
 
@@ -152,15 +155,17 @@ class WithShortDebugStringChild : public WithShortDebugString {
 TEST(ToStringTest, TestCustomIntrusive) {
   scoped_refptr<ToStringable> ptr(new ToStringable);
   scoped_refptr<ToStringableChild> child_ptr(new ToStringableChild);
-  ASSERT_EQ("ToStringable", ToString(*ptr));
-  CheckPointer("ToStringable", ptr);
-  CheckPointer("ToStringable", child_ptr);
-  ASSERT_EQ("ShortDebugString", ToString(WithShortDebugString()));
-  ASSERT_EQ("ShortDebugString", ToString(WithShortDebugStringChild()));
+  ASSERT_EQ(kToStringable, ToString(*ptr));
+  CheckPointer(kToStringable, ptr);
+  CheckPointer(kToStringable, child_ptr);
+  ASSERT_EQ(kShortDebugString, ToString(WithShortDebugString()));
+  ASSERT_EQ(kShortDebugString, ToString(WithShortDebugStringChild()));
 
   std::vector<scoped_refptr<ToStringable>> v(2);
   v[1] = ptr;
   ASSERT_EQ("[<NULL>, " + ToString(v[1]) + "]", ToString(v));
+
+  ASSERT_EQ(kToStringable, ToString(GStringPiece(kToStringable)));
 }
 
 class ToStringableNonIntrusive {
@@ -213,6 +218,41 @@ TEST(ToStringTest, Uuid) {
 
   ASSERT_EQ(ToString(id), str);
   ASSERT_EQ(ToString(vec), ToString(std::vector<std::string>{str}));
+}
+
+TEST(ToStringTest, Struct) {
+  struct TestStruct {
+    int a;
+    std::string b;
+    std::vector<int> c;
+
+    std::string ToString() const {
+      return YB_STRUCT_TO_STRING(a, b, c);
+    }
+  };
+
+  TestStruct t = {
+    .a = 42,
+    .b = "test",
+    .c = {1, 2, 3},
+  };
+
+  ASSERT_EQ(t.ToString(), "{ a: 42 b: test c: [1, 2, 3] }");
+
+  class TestClass {
+   public:
+    TestClass(int a, std::string b) : a_(a), b_(std::move(b)) {}
+
+    std::string ToString() const {
+      return YB_CLASS_TO_STRING(a, b);
+    }
+
+   private:
+    int a_;
+    std::string b_;
+  };
+
+  ASSERT_EQ(TestClass(42, "test").ToString(), "{ a: 42 b: test }");
 }
 
 } // namespace util_test

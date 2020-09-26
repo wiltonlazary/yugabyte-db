@@ -1,8 +1,8 @@
 ---
-title: CREATE CAST
+title: CREATE CAST statement [YSQL]
+headerTitle: CREATE CAST
 linkTitle: CREATE CAST
-summary: Create a new cast
-description: CREATE CAST
+description: Use the CREATE CAST statement to create a new cast.
 menu:
   latest:
     identifier: api-ysql-commands-create-cast
@@ -98,5 +98,4 @@ yugabyte=# SELECT CAST('2'::myint4 AS int4);
 ## See also
 
 - [`DROP CAST`](../ddl_drop_cast)
-
-[postgresql-docs-create-cast]: https://www.postgresql.org/docs/current/sql-createcast.html
+- [postgresql-docs-create-cast](https://www.postgresql.org/docs/current/sql-createcast.html)

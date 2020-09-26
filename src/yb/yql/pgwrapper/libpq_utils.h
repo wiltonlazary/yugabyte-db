@@ -101,6 +101,9 @@ class PGConn {
   CHECKED_STATUS CommitTransaction();
   CHECKED_STATUS RollbackTransaction();
 
+  // Would this query use an index [only] scan?
+  Result<bool> HasIndexScan(const std::string& query);
+
   CHECKED_STATUS CopyBegin(const std::string& command);
   Result<PGResultPtr> CopyEnd();
 
@@ -113,6 +116,10 @@ class PGConn {
 
   void CopyPutString(const std::string& value) {
     CopyPut(value.c_str(), value.length());
+  }
+
+  PGconn* get() {
+    return impl_.get();
   }
 
  private:

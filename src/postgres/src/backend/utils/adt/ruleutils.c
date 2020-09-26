@@ -1432,7 +1432,7 @@ pg_get_indexdef_worker(Oid indexrelid, int colno,
 		 * If it has options, append "WITH (options)"
 		 */
 		str = flatten_reloptions(indexrelid);
-		if (str)
+		if (str && strcmp(str,"") != 0)
 		{
 			appendStringInfo(&buf, " WITH (%s)", str);
 			pfree(str);
@@ -3381,7 +3381,7 @@ set_rtable_names(deparse_namespace *dpns, List *parent_namespaces,
 	MemSet(&hash_ctl, 0, sizeof(hash_ctl));
 	hash_ctl.keysize = NAMEDATALEN;
 	hash_ctl.entrysize = sizeof(NameHashEntry);
-	hash_ctl.hcxt = CurrentMemoryContext;
+	hash_ctl.hcxt = GetCurrentMemoryContext();
 	names_hash = hash_create("set_rtable_names names",
 							 list_length(dpns->rtable),
 							 &hash_ctl,
@@ -7570,7 +7570,7 @@ isSimpleNode(Node *node, Node *parentNode, int prettyFlags)
 				}
 				/* else do the same stuff as for T_SubLink et al. */
 			}
-			/* FALLTHROUGH */
+			switch_fallthrough();
 
 		case T_SubLink:
 		case T_NullTest:
@@ -11177,6 +11177,16 @@ flatten_reloptions(Oid relid)
 			}
 			else
 				value = "";
+
+			/*
+			 * We ignore the reloption for tablegroup.
+			 * It is parsed seperately in describe.c.
+			 */
+			if (strcmp(name, "tablegroup") == 0)
+			{
+				pfree(option);
+				continue;
+			}
 
 			if (i > 0)
 				appendStringInfoString(&buf, ", ");

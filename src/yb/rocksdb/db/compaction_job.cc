@@ -513,7 +513,7 @@ Result<FileNumbersHolder> CompactionJob::Run() {
   }
 
   if (output_directory_ && !db_options_.disableDataSync) {
-    output_directory_->Fsync();
+    RETURN_NOT_OK(output_directory_->Fsync());
   }
 
   compaction_stats_.micros = env_->NowMicros() - start_micros;
@@ -686,7 +686,7 @@ void CompactionJob::ProcessKeyValueCompaction(
   Status status;
   sub_compact->c_iter.reset(new CompactionIterator(
       input.get(), cfd->user_comparator(), &merge, versions_->LastSequence(),
-      &existing_snapshots_, earliest_write_conflict_snapshot_, env_, false,
+      &existing_snapshots_, earliest_write_conflict_snapshot_, false,
       sub_compact->compaction, compaction_filter));
   auto c_iter = sub_compact->c_iter.get();
   c_iter->SeekToFirst();
@@ -765,8 +765,6 @@ void CompactionJob::ProcessKeyValueCompaction(
   sub_compact->compaction_job_stats.total_input_raw_value_bytes +=
       c_iter_stats.total_input_raw_value_bytes;
 
-  RecordTick(stats_, FILTER_OPERATION_TOTAL_TIME,
-             c_iter_stats.total_filter_time);
   RecordDroppedKeys(c_iter_stats, &sub_compact->compaction_job_stats);
   RecordCompactionIOStats();
 
@@ -881,7 +879,7 @@ Status CompactionJob::FinishCompactionOutputFile(
     // Verify that the table is usable
     ColumnFamilyData* cfd = sub_compact->compaction->column_family_data();
     InternalIterator* iter = cfd->table_cache()->NewIterator(
-        ReadOptions(), env_options_, cfd->internal_comparator(), meta->fd,
+        ReadOptions(), env_options_, cfd->internal_comparator(), meta->fd, meta->UserFilter(),
         nullptr, cfd->internal_stats()->GetFileReadHist(
                      compact_->compaction->output_level()),
         false);
@@ -923,9 +921,9 @@ Status CompactionJob::FinishCompactionOutputFile(
     ColumnFamilyData* cfd = sub_compact->compaction->column_family_data();
     auto fn = TableFileName(cfd->ioptions()->db_paths, meta->fd.GetNumber(),
                             meta->fd.GetPathId());
-    sfm->OnAddFile(fn);
+    RETURN_NOT_OK(sfm->OnAddFile(fn));
     if (is_split_sst) {
-      sfm->OnAddFile(TableBaseToDataFileName(fn));
+      RETURN_NOT_OK(sfm->OnAddFile(TableBaseToDataFileName(fn)));
     }
     if (sfm->IsMaxAllowedSpaceReached()) {
       InstrumentedMutexLock l(db_mutex_);

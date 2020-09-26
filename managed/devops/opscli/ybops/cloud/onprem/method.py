@@ -14,7 +14,7 @@ from ybops.cloud.common.method import AbstractInstancesMethod
 from ybops.cloud.common.method import CreateInstancesMethod
 from ybops.cloud.common.method import DestroyInstancesMethod
 from ybops.cloud.common.method import ProvisionInstancesMethod
-from ybops.utils import get_ssh_host_port, validate_instance, get_datafile_path
+from ybops.utils import get_ssh_host_port, validate_instance, get_datafile_path, YB_HOME_DIR
 
 import json
 import logging
@@ -53,17 +53,9 @@ class OnPremProvisionInstancesMethod(ProvisionInstancesMethod):
         """
         self.create_method = OnPremCreateInstancesMethod(self.base_command)
 
-    def add_extra_args(self):
-        """Override to allow air-gapped OnPrem instances (isolated from public network)
-        """
-        super(OnPremProvisionInstancesMethod, self).add_extra_args()
-        self.parser.add_argument("--air_gap", action="store_true")
-
     def callback(self, args):
         # For onprem, we are always using pre-existing hosts!
         args.reuse_host = True
-        if args.air_gap:
-            self.extra_vars.update({"air_gap": args.air_gap})
         super(OnPremProvisionInstancesMethod, self).callback(args)
 
 
@@ -78,12 +70,13 @@ class OnPremValidateMethod(AbstractInstancesMethod):
     def callback(self, args):
         """args.search_pattern should be a private ip address for the device for OnPrem.
         """
-        self.extra_vars.update(get_ssh_host_port({"private_ip": args.search_pattern}))
-        print validate_instance(self.extra_vars["ssh_host"],
+        self.extra_vars.update(
+            get_ssh_host_port({"private_ip": args.search_pattern}, args.custom_ssh_port))
+        print(validate_instance(self.extra_vars["ssh_host"],
                                 self.extra_vars["ssh_port"],
                                 self.SSH_USER,
                                 args.private_key_file,
-                                self.mount_points.split(','))
+                                self.mount_points.split(',')))
 
 
 class OnPremDestroyInstancesMethod(DestroyInstancesMethod):
@@ -131,7 +124,7 @@ class OnPremFillInstanceProvisionTemplateMethod(AbstractMethod):
                                  help='The user who can SSH into the instance.')
         # Allow for ssh_port to not be mandatory so already created template scripts just default
         # to 22, without breaking...
-        self.parser.add_argument('--ssh_port', required=False, default=22,
+        self.parser.add_argument('--custom_ssh_port', required=False, default=22,
                                  help='The port on which to SSH into the instance.')
         self.parser.add_argument('--vars_file', required=True,
                                  help='The vault file containing needed vars.')
@@ -143,18 +136,21 @@ class OnPremFillInstanceProvisionTemplateMethod(AbstractMethod):
                                  help='Private key file to ssh into the instance.')
         self.parser.add_argument('--passwordless_sudo', action='store_true',
                                  help='If the ssh_user has passwordless sudo access or not.')
+        self.parser.add_argument("--air_gap", action="store_true",
+                                 help='If instances are air gapped or not.')
 
     def callback(self, args):
         config = {'devops_home': ybutils.YB_DEVOPS_HOME, 'cloud': self.cloud.name}
         file_name = 'provision_instance.py.j2'
         try:
             config.update(vars(args))
+            config["yb_home_dir"] = YB_HOME_DIR
             data_dir = os.path.dirname(get_datafile_path(file_name))
             template = Environment(loader=FileSystemLoader(data_dir)).get_template(file_name)
             with open(os.path.join(args.destination, args.name), 'w') as f:
                 f.write(template.render(config))
             os.chmod(f.name, stat.S_IRWXU)
-            print json.dumps({'script_path': f.name})
+            print(json.dumps({'script_path': f.name}))
         except Exception as e:
             logging.error(e)
-            print json.dumps({"error": "Unable to create script: {}".format(e.message)})
+            print(json.dumps({"error": "Unable to create script: {}".format(e.message)}))

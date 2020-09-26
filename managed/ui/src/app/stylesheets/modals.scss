@@ -1,7 +1,7 @@
 /* Copyright (c) YugaByte, Inc. */
 
-@import "_style/colors.scss";
-@import "_style/mixins.scss";
+@import "../../_style/colors.scss";
+@import "../../_style/mixins.scss";
 
 .modal-content {
   border-radius: 0px;
@@ -97,6 +97,7 @@
 .form-group {
   label {
     min-height: 14px;
+    font-weight: 500;
   }
 }
 

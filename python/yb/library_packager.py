@@ -1,4 +1,4 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python3
 
 # Copyright (c) YugaByte, Inc.
 #
@@ -37,12 +37,13 @@ import shutil
 import subprocess
 import sys
 
+from functools import total_ordering
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from yb.command_util import run_program, mkdir_p, copy_deep  # nopep8
 from yb.linuxbrew import get_linuxbrew_dir  # nopep8
 from yb.common_util import get_thirdparty_dir, YB_SRC_ROOT, sorted_grouped_by, \
                            safe_path_join  # nopep8
-
 
 # A resolved shared library dependency shown by ldd.
 # Example (split across two lines):
@@ -57,19 +58,19 @@ SYSTEM_LIBRARY_PATHS = ['/usr/lib', '/usr/lib64', '/lib', '/lib64',
                         '/lib/x86_64-linux-gnu']
 
 HOME_DIR = os.path.expanduser('~')
-LINUXBREW_HOME = get_linuxbrew_dir()
-LINUXBREW_CELLAR_GLIBC_DIR = safe_path_join(LINUXBREW_HOME, 'Cellar', 'glibc')
-ADDITIONAL_LIB_NAME_GLOBS = ['libnss_*', 'libresolv*']
-LINUXBREW_LDD_PATH = safe_path_join(LINUXBREW_HOME, 'bin', 'ldd')
+
+
+ADDITIONAL_LIB_NAME_GLOBS = ['libnss_*', 'libresolv*', 'libthread_db*']
 
 YB_SCRIPT_BIN_DIR = os.path.join(YB_SRC_ROOT, 'bin')
 YB_BUILD_SUPPORT_DIR = os.path.join(YB_SRC_ROOT, 'build-support')
 
 PATCHELF_NOT_AN_ELF_EXECUTABLE = 'not an ELF executable'
-PATCHELF_PATH = safe_path_join(LINUXBREW_HOME, 'bin', 'patchelf')
 
 LIBRARY_PATH_RE = re.compile('^(.*[.]so)(?:$|[.].*$)')
 LIBRARY_CATEGORIES = ['system', 'yb', 'yb-thirdparty', 'linuxbrew']
+
+linuxbrew_home = None
 
 
 # This is an alternative to global variables, bundling a few commonly used things.
@@ -80,6 +81,7 @@ DistributionContext = collections.namedtuple(
          'verbose_mode'])
 
 
+@total_ordering
 class Dependency:
     """
     Describes a dependency of an executable or a shared library on another shared library.
@@ -107,7 +109,7 @@ class Dependency:
     def __repr__(self):
         return str(self)
 
-    def __cmp__(self, other):
+    def __lt__(self, other):
         return (self.name, self.target) < (other.name, other.target)
 
     def get_category(self):
@@ -121,7 +123,7 @@ class Dependency:
         if self.category:
             return self.category
 
-        if self.target.startswith(LINUXBREW_HOME + '/'):
+        if linuxbrew_home.path_is_in_linuxbrew_dir(self.target):
             self.category = 'linuxbrew'
         elif self.target.startswith(get_thirdparty_dir() + '/'):
             self.category = 'yb-thirdparty'
@@ -147,14 +149,20 @@ class Dependency:
         raise RuntimeError(
             ("Could not determine the category of this binary "
              "(yugabyte / yb-thirdparty / linuxbrew / system): '{}'. "
-             "Does not reside in the Linuxbrew directory ('{}'), "
+             "Does not reside in the Linuxbrew directory ({}), "
              "YB third-party directory ('{}'), "
              "YB build directory ('{}'), "
              "YB general-purpose script directory ('{}'), "
              "YB build support script directory ('{}'), "
              "and does not appear to be a system library (does not start with any of {})."
-             ).format(self.target, LINUXBREW_HOME, get_thirdparty_dir(), self.context.build_dir,
-                      YB_SCRIPT_BIN_DIR, YB_BUILD_SUPPORT_DIR, SYSTEM_LIBRARY_PATHS))
+             ).format(
+                self.target,
+                linuxbrew_home.get_human_readable_dirs(),
+                get_thirdparty_dir(),
+                self.context.build_dir,
+                YB_SCRIPT_BIN_DIR,
+                YB_BUILD_SUPPORT_DIR,
+                SYSTEM_LIBRARY_PATHS))
 
 
 def add_common_arguments(parser):
@@ -168,7 +176,7 @@ def add_common_arguments(parser):
 
 
 def run_patchelf(*args):
-    patchelf_result = run_program([PATCHELF_PATH] + list(args), error_ok=True)
+    patchelf_result = run_program([linuxbrew_home.patchelf_path] + list(args), error_ok=True)
     if patchelf_result.returncode != 0 and patchelf_result.stderr not in [
             'cannot find section .interp',
             'cannot find section .dynamic',
@@ -235,26 +243,26 @@ class LibraryPackager:
         if SYSTEM_LIBRARY_PATH_RE.match(elf_file_path):
             ldd_path = '/usr/bin/ldd'
         else:
-            ldd_path = LINUXBREW_LDD_PATH
+            ldd_path = linuxbrew_home.ldd_path
 
         ldd_result = run_program([ldd_path, elf_file_path], error_ok=True)
         dependencies = set()
 
+        ldd_result_stdout_str = ldd_result.stdout
         if ldd_result.returncode != 0:
             # Interestingly, the below error message is printed to stdout, not stderr.
-            if ldd_result.stdout == 'not a dynamic executable':
+            if ldd_result_stdout_str == 'not a dynamic executable':
                 logging.debug(
                     "Not a dynamic executable: {}, ignoring dependency tracking".format(
                         elf_file_path))
                 return dependencies
             raise RuntimeError(ldd_result.error_msg)
 
-        for ldd_output_line in ldd_result.stdout.split("\n"):
+        for ldd_output_line in ldd_result_stdout_str.split("\n"):
             resolved_dep_match = RESOLVED_DEP_RE.match(ldd_output_line)
             if resolved_dep_match:
                 lib_name = resolved_dep_match.group(1)
                 lib_resolved_path = os.path.realpath(resolved_dep_match.group(2))
-
                 dependencies.add(Dependency(lib_name, lib_resolved_path, elf_file_path,
                                             self.context))
 
@@ -324,9 +332,9 @@ class LibraryPackager:
 
         # Not using the install_dyn_linked_binary method for copying patchelf and ld.so as we won't
         # need to do any post-processing on these two later.
-        shutil.copy(PATCHELF_PATH, self.main_dest_bin_dir)
+        shutil.copy(linuxbrew_home.patchelf_path, self.main_dest_bin_dir)
 
-        ld_path = os.path.join(LINUXBREW_HOME, 'lib', 'ld.so')
+        ld_path = linuxbrew_home.ld_so_path
         shutil.copy(ld_path, dest_lib_dir)
 
         all_deps = sorted(set(all_deps))
@@ -367,15 +375,17 @@ class LibraryPackager:
         # Add libresolv and libnss_* libraries explicitly because they are loaded by glibc at
         # runtime and will not be discovered automatically using ldd.
         for additional_lib_name_glob in ADDITIONAL_LIB_NAME_GLOBS:
-            for lib_path in glob.glob(os.path.join(LINUXBREW_CELLAR_GLIBC_DIR, '*', 'lib',
+            for lib_path in glob.glob(os.path.join(linuxbrew_home.cellar_glibc_dir, '*', 'lib',
                                                    additional_lib_name_glob)):
                 lib_basename = os.path.basename(lib_path)
                 if lib_basename.endswith('.a'):
                     continue
                 if os.path.isfile(lib_path):
                     self.install_dyn_linked_binary(lib_path, linuxbrew_lib_dest_dir)
+                    logging.info("Installed additional lib: " + lib_path)
                 elif os.path.islink(lib_path):
                     link_target_basename = os.path.basename(os.readlink(lib_path))
+                    logging.info("Installed additional symlink: " + lib_path)
                     symlink(link_target_basename,
                             os.path.join(linuxbrew_lib_dest_dir, lib_basename))
                 else:
@@ -390,11 +400,11 @@ class LibraryPackager:
 
         # Add other files used by glibc at runtime.
         linuxbrew_glibc_real_path = os.path.normpath(
-            os.path.join(os.path.realpath(LINUXBREW_LDD_PATH), '..', '..'))
+            os.path.join(os.path.realpath(linuxbrew_home.ldd_path), '..', '..'))
 
         linuxbrew_glibc_rel_path = os.path.relpath(
-            linuxbrew_glibc_real_path, os.path.realpath(LINUXBREW_HOME))
-        # We expect glibc to live under a path like "Cellar/glibc/2.23" in LINUXBREW_HOME.
+            linuxbrew_glibc_real_path, os.path.realpath(linuxbrew_home.linuxbrew_dir))
+        # We expect glibc to live under a path like "Cellar/glibc/2.23" in the Linuxbrew directory.
         if not linuxbrew_glibc_rel_path.startswith('Cellar/glibc/'):
             raise ValueError(
                 "Expected to find glibc under Cellar/glibc/<version> in Linuxbrew, but found it "
@@ -412,17 +422,18 @@ class LibraryPackager:
         ]:
             rel_paths.append(os.path.join(linuxbrew_glibc_rel_path, glibc_rel_path))
 
-        terminfo_glob_pattern = os.path.join(LINUXBREW_HOME, 'Cellar/ncurses/*/share/terminfo')
+        terminfo_glob_pattern = os.path.join(
+                linuxbrew_home.linuxbrew_dir, 'Cellar/ncurses/*/share/terminfo')
         terminfo_paths = glob.glob(terminfo_glob_pattern)
         if len(terminfo_paths) != 1:
             raise ValueError(
                 "Failed to find the terminfo directory using glob pattern %s. "
                 "Found: %s" % (terminfo_glob_pattern, terminfo_paths))
-        terminfo_rel_path = os.path.relpath(terminfo_paths[0], LINUXBREW_HOME)
+        terminfo_rel_path = os.path.relpath(terminfo_paths[0], linuxbrew_home.linuxbrew_dir)
         rel_paths.append(terminfo_rel_path)
 
         for rel_path in rel_paths:
-            src = os.path.join(LINUXBREW_HOME, rel_path)
+            src = os.path.join(linuxbrew_home.linuxbrew_dir, rel_path)
             dst = os.path.join(linuxbrew_dest_dir, rel_path)
             copy_deep(src, dst, create_dst_dir=True)
 
@@ -431,7 +442,10 @@ class LibraryPackager:
             post_install_script = post_install_script_input.read()
 
         new_post_install_script = post_install_script
-        replacements = [("original_linuxbrew_path_to_patch", LINUXBREW_HOME)]
+        replacements = [
+            ("original_linuxbrew_path_to_patch", linuxbrew_home.linuxbrew_dir),
+            ("original_linuxbrew_path_length", len(linuxbrew_home.linuxbrew_dir)),
+        ]
         for macro_var_name, list_of_binary_names in [
             ("main_elf_names_to_patch", main_elf_names_to_patch),
             ("postgres_elf_names_to_patch", postgres_elf_names_to_patch),
@@ -441,7 +455,13 @@ class LibraryPackager:
 
         for macro_var_name, value in replacements:
             new_post_install_script = new_post_install_script.replace(
-                '${%s}' % macro_var_name, value)
+                '${%s}' % macro_var_name, str(value))
 
         with open(post_install_path, 'w') as post_install_script_output:
             post_install_script_output.write(new_post_install_script)
+
+
+def set_build_root(build_root):
+    global linuxbrew_home
+    from yb import linuxbrew
+    linuxbrew_home = linuxbrew.LinuxbrewHome(build_root)

@@ -1,8 +1,8 @@
 ---
-title: CREATE VIEW
+title: CREATE VIEW statement [YSQL]
+headerTitle: CREATE VIEW
 linkTitle: CREATE VIEW
-summary: Create a new view in a database
-description: CREATE VIEW
+description: Use the CREATE VIEW statement to create a new view in a database. 
 menu:
   latest:
     identifier: api-ysql-commands-create-view
@@ -99,5 +99,4 @@ yugabyte=# SELECT * FROM sample_view;
 
 ## See also
 
-- [`DROP VIEW`](../ddl_drop_view)
 - [`SELECT`](../dml_select)
