@@ -347,7 +347,7 @@ public class ImportController extends AuthenticatedController {
          universe.setUniverseDetails(universeDetails);
       }
     };
-    Universe.saveDetails(universe.universeUUID, updater);
+    Universe.saveDetails(universe.universeUUID, updater, false);
   }
 
   /**
@@ -645,7 +645,8 @@ public class ImportController extends AuthenticatedController {
       }
     };
     // Save the updated universe object and return the updated universe.
-    return Universe.saveDetails(taskParams.universeUUID, updater);
+    // saveUniverseDetails(taskParams.universeUUID);
+    return Universe.saveDetails(taskParams.universeUUID, updater, false);
   }
 
   /**
@@ -841,6 +842,6 @@ public class ImportController extends AuthenticatedController {
         new ThreadPoolExecutor(TASK_THREADS, TASK_THREADS, THREAD_ALIVE_TIME,
                                TimeUnit.SECONDS, new LinkedBlockingQueue<Runnable>(),
                                namedThreadFactory);
-    LOG.debug("Started Import Thread Pool.");
+    LOG.trace("Started Import Thread Pool.");
   }
 }

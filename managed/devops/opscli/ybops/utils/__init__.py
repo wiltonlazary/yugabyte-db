@@ -37,6 +37,7 @@ from enum import Enum
 
 from ybops.common.colors import Colors
 from ybops.common.exceptions import YBOpsRuntimeError
+from ybops.utils.remote_shell import RemoteShell
 
 if sys.version_info[0] == 2:
     from replicated import Replicated
@@ -44,9 +45,9 @@ if sys.version_info[0] == 2:
 BLOCK_SIZE = 4096
 HOME_FOLDER = os.environ["HOME"]
 YB_FOLDER_PATH = os.path.join(HOME_FOLDER, ".yugabyte")
-SSH_RETRY_LIMIT = 60
+SSH_RETRY_LIMIT = 20
 DEFAULT_SSH_PORT = 22
-SSH_TIMEOUT = 16
+SSH_TIMEOUT = 15
 
 RSA_KEY_LENGTH = 2048
 RELEASE_VERSION_FILENAME = "version.txt"
@@ -169,7 +170,7 @@ def init_logging(log_level):
     """
     logging.basicConfig(
         level=log_level,
-        format="%(asctime)s %(levelname)s: %(message)s")
+        format="%(asctime)s %(levelname)s %(funcName)s:%(filename)s:%(lineno)d: %(message)s")
 
 
 def is_devops_root_dir(devops_home):
@@ -427,8 +428,6 @@ def wait_for_ssh(host_ip, ssh_port, ssh_user, ssh_key):
         if can_ssh(host_ip, ssh_port, ssh_user, ssh_key):
             return True
 
-        sys.stdout.write('.')
-        sys.stdout.flush()
         time.sleep(1)
 
         if retry_count > SSH_RETRY_LIMIT:
@@ -574,12 +573,84 @@ def validate_instance(host_name, port, username, ssh_key_file, mount_paths):
         ssh_client.close()
 
 
-def scp_package_to_tmp(package, host, user, port, private_key):
-    dest_path = os.path.join("/tmp", os.path.basename(package))
-    logging.info("Copying package from local '{}' to remote '{}'".format(
-        package, dest_path))
+def validate_cron_status(host_name, port, username, ssh_key_file):
+    """This method tries to ssh to the host with the username provided on the port, checks if
+    our expected cronjobs are present, and returns true if they are. Any failure, including SSH
+    issues will cause it to return false.
+    Args:
+        host_name (str): SSH host IP address
+        port (int): SSH port
+        username (str): SSH username
+        ssh_key_file (str): SSH key file
+    Returns:
+        bool: true if all cronjobs are present, false otherwise (or if errored)
+    """
+    ssh_key = paramiko.RSAKey.from_private_key_file(ssh_key_file)
+    ssh_client = get_ssh_client()
+
+    try:
+        # Try to connect via SSH
+        ssh_client.connect(hostname=host_name,
+                           username=username,
+                           pkey=ssh_key,
+                           port=port,
+                           timeout=SSH_TIMEOUT,
+                           banner_timeout=SSH_TIMEOUT)
+
+        _, stdout, stderr = ssh_client.exec_command("crontab -l")
+        cronjobs = ["clean_cores.sh", "zip_purge_yb_logs.sh", "yb-server-ctl.sh tserver"]
+        stdout = stdout.read()
+        return len(stderr.readlines()) == 0 and all(c in stdout for c in cronjobs)
+    except (paramiko.ssh_exception.NoValidConnectionsError,
+            paramiko.ssh_exception.AuthenticationException,
+            paramiko.ssh_exception.SSHException,
+            socket.timeout, socket.error) as e:
+        logging.error("Failed to validate cronjobs: {}".format(e))
+        return False
+    finally:
+        ssh_client.close()
+
+
+def remote_exec_command(host_name, port, username, ssh_key_file, cmd, timeout=SSH_TIMEOUT):
+    """This method will execute the given cmd on remote host and return the output.
+    Args:
+        host_name (str): SSH host IP address
+        port (int): SSH port
+        username (str): SSH username
+        ssh_key_file (str): SSH key file
+        cmd (str): Command to run
+        timetout (int): Time in seconds to wait before erroring
+    Returns:
+        rc (int): returncode
+        stdout (str): output log
+        stderr (str): error logs
+    """
+    ssh_key = paramiko.RSAKey.from_private_key_file(ssh_key_file)
+    ssh_client = get_ssh_client()
+
+    try:
+        ssh_client.connect(hostname=host_name,
+                           username=username,
+                           pkey=ssh_key,
+                           port=port,
+                           timeout=timeout,
+                           banner_timeout=timeout)
+
+        _, stdout, stderr = ssh_client.exec_command(cmd)
+        return stdout.channel.recv_exit_status(), stdout.readlines(), stderr.readlines()
+    except (paramiko.ssh_exception, socket.timeout, socket.error) as e:
+        logging.error("Failed to execute remote command: {}".format(e))
+        return False
+    finally:
+        ssh_client.close()
+
+
+def scp_to_tmp(filepath, host, user, port, private_key):
+    dest_path = os.path.join("/tmp", os.path.basename(filepath))
+    logging.info("[app] Copying local '{}' to remote '{}'".format(
+        filepath, dest_path))
     scp_cmd = [
-        "scp", "-i", private_key, "-P", str(port),
+        "scp", "-i", private_key, "-P", str(port), "-p",
         "-o", "stricthostkeychecking=no",
         "-o", "ServerAliveInterval=30",
         "-o", "ServerAliveCountMax=20",
@@ -587,7 +658,7 @@ def scp_package_to_tmp(package, host, user, port, private_key):
         "-o", "ControlPersist=600s",
         "-o", "IPQoS=throughput",
         "-vvvv",
-        package, "{}@{}:{}".format(user, host, dest_path)
+        filepath, "{}@{}:{}".format(user, host, dest_path)
     ]
     # Save the debug output to temp files.
     out_fd, out_name = tempfile.mkstemp(text=True)
@@ -606,6 +677,7 @@ def scp_package_to_tmp(package, host, user, port, private_key):
     # Cleanup the temp files now that they are clearly not needed.
     os.remove(out_name)
     os.remove(err_name)
+    return proc.returncode
 
 
 def get_or_create(getter):
@@ -664,3 +736,21 @@ def linux_get_ip_address(ifname):
     """Get the inet ip address of this machine (as shown by ifconfig). Assumes linux env.
     """
     return subprocess.check_output(["hostname", "--ip-address"]).strip()
+
+
+# Given a comma separated string of paths on a remote host
+# and ssh_options to connect to the remote host
+# returns a comma separated string of the root mount paths for those paths
+def get_mount_roots(ssh_options, paths):
+    remote_shell = RemoteShell(ssh_options)
+    remote_cmd = 'df --output=target {}'.format(" ".join(paths.split(",")))
+    # Example output of the df cmd
+    # $ df --output=target /bar/foo/rnd /storage/abc
+    # Mounted on
+    # /bar
+    # /storage
+
+    mount_roots = remote_shell.run_command(remote_cmd).stdout.split('\n')[1:]
+    return ",".join(
+        [mroot.strip() for mroot in mount_roots if mroot.strip()]
+    )

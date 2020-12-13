@@ -13,6 +13,7 @@ package com.yugabyte.yw.commissioner.tasks;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.yugabyte.yw.commissioner.AbstractTaskBase;
 import com.yugabyte.yw.common.ShellProcessHandler;
+import com.yugabyte.yw.common.ShellResponse;
 import com.yugabyte.yw.common.TableManager;
 import com.yugabyte.yw.forms.AbstractTaskParams;
 import com.yugabyte.yw.forms.BackupTableParams;
@@ -45,26 +46,50 @@ public class DeleteBackup extends AbstractTaskBase {
 
   @Override
   public void run() {
+    Backup backup = null;
     try {
-      Backup backup = Backup.get(params().customerUUID, params().backupUUID);
+      backup = Backup.get(params().customerUUID, params().backupUUID);
       if (backup.state != Backup.BackupState.Completed) {
         LOG.error("Cannot delete backup in any other state other than completed.");
         throw new RuntimeException("Backup cannot be deleted");
       }
       backup.transitionState(Backup.BackupState.Deleted);
       BackupTableParams backupParams = Json.fromJson(backup.backupInfo, BackupTableParams.class);
-      backupParams.actionType = BackupTableParams.ActionType.DELETE;
-      ShellProcessHandler.ShellResponse response = tableManager.deleteBackup(backupParams);
-      JsonNode jsonNode = Json.parse(response.message);
-      if (response.code != 0 || jsonNode.has("error")) {
-        LOG.error("Delete Backup failed. Response code={}, hasError={}.",
-                  response.code, jsonNode.has("error"));
-        throw new RuntimeException(response.message);
+      if (backupParams.backupList != null) {
+        for (BackupTableParams childBackupParams : backupParams.backupList) {
+          childBackupParams.actionType = BackupTableParams.ActionType.DELETE;
+          ShellResponse response = tableManager.deleteBackup(childBackupParams);
+          JsonNode jsonNode = Json.parse(response.message);
+          if (response.code != 0 || jsonNode.has("error")) {
+            // Revert state to completed since it couldn't get deleted.
+            backup.transitionState(Backup.BackupState.Completed);
+            LOG.error("Delete Backup failed for {}. Response code={}, hasError={}.",
+                      childBackupParams.storageLocation, response.code, jsonNode.has("error"));
+            throw new RuntimeException(response.message);
+          } else {
+            LOG.info("[" + getName() + "] STDOUT: " + response.message);
+          }
+        }
       } else {
-        LOG.info("[" + getName() + "] STDOUT: " + response.message);
+        backupParams.actionType = BackupTableParams.ActionType.DELETE;
+        ShellResponse response = tableManager.deleteBackup(backupParams);
+        JsonNode jsonNode = Json.parse(response.message);
+        if (response.code != 0 || jsonNode.has("error")) {
+          // Revert state to completed since it couldn't get deleted.
+          backup.transitionState(Backup.BackupState.Completed);
+          LOG.error("Delete Backup failed for {}. Response code={}, hasError={}.",
+                    backupParams.storageLocation, response.code, jsonNode.has("error"));
+          throw new RuntimeException(response.message);
+        } else {
+          LOG.info("[" + getName() + "] STDOUT: " + response.message);
+        }
       }
     } catch (Exception e) {
       LOG.error("Errored out with: " + e);
+      if (backup != null) {
+        // Revert state to completed since it couldn't get deleted.
+        backup.transitionState(Backup.BackupState.Completed);
+      }
       throw new RuntimeException(e);
     }
   }

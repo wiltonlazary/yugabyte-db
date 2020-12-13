@@ -48,6 +48,7 @@
 #include "yb/common/entity_ids.h"
 #include "yb/common/index.h"
 #include "yb/common/partition.h"
+#include "yb/common/transaction.h"
 #include "yb/consensus/consensus.pb.h"
 #include "yb/gutil/macros.h"
 #include "yb/gutil/ref_counted.h"
@@ -62,6 +63,8 @@
 #include "yb/master/ts_descriptor.h"
 #include "yb/master/ts_manager.h"
 #include "yb/master/yql_virtual_table.h"
+#include "yb/master/ysql_transaction_ddl.h"
+#include "yb/rpc/rpc.h"
 #include "yb/server/monitored_task.h"
 #include "yb/tserver/tablet_peer_lookup.h"
 #include "yb/util/cow_object.h"
@@ -172,7 +175,8 @@ class CatalogManager : public tserver::TabletPeerLookupIf {
 
   CHECKED_STATUS Init();
 
-  void Shutdown();
+  bool StartShutdown();
+  void CompleteShutdown();
   CHECKED_STATUS CheckOnline() const;
 
   // Create Postgres sys catalog table.
@@ -232,6 +236,9 @@ class CatalogManager : public tserver::TabletPeerLookupIf {
   // This is called at the end of IsCreateTableDone.
   CHECKED_STATUS IsMetricsSnapshotsTableCreated(IsCreateTableDoneResponsePB* resp);
 
+  // Called when transaction associated with table create finishes. Verifies postgres layer present.
+  CHECKED_STATUS VerifyTablePgLayer(scoped_refptr<TableInfo> table, bool txn_query_succeeded);
+
   // Truncate the specified table.
   //
   // The RPC context is provided for logging/tracing purposes,
@@ -243,6 +250,14 @@ class CatalogManager : public tserver::TabletPeerLookupIf {
   // Get the information about an in-progress truncate operation.
   CHECKED_STATUS IsTruncateTableDone(const IsTruncateTableDoneRequestPB* req,
                                      IsTruncateTableDoneResponsePB* resp);
+
+  // Backfill the specified index.  Currently only supported for YSQL.  YCQL does not need this as
+  // master automatically runs backfill according to the DocDB permissions.
+  CHECKED_STATUS BackfillIndex(
+      const BackfillIndexRequestPB* req,
+      BackfillIndexResponsePB* resp,
+      rpc::RpcContext* rpc);
+
   // Delete the specified table.
   //
   // The RPC context is provided for logging/tracing purposes,
@@ -280,13 +295,16 @@ class CatalogManager : public tserver::TabletPeerLookupIf {
   CHECKED_STATUS GetTableLocations(const GetTableLocationsRequestPB* req,
                                    GetTableLocationsResponsePB* resp);
 
+  // Lookup tablet by ID, then call GetTabletLocations below.
+  CHECKED_STATUS GetTabletLocations(const TabletId& tablet_id, TabletLocationsPB* locs_pb);
+
   // Look up the locations of the given tablet. The locations
   // vector is overwritten (not appended to).
   // If the tablet is not found, returns Status::NotFound.
   // If the tablet is not running, returns Status::ServiceUnavailable.
   // Otherwise, returns Status::OK and puts the result in 'locs_pb'.
   // This only returns tablets which are in RUNNING state.
-  CHECKED_STATUS GetTabletLocations(const TabletId& tablet_id,
+  CHECKED_STATUS GetTabletLocations(scoped_refptr<TabletInfo> tablet_info,
                                     TabletLocationsPB* locs_pb);
 
   // Returns the system tablet in catalog manager by the id.
@@ -414,7 +432,7 @@ class CatalogManager : public tserver::TabletPeerLookupIf {
   // to wait for the cluster to be fully initialized, e.g. minicluster, YugaWare, etc.
   CHECKED_STATUS IsInitDbDone(const IsInitDbDoneRequestPB* req, IsInitDbDoneResponsePB* resp);
 
-  uint64_t GetYsqlCatalogVersion();
+  CHECKED_STATUS GetYsqlCatalogVersion(uint64_t* catalog_version, uint64_t* last_breaking_version);
 
   virtual CHECKED_STATUS FillHeartbeatResponse(const TSHeartbeatRequestPB* req,
                                                TSHeartbeatResponsePB* resp);
@@ -467,7 +485,6 @@ class CatalogManager : public tserver::TabletPeerLookupIf {
 
   // Is the table a system table?
   bool IsSystemTable(const TableInfo& table) const;
-  bool IsSystemTableUnlocked(const TableInfo& table) const REQUIRES_SHARED(lock_);
 
   // Is the table a user created table?
   bool IsUserTable(const TableInfo& table) const;
@@ -479,6 +496,9 @@ class CatalogManager : public tserver::TabletPeerLookupIf {
 
   // Is the table a special sequences system table?
   bool IsSequencesSystemTable(const TableInfo& table) const;
+
+  // Is the table id from a table created for colocated database?
+  bool IsColocatedParentTableId(const TableId& table_id) const;
 
   // Is the table a table created for colocated database?
   bool IsColocatedParentTable(const TableInfo& table) const;
@@ -496,7 +516,19 @@ class CatalogManager : public tserver::TabletPeerLookupIf {
 
   // Let the catalog manager know that we have received a response for a delete tablet request,
   // and that we either deleted the tablet successfully, or we received a fatal error.
-  void NotifyTabletDeleteFinished(const TabletServerId& tserver_uuid, const TableId& table_id);
+  //
+  // Async tasks should call this when they finish. The last such tablet peer notification will
+  // trigger trying to transition the table from DELETING to DELETED state.
+  void NotifyTabletDeleteFinished(
+      const TabletServerId& tserver_uuid, const TableId& table_id, scoped_refptr<TableInfo> table);
+
+  // For a DeleteTable, we first mark tables as DELETING then move them to DELETED once all
+  // outstanding tasks are complete and the TS side tablets are deleted.
+  // For system tables or colocated tables, we just need outstanding tasks to be done.
+  //
+  // If all conditions are met, returns a lock in WRITE mode on this table, else nullptr.
+  std::unique_ptr<TableInfo::lock_type> MaybeTransitionTableToDeleted(
+      scoped_refptr<TableInfo> table);
 
   // Used by ConsensusService to retrieve the TabletPeer for a system
   // table specified by 'tablet_id'.
@@ -653,7 +685,7 @@ class CatalogManager : public tserver::TabletPeerLookupIf {
   std::string GenerateIdUnlocked(boost::optional<const SysRowEntry::Type> entity_type = boost::none)
       REQUIRES_SHARED(lock_);
 
-  ThreadPool* AsyncTaskPool() { return worker_pool_.get(); }
+  ThreadPool* AsyncTaskPool() { return async_task_pool_.get(); }
 
   PermissionsManager* permissions_manager() {
     return permissions_manager_.get();
@@ -680,19 +712,23 @@ class CatalogManager : public tserver::TabletPeerLookupIf {
   CHECKED_STATUS SplitTablet(
       const SplitTabletRequestPB* req, SplitTabletResponsePB* resp, rpc::RpcContext* rpc);
 
+  CHECKED_STATUS DeleteTablet(
+      const DeleteTabletRequestPB* req, DeleteTabletResponsePB* resp, rpc::RpcContext* rpc);
+
   // Test wrapper around protected DoSplitTablet method.
   CHECKED_STATUS TEST_SplitTablet(
       const scoped_refptr<TabletInfo>& source_tablet_info, docdb::DocKeyHash split_hash_code);
 
-  // For now just indirect to running the task.
-  // TODO(bogdan): Eventually schedule on a threadpool in a followup refactor.
+  // Schedule a task to run on the async task thread pool.
   CHECKED_STATUS ScheduleTask(std::shared_ptr<RetryingTSRpcTask> task);
 
   // Time since this peer became master leader. Caller should verify that it is leader before.
   MonoDelta TimeSinceElectedLeader();
 
   Result<std::vector<TableDescription>> CollectTables(
-      const google::protobuf::RepeatedPtrField<TableIdentifierPB>& tables, bool add_indexes);
+      const google::protobuf::RepeatedPtrField<TableIdentifierPB>& tables,
+      bool add_indexes,
+      bool include_parent_colocated_table = false);
 
  protected:
   // TODO Get rid of these friend classes and introduce formal interface.
@@ -787,7 +823,11 @@ class CatalogManager : public tserver::TabletPeerLookupIf {
                                   int64_t term) REQUIRES(lock_);
 
   void ProcessPendingNamespace(NamespaceId id,
-                               std::vector<scoped_refptr<TableInfo>> template_tables);
+                               std::vector<scoped_refptr<TableInfo>> template_tables,
+                               TransactionMetadata txn);
+
+  // Called when transaction associated with NS create finishes. Verifies postgres layer present.
+  CHECKED_STATUS VerifyNamespacePgLayer(scoped_refptr<NamespaceInfo> ns, bool txn_query_succeeded);
 
   CHECKED_STATUS ConsensusStateToTabletLocations(const consensus::ConsensusStatePB& cstate,
                                                  TabletLocationsPB* locs_pb);
@@ -982,7 +1022,7 @@ class CatalogManager : public tserver::TabletPeerLookupIf {
 
   // Starts the background task to send the SplitTablet RPC to the leader for the specified tablet.
   void SendSplitTabletRequest(
-      const scoped_refptr<TabletInfo>& tablet, std::array<TabletId, 2> new_tablet_ids,
+      const scoped_refptr<TabletInfo>& tablet, std::array<TabletId, kNumSplitParts> new_tablet_ids,
       const std::string& split_encoded_key, const std::string& split_partition_key);
 
   // Send the "truncate table request" to all tablets of the specified table.
@@ -1010,9 +1050,19 @@ class CatalogManager : public tserver::TabletPeerLookupIf {
   // Request tablet servers to delete all replicas of the tablet.
   void DeleteTabletReplicas(const TabletInfo* tablet, const std::string& msg);
 
+  // Returns error if and only if it is forbidden to both:
+  // 1) Delete single tablet from table.
+  // 2) Delete the whole table.
+  // This is used for pre-checks in both `DeleteTablet` and `DeleteTabletsAndSendRequests`.
+  CHECKED_STATUS CheckIfForbiddenToDeleteTabletOf(const scoped_refptr<TableInfo>& table);
+
   // Marks each of the tablets in the given table as deleted and triggers requests to the tablet
-  // servers to delete them.  The table parameter is expected to be given "write locked".
+  // servers to delete them. The table parameter is expected to be given "write locked".
   void DeleteTabletsAndSendRequests(const scoped_refptr<TableInfo>& table);
+
+  // Marks tablet as deleted and triggers requests to the tablet servers to delete them.
+  void DeleteTabletAndSendRequests(
+      const scoped_refptr<TabletInfo>& tablet, const std::string& deletion_msg);
 
   // Send the "delete tablet request" to the specified TS/tablet.
   // The specified 'reason' will be logged on the TS.
@@ -1226,7 +1276,10 @@ class CatalogManager : public tserver::TabletPeerLookupIf {
   // NOTE: Presently, this thread pool must contain only a single
   // thread (to correctly serialize invocations of ElectedAsLeaderCb
   // upon closely timed consecutive elections).
-  gscoped_ptr<ThreadPool> worker_pool_;
+  gscoped_ptr<ThreadPool> leader_initialization_pool_;
+
+  // Thread pool to do the async RPC task work.
+  gscoped_ptr<ThreadPool> async_task_pool_;
 
   // This field is updated when a node becomes leader master,
   // waits for all outstanding uncommitted metadata (table and tablet metadata)
@@ -1300,7 +1353,13 @@ class CatalogManager : public tserver::TabletPeerLookupIf {
 
   std::unique_ptr<EncryptionManager> encryption_manager_;
 
+  // Handles querying and processing YSQL DDL Transactions as a catalog manager background task.
+  YsqlTransactionDdl ysql_transaction_;
+
   MonoTime time_elected_leader_;
+
+  void StartElectionIfReady(
+      const consensus::ConsensusStatePB& cstate, TabletInfo* tablet);
 
  private:
   virtual bool CDCStreamExistsUnlocked(const CDCStreamId& id) REQUIRES_SHARED(lock_);

@@ -116,6 +116,7 @@ DECLARE_int32(max_backoff_ms_exponent);
 METRIC_DECLARE_counter(rpcs_queue_overflow);
 
 DEFINE_CAPABILITY(ClientTest, 0x1523c5ae);
+DECLARE_CAPABILITY(TabletReportLimit);
 
 using namespace std::literals; // NOLINT
 using namespace std::placeholders;
@@ -691,7 +692,7 @@ TEST_F(ClientTest, TestGetTabletServerBlacklist) {
   // We have to loop since some replicas may have been created slowly.
   scoped_refptr<internal::RemoteTablet> rt;
   while (true) {
-    rt = ASSERT_RESULT(LookupFirstTabletFuture(table.get()).get());
+    rt = ASSERT_RESULT(LookupFirstTabletFuture(table.table()).get());
     ASSERT_TRUE(rt.get() != nullptr);
     vector<internal::RemoteTabletServer*> tservers;
     rt->GetRemoteTabletServers(&tservers);
@@ -1419,6 +1420,7 @@ TEST_F(ClientTest, TestStaleLocations) {
   }
   ASSERT_OK(cluster_->mini_master()->Restart());
   ASSERT_OK(cluster_->mini_master()->master()->WaitUntilCatalogManagerIsLeaderAndReadyForTests());
+  locs_pb.Clear();
   ASSERT_OK(cluster_->mini_master()->master()->catalog_manager()->GetTabletLocations(
                   tablet_id, &locs_pb));
   ASSERT_TRUE(locs_pb.stale());
@@ -1428,6 +1430,7 @@ TEST_F(ClientTest, TestStaleLocations) {
     ASSERT_OK(cluster_->mini_tablet_server(i)->Start());
   }
   ASSERT_OK(cluster_->WaitForTabletServerCount(cluster_->num_tablet_servers()));
+  locs_pb.Clear();
   ASSERT_OK(cluster_->mini_master()->master()->catalog_manager()->GetTabletLocations(
                   tablet_id, &locs_pb));
 
@@ -1435,6 +1438,7 @@ TEST_F(ClientTest, TestStaleLocations) {
   // so spin until we get a non-stale location.
   int wait_time = 1000;
   for (int i = 0; i < 80; ++i) {
+    locs_pb.Clear();
     ASSERT_OK(cluster_->mini_master()->master()->catalog_manager()->GetTabletLocations(
                     tablet_id, &locs_pb));
     if (!locs_pb.stale()) {
@@ -1488,7 +1492,7 @@ TEST_F(ClientTest, TestReplicatedMultiTabletTableFailover) {
   ASSERT_NO_FATALS(InsertTestRows(table, kNumRowsToWrite));
 
   // Find the leader of the first tablet.
-  auto remote_tablet = ASSERT_RESULT(LookupFirstTabletFuture(table.get()).get());
+  auto remote_tablet = ASSERT_RESULT(LookupFirstTabletFuture(table.table()).get());
   internal::RemoteTabletServer *remote_tablet_server = remote_tablet->LeaderTServer();
 
   // Kill the leader of the first tablet.
@@ -1537,7 +1541,7 @@ TEST_F(ClientTest, TestReplicatedTabletWritesAndAltersWithLeaderElection) {
   SleepFor(MonoDelta::FromMilliseconds(1500));
 
   // Find the leader replica
-  auto remote_tablet = ASSERT_RESULT(LookupFirstTabletFuture(table.get()).get());
+  auto remote_tablet = ASSERT_RESULT(LookupFirstTabletFuture(table.table()).get());
   internal::RemoteTabletServer *remote_tablet_server;
   set<string> blacklist;
   vector<internal::RemoteTabletServer*> candidates;
@@ -2069,7 +2073,7 @@ TEST_F(ClientTest, TestReadFromFollower) {
 TEST_F(ClientTest, Capability) {
   constexpr CapabilityId kFakeCapability = 0x9c40e9a7;
 
-  auto rt = ASSERT_RESULT(LookupFirstTabletFuture(client_table_.get()).get());
+  auto rt = ASSERT_RESULT(LookupFirstTabletFuture(client_table_.table()).get());
   ASSERT_TRUE(rt.get() != nullptr);
   auto tservers = rt->GetRemoteTabletServers();
   ASSERT_EQ(tservers.size(), 3);
@@ -2080,6 +2084,10 @@ TEST_F(ClientTest, Capability) {
 
     // Check that fake capability is not reported.
     ASSERT_FALSE(replica->HasCapability(kFakeCapability));
+
+    // This capability is defined on the TServer, passed to the Master on registration,
+    // then propagated to the YBClient.  Ensure that this runtime pipeline holds.
+    ASSERT_TRUE(replica->HasCapability(CAPABILITY_TabletReportLimit));
   }
 }
 
@@ -2229,6 +2237,7 @@ TEST_F(ClientTest, GetNamespaceInfo) {
                                      kPgsqlKeyspaceID,
                                      "" /* source_namespace_id */,
                                      boost::none /* next_pg_oid */,
+                                     boost::none /* txn */,
                                      true /* colocated */));
 
   // CQL non-colocated.

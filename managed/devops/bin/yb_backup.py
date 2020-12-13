@@ -30,15 +30,19 @@ import re
 
 TABLET_UUID_LEN = 32
 UUID_RE_STR = '[0-9a-f-]{32,36}'
+COLOCATED_UUID_SUFFIX = '.colocated.parent.uuid'
+COLOCATED_NAME_SUFFIX = '.colocated.parent.tablename'
+COLOCATED_UUID_RE_STR = UUID_RE_STR + COLOCATED_UUID_SUFFIX
 UUID_ONLY_RE = re.compile('^' + UUID_RE_STR + '$')
 NEW_OLD_UUID_RE = re.compile(UUID_RE_STR + '[ ]*\t' + UUID_RE_STR)
+COLOCATED_NEW_OLD_UUID_RE = re.compile(COLOCATED_UUID_RE_STR + '[ ]*\t' + COLOCATED_UUID_RE_STR)
 LEADING_UUID_RE = re.compile('^(' + UUID_RE_STR + r')\b')
 FS_DATA_DIRS_ARG_NAME = '--fs_data_dirs'
 FS_DATA_DIRS_ARG_PREFIX = FS_DATA_DIRS_ARG_NAME + '='
 RPC_BIND_ADDRESSES_ARG_NAME = '--rpc_bind_addresses'
 RPC_BIND_ADDRESSES_ARG_PREFIX = RPC_BIND_ADDRESSES_ARG_NAME + '='
 
-IMPORTED_TABLE_RE = re.compile('Table being imported: ([^\.]*)\.(.*)')
+IMPORTED_TABLE_RE = re.compile(r'(?:Colocated t|T)able being imported: ([^\.]*)\.(.*)')
 RESTORATION_RE = re.compile('^Restoration id: (' + UUID_RE_STR + r')\b')
 
 SNAPSHOT_KEYSPACE_RE = re.compile("^[ \t]*Keyspace:.* name='(.*)' type")
@@ -83,6 +87,11 @@ DEFAULT_YB_USER = 'yugabyte'
 
 class BackupException(Exception):
     """A YugaByte backup exception."""
+    pass
+
+
+class CompatibilityException(BackupException):
+    """Exception which can be ignored for compatibility."""
     pass
 
 
@@ -306,6 +315,21 @@ def keyspace_type(keyspace):
     return 'ysql' if ('.' in keyspace) and (keyspace.split('.')[0].lower() == 'ysql') else 'ycql'
 
 
+def is_parent_colocated_table_name(table_name):
+    return table_name.endswith(COLOCATED_NAME_SUFFIX)
+
+
+def get_postgres_oid_from_table_id(table_id):
+    return table_id[-4:]
+
+
+def verify_colocated_table_ids(old_id, new_id):
+    # Assert that the postgres oids are the same.
+    if (get_postgres_oid_from_table_id(old_id) != get_postgres_oid_from_table_id(new_id)):
+        raise BackupException('Colocated tables have different oids: Old oid: {}, New oid: {}'
+                              .format(old_id, new_id))
+
+
 def keyspace_name(keyspace):
     return keyspace.split('.')[1] if ('.' in keyspace) else keyspace
 
@@ -455,7 +479,7 @@ class NfsBackupStorage(AbstractBackupStorage):
     # This is a single string because that's what we need for doing `mkdir && rsync`.
     def upload_file_cmd(self, src, dest):
         return ["mkdir -p {} && {} {} {}".format(
-            os.path.dirname(dest), " ".join(self._command_list_prefix()),
+            pipes.quote(os.path.dirname(dest)), " ".join(self._command_list_prefix()),
             pipes.quote(src), pipes.quote(dest))]
 
     def download_file_cmd(self, src, dest):
@@ -465,7 +489,7 @@ class NfsBackupStorage(AbstractBackupStorage):
     # `mkdir && rsync` and b) we need a list of 1 element, as it goes through a tuple().
     def upload_dir_cmd(self, src, dest):
         return ["mkdir -p {} && {} {} {}".format(
-            dest, " ".join(self._command_list_prefix()),
+            pipes.quote(dest), " ".join(self._command_list_prefix()),
             pipes.quote(src), pipes.quote(dest))]
 
     def download_dir_cmd(self, src, dest):
@@ -974,10 +998,13 @@ class YBBackup:
             raise BackupException('Timed out waiting for snapshot!')
 
         if update_table_list:
-            if len(snapshot_keyspaces) != len(snapshot_tables) or len(snapshot_tables) == 0:
+            if len(snapshot_tables) == 0:
+                raise CompatibilityException("Created snapshot does not have tables.")
+
+            if len(snapshot_keyspaces) != len(snapshot_tables):
                 raise BackupException(
-                    "In the snapshot found {} keyspaces and {} tables. The numbers must be equal "
-                    "and more than zero.".format(len(snapshot_keyspaces), len(snapshot_tables)))
+                    "In the snapshot found {} keyspaces and {} tables. The numbers must be equal.".
+                    format(len(snapshot_keyspaces), len(snapshot_tables)))
 
             self.args.keyspace = snapshot_keyspaces
             self.args.table = snapshot_tables
@@ -993,6 +1020,9 @@ class YBBackup:
         tablet_leaders = []
 
         for i in range(0, len(self.args.table)):
+            # Don't call list_tablets on a parent colocated table.
+            if is_parent_colocated_table_name(self.args.table[i]):
+                continue
             output = self.run_yb_admin(
                 ['list_tablets', self.args.keyspace[i], self.args.table[i], '0'])
             for line in output.splitlines():
@@ -1178,7 +1208,7 @@ class YBBackup:
                 if ip == tserver_ip:
                     logging.info("Found data directories on server {}: {}".format(ip, fs_data_dirs))
                     return fs_data_dirs
-        raise BackupException("Unable find data directories on server {}".format(tserver_ip))
+        raise BackupException("Unable to find data directories on server {}".format(tserver_ip))
 
     def generate_snapshot_dirs(self, data_dir_by_tserver, snapshot_id,
                                tablets_by_tserver_ip, table_ids):
@@ -1672,7 +1702,21 @@ class YBBackup:
             if not self.args.snapshot_id:
                 snapshot_id = self.create_snapshot()
                 logging.info("Snapshot started with id: %s" % snapshot_id)
-                self.wait_for_snapshot(snapshot_id, 'creating', CREATE_SNAPSHOT_TIMEOUT_SEC, True)
+                # TODO: Remove the following try-catch for compatibility to un-relax the code, after
+                #       we ensure nobody uses versions < v2.1.4 (after all move to >= v2.1.8).
+                try:
+                    # With 'update_table_list=True' it runs: 'yb-admin list_snapshots SHOW_DETAILS'
+                    # to get updated list of backed up namespaces and tables. Note that the last
+                    # argument 'SHOW_DETAILS' is not supported in old YB versions (< v2.1.4).
+                    self.wait_for_snapshot(snapshot_id, 'creating', CREATE_SNAPSHOT_TIMEOUT_SEC,
+                                           update_table_list=True)
+                except CompatibilityException as ex:
+                    logging.info("Ignoring the exception in the compatibility mode: {}".format(ex))
+                    # In the compatibility mode repeat the command in old style
+                    # (without the new command line argument 'SHOW_DETAILS').
+                    # With 'update_table_list=False' it runs: 'yb-admin list_snapshots'.
+                    self.wait_for_snapshot(snapshot_id, 'creating', CREATE_SNAPSHOT_TIMEOUT_SEC,
+                                           update_table_list=False)
 
                 if not self.args.no_snapshot_deleting:
                     logging.info("Snapshot %s will be deleted at exit...", snapshot_id)
@@ -1886,14 +1930,14 @@ class YBBackup:
         snapshot_metadata['table'] = {}
         snapshot_metadata['tablet'] = {}
         snapshot_metadata['snapshot_id'] = {}
-        for line in output.splitlines():
+        for idx, line in enumerate(output.splitlines()):
             table_match = IMPORTED_TABLE_RE.search(line)
             if table_match:
                 snapshot_metadata['keyspace_name'].append(table_match.group(1))
                 snapshot_metadata['table_name'].append(table_match.group(2))
                 logging.info('Imported table: {}.{}'.format(table_match.group(1),
                                                             table_match.group(2)))
-            if NEW_OLD_UUID_RE.search(line):
+            elif NEW_OLD_UUID_RE.search(line):
                 (entity, old_id, new_id) = split_by_tab(line)
                 if entity == 'Table':
                     snapshot_metadata['table'][new_id] = old_id
@@ -1904,6 +1948,19 @@ class YBBackup:
                 elif entity == 'Snapshot':
                     snapshot_metadata['snapshot_id']['old'] = old_id
                     snapshot_metadata['snapshot_id']['new'] = new_id
+            elif COLOCATED_NEW_OLD_UUID_RE.search(line):
+                (entity, old_id, new_id) = split_by_tab(line)
+                if entity == 'ParentColocatedTable':
+                    verify_colocated_table_ids(old_id, new_id)
+                    snapshot_metadata['table'][new_id] = old_id
+                    logging.info('Imported colocated table id was changed from {} to {}'
+                                 .format(old_id, new_id))
+                elif entity == 'ColocatedTable':
+                    # A colocated table's tablets are kept under its corresponding parent colocated
+                    # table, so we just need to verify the table ids now.
+                    verify_colocated_table_ids(old_id, new_id)
+                    logging.info('Imported colocated table id was changed from {} to {}'
+                                 .format(old_id, new_id))
 
         return snapshot_metadata
 

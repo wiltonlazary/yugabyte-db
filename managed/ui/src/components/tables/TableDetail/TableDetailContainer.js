@@ -2,18 +2,32 @@
 
 import { connect } from 'react-redux';
 import { TableDetail } from '..';
-import { fetchTableDetail, fetchTableDetailFailure, fetchTableDetailSuccess, resetTableDetail }
-  from '../../../actions/tables';
-import { fetchUniverseInfo, fetchUniverseInfoResponse, resetUniverseInfo }
-  from '../../../actions/universe';
+import {
+  fetchTableDetail,
+  fetchTableDetailFailure,
+  fetchTableDetailSuccess,
+  resetTableDetail
+} from '../../../actions/tables';
+import {
+  fetchUniverseInfo,
+  fetchUniverseInfoResponse,
+  resetUniverseInfo,
+  fetchUniversePendingTasks,
+  fetchUniversePendingTasksResponse
+} from '../../../actions/universe';
 
 const mapDispatchToProps = (dispatch) => {
   return {
     fetchUniverseDetail: (universeUUID) => {
-      dispatch(fetchUniverseInfo(universeUUID))
-        .then((response) => {
-          dispatch(fetchUniverseInfoResponse(response.payload));
-        });
+      dispatch(fetchUniverseInfo(universeUUID)).then((response) => {
+        dispatch(fetchUniverseInfoResponse(response.payload));
+      });
+    },
+
+    fetchCurrentUniversePendingTasks: (universeUUID) => {
+      dispatch(fetchUniversePendingTasks(universeUUID)).then((response) => {
+        dispatch(fetchUniversePendingTasksResponse(response.payload));
+      });
     },
 
     fetchTableDetail: (universeUUID, tableUUID) => {
@@ -26,7 +40,7 @@ const mapDispatchToProps = (dispatch) => {
       });
     },
 
-    resetTableDetail:() => {
+    resetTableDetail: () => {
       dispatch(resetTableDetail());
     },
 
@@ -40,7 +54,8 @@ function mapStateToProps(state) {
   return {
     customer: state.customer,
     universe: state.universe,
-    tables: state.tables
+    tables: state.tables,
+    universesPendingTasks: state.universesPendingTasks
   };
 }
 

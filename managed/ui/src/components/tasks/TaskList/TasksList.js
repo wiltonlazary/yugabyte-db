@@ -5,26 +5,27 @@ import { TaskListTable } from '../../tasks';
 import { showOrRedirect } from '../../../utils/LayoutUtils';
 
 export default class TasksList extends Component {
-
   componentDidMount() {
-    this.props.fetchCustomerTasks();
+    this.props.fetchCustomerTasks(1, 10);
   }
 
   render() {
     const {
-      tasks: { customerTaskList },
-      customer: { currentCustomer, INSECURE_apiToken }
+      tasks: { customerTaskList, taskPagination },
+      customer: { currentCustomer, INSECURE_apiToken },
+      fetchCustomerTasks
     } = this.props;
-    showOrRedirect(currentCustomer.data.features, "menu.tasks");
+    showOrRedirect(currentCustomer.data.features, 'menu.tasks');
     const errorPlatformMessage = (
-      <div className="oss-unavailable-warning">
-        Only available on Yugabyte Platform.
-      </div>
+      <div className="oss-unavailable-warning">Only available on Yugabyte Platform.</div>
     );
 
     return (
-      <TaskListTable taskList={customerTaskList || []}
+      <TaskListTable
+        taskList={customerTaskList || []}
         overrideContent={INSECURE_apiToken && errorPlatformMessage}
+        queryCustomerTasks={fetchCustomerTasks}
+        pagination={taskPagination}
       />
     );
   }

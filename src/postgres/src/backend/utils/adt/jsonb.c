@@ -24,8 +24,8 @@
 #include "utils/datetime.h"
 #include "utils/lsyscache.h"
 #include "utils/json.h"
-#include "utils/jsonapi.h"
 #include "utils/jsonb.h"
+#include "utils/jsonfuncs.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 
@@ -206,6 +206,24 @@ JsonbTypeName(JsonbValue *jbv)
 			return "boolean";
 		case jbvNull:
 			return "null";
+		case jbvDatetime:
+			switch (jbv->val.datetime.typid)
+			{
+				case DATEOID:
+					return "date";
+				case TIMEOID:
+					return "time without time zone";
+				case TIMETZOID:
+					return "time with time zone";
+				case TIMESTAMPOID:
+					return "timestamp without time zone";
+				case TIMESTAMPTZOID:
+					return "timestamp with time zone";
+				default:
+					elog(ERROR, "unrecognized jsonb value datetime type: %d",
+						 jbv->val.datetime.typid);
+			}
+			return "unknown";
 		default:
 			elog(ERROR, "unrecognized jsonb value type: %d", jbv->type);
 			return "unknown";
@@ -254,7 +272,7 @@ jsonb_from_cstring(char *json, int len)
 	sem.scalar = jsonb_in_scalar;
 	sem.object_field_start = jsonb_in_object_field_start;
 
-	pg_parse_json(lex, &sem);
+	pg_parse_json_or_ereport(lex, &sem);
 
 	/* after parsing, the item member has the composed jsonb structure */
 	PG_RETURN_POINTER(JsonbValueToJsonb(state.res));
@@ -805,17 +823,20 @@ datum_to_jsonb(Datum val, bool is_null, JsonbInState *result,
 				break;
 			case JSONBTYPE_DATE:
 				jb.type = jbvString;
-				jb.val.string.val = JsonEncodeDateTime(NULL, val, DATEOID);
+				jb.val.string.val = JsonEncodeDateTime(NULL, val,
+													   DATEOID, NULL);
 				jb.val.string.len = strlen(jb.val.string.val);
 				break;
 			case JSONBTYPE_TIMESTAMP:
 				jb.type = jbvString;
-				jb.val.string.val = JsonEncodeDateTime(NULL, val, TIMESTAMPOID);
+				jb.val.string.val = JsonEncodeDateTime(NULL, val,
+													   TIMESTAMPOID, NULL);
 				jb.val.string.len = strlen(jb.val.string.val);
 				break;
 			case JSONBTYPE_TIMESTAMPTZ:
 				jb.type = jbvString;
-				jb.val.string.val = JsonEncodeDateTime(NULL, val, TIMESTAMPTZOID);
+				jb.val.string.val = JsonEncodeDateTime(NULL, val,
+													   TIMESTAMPTZOID, NULL);
 				jb.val.string.len = strlen(jb.val.string.val);
 				break;
 			case JSONBTYPE_JSONCAST:
@@ -839,7 +860,7 @@ datum_to_jsonb(Datum val, bool is_null, JsonbInState *result,
 					sem.scalar = jsonb_in_scalar;
 					sem.object_field_start = jsonb_in_object_field_start;
 
-					pg_parse_json(lex, &sem);
+					pg_parse_json_or_ereport(lex, &sem);
 
 				}
 				break;

@@ -20,7 +20,7 @@ export default class TableDetail extends Component {
   constructor(props) {
     super(props);
     this.state = {
-      dimensions: {},
+      dimensions: {}
     };
   }
   static propTypes = {
@@ -29,10 +29,16 @@ export default class TableDetail extends Component {
   };
 
   componentDidMount() {
-    const universeUUID = this.props.universeUUID;
-    const tableUUID = this.props.tableUUID;
-    this.props.fetchUniverseDetail(universeUUID);
-    this.props.fetchTableDetail(universeUUID, tableUUID);
+    const {
+      fetchUniverseDetail,
+      fetchCurrentUniversePendingTasks,
+      fetchTableDetail,
+      universeUUID,
+      tableUUID
+    } = this.props;
+    fetchUniverseDetail(universeUUID);
+    fetchCurrentUniversePendingTasks(universeUUID);
+    fetchTableDetail(universeUUID, tableUUID);
   }
 
   componentWillUnmount() {
@@ -41,15 +47,16 @@ export default class TableDetail extends Component {
   }
 
   onResize(dimensions) {
-    this.setState({dimensions});
+    this.setState({ dimensions });
   }
 
   render() {
-    let tableInfoContent = <span/>;
+    let tableInfoContent = <span />;
     const {
       customer,
       universe: { currentUniverse },
-      tables: { currentTableDetail }
+      tables: { currentTableDetail },
+      universesPendingTasks
     } = this.props;
     const width = this.state.dimensions.width;
     if (getPromiseState(currentUniverse).isSuccess()) {
@@ -57,7 +64,7 @@ export default class TableDetail extends Component {
       if (isNonEmptyObject(primaryCluster)) {
         tableInfoContent = (
           <div>
-            <Row className={"table-detail-row"}>
+            <Row className={'table-detail-row'}>
               <Col lg={4}>
                 <TableInfoPanel tableInfo={currentTableDetail} />
               </Col>
@@ -65,7 +72,7 @@ export default class TableDetail extends Component {
             </Row>
             <Row>
               <Col lg={12}>
-                <RegionMap regions={primaryCluster.regions} type={"Table"} />
+                <RegionMap regions={primaryCluster.regions} type={'Table'} />
                 <YBMapLegend title="Placement Policy" regions={primaryCluster.regions} />
               </Col>
             </Row>
@@ -73,72 +80,110 @@ export default class TableDetail extends Component {
         );
       }
     }
-    let tableSchemaContent = <span/>;
+    let tableSchemaContent = <span />;
     if (isValidObject(currentTableDetail)) {
-      tableSchemaContent = <TableSchema tableInfo={currentTableDetail}/>;
+      tableSchemaContent = <TableSchema tableInfo={currentTableDetail} />;
     }
-    let tableMetricsContent = <span/>;
-    if (isNonEmptyObject(currentUniverse) && isNonEmptyObject(currentUniverse.data) && isNonEmptyObject(currentTableDetail)) {
+    let tableMetricsContent = <span />;
+    if (
+      isNonEmptyObject(currentUniverse) &&
+      isNonEmptyObject(currentUniverse.data) &&
+      isNonEmptyObject(currentTableDetail)
+    ) {
       const nodePrefixes = [currentUniverse.data.universeDetails.nodePrefix];
       const tableName = currentTableDetail.tableDetails.tableName;
-      tableMetricsContent =
-        (<CustomerMetricsPanel origin={"table"}
+      tableMetricsContent = (
+        <CustomerMetricsPanel
+          origin={'table'}
           width={width}
           customer={customer}
           tableName={tableName}
-          nodePrefixes={nodePrefixes} />);
+          nodePrefixes={nodePrefixes}
+        />
+      );
     }
     const tabElements = [
-      <Tab eventKey={"overview"} title="Overview" key="overview-tab" mountOnEnter={true} unmountOnExit={true}>
+      <Tab
+        eventKey={'overview'}
+        title="Overview"
+        key="overview-tab"
+        mountOnEnter={true}
+        unmountOnExit={true}
+      >
         {tableInfoContent}
       </Tab>,
-      <Tab eventKey={"schema"} title="Schema" key="tables-tab" mountOnEnter={true} unmountOnExit={true}>
+      <Tab
+        eventKey={'schema'}
+        title="Schema"
+        key="tables-tab"
+        mountOnEnter={true}
+        unmountOnExit={true}
+      >
         {tableSchemaContent}
       </Tab>,
-      <Tab eventKey={"metrics"} title="Metrics" key="metrics-tab" mountOnEnter={true} unmountOnExit={true}>
+      <Tab
+        eventKey={'metrics'}
+        title="Metrics"
+        key="metrics-tab"
+        mountOnEnter={true}
+        unmountOnExit={true}
+      >
         {tableMetricsContent}
       </Tab>
     ];
-    let tableName = "";
+    let tableName = '';
     if (isValidObject(currentTableDetail.tableDetails)) {
-      tableName = <Fragment>{currentTableDetail.tableDetails.keyspace}<strong>.</strong><em>{currentTableDetail.tableDetails.tableName}</em></Fragment>;
+      tableName = (
+        <Fragment>
+          {currentTableDetail.tableDetails.keyspace}
+          <strong>.</strong>
+          <em>{currentTableDetail.tableDetails.tableName}</em>
+        </Fragment>
+      );
     }
 
-    let universeState = <span/>;
-    if (isNonEmptyObject(currentUniverse.data) && isNonEmptyObject(currentTableDetail.tableDetails)) {
+    let universeState = <span />;
+    if (
+      isNonEmptyObject(currentUniverse.data) &&
+      isNonEmptyObject(currentTableDetail.tableDetails)
+    ) {
+      const universeUUID = currentUniverse.data.universeUUID;
+      const pendingTasks = universeUUID in universesPendingTasks.data ?
+        universesPendingTasks.data[universeUUID] :
+        [];
       universeState = (
         <Col lg={10} sm={8} xs={6}>
           {/* UNIVERSE NAME */}
           <div className="universe-detail-status-container">
             <h2>
-              <Link to={`/universes/${currentUniverse.data.universeUUID}`}>
-                {currentUniverse.data.name}
-              </Link>
+              <Link to={`/universes/${universeUUID}`}>{currentUniverse.data.name}</Link>
               <span>
                 <i className="fa fa-chevron-right"></i>
-                <Link to={`/universes/${currentUniverse.data.universeUUID}/tables`}>
-                  Tables
-                </Link>
+                <Link to={`/universes/${universeUUID}/tables`}>Tables</Link>
                 <i className="fa fa-chevron-right"></i>
-                { tableName }
+                {tableName}
               </span>
             </h2>
-            <UniverseStatusContainer currentUniverse={currentUniverse.data} showLabelText={true} refreshUniverseData={this.getUniverseInfo}/>
+            <UniverseStatusContainer
+              currentUniverse={currentUniverse.data}
+              showLabelText={true}
+              pendingTasks={pendingTasks}
+              refreshUniverseData={this.getUniverseInfo}
+            />
           </div>
-        </Col>);
+        </Col>
+      );
     }
 
     return (
       <div className="dashboard-container">
         <Grid id="page-wrapper" fluid={true}>
-          <Row className="header-row">
-            {universeState}
-          </Row>
+          <Row className="header-row">{universeState}</Row>
           <Row>
             <Col lg={12}>
               <Measure onMeasure={this.onResize.bind(this)}>
-                <YBTabsPanel defaultTab={"schema"} id={"tables-tab-panel"}>
-                  { tabElements }
+                <YBTabsPanel defaultTab={'schema'} id={'tables-tab-panel'}>
+                  {tabElements}
                 </YBTabsPanel>
               </Measure>
             </Col>

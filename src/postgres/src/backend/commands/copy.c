@@ -31,6 +31,7 @@
 #include "commands/trigger.h"
 #include "executor/execPartition.h"
 #include "executor/executor.h"
+#include "executor/tuptable.h"
 #include "foreign/fdwapi.h"
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
@@ -2391,8 +2392,6 @@ CopyFrom(CopyState cstate)
 	int			prev_leaf_part_index = -1;
 	bool		useNonTxnInsert;
 	bool		isBatchTxnCopy = cstate->batch_size > 0;
-	bool		shouldResetMemoryPerRow = IsYBRelation(cstate->rel) && cstate->filename != NULL;
-	MemoryContext row_context;
 
 #define MAX_BUFFERED_TUPLES 1000
 	HeapTuple  *bufferedTuples = NULL;	/* initialize to silence warning */
@@ -2711,20 +2710,6 @@ CopyFrom(CopyState cstate)
 				 errhint("Non-transactional COPY is not supported on relations with "
 						 "secondary indices or triggers.")));
 
-	/*
-	 * For YBRelations copied from stdin, require
-	 * all rows to be held in memory before being inserted into relation.
-	 * Thus, memory context will not be reset per row for stdin query types.
-	 */
-	if (shouldResetMemoryPerRow)
-	{
-		row_context =
-			AllocSetContextCreate(GetCurrentMemoryContext(),
-								  "COPY FROM ROW CONTEXT",
-								  ALLOCSET_DEFAULT_SIZES);
-		oldcontext = MemoryContextSwitchTo(row_context);
-	}
-
 	bool has_more_tuples = true;
 	while (has_more_tuples)
 	{
@@ -2736,13 +2721,16 @@ CopyFrom(CopyState cstate)
 		 */
 		for (int i = 0; cstate->batch_size == 0 || i < cstate->batch_size; i++)
 		{
+			if (IsYBRelation(cstate->rel))
+				MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
+
 			TupleTableSlot *slot;
 			bool		skip_tuple;
 			Oid			loaded_oid = InvalidOid;
 
 			CHECK_FOR_INTERRUPTS();
 
-			if (nBufferedTuples == 0)
+			if (!IsYBRelation(cstate->rel) && nBufferedTuples == 0)
 			{
 				/*
 				 * Reset the per-tuple exprcontext. We can only do this if the
@@ -2753,7 +2741,7 @@ CopyFrom(CopyState cstate)
 			}
 
 			/* Switch into its memory context */
-			if (!shouldResetMemoryPerRow)
+			if (!IsYBRelation(cstate->rel))
 				MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
 
 			has_more_tuples = NextCopyFrom(cstate, econtext, values, nulls, &loaded_oid);
@@ -2773,17 +2761,18 @@ CopyFrom(CopyState cstate)
 			tuple->t_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
 
 			/* Triggers and stuff need to be invoked in query context. */
-			if (!shouldResetMemoryPerRow)
+			if (!IsYBRelation(cstate->rel))
 				MemoryContextSwitchTo(oldcontext);
 
 			/* Place tuple in tuple slot --- but slot shouldn't free it */
 			slot = myslot;
-			ExecStoreTuple(tuple, slot, InvalidBuffer, false);
+			ExecStoreHeapTuple(tuple, slot, false);
 
 			/* Determine the partition to heap_insert the tuple into */
 			if (cstate->partition_tuple_routing)
 			{
 				int			leaf_part_index;
+				TupleConversionMap *map;
 				PartitionTupleRouting *proute = cstate->partition_tuple_routing;
 
 				/*
@@ -2866,10 +2855,32 @@ CopyFrom(CopyState cstate)
 				 * We might need to convert from the parent rowtype to the
 				 * partition rowtype.
 				 */
-				tuple = ConvertPartitionTupleSlot(proute->parent_child_tupconv_maps[leaf_part_index],
-												  tuple,
-												  proute->partition_tuple_slot,
-												  &slot);
+           map = proute->parent_child_tupconv_maps[leaf_part_index];
+           if (map != NULL)
+           {
+               TupleTableSlot *new_slot;
+               MemoryContext oldcontext;
+
+               Assert(proute->partition_tuple_slots != NULL &&
+                      proute->partition_tuple_slots[leaf_part_index] != NULL);
+               new_slot = proute->partition_tuple_slots[leaf_part_index];
+               slot = execute_attr_map_slot(map->attrMap, slot, new_slot);
+
+               /*
+                * Get the tuple in the per-tuple context, so that it will be
+                * freed after each batch insert.
+                */
+               oldcontext = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
+               tuple = ExecCopySlotTuple(slot);
+               MemoryContextSwitchTo(oldcontext);
+           }
+				/*
+				 * Tuple memory will be allocated to per row memory context
+				 * which will be cleaned up after every row gets processed.
+				 * Thus there is no need to clean the tuple memory.
+				 */
+				if (IsYBRelation(cstate->rel))
+					slot->tts_shouldFree = false;
 
 				tuple->t_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
 			}
@@ -3019,10 +3030,8 @@ CopyFrom(CopyState cstate)
 			/*
 			 * Free context per row.
 			 */
-			if (shouldResetMemoryPerRow)
-			{
-				MemoryContextReset(row_context);
-			}
+			if (IsYBRelation(cstate->rel))
+				ResetPerTupleExprContext(estate);
 		}
 		/*
 		 * Commit transaction per batch.
@@ -3049,14 +3058,6 @@ CopyFrom(CopyState cstate)
 	FreeBulkInsertState(bistate);
 
 	MemoryContextSwitchTo(oldcontext);
-	/*
-	 * Delete all context allocated in local context
-	 * including itself and its descendents.
-	 */
-	if (shouldResetMemoryPerRow)
-	{
-		MemoryContextDelete(row_context);
-	}
 
 	/*
 	 * In the old protocol, tell pqcomm that we can process normal protocol
@@ -3150,7 +3151,7 @@ CopyFromInsertBatch(CopyState cstate, EState *estate, CommandId mycid,
 			List	   *recheckIndexes;
 
 			cstate->cur_lineno = firstBufferedLineNo + i;
-			ExecStoreTuple(bufferedTuples[i], myslot, InvalidBuffer, false);
+			ExecStoreHeapTuple(bufferedTuples[i], myslot, false);
 			recheckIndexes =
 				ExecInsertIndexTuples(myslot, bufferedTuples[i],
 									  estate, false, NULL, NIL);
@@ -3325,9 +3326,21 @@ BeginCopyFrom(ParseState *pstate,
 	{
 		Assert(!is_program);	/* the grammar does not allow this */
 		if (whereToSendOutput == DestRemote)
+		{
+			bool isDataSent = YBIsDataSent();
 			ReceiveCopyBegin(cstate);
-		else
+			/*
+			 * ReceiveCopyBegin sends a message back to the client
+			 * with the expected format of the copy data.
+			 * This implicitly causes YB data to be marked as sent
+			 * although the message does not contain any data from YB.
+			 * So we can safely roll back YBIsDataSent to its previous value.
+			 */
+			if (!isDataSent) YBMarkDataNotSent();
+		}
+		else {
 			cstate->copy_file = stdin;
+		}
 	}
 	else
 	{

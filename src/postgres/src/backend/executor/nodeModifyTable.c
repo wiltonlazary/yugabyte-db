@@ -988,7 +988,7 @@ ldelete:;
 
 			if (slot->tts_tupleDescriptor != RelationGetDescr(resultRelationDesc))
 				ExecSetSlotDescriptor(slot, RelationGetDescr(resultRelationDesc));
-			ExecStoreTuple(&deltuple, slot, InvalidBuffer, false);
+			ExecStoreHeapTuple(&deltuple, slot, false);
 		}
 
 		rslot = ExecProcessReturning(resultRelInfo, slot, planSlot);
@@ -1334,10 +1334,9 @@ lreplace:;
 			map_index = resultRelInfo - mtstate->resultRelInfo;
 			Assert(map_index >= 0 && map_index < mtstate->mt_nplans);
 			tupconv_map = tupconv_map_for_subplan(mtstate, map_index);
-			tuple = ConvertPartitionTupleSlot(tupconv_map,
-											  tuple,
-											  proute->root_tuple_slot,
-											  &slot);
+			if (tupconv_map != NULL)
+				slot = execute_attr_map_slot(tupconv_map->attrMap,
+											  slot, proute->root_tuple_slot);
 
 			/*
 			 * Prepare for tuple routing, making it look like we're inserting
@@ -1678,7 +1677,7 @@ yb_skip_transaction_control_check:
 	if (IsYugaByteEnabled())
 	{
 		oldtuple = ExecMaterializeSlot(estate->yb_conflict_slot);
-		ExecStoreTuple(oldtuple, mtstate->mt_existing, buffer, false);
+		ExecStoreBufferHeapTuple(oldtuple, mtstate->mt_existing, buffer);
 		planSlot->tts_tuple->t_ybctid = oldtuple->t_ybctid;
 	}
 	else
@@ -1699,7 +1698,7 @@ yb_skip_transaction_control_check:
 		ExecCheckHeapTupleVisible(estate, &tuple, buffer);
 
 		/* Store target's existing tuple in the state's dedicated slot */
-		ExecStoreTuple(&tuple, mtstate->mt_existing, buffer, false);
+		ExecStoreBufferHeapTuple(&tuple, mtstate->mt_existing, buffer);
 	}
 
 	/*
@@ -1927,6 +1926,7 @@ ExecPrepareTupleRouting(ModifyTableState *mtstate,
 	int			partidx;
 	ResultRelInfo *partrel;
 	HeapTuple	tuple;
+	TupleConversionMap *map;
 
 	/*
 	 * Determine the target partition.  If ExecFindPartition does not find a
@@ -2014,10 +2014,16 @@ ExecPrepareTupleRouting(ModifyTableState *mtstate,
 	/*
 	 * Convert the tuple, if necessary.
 	 */
-	ConvertPartitionTupleSlot(proute->parent_child_tupconv_maps[partidx],
-							  tuple,
-							  proute->partition_tuple_slot,
-							  &slot);
+    map = proute->parent_child_tupconv_maps[partidx];
+    if (map != NULL)
+    {
+        TupleTableSlot *new_slot;
+
+        Assert(proute->partition_tuple_slots != NULL &&
+              proute->partition_tuple_slots[partidx] != NULL);
+        new_slot = proute->partition_tuple_slots[partidx];
+        slot = execute_attr_map_slot(map->attrMap, slot, new_slot);
+    }
 
 	/* Initialize information needed to handle ON CONFLICT DO UPDATE. */
 	Assert(mtstate != NULL);
@@ -2698,7 +2704,7 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 		mtstate->ps.plan->targetlist = (List *) linitial(node->returningLists);
 
 		/* Set up a slot for the output of the RETURNING projection(s) */
-		ExecInitResultTupleSlotTL(estate, &mtstate->ps);
+		ExecInitResultTupleSlotTL(&mtstate->ps);
 		slot = mtstate->ps.ps_ResultTupleSlot;
 
 		/* Need an econtext too */
@@ -2728,7 +2734,7 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 		 * expects one (maybe should change that?).
 		 */
 		mtstate->ps.plan->targetlist = NIL;
-		ExecInitResultTupleSlotTL(estate, &mtstate->ps);
+		ExecInitResultTypeTL(&mtstate->ps);
 
 		mtstate->ps.ps_ExprContext = NULL;
 	}
@@ -3019,7 +3025,8 @@ ExecEndModifyTable(ModifyTableState *node)
 	/*
 	 * clean out the tuple table
 	 */
-	ExecClearTuple(node->ps.ps_ResultTupleSlot);
+	if (node->ps.ps_ResultTupleSlot)
+		ExecClearTuple(node->ps.ps_ResultTupleSlot);
 
 	/*
 	 * Terminate EPQ execution if active

@@ -2,6 +2,7 @@
 
 package com.yugabyte.yw.common;
 
+import com.yugabyte.yw.forms.CertificateParams;
 import com.yugabyte.yw.models.CertificateInfo;
 import org.bouncycastle.asn1.x500.X500Name;
 import org.bouncycastle.asn1.x500.X500NameBuilder;
@@ -154,6 +155,8 @@ public class CertificateHelper {
 
   public static JsonNode createClientCertificate(UUID rootCA, String storagePath, String username,
                                                  Date certStart, Date certExpiry) {
+    LOG.info("Creating client certificate signed by root CA {} and user {} at path {}",
+            rootCA, username, storagePath);
     try {
       // Add the security provider in case createRootCA was never called.
       Security.addProvider(new BouncyCastleProvider());
@@ -189,7 +192,8 @@ public class CertificateHelper {
         kf = KeyFactory.getInstance("RSA");
         pk = kf.generatePrivate(spec);
       } catch (InvalidKeySpecException e) {
-        LOG.error("Unable to create client CA for username {}: {}", username, e);
+        LOG.error("Unable to create client CA for username {} using root CA {}",
+                  username, rootCA, e);
         throw new RuntimeException("Could not create client cert.");
       }
 
@@ -249,13 +253,13 @@ public class CertificateHelper {
         bodyJson.put(CLIENT_CERT, certWriter.toString());
         bodyJson.put(CLIENT_KEY, keyWriter.toString());
       }
-      LOG.info("Created Client CA for username {}.", username);
+      LOG.info("Created Client CA for username {} signed by root CA {}.", username, rootCA);
       return bodyJson;
 
     } catch (NoSuchAlgorithmException | IOException | OperatorCreationException |
              CertificateException | InvalidKeyException | NoSuchProviderException |
              SignatureException e) {
-      LOG.error("Unable to create client CA for username {}: {}", username, e);
+      LOG.error("Unable to create client CA for username {} using root CA {}", username, rootCA, e);
       throw new RuntimeException("Could not create client cert.");
     }
   }
@@ -263,14 +267,11 @@ public class CertificateHelper {
   public static UUID uploadRootCA(
     String label, UUID customerUUID, String storagePath,
     String certContent, String keyContent, Date certStart,
-    Date certExpiry, CertificateInfo.Type certType) throws IOException {
+    Date certExpiry, CertificateInfo.Type certType,
+    CertificateParams.CustomCertInfo customCertInfo) throws IOException {
 
-      if (certContent == null) {
+    if (certContent == null) {
       throw new RuntimeException("Certfile can't be null");
-    }
-
-    if (certType == CertificateInfo.Type.SelfSigned && keyContent == null) {
-      throw new RuntimeException("Key content can't be null for self signed certs");
     }
     UUID rootCA_UUID = UUID.randomUUID();
     String keyPath = null;
@@ -289,14 +290,19 @@ public class CertificateHelper {
       File keyfile = new File(keyPath);
       Files.write(keyfile.toPath(), keyContent.getBytes());
     }
-
     LOG.info(
       "Uploaded cert label {} (uuid {}) of type {} at paths {}, {}",
       label, rootCA_UUID, certType,
       certPath, ((keyPath == null) ? "no private key" : keyPath)
     );
-    CertificateInfo cert = CertificateInfo.create(rootCA_UUID, customerUUID, label, certStart,
+    CertificateInfo cert;
+    if (certType == CertificateInfo.Type.SelfSigned) {
+      cert = CertificateInfo.create(rootCA_UUID, customerUUID, label, certStart,
         certExpiry, keyPath, certPath, certType);
+    } else {
+      cert = CertificateInfo.create(rootCA_UUID, customerUUID, label, certStart,
+        certExpiry, certPath, customCertInfo);
+    }
 
     return cert.uuid;
 

@@ -54,6 +54,7 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
   @Override
   public void run() {
     try {
+      checkUniverseVersion();
       // Verify the task params.
       verifyParams(UniverseOpType.EDIT);
 
@@ -107,7 +108,7 @@ public class EditKubernetesUniverse extends KubernetesTaskBase {
               ServerType.TSERVER, universe, isMultiAz);
 
       for (UUID currAZs : currPlacement.configs.keySet()) {
-        PlacementInfoUtil.addPlacementZoneHelper(currAZs, activeZones);
+        PlacementInfoUtil.addPlacementZone(currAZs, activeZones);
       }
 
       boolean userIntentChange = false;

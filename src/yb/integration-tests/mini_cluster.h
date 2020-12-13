@@ -105,6 +105,7 @@ class MiniCluster : public MiniClusterBase {
   typedef std::vector<std::shared_ptr<master::MiniMaster> > MiniMasters;
   typedef std::vector<std::shared_ptr<tserver::MiniTabletServer> > MiniTabletServers;
   typedef std::vector<uint16_t> Ports;
+  typedef MiniClusterOptions Options;
 
   MiniCluster(Env* env, const MiniClusterOptions& options);
   ~MiniCluster();
@@ -270,6 +271,11 @@ std::vector<std::shared_ptr<tablet::TabletPeer>> ListTabletPeers(
     const std::function<bool(const std::shared_ptr<tablet::TabletPeer>&)>& filter);
 
 std::vector<tablet::TabletPeerPtr> ListTableTabletLeadersPeers(
+    MiniCluster* cluster, const TableId& table_id);
+
+std::vector<tablet::TabletPeerPtr> ListTableActiveTabletPeers(
+    MiniCluster* cluster, const TableId& table_id);
+std::vector<tablet::TabletPeerPtr> ListTableInactiveSplitTabletPeers(
     MiniCluster* cluster, const TableId& table_id);
 
 CHECKED_STATUS WaitUntilTabletHasLeader(

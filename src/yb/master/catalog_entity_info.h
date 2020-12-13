@@ -37,15 +37,15 @@
 
 #include <mutex>
 
-#include "yb/master/ts_descriptor.h"
+#include "yb/common/entity_ids.h"
+#include "yb/common/index.h"
+#include "yb/common/schema.h"
 #include "yb/master/master.pb.h"
 #include "yb/master/tasks_tracker.h"
-#include "yb/util/cow_object.h"
-#include "yb/common/entity_ids.h"
-#include "yb/util/monotime.h"
+#include "yb/master/ts_descriptor.h"
 #include "yb/server/monitored_task.h"
-#include "yb/common/schema.h"
-#include "yb/common/index.h"
+#include "yb/util/cow_object.h"
+#include "yb/util/monotime.h"
 
 namespace yb {
 namespace master {
@@ -160,6 +160,7 @@ struct PersistentTabletInfo : public Persistent<SysTabletsEntryPB, SysRowEntry::
 };
 
 class TableInfo;
+typedef scoped_refptr<TableInfo> TableInfoPtr;
 
 typedef std::unordered_map<TabletServerId, MonoTime> LeaderStepDownFailureTimes;
 
@@ -228,6 +229,11 @@ class TabletInfo : public RefCountedThreadSafe<TabletInfo>,
 
   CHECKED_STATUS CheckRunning() const;
 
+  bool InitiateElection() {
+    bool expected = false;
+    return initiated_election_.compare_exchange_strong(expected, true);
+  }
+
  private:
   friend class RefCountedThreadSafe<TabletInfo>;
 
@@ -256,6 +262,8 @@ class TabletInfo : public RefCountedThreadSafe<TabletInfo>,
   std::unordered_map<TableId, uint32_t> reported_schema_version_ = {};
 
   LeaderStepDownFailureTimes leader_stepdown_failure_times_;
+
+  std::atomic<bool> initiated_election_{false};
 
   DISALLOW_COPY_AND_ASSIGN(TabletInfo);
 };
@@ -369,6 +377,12 @@ class TableInfo : public RefCountedThreadSafe<TableInfo>,
 
   // This only returns tablets which are in RUNNING state.
   void GetTabletsInRange(const GetTableLocationsRequestPB* req, TabletInfos *ret) const;
+  void GetTabletsInRange(
+      const std::string& partition_key_start, const std::string& partition_key_end,
+      TabletInfos* ret,
+      int32_t max_returned_locations = std::numeric_limits<int32_t>::max()) const;
+
+  std::size_t NumTablets() const;
 
   // Get all tablets of the table.
   void GetAllTablets(TabletInfos *ret) const;

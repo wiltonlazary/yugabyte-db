@@ -11,6 +11,7 @@ import com.yugabyte.yw.commissioner.UserTaskDetails;
 import com.yugabyte.yw.commissioner.tasks.params.NodeTaskParams;
 import com.yugabyte.yw.common.ApiUtils;
 import com.yugabyte.yw.common.ShellProcessHandler;
+import com.yugabyte.yw.common.ShellResponse;
 import com.yugabyte.yw.commissioner.tasks.UniverseDefinitionTaskBase.ServerType;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UserIntent;
@@ -30,8 +31,11 @@ import org.mockito.runners.MockitoJUnitRunner;
 import org.yb.client.IsServerReadyResponse;
 import org.yb.client.YBClient;
 import org.yb.client.SetFlagResponse;
+import org.yb.client.GetMasterClusterConfigResponse;
+import org.yb.master.Master;
 import play.libs.Json;
 
+import java.util.Arrays;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -60,7 +64,7 @@ public class UpgradeUniverseTest extends CommissionerBaseTest {
 
   YBClient mockClient;
   Universe defaultUniverse;
-  ShellProcessHandler.ShellResponse dummyShellResponse;
+  ShellResponse dummyShellResponse;
 
   @Before
   public void setUp() {
@@ -81,15 +85,22 @@ public class UpgradeUniverseTest extends CommissionerBaseTest {
 
     // Setup mocks
     mockClient = mock(YBClient.class);
+    Master.SysClusterConfigEntryPB.Builder configBuilder =
+      Master.SysClusterConfigEntryPB.newBuilder().setVersion(2);
+    GetMasterClusterConfigResponse mockConfigResponse =
+      new GetMasterClusterConfigResponse(1111, "", configBuilder.build(), null);
+    try {
+      when(mockClient.getMasterClusterConfig()).thenReturn(mockConfigResponse);
+    } catch (Exception e) {}
     when(mockYBClient.getClient(any(), any())).thenReturn(mockClient);
     when(mockClient.waitForServer(any(HostAndPort.class), anyLong())).thenReturn(true);
     when(mockClient.getLeaderMasterHostAndPort())
-            .thenReturn(HostAndPort.fromString("host-n3").withDefaultPort(11));
+            .thenReturn(HostAndPort.fromString("host-n2").withDefaultPort(11));
     IsServerReadyResponse okReadyResp = new IsServerReadyResponse(0, "", null, 0, 0);
     try {
       when(mockClient.isServerReady(any(HostAndPort.class), anyBoolean())).thenReturn(okReadyResp);
     } catch (Exception ex) {}
-    dummyShellResponse =  new ShellProcessHandler.ShellResponse();
+    dummyShellResponse =  new ShellResponse();
     when(mockNodeManager.nodeCommand(any(), any())).thenReturn(dummyShellResponse);
   }
 
@@ -172,13 +183,54 @@ public class UpgradeUniverseTest extends CommissionerBaseTest {
       TaskType.SetNodeState
   );
 
+  List<TaskType> ROLLING_RESTART_TASK_SEQUENCE = ImmutableList.of(
+      TaskType.SetNodeState,
+      TaskType.AnsibleClusterServerCtl,
+      TaskType.AnsibleClusterServerCtl,
+      TaskType.WaitForServer,
+      TaskType.WaitForServerReady,
+      TaskType.WaitForEncryptionKeyInMemory,
+      TaskType.SetNodeState
+  );
+
+  private int assertRollingRestartSequence(Map<Integer, List<TaskInfo>> subTasksByPosition,
+                                            ServerType serverType, int startPosition) {
+    int position = startPosition;
+    List<TaskType> taskSequence = ROLLING_RESTART_TASK_SEQUENCE;
+    // We need to check that the master leader is upgraded last.
+    List<Integer> nodeOrder = serverType == MASTER ?
+        Arrays.asList(1, 3, 2) : Arrays.asList(1, 2, 3);
+    for (int nodeIdx : nodeOrder) {
+      String nodeName = String.format("host-n%d", nodeIdx);
+      for (int j = 0; j < taskSequence.size(); j++) {
+        Map<String, Object> assertValues = new HashMap<String, Object>();
+        List<TaskInfo> tasks = subTasksByPosition.get(position);
+        TaskType taskType = tasks.get(0).getTaskType();
+        UserTaskDetails.SubTaskGroupType subTaskGroupType = tasks.get(0).getSubTaskGroupType();
+        assertEquals(1, tasks.size());
+        assertEquals(taskSequence.get(j), taskType);
+        if (!NON_NODE_TASKS.contains(taskType)) {
+          assertValues.putAll(ImmutableMap.of(
+              "nodeName", nodeName, "nodeCount", 1
+          ));
+          assertNodeSubTask(tasks, assertValues);
+        }
+        position++;
+      }
+    }
+    return position;
+  }
+
   private int assertSoftwareUpgradeSequence(Map<Integer, List<TaskInfo>> subTasksByPosition,
                                             ServerType serverType,
                                             int startPosition, boolean isRollingUpgrade) {
     int position = startPosition;
     if (isRollingUpgrade) {
       List<TaskType> taskSequence = SOFTWARE_ROLLING_UPGRADE_TASK_SEQUENCE;
-      for (int nodeIdx = 1; nodeIdx <= 3; nodeIdx++) {
+      // We need to check that the master leader is upgraded last.
+      List<Integer> nodeOrder = serverType == MASTER ?
+          Arrays.asList(1, 3, 2) : Arrays.asList(1, 2, 3);
+      for (int nodeIdx : nodeOrder) {
         String nodeName = String.format("host-n%d", nodeIdx);
         for (int j = 0; j < taskSequence.size(); j++) {
           Map<String, Object> assertValues = new HashMap<String, Object>();
@@ -255,7 +307,10 @@ public class UpgradeUniverseTest extends CommissionerBaseTest {
     switch (option) {
       case ROLLING_UPGRADE:
         List<TaskType> taskSequence = GFLAGS_ROLLING_UPGRADE_TASK_SEQUENCE;
-        for (int nodeIdx = 1; nodeIdx <= 3; nodeIdx++) {
+        // We need to check that the master leader is upgraded last.
+        List<Integer> nodeOrder = serverType == MASTER ?
+            Arrays.asList(1, 3, 2) : Arrays.asList(1, 2, 3);
+        for (int nodeIdx : nodeOrder) {
           String nodeName = String.format("host-n%d", nodeIdx);
           for (int j = 0; j < taskSequence.size(); j++) {
             Map<String, Object> assertValues = new HashMap<String, Object>();
@@ -354,6 +409,20 @@ public class UpgradeUniverseTest extends CommissionerBaseTest {
     FULL_UPGRADE_TSERVER_ONLY
   }
 
+  private int assertRollingRestartCommonTasks(Map<Integer, List<TaskInfo>> subTasksByPosition,
+                                              int startPosition) {
+    int position = startPosition;
+    List<TaskType> commonNodeTasks = new ArrayList<>();
+    commonNodeTasks.addAll(ImmutableList.of(
+          TaskType.LoadBalancerStateChange,
+          TaskType.UniverseUpdateSucceeded));
+    for (int i = 0; i < commonNodeTasks.size(); i++) {
+      assertTaskType(subTasksByPosition.get(position), commonNodeTasks.get(i));
+      position++;
+    }
+    return position;
+  }
+
   private int assertGFlagsCommonTasks(Map<Integer, List<TaskInfo>> subTasksByPosition,
                                       int startPosition, UpgradeType type, boolean isFinalStep) {
     int position = startPosition;
@@ -441,9 +510,9 @@ public class UpgradeUniverseTest extends CommissionerBaseTest {
     verify(mockNodeManager, times(0)).nodeCommand(any(), any());
     assertEquals(TaskInfo.State.Failure, taskInfo.getTaskState());
     defaultUniverse.refresh();
-    assertEquals(4, defaultUniverse.version);
-    // In case of an exception, the LoadBalancer enable task should be queued.
-    assertEquals(1, taskInfo.getSubTasks().size());
+    assertEquals(2, defaultUniverse.version);
+    // In case of an exception, no task should be queued.
+    assertEquals(0, taskInfo.getSubTasks().size());
   }
 
   @Test
@@ -453,9 +522,9 @@ public class UpgradeUniverseTest extends CommissionerBaseTest {
     verify(mockNodeManager, times(0)).nodeCommand(any(), any());
     assertEquals(TaskInfo.State.Failure, taskInfo.getTaskState());
     defaultUniverse.refresh();
-    assertEquals(4, defaultUniverse.version);
-    // In case of an exception, the LoadBalancer enable task should be queued.
-    assertEquals(1, taskInfo.getSubTasks().size());
+    assertEquals(2, defaultUniverse.version);
+    // In case of an exception, no task should be queued.
+    assertEquals(0, taskInfo.getSubTasks().size());
   }
 
   @Test
@@ -473,8 +542,8 @@ public class UpgradeUniverseTest extends CommissionerBaseTest {
     List<TaskInfo> downloadTasks = subTasksByPosition.get(position++);
     assertTaskType(downloadTasks, TaskType.AnsibleConfigureServers);
     assertEquals(3, downloadTasks.size());
-    assertTaskType(subTasksByPosition.get(position++), TaskType.LoadBalancerStateChange);
     position = assertSoftwareUpgradeSequence(subTasksByPosition, MASTER, position, true);
+    assertTaskType(subTasksByPosition.get(position++), TaskType.LoadBalancerStateChange);
     position = assertSoftwareCommonTasks(subTasksByPosition, position, UpgradeType.ROLLING_UPGRADE, false);
     position = assertSoftwareUpgradeSequence(subTasksByPosition, TSERVER, position, true);
     assertSoftwareCommonTasks(subTasksByPosition, position, UpgradeType.ROLLING_UPGRADE, true);
@@ -604,12 +673,8 @@ public class UpgradeUniverseTest extends CommissionerBaseTest {
     Map<Integer, List<TaskInfo>> subTasksByPosition =
         subTasks.stream().collect(Collectors.groupingBy(w -> w.getPosition()));
 
-    List<TaskInfo> tasks = subTasksByPosition.get(0);
-    TaskType taskType = tasks.get(0).getTaskType();
-    assertEquals(1, tasks.size());
-    assertEquals(TaskType.LoadBalancerStateChange, taskType);
-
-    int position = 1;
+    int position = 0;
+    assertTaskType(subTasksByPosition.get(position++), TaskType.LoadBalancerStateChange);
     position = assertGFlagsUpgradeSequence(subTasksByPosition, TSERVER, position,
                                            UpgradeParams.UpgradeOption.ROLLING_UPGRADE);
     position = assertGFlagsCommonTasks(subTasksByPosition, position,
@@ -645,16 +710,23 @@ public class UpgradeUniverseTest extends CommissionerBaseTest {
     UpgradeUniverse.Params taskParams = new UpgradeUniverse.Params();
     TaskInfo taskInfo = submitTask(taskParams, UpgradeUniverse.UpgradeTaskType.GFlags);
     verify(mockNodeManager, times(0)).nodeCommand(any(), any());
-    List<TaskInfo> subTasks = taskInfo.getSubTasks();
-    assertEquals(1, subTasks.size());
-    Map<Integer, List<TaskInfo>> subTasksByPosition =
-        subTasks.stream().collect(Collectors.groupingBy(w -> w.getPosition()));
-    assertEquals(1, subTasksByPosition.get(0).size());
-    assertTaskType(subTasksByPosition.get(0), TaskType.UniverseUpdateSucceeded);
+    assertEquals(TaskInfo.State.Failure, taskInfo.getTaskState());
+    defaultUniverse.refresh();
+    assertEquals(2, defaultUniverse.version);
+    // In case of an exception, no task should be queued.
+    assertEquals(0, taskInfo.getSubTasks().size());
   }
 
   @Test
   public void testGFlagsUpgradeWithSameMasterFlags() {
+    Master.SysClusterConfigEntryPB.Builder configBuilder =
+      Master.SysClusterConfigEntryPB.newBuilder().setVersion(3);
+    GetMasterClusterConfigResponse mockConfigResponse =
+      new GetMasterClusterConfigResponse(1111, "", configBuilder.build(), null);
+    try {
+      when(mockClient.getMasterClusterConfig()).thenReturn(mockConfigResponse);
+    } catch (Exception e) {}
+    when(mockYBClient.getClient(any(), any())).thenReturn(mockClient);
     // Simulate universe created with master flags and tserver flags.
     final Map<String, String> masterFlags = ImmutableMap.of("master-flag", "m123");
     Universe.UniverseUpdater updater = new Universe.UniverseUpdater() {
@@ -679,10 +751,8 @@ public class UpgradeUniverseTest extends CommissionerBaseTest {
     Map<Integer, List<TaskInfo>> subTasksByPosition =
             subTasks.stream().collect(Collectors.groupingBy(w -> w.getPosition()));
     List<TaskInfo> tasks = subTasksByPosition.get(0);
-    TaskType taskType = tasks.get(0).getTaskType();
-    assertEquals(1, tasks.size());
-    assertEquals(TaskType.LoadBalancerStateChange, taskType);
-    int position = 1;
+    int position = 0;
+    assertTaskType(subTasksByPosition.get(position++), TaskType.LoadBalancerStateChange);
     position = assertGFlagsUpgradeSequence(subTasksByPosition, TSERVER, position,
                                            UpgradeParams.UpgradeOption.ROLLING_UPGRADE, true);
     position = assertGFlagsCommonTasks(subTasksByPosition, position,
@@ -692,6 +762,14 @@ public class UpgradeUniverseTest extends CommissionerBaseTest {
 
   @Test
   public void testGFlagsUpgradeWithSameTserverFlags() {
+    Master.SysClusterConfigEntryPB.Builder configBuilder =
+      Master.SysClusterConfigEntryPB.newBuilder().setVersion(3);
+    GetMasterClusterConfigResponse mockConfigResponse =
+      new GetMasterClusterConfigResponse(1111, "", configBuilder.build(), null);
+    try {
+      when(mockClient.getMasterClusterConfig()).thenReturn(mockConfigResponse);
+    } catch (Exception e) {}
+    when(mockYBClient.getClient(any(), any())).thenReturn(mockClient);
     // Simulate universe created with master flags and tserver flags.
     final Map<String, String> tserverFlags = ImmutableMap.of("tserver-flag", "m123");
     Universe.UniverseUpdater updater = new Universe.UniverseUpdater() {
@@ -726,6 +804,26 @@ public class UpgradeUniverseTest extends CommissionerBaseTest {
   @Test
   public void testRemoveFlags() {
     for (ServerType serverType : ImmutableList.of(MASTER, TSERVER)) {
+      if (serverType.equals(MASTER)) {
+        Master.SysClusterConfigEntryPB.Builder configBuilder =
+          Master.SysClusterConfigEntryPB.newBuilder().setVersion(3);
+        GetMasterClusterConfigResponse mockConfigResponse =
+          new GetMasterClusterConfigResponse(1111, "", configBuilder.build(), null);
+        try {
+          when(mockClient.getMasterClusterConfig()).thenReturn(mockConfigResponse);
+        } catch (Exception e) {}
+        when(mockYBClient.getClient(any(), any())).thenReturn(mockClient);
+      } else if (serverType.equals(TSERVER)) {
+        Master.SysClusterConfigEntryPB.Builder configBuilder =
+          Master.SysClusterConfigEntryPB.newBuilder().setVersion(4);
+        GetMasterClusterConfigResponse mockConfigResponse =
+          new GetMasterClusterConfigResponse(1111, "", configBuilder.build(), null);
+        try {
+          when(mockClient.getMasterClusterConfig()).thenReturn(mockConfigResponse);
+        } catch (Exception e) {}
+        when(mockYBClient.getClient(any(), any())).thenReturn(mockClient);
+      }
+      System.out.println("SERVER TYPE: " + serverType.toString());
       // Simulate universe created with master flags and tserver flags.
       final Map<String, String> tserverFlags = ImmutableMap.of("tserver-flag", "t1");
       final Map<String, String> masterGFlags = ImmutableMap.of("master-flag", "m1");
@@ -750,7 +848,7 @@ public class UpgradeUniverseTest extends CommissionerBaseTest {
         taskParams.tserverGFlags = new HashMap<>();
       }
 
-      int expectedVersion = serverType == MASTER ? 3 : 14;
+      int expectedVersion = serverType == MASTER ? 3 : 4;
       TaskInfo taskInfo = submitTask(taskParams,
               UpgradeUniverse.UpgradeTaskType.GFlags,
               expectedVersion);
@@ -761,7 +859,10 @@ public class UpgradeUniverseTest extends CommissionerBaseTest {
       List<TaskInfo> subTasks = new ArrayList<>(taskInfo.getSubTasks());
       Map<Integer, List<TaskInfo>> subTasksByPosition =
               subTasks.stream().collect(Collectors.groupingBy(w -> w.getPosition()));
-      int position = serverType == MASTER ? 0 : 1;
+      int position = 0;
+      if (serverType != MASTER) {
+        assertTaskType(subTasksByPosition.get(position++), TaskType.LoadBalancerStateChange);
+      }
       position = assertGFlagsUpgradeSequence(subTasksByPosition, serverType, position,
               UpgradeParams.UpgradeOption.ROLLING_UPGRADE, true, true);
       position = assertGFlagsCommonTasks(subTasksByPosition, position, serverType == MASTER ?
@@ -806,5 +907,25 @@ public class UpgradeUniverseTest extends CommissionerBaseTest {
     position = assertGFlagsCommonTasks(subTasksByPosition, position,
             UpgradeType.ROLLING_UPGRADE_MASTER_ONLY, true);
     assertEquals(6, position);
+  }
+
+  @Test
+  public void testRollingRestart() throws Exception {
+    UpgradeUniverse.Params taskParams = new UpgradeUniverse.Params();
+    TaskInfo taskInfo = submitTask(taskParams, UpgradeUniverse.UpgradeTaskType.Restart);
+    verify(mockNodeManager, times(12)).nodeCommand(any(), any());
+
+    List<TaskInfo> subTasks = taskInfo.getSubTasks();
+    Map<Integer, List<TaskInfo>> subTasksByPosition =
+        subTasks.stream().collect(Collectors.groupingBy(w -> w.getPosition()));
+
+    int position = 0;
+    position = assertRollingRestartSequence(subTasksByPosition, MASTER, position);
+    assertTaskType(subTasksByPosition.get(position++), TaskType.LoadBalancerStateChange);
+    position = assertRollingRestartSequence(subTasksByPosition, TSERVER, position);
+    assertRollingRestartCommonTasks(subTasksByPosition, position);
+    assertEquals(43, position);
+    assertEquals(100.0, taskInfo.getPercentCompleted(), 0);
+    assertEquals(TaskInfo.State.Success, taskInfo.getTaskState());
   }
 }

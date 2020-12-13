@@ -178,10 +178,11 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
   class FlushFaultHooks;
 
   // A function that returns the current majority-replicated hybrid time leader lease, or waits
-  // until a hybrid time leader lease with at least the given microsecond component is acquired
+  // until a hybrid time leader lease with at least the given hybrid time is acquired
   // (first argument), or a timeout occurs (second argument). HybridTime::kInvalid is returned
   // in case of a timeout.
-  using HybridTimeLeaseProvider = std::function<FixedHybridTimeLease(MicrosTime, CoarseTimePoint)>;
+  using HybridTimeLeaseProvider = std::function<Result<FixedHybridTimeLease>(
+      HybridTime, CoarseTimePoint)>;
   using TransactionIdSet = std::unordered_set<TransactionId, TransactionIdHash>;
 
   // Create a new tablet.
@@ -211,13 +212,16 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
                                       const HybridTime read_time);
 
   CHECKED_STATUS UpdateIndexInBatches(
-      const QLTableRow& row, const std::vector<IndexInfo>& indexes,
+      const QLTableRow& row,
+      const std::vector<IndexInfo>& indexes,
+      const HybridTime write_time,
       std::vector<std::pair<const IndexInfo*, QLWriteRequestPB>>* index_requests,
       CoarseTimePoint* last_flushed_at);
 
   CHECKED_STATUS FlushIndexBatchIfRequired(
       std::vector<std::pair<const IndexInfo*, QLWriteRequestPB>>* index_requests,
       bool force_flush,
+      const HybridTime write_time,
       CoarseTimePoint* last_flushed_at);
 
   CHECKED_STATUS
@@ -278,11 +282,14 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
   void StartOperation(WriteOperationState* operation_state);
 
   // Apply all of the row operations associated with this transaction.
-  CHECKED_STATUS ApplyRowOperations(WriteOperationState* operation_state);
+  CHECKED_STATUS ApplyRowOperations(
+      WriteOperationState* operation_state,
+      AlreadyAppliedToRegularDB already_applied_to_regular_db = AlreadyAppliedToRegularDB::kFalse);
 
   CHECKED_STATUS ApplyOperationState(
       const OperationState& operation_state, int64_t batch_idx,
-      const docdb::KeyValueWriteBatchPB& write_batch);
+      const docdb::KeyValueWriteBatchPB& write_batch,
+      AlreadyAppliedToRegularDB already_applied_to_regular_db = AlreadyAppliedToRegularDB::kFalse);
 
   // Apply a set of RocksDB row operations.
   // If rocksdb_write_batch is specified it could contain preencoded RocksDB operations.
@@ -290,7 +297,8 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
       int64_t batch_idx, // index of this batch in its transaction
       const docdb::KeyValueWriteBatchPB& put_batch,
       const rocksdb::UserFrontiers* frontiers,
-      HybridTime hybrid_time);
+      HybridTime hybrid_time,
+      AlreadyAppliedToRegularDB already_applied_to_regular_db = AlreadyAppliedToRegularDB::kFalse);
 
   void WriteToRocksDB(
       const rocksdb::UserFrontiers* frontiers,
@@ -336,9 +344,11 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
   CHECKED_STATUS HandlePgsqlReadRequest(
       CoarseTimePoint deadline,
       const ReadHybridTime& read_time,
+      bool is_explicit_request_read_time,
       const PgsqlReadRequestPB& pgsql_read_request,
       const TransactionMetadataPB& transaction_metadata,
-      PgsqlReadRequestResult* result) override;
+      PgsqlReadRequestResult* result,
+      size_t* num_rows_read) override;
 
   CHECKED_STATUS CreatePagingStateForRead(
       const PgsqlReadRequestPB& pgsql_read_request, const size_t row_count,
@@ -495,8 +505,12 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
   ScopedRWOperation GetPermitToWrite(CoarseTimePoint deadline);
 
   // Used from tests
-  const std::shared_ptr<rocksdb::Statistics>& rocksdb_statistics() const {
-    return rocksdb_statistics_;
+  const std::shared_ptr<rocksdb::Statistics>& regulardb_statistics() const {
+    return regulardb_statistics_;
+  }
+
+  const std::shared_ptr<rocksdb::Statistics>& intentsdb_statistics() const {
+    return intentsdb_statistics_;
   }
 
   TransactionCoordinator* transaction_coordinator() {
@@ -507,7 +521,13 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
     return transaction_participant_.get();
   }
 
+  // Returns true if this tablet may have large contiguous ranges of data which are not relevant,
+  // e.g. in the case of a recent tablet split where no compaction has occurred yet.
+  bool MightHaveNonRelevantData();
+
   void ForceRocksDBCompactInTest();
+
+  CHECKED_STATUS ForceFullRocksDBCompactAsync();
 
   docdb::DocDB doc_db() const { return { regular_db_.get(), intents_db_.get(), &key_bounds_ }; }
 
@@ -737,7 +757,8 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
   std::shared_ptr<FlushCompactCommonHooks> common_hooks_;
 
   // Statistics for the RocksDB database.
-  std::shared_ptr<rocksdb::Statistics> rocksdb_statistics_;
+  std::shared_ptr<rocksdb::Statistics> regulardb_statistics_;
+  std::shared_ptr<rocksdb::Statistics> intentsdb_statistics_;
 
   // RocksDB database for key-value tables.
   std::unique_ptr<rocksdb::DB> regular_db_;
@@ -798,7 +819,7 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
 
   HybridTimeLeaseProvider ht_lease_provider_;
 
-  HybridTime DoGetSafeTime(
+  Result<HybridTime> DoGetSafeTime(
       RequireLease require_lease, HybridTime min_allowed, CoarseTimePoint deadline) const override;
 
   using IndexOps = std::vector<std::pair<
@@ -821,7 +842,7 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
 
   void RegularDbFilesChanged();
 
-  HybridTime ApplierSafeTime(HybridTime min_allowed, CoarseTimePoint deadline) override;
+  Result<HybridTime> ApplierSafeTime(HybridTime min_allowed, CoarseTimePoint deadline) override;
 
   void MinRunningHybridTimeSatisfied() override {
     CleanupIntentFiles();

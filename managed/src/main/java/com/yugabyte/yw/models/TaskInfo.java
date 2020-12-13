@@ -7,6 +7,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.EnumSet;
 
 import javax.persistence.Column;
 import javax.persistence.Entity;
@@ -54,6 +55,12 @@ public class TaskInfo extends Model {
     @EnumValue("Unknown")
     Unknown,
   }
+
+  public static final EnumSet<State> INCOMPLETE_STATES = EnumSet.of(
+    State.Created,
+    State.Initializing,
+    State.Running
+  );
 
   // The task UUID.
   @Id
@@ -140,6 +147,10 @@ public class TaskInfo extends Model {
     return taskState;
   }
 
+  boolean hasCompleted() {
+    return taskState == State.Success || taskState == State.Failure;
+  }
+
   public TaskType getTaskType() {
     return taskType;
   }
@@ -195,19 +206,26 @@ public class TaskInfo extends Model {
   }
 
   public List<TaskInfo> getIncompleteSubTasks() {
-    Object[] incompleteStates = {State.Created, State.Initializing, State.Running};
     return TaskInfo.find.query().where()
       .eq("parent_uuid", getTaskUUID())
-      .in("task_state", incompleteStates)
+      .in("task_state", INCOMPLETE_STATES)
+      .findList();
+  }
+
+  public static List<TaskInfo> getFailedSubTasks(UUID parentUUID) {
+    return TaskInfo.find.query().where()
+      .eq("parent_uuid", parentUUID)
+      .eq("task_state", TaskInfo.State.Failure.name())
+      .orderBy("position desc")
       .findList();
   }
 
   @Override
   public String toString() {
     StringBuilder sb = new StringBuilder();
-    sb.append("taskType : " + taskType);
+    sb.append("taskType : ").append(taskType);
     sb.append(", ");
-    sb.append("taskState: " + taskState);
+    sb.append("taskState: ").append(taskState);
     return sb.toString();
   }
 

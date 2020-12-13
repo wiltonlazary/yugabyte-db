@@ -375,6 +375,12 @@ class ToStringable {
   virtual ~ToStringable() = default;
 };
 
+class RequestCleanup {
+ public:
+  virtual void CleanupRequest() = 0;
+  virtual ~RequestCleanup() = default;
+};
+
 // Manager of RemoteTablets and RemoteTabletServers. The client consults
 // this class to look up a given tablet or server.
 //
@@ -402,13 +408,13 @@ class MetaCache : public RefCountedThreadSafe<MetaCache> {
   //
   // NOTE: the memory referenced by 'table' must remain valid until 'callback'
   // is invoked.
-  void LookupTabletByKey(const YBTable* table,
+  void LookupTabletByKey(const std::shared_ptr<const YBTable>& table,
                          const std::string& partition_key,
                          CoarseTimePoint deadline,
                          LookupTabletCallback callback);
 
   std::future<Result<internal::RemoteTabletPtr>> LookupTabletByKeyFuture(
-      const YBTable* table,
+      const std::shared_ptr<const YBTable>& table,
       const std::string& partition_key,
       CoarseTimePoint deadline) {
     return MakeFuture<Result<internal::RemoteTabletPtr>>([&](auto callback) {
@@ -416,7 +422,10 @@ class MetaCache : public RefCountedThreadSafe<MetaCache> {
     });
   }
 
+  // If table is specified and cache is not used or has no tablet leader also checks whether table
+  // partitions are stale and returns ClientErrorCode::kTablePartitionsAreStale in that case.
   void LookupTabletById(const TabletId& tablet_id,
+                        const std::shared_ptr<const YBTable>& table,
                         CoarseTimePoint deadline,
                         LookupTabletCallback callback,
                         UseCache use_cache);
@@ -448,7 +457,7 @@ class MetaCache : public RefCountedThreadSafe<MetaCache> {
   CHECKED_STATUS ProcessTabletLocations(
       const google::protobuf::RepeatedPtrField<master::TabletLocationsPB>& locations,
       const std::string* partition_group_start,
-      int64_t request_no);
+      RequestCleanup* cleanup);
 
   void InvalidateTableCache(const TableId& table_id);
 
@@ -503,7 +512,7 @@ class MetaCache : public RefCountedThreadSafe<MetaCache> {
   // Lookup the given tablet by key, only consulting local information.
   // Returns true and sets *remote_tablet if successful.
   RemoteTabletPtr LookupTabletByKeyFastPathUnlocked(
-      const YBTable* table,
+      const std::shared_ptr<const YBTable>& table,
       const std::string& partition_key) REQUIRES_SHARED(mutex_);
 
   RemoteTabletPtr LookupTabletByIdFastPathUnlocked(const TabletId& tablet_id)
@@ -518,10 +527,12 @@ class MetaCache : public RefCountedThreadSafe<MetaCache> {
   // Notify appropriate callbacks that lookup of specified partition group of specified table
   // was failed because of specified status.
   void LookupByKeyFailed(
-      const YBTable* table, const std::string& partition_group_start, int64_t request_no,
-      const Status& status);
+      const std::shared_ptr<const YBTable>& table, const std::string& partition_group_start,
+      int64_t request_no, const Status& status);
 
-  void LookupByIdFailed(const TabletId& tablet_id, int64_t request_no, const Status& status);
+  void LookupByIdFailed(
+      const TabletId& tablet_id, const std::shared_ptr<const YBTable>& table, int64_t request_no,
+      const Status& status);
 
   class CallbackNotifier;
 
@@ -538,7 +549,7 @@ class MetaCache : public RefCountedThreadSafe<MetaCache> {
       CallbackNotifier* notifier) REQUIRES(mutex_);
 
   RemoteTabletPtr FastLookupTabletByKeyUnlocked(
-      const YBTable* table,
+      const std::shared_ptr<const YBTable>& table,
       const std::string& partition_start) REQUIRES_SHARED(mutex_);
 
   // If `tablet` is a result of splitting of pre-split tablet for which we already have
@@ -552,13 +563,14 @@ class MetaCache : public RefCountedThreadSafe<MetaCache> {
 
   template <class Lock>
   bool DoLookupTabletByKey(
-      const YBTable* table, const std::string& partition_start, CoarseTimePoint deadline,
-      LookupTabletCallback* callback, const std::string** partition_group_start);
+      const std::shared_ptr<const YBTable>& table, const std::string& partition_start,
+      CoarseTimePoint deadline, LookupTabletCallback* callback,
+      const std::string** partition_group_start);
 
   template <class Lock>
   bool DoLookupTabletById(
-      const TabletId& tablet_id, CoarseTimePoint deadline, UseCache use_cache,
-      LookupTabletCallback* callback);
+      const TabletId& tablet_id, const std::shared_ptr<const YBTable>& table,
+      CoarseTimePoint deadline, UseCache use_cache, LookupTabletCallback* callback);
 
   YBClient* const client_;
 

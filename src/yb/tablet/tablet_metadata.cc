@@ -399,7 +399,7 @@ Status RaftGroupMetadata::DeleteTabletData(TabletDataState delete_type,
   {
     std::lock_guard<MutexType> lock(data_mutex_);
     tablet_data_state_ = delete_type;
-    if (last_logged_opid) {
+    if (!last_logged_opid.empty()) {
       tombstone_last_logged_opid_ = last_logged_opid;
     }
   }
@@ -442,6 +442,8 @@ Status RaftGroupMetadata::DeleteTabletData(TabletDataState delete_type,
     LOG_IF(WARNING, !s.ok()) << "Unable to delete intents directory " << intents_dir;
   }
 
+  // TODO(tsplit): decide what to do with snapshots for split tablets that we delete after split.
+  // As for now, snapshots will be deleted as well.
   const auto snapshots_dir = this->snapshots_dir();
   if (fs_manager_->env()->FileExists(snapshots_dir)) {
     auto s = fs_manager_->env()->DeleteRecursively(snapshots_dir);
@@ -666,7 +668,7 @@ void RaftGroupMetadata::ToSuperBlockUnlocked(RaftGroupReplicaSuperBlockPB* super
 
   pb.set_wal_dir(wal_dir_);
   pb.set_tablet_data_state(tablet_data_state_);
-  if (tombstone_last_logged_opid_) {
+  if (!tombstone_last_logged_opid_.empty()) {
     tombstone_last_logged_opid_.ToPB(pb.mutable_tombstone_last_logged_opid());
   }
 

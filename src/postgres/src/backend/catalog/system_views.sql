@@ -1105,6 +1105,15 @@ STRICT IMMUTABLE PARALLEL SAFE
 AS 'jsonb_set';
 
 CREATE OR REPLACE FUNCTION
+  jsonb_set_lax(jsonb_in jsonb, path text[] , replacement jsonb,
+            create_if_missing boolean DEFAULT true,
+            null_value_treatment text DEFAULT 'use_json_null')
+RETURNS jsonb
+LANGUAGE INTERNAL
+CALLED ON NULL INPUT IMMUTABLE PARALLEL SAFE
+AS 'jsonb_set_lax';
+
+CREATE OR REPLACE FUNCTION
   parse_ident(str text, strict boolean DEFAULT true)
 RETURNS text[]
 LANGUAGE INTERNAL
@@ -1158,6 +1167,46 @@ RETURNS jsonb
 LANGUAGE INTERNAL
 STRICT IMMUTABLE PARALLEL SAFE
 AS 'jsonb_path_query_first';
+
+CREATE OR REPLACE FUNCTION
+  jsonb_path_exists_tz(target jsonb, path jsonpath, vars jsonb DEFAULT '{}',
+                    silent boolean DEFAULT false)
+RETURNS boolean
+LANGUAGE INTERNAL
+STRICT STABLE PARALLEL SAFE
+AS 'jsonb_path_exists_tz';
+
+CREATE OR REPLACE FUNCTION
+  jsonb_path_match_tz(target jsonb, path jsonpath, vars jsonb DEFAULT '{}',
+                   silent boolean DEFAULT false)
+RETURNS boolean
+LANGUAGE INTERNAL
+STRICT STABLE PARALLEL SAFE
+AS 'jsonb_path_match_tz';
+
+CREATE OR REPLACE FUNCTION
+  jsonb_path_query_tz(target jsonb, path jsonpath, vars jsonb DEFAULT '{}',
+                   silent boolean DEFAULT false)
+RETURNS SETOF jsonb
+LANGUAGE INTERNAL
+STRICT STABLE PARALLEL SAFE
+AS 'jsonb_path_query_tz';
+
+CREATE OR REPLACE FUNCTION
+  jsonb_path_query_array_tz(target jsonb, path jsonpath, vars jsonb DEFAULT '{}',
+                         silent boolean DEFAULT false)
+RETURNS jsonb
+LANGUAGE INTERNAL
+STRICT STABLE PARALLEL SAFE
+AS 'jsonb_path_query_array_tz';
+
+CREATE OR REPLACE FUNCTION
+  jsonb_path_query_first_tz(target jsonb, path jsonpath, vars jsonb DEFAULT '{}',
+                         silent boolean DEFAULT false)
+RETURNS jsonb
+LANGUAGE INTERNAL
+STRICT STABLE PARALLEL SAFE
+AS 'jsonb_path_query_first_tz';
 
 --
 -- The default permissions for functions mean that anyone can execute them.

@@ -837,11 +837,11 @@ def get_device_names(instance_type, num_volumes):
 
 
 def is_next_gen(instance_type):
-    return instance_type.startswith(("c3", "c4", "c5", "m4", "r4"))
+    return instance_type.startswith(("c3.", "c4.", "c5.", "m4.", "r4."))
 
 
 def is_nvme(instance_type):
-    return instance_type.startswith("i3")
+    return instance_type.startswith(("i3.", "c5d."))
 
 
 def has_ephemerals(instance_type):
@@ -945,6 +945,7 @@ def create_instance(args):
         "Tags": instance_tags
     }]
     # TODO: user_data > templates/cloud_init.yml.j2, still needed?
+    logging.info("[app] About to create AWS VM {}. ".format(args.search_pattern))
     instance_ids = client.create_instances(**vars)
     if len(instance_ids) != 1:
         logging.error("Invalid create_instances response: {}".format(instance_ids))
@@ -952,6 +953,7 @@ def create_instance(args):
             len(instance_ids)))
     instance = instance_ids[0]
     instance.wait_until_running()
+    logging.info("[app] AWS VM {} created.".format(args.search_pattern))
 
 
 def modify_tags(region, instance_id, tags_to_set_str, tags_to_remove_str):

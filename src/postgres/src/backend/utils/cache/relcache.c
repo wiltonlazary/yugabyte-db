@@ -64,6 +64,7 @@
 #include "catalog/pg_type.h"
 #include "catalog/schemapg.h"
 #include "catalog/storage.h"
+#include "catalog/ybc_catalog_version.h"
 #include "commands/dbcommands.h"
 #include "commands/policy.h"
 #include "commands/trigger.h"
@@ -1532,6 +1533,7 @@ void YBPreloadRelCache()
 				need = relation->rd_rel->relnatts;
 				ndef = 0;
 				attrdef = NULL;
+				attrmiss = NULL;
 				constr = (TupleConstr*) MemoryContextAlloc(CacheMemoryContext, sizeof(TupleConstr));
 				constr->has_not_null = false;
 			}
@@ -1670,7 +1672,8 @@ void YBPreloadRelCache()
 			/*
 			 * Set up constraint/default info
 			 */
-			if (constr->has_not_null || ndef > 0 || relation->rd_rel->relchecks)
+			if (constr->has_not_null || ndef > 0 ||
+				attrmiss || relation->rd_rel->relchecks)
 			{
 				relation->rd_att->constr = constr;
 
@@ -4327,6 +4330,15 @@ RelationCacheInitializePhase3(void)
 		return;
 
 	/*
+	 * In YugaByte mode initialize the catalog cache version to the latest
+	 * version from the master (except during initdb).
+	 */
+	if (IsYugaByteEnabled())
+	{
+		YBCGetMasterCatalogVersion(&yb_catalog_cache_version);
+	}
+
+	/*
 	 * In YB mode initialize the relache at the beginning so that we need
 	 * fewer cache lookups in steady state.
 	 */
@@ -6185,7 +6197,7 @@ load_relcache_init_file(bool shared)
 
 		/* Else, still need to check with the master version to be sure. */
 		uint64_t catalog_master_version = 0;
-		YBCPgGetCatalogMasterVersion(&catalog_master_version);
+		YBCGetMasterCatalogVersion(&catalog_master_version);
 
 		/* File version does not match actual master version (i.e. too old) */
 		if (ybc_stored_cache_version != catalog_master_version)

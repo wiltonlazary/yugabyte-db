@@ -15,6 +15,7 @@ import java.util.*;
 
 import com.yugabyte.yw.common.PlacementInfoUtil;
 
+import org.yb.Common.TableType;
 import play.libs.Json;
 
 import static com.yugabyte.yw.common.TableManager.CommandSubType.BACKUP;
@@ -48,7 +49,7 @@ public class TableManager extends DevopsBase {
   @Inject
   ReleaseManager releaseManager;
 
-  public ShellProcessHandler.ShellResponse runCommand(CommandSubType subType,
+  public ShellResponse runCommand(CommandSubType subType,
                                                       TableManagerParams taskParams) {
     Universe universe = Universe.get(taskParams.universeUUID);
     Cluster primaryCluster = universe.getUniverseDetails().getPrimaryCluster();
@@ -75,9 +76,9 @@ public class TableManager extends DevopsBase {
     commandArgs.add("--masters");
     commandArgs.add(universe.getMasterAddresses());
 
-    BackupTableParams backupTableParams = null;
-    Customer customer = null;
-    CustomerConfig customerConfig = null;
+    BackupTableParams backupTableParams;
+    Customer customer;
+    CustomerConfig customerConfig;
 
     switch (subType) {
       case BACKUP:
@@ -100,7 +101,11 @@ public class TableManager extends DevopsBase {
               commandArgs.add(taskParams.tableName);
             }
             commandArgs.add("--keyspace");
-            commandArgs.add(taskParams.keyspace);
+            if (backupTableParams.backupType == TableType.PGSQL_TABLE_TYPE) {
+              commandArgs.add("ysql." + taskParams.keyspace);
+            } else {
+              commandArgs.add(taskParams.keyspace);
+            }
           }
         } else if (backupTableParams.actionType == BackupTableParams.ActionType.RESTORE) {
           if (backupTableParams.tableUUIDList != null && !backupTableParams.tableUUIDList.isEmpty()) {
@@ -143,15 +148,11 @@ public class TableManager extends DevopsBase {
           commandArgs.add(taskParams.tableUUID.toString().replace("-", ""));
         }
         commandArgs.add("--no_auto_name");
-        if (nodeToNodeTlsEnabled) {
-          commandArgs.add("--certs_dir");
-          commandArgs.add(getCertsDir(region, provider));
-        }
         if (taskParams.sse) {
           commandArgs.add("--sse");
         }
         addCommonCommandArgs(backupTableParams, accessKey, region, customerConfig,
-                             namespaceToConfig, commandArgs);
+                             provider, namespaceToConfig, nodeToNodeTlsEnabled, commandArgs);
         // Update env vars with customer config data after provider config to make sure the correct
         // credentials are used.
         extraVars.putAll(customerConfig.dataAsMap());
@@ -198,7 +199,7 @@ public class TableManager extends DevopsBase {
                                             backupTableParams.storageConfigUUID);
         LOG.info("Deleting backup at location {}", backupTableParams.storageLocation);
         addCommonCommandArgs(backupTableParams, accessKey, region, customerConfig,
-                             namespaceToConfig, commandArgs);
+                             provider, namespaceToConfig, nodeToNodeTlsEnabled, commandArgs);
         extraVars.putAll(customerConfig.dataAsMap());
         break;
     }
@@ -214,8 +215,8 @@ public class TableManager extends DevopsBase {
 
   private void addCommonCommandArgs(BackupTableParams backupTableParams, AccessKey accessKey,
                                     Region region, CustomerConfig customerConfig,
-                                    Map<String, String> namespaceToConfig,
-                                    List<String> commandArgs) {
+                                    Provider provider, Map<String, String> namespaceToConfig,
+                                    boolean nodeToNodeTlsEnabled, List<String> commandArgs) {
     if (region.provider.code.equals("kubernetes")) {
       commandArgs.add("--k8s_config");
       commandArgs.add(Json.stringify(Json.toJson(namespaceToConfig)));
@@ -233,6 +234,10 @@ public class TableManager extends DevopsBase {
     commandArgs.add(backupTableParams.storageLocation);
     commandArgs.add("--storage_type");
     commandArgs.add(customerConfig.name.toLowerCase());
+    if (nodeToNodeTlsEnabled) {
+      commandArgs.add("--certs_dir");
+      commandArgs.add(getCertsDir(region, provider));
+    }
     commandArgs.add(backupTableParams.actionType.name().toLowerCase());
     if (backupTableParams.enableVerboseLogs) {
       commandArgs.add("--verbose");
@@ -244,15 +249,15 @@ public class TableManager extends DevopsBase {
     return YB_CLOUD_COMMAND_TYPE;
   }
 
-  public ShellProcessHandler.ShellResponse bulkImport(BulkImportParams taskParams) {
+  public ShellResponse bulkImport(BulkImportParams taskParams) {
     return runCommand(BULK_IMPORT, taskParams);
   }
 
-  public ShellProcessHandler.ShellResponse createBackup(BackupTableParams taskParams) {
+  public ShellResponse createBackup(BackupTableParams taskParams) {
     return runCommand(BACKUP, taskParams);
   }
 
-  public ShellProcessHandler.ShellResponse deleteBackup(BackupTableParams taskParams) {
+  public ShellResponse deleteBackup(BackupTableParams taskParams) {
     return runCommand(DELETE, taskParams);
   }
 }

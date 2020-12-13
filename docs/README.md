@@ -1,12 +1,11 @@
 # YugabyteDB Docs
 
-This repository contains the documentation for YugabyteDB available at https://docs.yugabyte.com/
-
-Please [open an issue](https://github.com/yugabyte/docs/issues) to suggest enhancements.
+This repository contains the source code for the (public documentation for YugabyteDB)[https://docs.yugabyte.com/]. Please [open an issue](https://github.com/YugaByte/docs/issues) to request features or suggest enhancements.
 
 
 # Contributing to YugabyteDB Docs
 
+## Prerequisites
 YugabyteDB docs are based on the Hugo framework and use the Material Docs theme.
 
 * Hugo framework: http://gohugo.io/overview/introduction/
@@ -15,31 +14,33 @@ YugabyteDB docs are based on the Hugo framework and use the Material Docs theme.
 
 ## Step 1. Initial setup
 
-Follow these steps if this is the first time you are setting up for working on the docs locally.
+Follow these steps if this is the first time you are setting up the YugabyteDB docs repo locally.
 
 1. Fork this repository on GitHub and create a local clone of your fork. This should look something like below:
-   ```sh
-   git clone git@github.com:<YOUR_GITHUB_ID>/yugabyte-db.git
-   ```
+```
+git clone git@github.com:<YOUR_GITHUB_ID>/yugabyte-db.git
+cd ./yugabyte-db
+```
 
-   Add the original repository as an upstream remote:
-   ```sh
-   git remote add --track master upstream https://github.com/yugabyte/yugabyte-db.git
-   ```
+Add the master as a remote branch by running the following:
+```
+$ git remote add --track master upstream https://github.com/yugabyte/yugabyte-db.git
+```
 
-1. Install Hugo. For example, on a Mac, you can run the following commands:
-   ```sh
-   brew update
-   brew install hugo
-   brew install npm
-   ```
+2. Install Hugo. For example, on a Mac, you can run the following commands:
+```
+brew update
+brew install hugo
+brew install npm
+```
 
-1. Install node modules as shown below:
-   ```sh
-   npm ci
-   ```
+4. Install node modules as shown below:
+```
+$ cd docs
+$ npm ci
+```
 
-## Step 2. Update your repo and start the local webserver
+## Step 2. Update your docs repo and start the local webserver
 
 The assumption here is that you are working on a local clone of your fork. See the previous step.
 
@@ -57,6 +58,7 @@ $ git push origin master
 
 2. Start the local webserver on `127.0.0.1` interface by running the following:
 ```
+$ cd docs
 $ npm start
 ```
 
@@ -76,138 +78,36 @@ YB_HUGO_BASE=<YOUR_IP_OR_HOSTNAME> npm start
 You can now share the following link: `http://<YOUR_IP_OR_HOSTNAME>:1313`
 
 
-## Step 3. Make changes
+## Step 3. Identify an issue
 
-It is suggested that you create and checkout a feature branch off `master` for your changes:
-```
-$ git branch <feature branch name> master
-$ git checkout <feature branch name>
-```
+There needs to be a GitHub issue describing the enhancement you intend to do. Please post a comment on the issue you plan to work on before starting to work on it. This is to ensure someone else does not end up working on this in parallel.
 
-Make the changes locally and test them on the browser.
+In case you do not have an issue and you're looking for one to work on, here is some useful information to help you:
+* All issues are tracked using [GitHub issues](https://github.com/yugabyte/yugabyte-db/issues)
+* Documentation related issues have the `area/documentation` label, here is a [list of documentation issues](https://github.com/yugabyte/yugabyte-db/issues?q=is%3Aopen+is%3Aissue+label%3Aarea%2Fdocumentation)
+* If you are new, look for [issues with the label `good first issue`](https://github.com/yugabyte/yugabyte-db/issues?q=is%3Aopen+is%3Aissue+label%3Aarea%2Fdocumentation+label%3A%22good+first+issue%22). If none exist, join [the community slack](https://www.yugabyte.com/slack) and let us know in the `contributors` channel.
+* You can also look for [issues with the label `help wanted`](https://github.com/yugabyte/yugabyte-db/issues?q=is%3Aopen+is%3Aissue+label%3Aarea%2Fdocumentation+label%3A%22help+wanted%22+). If none exist, join [the community slack](https://www.yugabyte.com/slack) and let us know in the `contributors` channel.
+
+If you run into any issues, please let us know by posting in our [the community slack](https://www.yugabyte.com/slack), we really appreciate your feedback (and love to talk to you as well).
+
+## Step 4. Make changes
+
+Make the changes locally and test them on the browser. You can make the changes on a branch with
+```
+$ git checkout -b <short_description_of_branch>
+```
 
 Once you are satisfied with your changes, commit them to your local branch. You can do this by running the following command:
 ```
-# Add files you have made changes to.
-$ git add ...
+# Add all files you have made changes to.
+$ git add -A
 
 # Commit these changes.
 $ git commit
 ```
 
-## Step 4. Submit a pull request
+## Step 5. Submit a pull request
 
-Create a pull request once you are ready to submit your changes.
+Create a [pull request in the YugabyteDB docs repo](https://github.com/yugabyte/docs/pulls) once you are ready to submit your changes.
 
 We will review your changes, add any feedback and once everything looks good merge your changes into the mainline.
-
-
-## Advanced Usage
-
-_Note: YCQL docs are still using an old method.  Follow these instructions for YSQL, but use these
-instructions just as a reference for YCQL._
-
-### Generate API syntax diagrams
-
-1. Download the latest RRDiagram JAR file (`rrdiagram.jar`).  You can find it on the [release
-   page](https://github.com/yugabyte/RRDiagram/releases/), or you can try running the following
-   command.
-
-   ```sh
-   wget $(curl -s https://api.github.com/repos/Yugabyte/RRDiagram/releases/latest \
-          | grep browser_download_url | cut -d \" -f 4)
-   ```
-
-   _Note: Alternatively, you can manually build the JAR file as described in the [build
-   section](https://github.com/yugabyte/RRDiagram#build) of the `RRDiagram` repository._
-
-1. Run the diagram generator using the following command:
-
-   ```sh
-   java -jar rrdiagram.jar content/latest/api/ysql/syntax_resources/ysql_grammar.ebnf \
-     content/latest/api/ysql/syntax_resources/
-   ```
-
-   To display helpful `WARNING` messages, end the last argument with `syntax_resources`, not
-   `commands`.
-
-   The following files will be regenerated _if they exist_:
-
-   - `content/latest/api/ysql/syntax_resources/commands/*.diagram.md`
-   - `content/latest/api/ysql/syntax_resources/commands/*.grammar.md`
-   - `content/latest/api/ysql/syntax_resources/grammar_diagrams.md`
-
-   _Note: To see help, run `java -jar rrdiagram.jar` (without arguments)._
-
-### Add a new docs page
-
-You may need to add a new docs page if you are adding a new command that doesn't belong in the
-existing doc pages.
-
-1. Add new rules to the source grammar file:
-
-   - `content/latest/api/ysql/syntax_resources/ysql_grammar.ebnf`
-
-1. Prepare the new diagram and grammar files by creating the following **empty** files:
-
-   - `content/latest/api/ysql/syntax_resources/commands/<rules>.diagram.md`
-   - `content/latest/api/ysql/syntax_resources/commands/<rules>.grammar.md`
-
-   For `<rules>`, use a comma-separated list of rule names that you want in your new docs page.
-
-   _Example: for the YSQL 'COPY' command, the diagram and grammar files are the following:_
-
-   - `content/latest/api/ysql/syntax_resources/commands/copy_from,copy_to,copy_option.diagram.md`
-   - `content/latest/api/ysql/syntax_resources/commands/copy_from,copy_to,copy_option.grammar.md`
-
-1. Create the docs page file:
-
-   - `content/latest/api/ysql/commands/<name>.md`
-
-   Use the existing files in that directory as examples.  For `<name>`, follow the naming convention
-   exhibited by the other files.  For YSQL, note the usage of the template `includeMarkdown` macro.
-
-   _Example: for the YSQL `COPY` command, the created file is the following:_
-
-   - `content/latest/api/ysql/commands/cmd_copy.md`
-
-1. Update the index page files:
-
-   - `content/latest/api/ysql/_index.md`
-   - `content/latest/api/ysql/commands/_index.md`
-
-1. [Run the diagram generator](#generate-api-syntax-diagrams).
-
-   Ensure that no `WARNING`s are thrown related to the rules that you added.
-
-1. Check the new docs page and index pages to make sure that there are no broken links.
-
-### Edit rules in a docs page
-
-You may need to add or edit grammar rules in an existing docs page.
-
-1. Add or edit rules in the source grammar file:
-
-   - `content/latest/api/ysql/syntax_resources/ysql_grammar.ebnf`
-
-1. Rename the diagram and grammar files if needed:
-
-   - `content/latest/api/ysql/syntax_resources/commands/<oldrules>.diagram.md` to
-     `content/latest/api/ysql/syntax_resources/commands/<newrules>.diagram.md`
-   - `content/latest/api/ysql/syntax_resources/commands/<oldrules>.grammar.md` to
-     `content/latest/api/ysql/syntax_resources/commands/<newrules>.grammar.md`
-
-1. Edit the contents of the docs page file:
-
-   - `content/latest/api/ysql/commands/<name>.md`
-
-1. [Run the diagram generator](#generate-api-syntax-diagrams).
-
-   Ensure that no `WARNING`s are thrown related to the rules that you added or edited.
-
-1. Check the modified docs page to make sure that there are no broken links.
-
-### Notes
-
-- To force the page to be re-rendered, you may need to save the docs page file (for example,
-  `commands/cmd_copy.md`).
